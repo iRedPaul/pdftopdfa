@@ -565,6 +565,31 @@ class TestApplyOcr:
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_tesseract_path_accepts_directory(
+        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_path: Path
+    ) -> None:
+        """TESSERACT_PATH pointing to a directory uses it directly (not its parent)."""
+        output_path = tmp_path / "output.pdf"
+        tesseract_dir = tmp_path / "tesseract" / "bin"
+        tesseract_dir.mkdir(parents=True)
+
+        captured_path = {}
+
+        def capture_path(*args: object, **kwargs: object) -> None:
+            captured_path["during"] = os.environ.get("PATH", "")
+
+        mock_ocrmypdf.ocr.side_effect = capture_path
+
+        with patch.dict(
+            "os.environ",
+            {"TESSERACT_PATH": str(tesseract_dir)},
+        ):
+            apply_ocr(sample_pdf, output_path, "eng")
+
+        assert captured_path["during"].startswith(str(tesseract_dir) + os.pathsep)
+
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
     def test_tesseract_path_not_set_leaves_path_unchanged(
         self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
     ) -> None:

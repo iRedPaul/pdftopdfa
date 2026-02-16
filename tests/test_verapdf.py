@@ -65,6 +65,11 @@ class TestGetVerapdfCmd:
         with patch.dict("os.environ", {"VERAPDF_PATH": "/opt/verapdf/bin/verapdf"}):
             assert _get_verapdf_cmd() == "/opt/verapdf/bin/verapdf"
 
+    def test_returns_executable_in_dir_when_dir_set(self, tmp_path: Path) -> None:
+        """Returns <dir>/verapdf when VERAPDF_PATH points to a directory."""
+        with patch.dict("os.environ", {"VERAPDF_PATH": str(tmp_path)}):
+            assert _get_verapdf_cmd() == str(tmp_path / "verapdf")
+
     @patch("pdftopdfa.verapdf.shutil.which")
     def test_is_available_uses_custom_path(self, mock_which: MagicMock) -> None:
         """is_verapdf_available uses VERAPDF_PATH."""

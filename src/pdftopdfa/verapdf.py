@@ -52,7 +52,13 @@ VALID_FLAVOURS = frozenset(
 
 def _get_verapdf_cmd() -> str:
     """Returns the veraPDF command from VERAPDF_PATH or falls back to 'verapdf'."""
-    return os.environ.get("VERAPDF_PATH", "verapdf")
+    verapdf_path = os.environ.get("VERAPDF_PATH")
+    if not verapdf_path:
+        return "verapdf"
+    p = Path(verapdf_path)
+    if p.is_dir():
+        return str(p / "verapdf")
+    return verapdf_path
 
 
 @dataclass
@@ -272,7 +278,7 @@ def validate_with_verapdf(
             "veraPDF is not installed or not in PATH. "
             "Installation: https://verapdf.org/ — "
             "or set the VERAPDF_PATH environment variable to the "
-            "veraPDF executable."
+            "veraPDF executable or its parent directory."
         )
 
     if not path.exists():

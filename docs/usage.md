@@ -305,5 +305,5 @@ if result.validation_failed:
 
 | Variable | Description |
 |----------|-------------|
-| `VERAPDF_PATH` | Custom path to the veraPDF executable |
-| `TESSERACT_PATH` | Custom path to the Tesseract executable (for OCR) |
+| `VERAPDF_PATH` | Custom path to the veraPDF executable or its parent directory |
+| `TESSERACT_PATH` | Custom path to the Tesseract executable or its parent directory (for OCR) |
