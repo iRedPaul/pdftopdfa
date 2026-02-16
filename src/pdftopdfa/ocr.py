@@ -41,6 +41,7 @@ except ImportError:
     class PriorOcrFoundError(Exception):  # type: ignore[no-redef]
         pass
 
+
 # Optional import of OpenCV (used for OCR image preprocessing)
 try:
     import cv2  # noqa: F401
