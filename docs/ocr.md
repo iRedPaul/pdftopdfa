@@ -57,10 +57,22 @@ The presets map to the following ocrmypdf parameters:
 |--------------------|--------|-----------|--------|
 | `skip_text` | True | True | True |
 | `deskew` | False | False | True |
-| `clean` | False | True | True |
 | `rotate_pages` | False | False | True |
 | `remove_background` | False | False | True |
 | `oversample` | - | 300 | 300 |
 | `optimize` | 0 | 1 | 1 |
+| OpenCV preprocessing | No | Yes | Yes |
 
-**Note:** `clean=True` only preprocesses images internally for Tesseract -- the original images in the PDF remain unchanged.
+## Image Preprocessing
+
+The `default` and `best` presets automatically preprocess page images before OCR using OpenCV (installed as part of `pdftopdfa[ocr]`).
+
+The preprocessing pipeline applies:
+
+1. **Grayscale conversion** -- color images are converted to grayscale
+2. **Denoising** -- `cv2.fastNlMeansDenoising` removes scanner noise
+3. **Adaptive thresholding** -- `cv2.adaptiveThreshold` with Gaussian method produces a clean binary image
+
+The preprocessing only affects the image that Tesseract sees for recognition. The original page images in the PDF remain unchanged.
+
+If OpenCV is not installed, preprocessing is skipped with a warning and OCR still runs normally.

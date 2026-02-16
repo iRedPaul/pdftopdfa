@@ -41,6 +41,13 @@ except ImportError:
     class PriorOcrFoundError(Exception):  # type: ignore[no-redef]
         pass
 
+# Optional import of OpenCV (used for OCR image preprocessing)
+try:
+    import cv2  # noqa: F401
+
+    HAS_OPENCV = True
+except ImportError:
+    HAS_OPENCV = False
 
 if TYPE_CHECKING:
     import pikepdf
@@ -93,7 +100,6 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
     OcrQuality.FAST: {
         "skip_text": True,
         "deskew": False,
-        "clean": False,
         "rotate_pages": False,
         "remove_background": False,
         "optimize": 0,
@@ -103,7 +109,6 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
     OcrQuality.DEFAULT: {
         "skip_text": True,
         "deskew": False,
-        "clean": True,
         "rotate_pages": False,
         "remove_background": False,
         "oversample": 300,
@@ -114,7 +119,6 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
     OcrQuality.BEST: {
         "skip_text": True,
         "deskew": True,
-        "clean": True,
         "rotate_pages": True,
         "remove_background": True,
         "oversample": 300,
@@ -123,6 +127,9 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
         "progress_bar": False,
     },
 }
+
+# Quality levels that benefit from OpenCV preprocessing
+_PREPROCESS_QUALITIES = frozenset({OcrQuality.DEFAULT, OcrQuality.BEST})
 
 
 def is_ocr_available() -> bool:
@@ -358,7 +365,18 @@ def apply_ocr(
     )
 
     try:
-        ocr_kwargs = OCR_SETTINGS[quality]
+        ocr_kwargs = dict(OCR_SETTINGS[quality])
+
+        if quality in _PREPROCESS_QUALITIES:
+            if HAS_OPENCV:
+                ocr_kwargs["plugins"] = ["pdftopdfa.ocr_preprocess"]
+                logger.debug("OpenCV preprocessing plugin enabled")
+            else:
+                logger.warning(
+                    "OpenCV not available; skipping image preprocessing. "
+                    "Install opencv-python-headless for better OCR quality."
+                )
+
         with _temporary_tesseract_path():
             ocrmypdf.ocr(
                 input_path,
@@ -379,11 +397,7 @@ def apply_ocr(
         return output_path
 
     except MissingDependencyError as e:
-        raise OCRError(
-            "OCR failed: Tesseract is not installed. "
-            "Please install Tesseract OCR or set the "
-            "TESSERACT_PATH environment variable."
-        ) from e
+        raise OCRError(f"OCR failed: {e}") from e
 
     except Exception as e:
         raise OCRError(f"OCR failed: {e}") from e
