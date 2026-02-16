@@ -817,6 +817,9 @@ class TestOpenCVPlugin:
         assert "OpenCV not available" in caplog.text
 
 
+cv2 = pytest.importorskip("cv2", reason="OpenCV not installed")
+
+
 class TestFilterOcrImage:
     """Tests for the filter_ocr_image plugin hook."""
 
