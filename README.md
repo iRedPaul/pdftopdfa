@@ -40,7 +40,7 @@ pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with 
 ### Prerequisites
 
 - Python 3.12, 3.13, or 3.14
-- macOS or Linux
+- macOS, Linux, or Windows
 
 ### Install from PyPI
 
@@ -101,7 +101,7 @@ See [docs/usage.md](docs/usage.md) for the full CLI reference, Python API docume
 - **No PDF/A-1 support** -- only PDF/A-2 and PDF/A-3 levels are supported
 - **Encrypted PDFs** -- password-protected PDFs cannot be converted
 - **Font replacement** -- fonts without a suitable metrically compatible replacement produce a warning; the resulting file may not be fully compliant
-- **Platform** -- currently supported on macOS and Linux
+- **Platform** -- supported on macOS, Linux, and Windows
 - **Python versions** -- tested on Python 3.12, 3.13, and 3.14
 
 ## Development
