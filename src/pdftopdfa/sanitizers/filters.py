@@ -11,6 +11,7 @@ and re-encodes non-image streams to fix /Length mismatches (rule 6.1.7.1).
 """
 
 import logging
+import warnings
 import zlib
 
 from pikepdf import Array, Dictionary, Name, Pdf, Stream, parse_content_stream
@@ -333,7 +334,11 @@ def _sanitize_inline_images_in_stream(
 ) -> tuple[bool, bool]:
     """Sanitize inline-image filters inside one content stream."""
     try:
-        instructions = list(parse_content_stream(stream))
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message="Unexpected end of stream", category=UserWarning
+            )
+            instructions = list(parse_content_stream(stream))
     except Exception:
         return False, False
 
@@ -376,7 +381,12 @@ def _may_contain_inline_images(stream: Stream) -> bool:
         return str(subtype) == "/Form"
     # No /Subtype — could be a page content stream.
     # Skip if /Type is present (e.g. /Metadata, /XRef).
-    return stream.get("/Type") is None
+    if stream.get("/Type") is not None:
+        return False
+    # Skip font streams (have /Length1, /Length2, or /Length3).
+    if stream.get("/Length1") is not None:
+        return False
+    return True
 
 
 def _has_lzw_filter(stream: Stream) -> bool:

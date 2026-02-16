@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import warnings
 from decimal import Decimal
 from typing import Any
 
@@ -307,7 +308,11 @@ def _sanitize_content_stream(stream_obj: Stream, stats: dict[str, int]) -> None:
         stats["hex_odd_fixed"] += odd_hex
 
     try:
-        instructions = list(pikepdf.parse_content_stream(stream_obj))
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message="Unexpected end of stream", category=UserWarning
+            )
+            instructions = list(pikepdf.parse_content_stream(stream_obj))
     except Exception:
         return
 
