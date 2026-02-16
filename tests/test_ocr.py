@@ -552,7 +552,8 @@ class TestApplyOcr:
         ):
             apply_ocr(sample_pdf, output_path, "eng")
 
-        assert captured_path["during"].startswith("/opt/tesseract/bin" + os.pathsep)
+        expected_dir = str(Path("/opt/tesseract/bin/tesseract").parent)
+        assert captured_path["during"].startswith(expected_dir + os.pathsep)
         # PATH is restored after the call
         assert os.environ.get("PATH", "") == original_path
 
