@@ -4,9 +4,12 @@
 
 """Unit tests for ocr.py."""
 
+import logging
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+from PIL import Image
 
 import pikepdf
 import pytest
@@ -16,6 +19,7 @@ from pikepdf import Array, Dictionary, Name, Pdf
 from pdftopdfa.exceptions import OCRError
 from pdftopdfa.ocr import (
     OCR_SETTINGS,
+    _PREPROCESS_QUALITIES,
     OcrQuality,
     _page_has_images,
     _page_has_text,
@@ -412,6 +416,7 @@ class TestApplyOcr:
             with pytest.raises(OCRError, match="OCR not available"):
                 apply_ocr(sample_pdf, output_path, "deu")
 
+    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     def test_apply_ocr_calls_ocrmypdf(
@@ -514,10 +519,10 @@ class TestApplyOcr:
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     @patch("pdftopdfa.ocr.MissingDependencyError", Exception)
-    def test_apply_ocr_handles_missing_tesseract(
+    def test_apply_ocr_handles_missing_dependency(
         self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
     ) -> None:
-        """MissingDependencyError is converted to OCRError with Tesseract hint."""
+        """MissingDependencyError is converted to OCRError preserving the message."""
         output_path = tmp_dir / "output.pdf"
 
         # Simulate MissingDependencyError
@@ -525,9 +530,11 @@ class TestApplyOcr:
             pass
 
         with patch("pdftopdfa.ocr.MissingDependencyError", MockMissingDependencyError):
-            mock_ocrmypdf.ocr.side_effect = MockMissingDependencyError()
+            mock_ocrmypdf.ocr.side_effect = MockMissingDependencyError(
+                "tesseract is not installed"
+            )
 
-            with pytest.raises(OCRError, match="Tesseract"):
+            with pytest.raises(OCRError, match="tesseract is not installed"):
                 apply_ocr(sample_pdf, output_path, "deu")
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
@@ -626,36 +633,36 @@ class TestOcrQuality:
         settings = OCR_SETTINGS[OcrQuality.FAST]
         assert settings["skip_text"] is True
         assert settings["deskew"] is False
-        assert settings["clean"] is False
         assert settings["rotate_pages"] is False
         assert settings["remove_background"] is False
         assert settings["optimize"] == 0
         assert settings["progress_bar"] is False
         assert "oversample" not in settings
+        assert "clean" not in settings
 
     def test_ocr_settings_default_preset(self) -> None:
         """Default preset uses quality parameters without visual changes."""
         settings = OCR_SETTINGS[OcrQuality.DEFAULT]
         assert settings["skip_text"] is True
         assert settings["deskew"] is False
-        assert settings["clean"] is True
         assert settings["rotate_pages"] is False
         assert settings["remove_background"] is False
         assert settings["oversample"] == 300
         assert settings["optimize"] == 1
         assert settings["progress_bar"] is False
+        assert "clean" not in settings
 
     def test_ocr_settings_best_preset(self) -> None:
         """Best preset uses all quality parameters including visual changes."""
         settings = OCR_SETTINGS[OcrQuality.BEST]
         assert settings["skip_text"] is True
         assert settings["deskew"] is True
-        assert settings["clean"] is True
         assert settings["rotate_pages"] is True
         assert settings["remove_background"] is True
         assert settings["oversample"] == 300
         assert settings["optimize"] == 1
         assert settings["progress_bar"] is False
+        assert "clean" not in settings
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
@@ -674,6 +681,7 @@ class TestOcrQuality:
             **OCR_SETTINGS[OcrQuality.FAST],
         )
 
+    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     def test_apply_ocr_default_quality(
@@ -691,6 +699,7 @@ class TestOcrQuality:
             **OCR_SETTINGS[OcrQuality.DEFAULT],
         )
 
+    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     def test_apply_ocr_best_quality(
@@ -722,3 +731,127 @@ class TestOcrQuality:
         expected = OCR_SETTINGS[OcrQuality.DEFAULT]
         for key, value in expected.items():
             assert call_kwargs[key] == value
+
+
+class TestOpenCVPlugin:
+    """Tests for OpenCV preprocessing plugin integration."""
+
+    def test_preprocess_qualities_contains_default_and_best(self) -> None:
+        """_PREPROCESS_QUALITIES includes DEFAULT and BEST."""
+        assert OcrQuality.DEFAULT in _PREPROCESS_QUALITIES
+        assert OcrQuality.BEST in _PREPROCESS_QUALITIES
+        assert OcrQuality.FAST not in _PREPROCESS_QUALITIES
+
+    @patch("pdftopdfa.ocr.HAS_OPENCV", True)
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_uses_opencv_plugin(
+        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """Plugins kwarg is set when OpenCV is available and quality supports it."""
+        output_path = tmp_dir / "output.pdf"
+
+        apply_ocr(sample_pdf, output_path, "eng", quality=OcrQuality.DEFAULT)
+
+        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
+        assert call_kwargs["plugins"] == ["pdftopdfa.ocr_preprocess"]
+
+    @patch("pdftopdfa.ocr.HAS_OPENCV", True)
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_best_uses_opencv_plugin(
+        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """BEST quality also uses the OpenCV plugin."""
+        output_path = tmp_dir / "output.pdf"
+
+        apply_ocr(sample_pdf, output_path, "eng", quality=OcrQuality.BEST)
+
+        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
+        assert call_kwargs["plugins"] == ["pdftopdfa.ocr_preprocess"]
+
+    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_no_opencv_no_plugin(
+        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """No plugins kwarg when OpenCV is not available."""
+        output_path = tmp_dir / "output.pdf"
+
+        apply_ocr(sample_pdf, output_path, "eng", quality=OcrQuality.DEFAULT)
+
+        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
+        assert "plugins" not in call_kwargs
+
+    @patch("pdftopdfa.ocr.HAS_OPENCV", True)
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_fast_no_plugin(
+        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """FAST quality never uses the OpenCV plugin."""
+        output_path = tmp_dir / "output.pdf"
+
+        apply_ocr(sample_pdf, output_path, "eng", quality=OcrQuality.FAST)
+
+        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
+        assert "plugins" not in call_kwargs
+
+    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_no_opencv_logs_warning(
+        self,
+        mock_ocrmypdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Warning is logged when OpenCV is not available."""
+        output_path = tmp_dir / "output.pdf"
+
+        with caplog.at_level(logging.WARNING, logger="pdftopdfa.ocr"):
+            apply_ocr(sample_pdf, output_path, "eng", quality=OcrQuality.DEFAULT)
+
+        assert "OpenCV not available" in caplog.text
+
+
+class TestFilterOcrImage:
+    """Tests for the filter_ocr_image plugin hook."""
+
+    def test_filter_ocr_image_color_input(self) -> None:
+        """Color image is converted to grayscale and binarized."""
+        from pdftopdfa.ocr_preprocess import filter_ocr_image
+
+        # Create a color image (RGB)
+        img = Image.new("RGB", (100, 100), color=(128, 128, 128))
+        result = filter_ocr_image(page=None, image=img)
+
+        assert isinstance(result, Image.Image)
+        assert result.mode == "L"  # Grayscale output
+        assert result.size == (100, 100)
+
+    def test_filter_ocr_image_grayscale_input(self) -> None:
+        """Grayscale image is processed without color conversion."""
+        from pdftopdfa.ocr_preprocess import filter_ocr_image
+
+        img = Image.new("L", (100, 100), color=128)
+        result = filter_ocr_image(page=None, image=img)
+
+        assert isinstance(result, Image.Image)
+        assert result.mode == "L"
+        assert result.size == (100, 100)
+
+    def test_filter_ocr_image_binarizes_output(self) -> None:
+        """Output image contains only black and white pixels."""
+        from pdftopdfa.ocr_preprocess import filter_ocr_image
+
+        import numpy as np
+
+        img = Image.new("L", (100, 100), color=128)
+        result = filter_ocr_image(page=None, image=img)
+
+        pixels = np.array(result)
+        unique_values = set(np.unique(pixels))
+        assert unique_values <= {0, 255}
