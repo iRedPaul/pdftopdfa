@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=80.10.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdftopdfa"
+version = "0.1.0"
+description = "Convert PDF files to the archival PDF/A format"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.12"
+authors = [
+    {name = "iredpaul"}
+]
+keywords = ["pdf", "pdfa", "pdf-a", "archival", "conversion", "iso-19005"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Text Processing :: General",
+]
+dependencies = [
+    "pikepdf>=10.3.0",
+    "lxml>=6.0.2",
+    "click>=8.3.1",
+    "colorama>=0.4.6",
+    "tqdm>=4.67.3",
+    "fonttools>=4.61.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/iredpaul/pdftopdfa"
+Repository = "https://github.com/iredpaul/pdftopdfa"
+Issues = "https://github.com/iredpaul/pdftopdfa/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.15.0",
+]
+ocr = [
+    "ocrmypdf>=17.1.0",
+]
+
+[project.scripts]
+pdftopdfa = "pdftopdfa.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pdftopdfa = [
+    "resources/icc/*.icc",
+    "resources/icc/LICENSES.txt",
+    "resources/fonts/*.ttf",
+    "resources/fonts/*.otf",
+    "resources/fonts/*.ttc",
+    "resources/fonts/LICENSES.txt",
+    "resources/cid_unicode/*.bin.gz",
+    "resources/cid_unicode/LICENSES.txt",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short --cov=pdftopdfa --cov-report=term-missing"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = []
+
+[tool.ruff.lint.isort]
+known-first-party = ["pdftopdfa"]

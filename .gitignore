@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.coverage
+.pytest_cache/
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Tools
+.ruff_cache/
+
+# macOS
+.DS_Store
+
+# Claude Code
+CLAUDE.md
+AGENTS.md
+.claude/
+
+# Test data
+veraPDF-corpus-staging/

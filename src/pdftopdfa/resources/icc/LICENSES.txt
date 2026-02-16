@@ -1,0 +1,76 @@
+ICC Color Profile Licenses
+==========================
+
+All ICC color profiles included in this directory are compatible with
+the Mozilla Public License 2.0 used by this project.
+
+
+ISOcoated_v2_300_bas.icc
+------------------------
+Version: basICColor CMYKick v1.2
+Standard: ISO 12647-2:2004 / FOGRA39
+
+Copyright (c) 2006-2007 Color Solutions, All Rights Reserved
+Copyright (c) 2007-2010 basICColor GmbH
+
+This profile is released under the zlib/libpng license.
+
+The zlib/libpng License:
+
+This software is provided 'as-is', without any express or implied
+warranty. In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgment in the product documentation would be
+   appreciated but is not required.
+
+2. Altered source versions must be plainly marked as such, and must not
+   be misrepresented as being the original software.
+
+3. This notice may not be removed or altered from any source distribution.
+
+Source: https://www.colormanagement.org
+See also: https://www.eci.org/en/downloads (ECI - European Color Initiative)
+
+
+sRGB2014.icc
+------------
+Version: sRGB IEC61966-2.1 (revised February 2015)
+Standard: IEC 61966-2-1:1999/Amd 1:2003/Cor 1:2014
+
+Copyright (c) 1998 Hewlett-Packard Company (original sRGB specification)
+Copyright (c) 2015 International Color Consortium (ICC)
+
+This profile is provided by the ICC and is freely available for use,
+copying, distribution, and modification (with appropriate attribution
+changes for modified versions).
+
+The 2014 corrigendum to IEC 61966 corrected inconsistencies in the original
+standard. This profile was revised in February 2015 to bring the black point
+tag into alignment with current ISO and IEC recommendations.
+
+Source: https://www.color.org/srgbprofiles.xalter
+
+
+sGray.icc
+---------
+Version: sGrey-v2-micro (compact grayscale profile)
+Based on: sRGB grayscale equivalent
+
+From: Compact-ICC-Profiles by Clinton Ingram (saucecontrol)
+Copyright: Released to the public domain
+
+This profile is released under the CC0-1.0 license (Creative Commons Zero).
+No restrictions on distribution and use to the extent allowed by law.
+
+These minimal ICC profiles contain the minimum tags necessary to correctly
+represent a color space and use custom packing to minimize file size.
+Intended for embedding in image files where profile size is a consideration.
+
+Source: https://github.com/saucecontrol/Compact-ICC-Profiles
