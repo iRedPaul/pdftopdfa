@@ -13,6 +13,7 @@ This module handles three related requirements:
 
 import logging
 import re
+import warnings
 
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
@@ -278,7 +279,11 @@ def _sanitize_stream_operators(
         bad_args_removed).
     """
     try:
-        instructions = list(pikepdf.parse_content_stream(stream_obj))
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message="Unexpected end of stream", category=UserWarning
+            )
+            instructions = list(pikepdf.parse_content_stream(stream_obj))
     except Exception:
         return 0, 0, 0, 0
 
