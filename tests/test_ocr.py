@@ -9,17 +9,16 @@ import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from PIL import Image
-
 import pikepdf
 import pytest
 from conftest import new_pdf
 from pikepdf import Array, Dictionary, Name, Pdf
+from PIL import Image
 
 from pdftopdfa.exceptions import OCRError
 from pdftopdfa.ocr import (
-    OCR_SETTINGS,
     _PREPROCESS_QUALITIES,
+    OCR_SETTINGS,
     OcrQuality,
     _page_has_images,
     _page_has_text,
@@ -845,9 +844,9 @@ class TestFilterOcrImage:
 
     def test_filter_ocr_image_binarizes_output(self) -> None:
         """Output image contains only black and white pixels."""
-        from pdftopdfa.ocr_preprocess import filter_ocr_image
-
         import numpy as np
+
+        from pdftopdfa.ocr_preprocess import filter_ocr_image
 
         img = Image.new("L", (100, 100), color=128)
         result = filter_ocr_image(page=None, image=img)
