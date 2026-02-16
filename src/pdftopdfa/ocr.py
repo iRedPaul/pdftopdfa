@@ -73,7 +73,8 @@ def _temporary_tesseract_path():
     if not tesseract_path:
         yield
         return
-    tesseract_dir = str(Path(tesseract_path).parent)
+    p = Path(tesseract_path)
+    tesseract_dir = str(p) if p.is_dir() else str(p.parent)
     with _path_lock:
         saved = os.environ.get("PATH", "")
         os.environ["PATH"] = tesseract_dir + os.pathsep + saved

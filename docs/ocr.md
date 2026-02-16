@@ -8,7 +8,7 @@ pdftopdfa can add a text layer to scanned PDFs using [Tesseract](https://github.
 pip install "pdftopdfa[ocr]"
 ```
 
-Tesseract must be installed on the system. You can specify a custom path via the `TESSERACT_PATH` environment variable.
+Tesseract must be installed on the system. You can specify a custom path to the Tesseract executable or its parent directory via the `TESSERACT_PATH` environment variable.
 
 ## Usage
 
