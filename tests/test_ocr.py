@@ -430,6 +430,8 @@ class TestApplyOcr:
             sample_pdf,
             output_path,
             language="eng",
+            output_type="pdf",
+            rasterizer="pypdfium",
             **OCR_SETTINGS[OcrQuality.DEFAULT],
         )
 
@@ -658,7 +660,6 @@ class TestOcrQuality:
         assert settings["skip_text"] is True
         assert settings["deskew"] is False
         assert settings["rotate_pages"] is False
-        assert settings["remove_background"] is False
         assert settings["optimize"] == 0
         assert settings["progress_bar"] is False
         assert "oversample" not in settings
@@ -670,7 +671,6 @@ class TestOcrQuality:
         assert settings["skip_text"] is True
         assert settings["deskew"] is False
         assert settings["rotate_pages"] is False
-        assert settings["remove_background"] is False
         assert settings["oversample"] == 300
         assert settings["optimize"] == 1
         assert settings["progress_bar"] is False
@@ -682,7 +682,6 @@ class TestOcrQuality:
         assert settings["skip_text"] is True
         assert settings["deskew"] is True
         assert settings["rotate_pages"] is True
-        assert settings["remove_background"] is True
         assert settings["oversample"] == 300
         assert settings["optimize"] == 1
         assert settings["progress_bar"] is False
@@ -702,6 +701,8 @@ class TestOcrQuality:
             sample_pdf,
             output_path,
             language="eng",
+            output_type="pdf",
+            rasterizer="pypdfium",
             **OCR_SETTINGS[OcrQuality.FAST],
         )
 
@@ -720,6 +721,8 @@ class TestOcrQuality:
             sample_pdf,
             output_path,
             language="eng",
+            output_type="pdf",
+            rasterizer="pypdfium",
             **OCR_SETTINGS[OcrQuality.DEFAULT],
         )
 
@@ -738,6 +741,8 @@ class TestOcrQuality:
             sample_pdf,
             output_path,
             language="eng",
+            output_type="pdf",
+            rasterizer="pypdfium",
             **OCR_SETTINGS[OcrQuality.BEST],
         )
 

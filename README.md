@@ -151,6 +151,7 @@ Contributions are welcome! Please open an [issue](https://github.com/iredpaul/pd
 **Optional:**
 
 - [ocrmypdf](https://ocrmypdf.readthedocs.io/) -- OCR support (requires [Tesseract](https://github.com/tesseract-ocr/tesseract))
+- [pypdfium2](https://github.com/nicfit/pypdfium2) -- PDF page rasterizer for OCR
 - [OpenCV](https://opencv.org/) -- improved OCR preprocessing (deskewing, denoising)
 - [veraPDF](https://verapdf.org/) -- ISO-compliant PDF/A validation
 
