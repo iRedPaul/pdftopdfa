@@ -413,7 +413,7 @@ class TestApplyOcr:
 
         with patch("pdftopdfa.ocr.HAS_OCR", False):
             with pytest.raises(OCRError, match="OCR not available"):
-                apply_ocr(sample_pdf, output_path, "deu")
+                apply_ocr(sample_pdf, output_path, ["deu"])
 
     @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
@@ -424,12 +424,12 @@ class TestApplyOcr:
         """apply_ocr calls ocrmypdf.ocr with correct default parameters."""
         output_path = tmp_dir / "output.pdf"
 
-        apply_ocr(sample_pdf, output_path, "eng")
+        apply_ocr(sample_pdf, output_path, ["eng"])
 
         mock_ocrmypdf.ocr.assert_called_once_with(
             sample_pdf,
             output_path,
-            language="eng",
+            language=["eng"],
             output_type="pdf",
             rasterizer="pypdfium",
             **OCR_SETTINGS[OcrQuality.DEFAULT],
@@ -451,7 +451,7 @@ class TestApplyOcr:
             # Since we patch Exception as EncryptedPdfError, it gets caught
             # but handled as a general error
             with pytest.raises(OCRError, match="OCR failed"):
-                apply_ocr(sample_pdf, output_path, "deu")
+                apply_ocr(sample_pdf, output_path, ["deu"])
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
@@ -474,7 +474,7 @@ class TestApplyOcr:
         with patch("pdftopdfa.ocr.PriorOcrFoundError", MockPriorOcrFoundError):
             mock_ocrmypdf.ocr.side_effect = MockPriorOcrFoundError()
 
-            result = apply_ocr(sample_pdf, output_path, "deu")
+            result = apply_ocr(sample_pdf, output_path, ["deu"])
 
             mock_copy.assert_called_once_with(sample_pdf, output_path)
             assert result == output_path
@@ -487,7 +487,7 @@ class TestApplyOcr:
         """apply_ocr returns the output path."""
         output_path = tmp_dir / "output.pdf"
 
-        result = apply_ocr(sample_pdf, output_path, "deu")
+        result = apply_ocr(sample_pdf, output_path, ["deu"])
 
         assert result == output_path
 
@@ -502,7 +502,7 @@ class TestApplyOcr:
         apply_ocr(sample_pdf, output_path)
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert call_kwargs["language"] == "eng"
+        assert call_kwargs["language"] == ["eng"]
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
@@ -512,10 +512,10 @@ class TestApplyOcr:
         """apply_ocr supports multiple languages."""
         output_path = tmp_dir / "output.pdf"
 
-        apply_ocr(sample_pdf, output_path, "deu+eng")
+        apply_ocr(sample_pdf, output_path, ["deu", "eng"])
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert call_kwargs["language"] == "deu+eng"
+        assert call_kwargs["language"] == ["deu", "eng"]
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
@@ -536,7 +536,7 @@ class TestApplyOcr:
             )
 
             with pytest.raises(OCRError, match="tesseract is not installed"):
-                apply_ocr(sample_pdf, output_path, "deu")
+                apply_ocr(sample_pdf, output_path, ["deu"])
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
@@ -558,7 +558,7 @@ class TestApplyOcr:
             "os.environ",
             {"TESSERACT_PATH": "/opt/tesseract/bin/tesseract"},
         ):
-            apply_ocr(sample_pdf, output_path, "eng")
+            apply_ocr(sample_pdf, output_path, ["eng"])
 
         expected_dir = str(Path("/opt/tesseract/bin/tesseract").parent)
         assert captured_path["during"].startswith(expected_dir + os.pathsep)
@@ -586,7 +586,7 @@ class TestApplyOcr:
             "os.environ",
             {"TESSERACT_PATH": str(tesseract_dir)},
         ):
-            apply_ocr(sample_pdf, output_path, "eng")
+            apply_ocr(sample_pdf, output_path, ["eng"])
 
         assert captured_path["during"].startswith(str(tesseract_dir) + os.pathsep)
 
@@ -609,7 +609,7 @@ class TestApplyOcr:
         with patch.dict("os.environ", {}, clear=False):
             # Ensure TESSERACT_PATH is not set
             os.environ.pop("TESSERACT_PATH", None)
-            apply_ocr(sample_pdf, output_path, "eng")
+            apply_ocr(sample_pdf, output_path, ["eng"])
 
         assert captured_path["during"] == original_path
 
@@ -629,7 +629,7 @@ class TestApplyOcr:
             {"TESSERACT_PATH": "/opt/tesseract/bin/tesseract"},
         ):
             with pytest.raises(OCRError):
-                apply_ocr(sample_pdf, output_path, "eng")
+                apply_ocr(sample_pdf, output_path, ["eng"])
 
         assert os.environ.get("PATH", "") == original_path
 
@@ -695,12 +695,12 @@ class TestOcrQuality:
         """apply_ocr with FAST quality passes correct parameters."""
         output_path = tmp_dir / "output.pdf"
 
-        apply_ocr(sample_pdf, output_path, "eng", quality=OcrQuality.FAST)
+        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.FAST)
 
         mock_ocrmypdf.ocr.assert_called_once_with(
             sample_pdf,
             output_path,
-            language="eng",
+            language=["eng"],
             output_type="pdf",
             rasterizer="pypdfium",
             **OCR_SETTINGS[OcrQuality.FAST],
@@ -715,12 +715,12 @@ class TestOcrQuality:
         """apply_ocr with DEFAULT quality passes correct parameters."""
         output_path = tmp_dir / "output.pdf"
 
-        apply_ocr(sample_pdf, output_path, "eng", quality=OcrQuality.DEFAULT)
+        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.DEFAULT)
 
         mock_ocrmypdf.ocr.assert_called_once_with(
             sample_pdf,
             output_path,
-            language="eng",
+            language=["eng"],
             output_type="pdf",
             rasterizer="pypdfium",
             **OCR_SETTINGS[OcrQuality.DEFAULT],
@@ -735,12 +735,12 @@ class TestOcrQuality:
         """apply_ocr with BEST quality passes correct parameters."""
         output_path = tmp_dir / "output.pdf"
 
-        apply_ocr(sample_pdf, output_path, "eng", quality=OcrQuality.BEST)
+        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
 
         mock_ocrmypdf.ocr.assert_called_once_with(
             sample_pdf,
             output_path,
-            language="eng",
+            language=["eng"],
             output_type="pdf",
             rasterizer="pypdfium",
             **OCR_SETTINGS[OcrQuality.BEST],
@@ -754,7 +754,7 @@ class TestOcrQuality:
         """apply_ocr uses DEFAULT quality when quality parameter is omitted."""
         output_path = tmp_dir / "output.pdf"
 
-        apply_ocr(sample_pdf, output_path, "eng")
+        apply_ocr(sample_pdf, output_path, ["eng"])
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
         expected = OCR_SETTINGS[OcrQuality.DEFAULT]
@@ -780,7 +780,7 @@ class TestOpenCVPlugin:
         """Plugins kwarg is set when OpenCV is available and quality supports it."""
         output_path = tmp_dir / "output.pdf"
 
-        apply_ocr(sample_pdf, output_path, "eng", quality=OcrQuality.DEFAULT)
+        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.DEFAULT)
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
         assert call_kwargs["plugins"] == ["pdftopdfa.ocr_preprocess"]
@@ -794,7 +794,7 @@ class TestOpenCVPlugin:
         """BEST quality also uses the OpenCV plugin."""
         output_path = tmp_dir / "output.pdf"
 
-        apply_ocr(sample_pdf, output_path, "eng", quality=OcrQuality.BEST)
+        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
         assert call_kwargs["plugins"] == ["pdftopdfa.ocr_preprocess"]
@@ -808,7 +808,7 @@ class TestOpenCVPlugin:
         """No plugins kwarg when OpenCV is not available."""
         output_path = tmp_dir / "output.pdf"
 
-        apply_ocr(sample_pdf, output_path, "eng", quality=OcrQuality.DEFAULT)
+        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.DEFAULT)
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
         assert "plugins" not in call_kwargs
@@ -822,7 +822,7 @@ class TestOpenCVPlugin:
         """FAST quality never uses the OpenCV plugin."""
         output_path = tmp_dir / "output.pdf"
 
-        apply_ocr(sample_pdf, output_path, "eng", quality=OcrQuality.FAST)
+        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.FAST)
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
         assert "plugins" not in call_kwargs
@@ -841,7 +841,7 @@ class TestOpenCVPlugin:
         output_path = tmp_dir / "output.pdf"
 
         with caplog.at_level(logging.WARNING, logger="pdftopdfa.ocr"):
-            apply_ocr(sample_pdf, output_path, "eng", quality=OcrQuality.DEFAULT)
+            apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.DEFAULT)
 
         assert "OpenCV not available" in caplog.text
 

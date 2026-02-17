@@ -113,7 +113,7 @@ def convert_to_pdfa(
     level: str = "3b",
     *,
     validate: bool = False,
-    ocr_language: str | None = None,
+    ocr_languages: list[str] | None = None,
     ocr_quality: OcrQuality | None = None,
     convert_calibrated: bool = True,
 ) -> ConversionResult
@@ -127,7 +127,7 @@ def convert_to_pdfa(
 | `output_path` | `Path` | *required* | Path for the output PDF/A |
 | `level` | `str` | `"3b"` | PDF/A level: `"2b"`, `"2u"`, `"3b"`, or `"3u"` |
 | `validate` | `bool` | `False` | Validate output with veraPDF |
-| `ocr_language` | `str \| None` | `None` | OCR language (e.g. `"eng"`, `"deu+eng"`) |
+| `ocr_languages` | `list[str] \| None` | `None` | OCR languages (e.g. `["eng"]`, `["deu", "eng"]`) |
 | `ocr_quality` | `OcrQuality \| None` | `None` | OCR quality preset |
 | `convert_calibrated` | `bool` | `True` | Convert CalGray/CalRGB to ICCBased |
 
@@ -142,7 +142,7 @@ def convert_directory(
     recursive: bool = False,
     validate: bool = False,
     show_progress: bool = True,
-    ocr_language: str | None = None,
+    ocr_languages: list[str] | None = None,
     ocr_quality: OcrQuality | None = None,
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
@@ -159,7 +159,7 @@ def convert_directory(
 | `recursive` | `bool` | `False` | Process subdirectories |
 | `validate` | `bool` | `False` | Validate output with veraPDF |
 | `show_progress` | `bool` | `True` | Show tqdm progress bar |
-| `ocr_language` | `str \| None` | `None` | OCR language (e.g. `"eng"`, `"deu+eng"`) |
+| `ocr_languages` | `list[str] \| None` | `None` | OCR languages (e.g. `["eng"]`, `["deu", "eng"]`) |
 | `ocr_quality` | `OcrQuality \| None` | `None` | OCR quality preset |
 | `force_overwrite` | `bool` | `False` | Overwrite existing output files |
 | `convert_calibrated` | `bool` | `True` | Convert CalGray/CalRGB to ICCBased |

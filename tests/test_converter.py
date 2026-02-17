@@ -235,7 +235,7 @@ class TestConvertToPdfa:
         mock_is_ocr_available.return_value = False
         output_path = tmp_dir / "output.pdf"
 
-        result = convert_to_pdfa(sample_pdf, output_path, ocr_language="deu")
+        result = convert_to_pdfa(sample_pdf, output_path, ocr_languages=["deu"])
 
         assert result.success is True
         has_ocr_warning = any("OCR not available" in w for w in result.warnings)
@@ -244,7 +244,7 @@ class TestConvertToPdfa:
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.needs_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_convert_with_ocr_language_parameter(
+    def test_convert_with_ocr_languages_parameter(
         self,
         mock_is_ocr_available: MagicMock,
         mock_needs_ocr: MagicMock,
@@ -252,13 +252,13 @@ class TestConvertToPdfa:
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """ocr_language is passed through to apply_ocr."""
+        """ocr_languages is passed through to apply_ocr."""
         mock_is_ocr_available.return_value = True
         mock_needs_ocr.return_value = True
 
         # apply_ocr should create the temporary file
         def create_ocr_output(
-            input_path: Path, output_path: Path, lang: str, **kwargs: object
+            input_path: Path, output_path: Path, langs: list[str], **kwargs: object
         ) -> Path:
             # Copy input to output (simulates OCR)
             import shutil
@@ -270,13 +270,13 @@ class TestConvertToPdfa:
 
         output_path = tmp_dir / "output.pdf"
 
-        result = convert_to_pdfa(sample_pdf, output_path, ocr_language="eng")
+        result = convert_to_pdfa(sample_pdf, output_path, ocr_languages=["eng"])
 
         assert result.success is True
-        # Check if apply_ocr was called with the correct language
+        # Check if apply_ocr was called with the correct languages
         mock_apply_ocr.assert_called_once()
         call_args = mock_apply_ocr.call_args
-        assert call_args[0][2] == "eng"  # Language parameter
+        assert call_args[0][2] == ["eng"]  # Languages parameter
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.needs_ocr")
@@ -294,7 +294,7 @@ class TestConvertToPdfa:
         mock_needs_ocr.return_value = True
 
         def create_ocr_output(
-            input_path: Path, output_path: Path, lang: str, **kwargs: object
+            input_path: Path, output_path: Path, langs: list[str], **kwargs: object
         ) -> Path:
             import shutil
 
@@ -305,7 +305,7 @@ class TestConvertToPdfa:
 
         output_path = tmp_dir / "output.pdf"
 
-        result = convert_to_pdfa(sample_pdf, output_path, ocr_language="deu+eng")
+        result = convert_to_pdfa(sample_pdf, output_path, ocr_languages=["deu", "eng"])
 
         assert result.success is True
         has_ocr_done_warning = any(
@@ -328,7 +328,7 @@ class TestConvertToPdfa:
 
         output_path = tmp_dir / "output.pdf"
 
-        result = convert_to_pdfa(sample_pdf, output_path, ocr_language="deu")
+        result = convert_to_pdfa(sample_pdf, output_path, ocr_languages=["deu"])
 
         assert result.success is True
         # No OCR warning should be present
@@ -533,20 +533,20 @@ class TestConvertDirectory:
         assert results[0].input_path == input_dir / "doc.pdf"
 
     @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_convert_directory_with_ocr_language(
+    def test_convert_directory_with_ocr_languages(
         self,
         mock_is_ocr_available: MagicMock,
         tmp_dir: Path,
         sample_pdf_bytes: bytes,
     ) -> None:
-        """ocr_language parameter is passed through to convert_to_pdfa."""
+        """ocr_languages parameter is passed through to convert_to_pdfa."""
         mock_is_ocr_available.return_value = False  # OCR not available
 
         input_dir = tmp_dir / "input"
         input_dir.mkdir()
         (input_dir / "test.pdf").write_bytes(sample_pdf_bytes)
 
-        results = convert_directory(input_dir, show_progress=False, ocr_language="deu")
+        results = convert_directory(input_dir, show_progress=False, ocr_languages=["deu"])
 
         assert len(results) == 1
         assert results[0].success is True

@@ -353,7 +353,7 @@ def convert_to_pdfa(
     level: str = "3b",
     *,
     validate: bool = False,
-    ocr_language: str | None = None,
+    ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
     convert_calibrated: bool = True,
 ) -> ConversionResult:
@@ -364,8 +364,9 @@ def convert_to_pdfa(
         output_path: Path for the output PDF/A.
         level: PDF/A conformance level ('2b' or '3b').
         validate: If True, the result is validated.
-        ocr_language: Optional OCR language code (e.g., "deu", "eng", "deu+eng").
-            If specified, OCR is applied to image-based pages.
+        ocr_languages: Optional list of Tesseract language codes
+            (e.g., ``["deu", "eng"]``).  If specified, OCR is applied to
+            image-based pages.
         ocr_quality: OCR quality preset. If None, uses OcrQuality.DEFAULT.
 
     Returns:
@@ -445,7 +446,7 @@ def convert_to_pdfa(
 
         # 1. Optional: Perform OCR
         actual_input = input_path
-        if ocr_language is not None:
+        if ocr_languages is not None:
             from .ocr import OcrQuality, apply_ocr, is_ocr_available, needs_ocr
 
             if not is_ocr_available():
@@ -466,11 +467,12 @@ def convert_to_pdfa(
                         apply_ocr(
                             input_path,
                             ocr_temp_file,
-                            ocr_language,
+                            ocr_languages,
                             quality=effective_quality,
                         )
                         actual_input = ocr_temp_file
-                        warnings.append(f"OCR performed (language: {ocr_language})")
+                        lang_str = "+".join(ocr_languages)
+                        warnings.append(f"OCR performed (languages: {lang_str})")
                     else:
                         logger.debug("PDF already contains text, OCR not necessary")
 
@@ -735,7 +737,7 @@ def convert_files(
     level: str = "3b",
     *,
     validate: bool = False,
-    ocr_language: str | None = None,
+    ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
     force_overwrite: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
@@ -750,7 +752,7 @@ def convert_files(
         file_pairs: List of (input_path, output_path) tuples.
         level: PDF/A conformance level (e.g. '2b', '3b').
         validate: If True, results are validated.
-        ocr_language: Optional OCR language code (e.g., "deu", "eng", "deu+eng").
+        ocr_languages: Optional list of Tesseract language codes (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
         force_overwrite: If True, existing output files are overwritten.
             If False, existing outputs are skipped with an error result.
@@ -796,7 +798,7 @@ def convert_files(
                 output_path=output_path,
                 level=level,
                 validate=validate,
-                ocr_language=ocr_language,
+                ocr_languages=ocr_languages,
                 ocr_quality=ocr_quality,
                 convert_calibrated=convert_calibrated,
             )
@@ -831,7 +833,7 @@ def convert_directory(
     recursive: bool = False,
     validate: bool = False,
     show_progress: bool = True,
-    ocr_language: str | None = None,
+    ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
@@ -846,7 +848,7 @@ def convert_directory(
         recursive: If True, subdirectories are included.
         validate: If True, results are validated.
         show_progress: If True, a progress bar is shown.
-        ocr_language: Optional OCR language code (e.g., "deu", "eng", "deu+eng").
+        ocr_languages: Optional list of Tesseract language codes (e.g., ``["deu", "eng"]``).
             If specified, OCR is applied to image-based pages.
         ocr_quality: OCR quality preset.
         force_overwrite: If True, existing output files are overwritten.
@@ -917,7 +919,7 @@ def convert_directory(
         file_pairs=file_pairs,
         level=level,
         validate=validate,
-        ocr_language=ocr_language,
+        ocr_languages=ocr_languages,
         ocr_quality=ocr_quality,
         force_overwrite=force_overwrite,
         on_progress=_on_progress if show_progress else None,
