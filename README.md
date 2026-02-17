@@ -42,24 +42,14 @@ pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with 
 - Python 3.12, 3.13, or 3.14
 - macOS, Linux, or Windows
 
-### Install from PyPI
-
 ```bash
 pip install pdftopdfa
-```
-
-### Install from the repository
-
-```bash
-git clone https://github.com/iredpaul/pdftopdfa.git
-cd pdftopdfa
-pip install .
 ```
 
 ### Optional: OCR support
 
 ```bash
-pip install ".[ocr]"
+pip install "pdftopdfa[ocr]"
 ```
 
 OCR requires a [Tesseract](https://github.com/tesseract-ocr/tesseract) installation on the system. See [docs/ocr.md](docs/ocr.md) for details on OCR usage and quality presets.
