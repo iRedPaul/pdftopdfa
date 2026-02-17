@@ -279,6 +279,27 @@ The default level is **3b**.
 
 ---
 
+## Already Compliant PDFs
+
+Before converting, pdftopdfa checks whether the input PDF is already PDF/A compliant. If [veraPDF](https://verapdf.org/) is available, it validates the detected level. The behavior depends on the relationship between the detected and the target level:
+
+| Detected level | Target level | Behavior |
+|----------------|--------------|----------|
+| Same (e.g. 2b -> 2b) | -- | **Skipped.** File is copied without conversion. |
+| Higher conformance, same part (e.g. 2u -> 2b) | -- | **Skipped.** The existing higher conformance satisfies the target. |
+| Lower conformance, same part (e.g. 2b -> 2u) | -- | **Converted.** The "u" level requires additional Unicode mappings. |
+| Different part (e.g. 2b -> 3b or 3b -> 2b) | -- | **Converted.** PDF/A parts are not interchangeable (e.g. part 3 allows arbitrary embedded files that part 2 does not). |
+
+**Important details:**
+
+- The pre-check only skips conversion when veraPDF confirms the PDF is actually valid. If the PDF claims a level in its XMP metadata but fails validation, it is converted normally.
+- If veraPDF is not installed, the pre-check is skipped entirely and the PDF is always converted.
+- When conversion is skipped, the result includes the warning `"Conversion skipped: PDF already valid PDF/A"` and the `level` field reflects the detected level (not the requested target).
+
+**Conformance hierarchy (within the same part):** a > u > b. For example, a PDF/A-2a file satisfies a target of 2u or 2b, but a PDF/A-2b file does not satisfy a target of 2u.
+
+---
+
 ## Validation
 
 pdftopdfa uses [veraPDF](https://verapdf.org/) for ISO-compliant PDF/A validation. veraPDF must be installed separately and available in `PATH`, or you can set the `VERAPDF_PATH` environment variable.
