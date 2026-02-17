@@ -672,7 +672,7 @@ class TestOcrQuality:
         assert settings["deskew"] is False
         assert settings["rotate_pages"] is False
         assert settings["oversample"] == 300
-        assert settings["optimize"] == 1
+        assert settings["optimize"] == 0
         assert settings["progress_bar"] is False
         assert "clean" not in settings
 
@@ -683,7 +683,7 @@ class TestOcrQuality:
         assert settings["deskew"] is True
         assert settings["rotate_pages"] is True
         assert settings["oversample"] == 300
-        assert settings["optimize"] == 1
+        assert settings["optimize"] == 0
         assert settings["progress_bar"] is False
         assert "clean" not in settings
 
