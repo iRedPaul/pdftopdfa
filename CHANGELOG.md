@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2] - 2026-02-17
+
+### Changes
+
+- Use pypdfium rasterizer and plain PDF output for OCR, letting pdftopdfa handle PDF/A compliance exclusively
+- Remove `remove_background` parameter from all OCR presets
+- Add `pypdfium2` as an OCR dependency
+
 ## [0.1.1] - 2026-02-17
 
 ### Features
