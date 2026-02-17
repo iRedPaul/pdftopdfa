@@ -58,7 +58,6 @@ The presets map to the following ocrmypdf parameters:
 | `skip_text` | True | True | True |
 | `deskew` | False | False | True |
 | `rotate_pages` | False | False | True |
-| `remove_background` | False | False | True |
 | `oversample` | - | 300 | 300 |
 | `optimize` | 0 | 1 | 1 |
 | OpenCV preprocessing | No | Yes | Yes |

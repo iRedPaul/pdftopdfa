@@ -103,7 +103,6 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
         "skip_text": True,
         "deskew": False,
         "rotate_pages": False,
-        "remove_background": False,
         "optimize": 0,
         "tesseract_timeout": 120,
         "progress_bar": False,
@@ -112,7 +111,6 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
         "skip_text": True,
         "deskew": False,
         "rotate_pages": False,
-        "remove_background": False,
         "oversample": 300,
         "optimize": 1,
         "tesseract_timeout": 120,
@@ -122,7 +120,6 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
         "skip_text": True,
         "deskew": True,
         "rotate_pages": True,
-        "remove_background": True,
         "oversample": 300,
         "optimize": 1,
         "tesseract_timeout": 120,
@@ -384,6 +381,8 @@ def apply_ocr(
                 input_path,
                 output_path,
                 language=language,
+                output_type="pdf",
+                rasterizer="pypdfium",
                 **ocr_kwargs,
             )
         logger.info("OCR completed successfully: %s", output_path)
