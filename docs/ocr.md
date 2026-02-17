@@ -36,7 +36,7 @@ result = convert_to_pdfa(
     input_path=Path("scan.pdf"),
     output_path=Path("scan_pdfa.pdf"),
     level="2b",
-    ocr_language="eng",
+    ocr_languages=["eng"],
     ocr_quality=OcrQuality.BEST,
 )
 ```

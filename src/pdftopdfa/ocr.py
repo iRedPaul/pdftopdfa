@@ -329,7 +329,7 @@ def _form_xobject_has_text(
 def apply_ocr(
     input_path: Path,
     output_path: Path,
-    language: str = "eng",
+    languages: list[str] | None = None,
     *,
     quality: OcrQuality = OcrQuality.DEFAULT,
 ) -> Path:
@@ -341,8 +341,8 @@ def apply_ocr(
     Args:
         input_path: Path to the input PDF.
         output_path: Path for the OCR-processed PDF.
-        language: Tesseract language code (default: "eng" for English).
-            Multiple languages can be combined with +: "eng+deu".
+        languages: List of Tesseract language codes (default: ``["eng"]``).
+            Example: ``["deu", "eng"]`` for German + English.
         quality: OCR quality preset (default: OcrQuality.DEFAULT).
 
     Returns:
@@ -351,15 +351,17 @@ def apply_ocr(
     Raises:
         OCRError: If OCR is not available or fails.
     """
+    if languages is None:
+        languages = ["eng"]
     if not HAS_OCR:
         raise OCRError(
             "OCR not available. Install the OCR dependency: pip install pdftopdfa[ocr]"
         )
 
     logger.info(
-        "Starting OCR for %s (language: %s, quality: %s)",
+        "Starting OCR for %s (languages: %s, quality: %s)",
         input_path,
-        language,
+        "+".join(languages),
         quality.value,
     )
 
@@ -380,7 +382,7 @@ def apply_ocr(
             ocrmypdf.ocr(
                 input_path,
                 output_path,
-                language=language,
+                language=languages,
                 output_type="pdf",
                 rasterizer="pypdfium",
                 **ocr_kwargs,
