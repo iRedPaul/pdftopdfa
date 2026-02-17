@@ -752,7 +752,8 @@ def convert_files(
         file_pairs: List of (input_path, output_path) tuples.
         level: PDF/A conformance level (e.g. '2b', '3b').
         validate: If True, results are validated.
-        ocr_languages: Optional list of Tesseract language codes (e.g., ``["deu", "eng"]``).
+        ocr_languages: Optional list of Tesseract language codes
+            (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
         force_overwrite: If True, existing output files are overwritten.
             If False, existing outputs are skipped with an error result.
@@ -848,7 +849,8 @@ def convert_directory(
         recursive: If True, subdirectories are included.
         validate: If True, results are validated.
         show_progress: If True, a progress bar is shown.
-        ocr_languages: Optional list of Tesseract language codes (e.g., ``["deu", "eng"]``).
+        ocr_languages: Optional list of Tesseract language codes
+            (e.g., ``["deu", "eng"]``).
             If specified, OCR is applied to image-based pages.
         ocr_quality: OCR quality preset.
         force_overwrite: If True, existing output files are overwritten.

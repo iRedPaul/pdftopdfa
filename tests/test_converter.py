@@ -546,7 +546,9 @@ class TestConvertDirectory:
         input_dir.mkdir()
         (input_dir / "test.pdf").write_bytes(sample_pdf_bytes)
 
-        results = convert_directory(input_dir, show_progress=False, ocr_languages=["deu"])
+        results = convert_directory(
+            input_dir, show_progress=False, ocr_languages=["deu"]
+        )
 
         assert len(results) == 1
         assert results[0].success is True

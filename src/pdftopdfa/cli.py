@@ -325,7 +325,8 @@ def _convert_single_file(
         do_validate: Whether to validate after conversion.
         force: Whether to overwrite existing files.
         quiet: Whether to only output errors.
-        ocr_languages: Optional list of Tesseract language codes (e.g., ``["deu", "eng"]``).
+        ocr_languages: Optional list of Tesseract language codes
+            (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
 
@@ -420,7 +421,8 @@ def _convert_directory(
         force: Whether to overwrite existing output files.
         recursive: Whether to process recursively.
         quiet: Whether to only output errors.
-        ocr_languages: Optional list of Tesseract language codes (e.g., ``["deu", "eng"]``).
+        ocr_languages: Optional list of Tesseract language codes
+            (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
 
