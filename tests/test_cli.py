@@ -398,9 +398,7 @@ class TestCliOcr:
         )
         output_path = tmp_dir / "output.pdf"
 
-        result = runner.invoke(
-            main, [str(sample_pdf), str(output_path), "--ocr-force"]
-        )
+        result = runner.invoke(main, [str(sample_pdf), str(output_path), "--ocr-force"])
 
         assert result.exit_code == EXIT_SUCCESS
         assert output_path.exists()

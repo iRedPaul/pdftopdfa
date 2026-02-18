@@ -468,9 +468,7 @@ def convert_to_pdfa(
                     os.close(fd)
                     ocr_temp_file = Path(tmp_path)
                     effective_quality = (
-                        ocr_quality
-                        if ocr_quality is not None
-                        else OcrQuality.DEFAULT
+                        ocr_quality if ocr_quality is not None else OcrQuality.DEFAULT
                     )
                     apply_ocr(
                         input_path,

@@ -817,9 +817,7 @@ class TestApplyOcrForce:
         """force=True with BEST quality preserves other settings."""
         output_path = tmp_dir / "output.pdf"
 
-        apply_ocr(
-            sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST, force=True
-        )
+        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST, force=True)
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
         assert call_kwargs["redo_ocr"] is True
