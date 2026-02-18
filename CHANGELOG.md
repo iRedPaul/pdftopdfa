@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.4] - 2026-02-18
+
+### Bug Fixes
+
+- Preserve image metadata (DPI) in OCR preprocessing so ocrmypdf receives correct resolution
+
+### Changes
+
+- Fix E501 line-too-long lint errors in docstrings and tests
+
+### Documentation
+
+- Simplify installation section in README
+
+### CI / Build
+
+- Add macOS to CI test matrix
+
 ## [0.1.3] - 2026-02-17
 
 ### Bug Fixes
