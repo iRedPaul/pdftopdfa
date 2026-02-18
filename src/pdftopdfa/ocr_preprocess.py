@@ -51,4 +51,6 @@ def filter_ocr_image(page, image):  # noqa: ARG001 – page required by hook spe
         C=2,
     )
 
-    return Image.fromarray(binary)
+    result = Image.fromarray(binary)
+    result.info = image.info.copy()
+    return result
