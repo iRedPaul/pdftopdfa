@@ -762,6 +762,72 @@ class TestOcrQuality:
             assert call_kwargs[key] == value
 
 
+class TestApplyOcrForce:
+    """Tests for apply_ocr(force=True) behaviour."""
+
+    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_force_sets_redo_ocr(
+        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """force=True sets redo_ocr=True in ocrmypdf call."""
+        output_path = tmp_dir / "output.pdf"
+
+        apply_ocr(sample_pdf, output_path, ["eng"], force=True)
+
+        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
+        assert call_kwargs["redo_ocr"] is True
+
+    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_force_removes_skip_text(
+        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """force=True removes skip_text from ocrmypdf call."""
+        output_path = tmp_dir / "output.pdf"
+
+        apply_ocr(sample_pdf, output_path, ["eng"], force=True)
+
+        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
+        assert "skip_text" not in call_kwargs
+
+    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_no_force_uses_skip_text(
+        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """force=False (default) still uses skip_text=True."""
+        output_path = tmp_dir / "output.pdf"
+
+        apply_ocr(sample_pdf, output_path, ["eng"])
+
+        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
+        assert call_kwargs["skip_text"] is True
+        assert "redo_ocr" not in call_kwargs
+
+    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_force_with_best_quality(
+        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """force=True with BEST quality preserves other settings."""
+        output_path = tmp_dir / "output.pdf"
+
+        apply_ocr(
+            sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST, force=True
+        )
+
+        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
+        assert call_kwargs["redo_ocr"] is True
+        assert "skip_text" not in call_kwargs
+        assert call_kwargs["deskew"] is True
+        assert call_kwargs["rotate_pages"] is True
+
+
 class TestOpenCVPlugin:
     """Tests for OpenCV preprocessing plugin integration."""
 

@@ -355,6 +355,7 @@ def convert_to_pdfa(
     validate: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
+    ocr_force: bool = False,
     convert_calibrated: bool = True,
 ) -> ConversionResult:
     """Converts a PDF file to the PDF/A format.
@@ -368,6 +369,8 @@ def convert_to_pdfa(
             (e.g., ``["deu", "eng"]``).  If specified, OCR is applied to
             image-based pages.
         ocr_quality: OCR quality preset. If None, uses OcrQuality.DEFAULT.
+        ocr_force: If True, force OCR even on pages that already contain
+            text by using ocrmypdf's ``redo_ocr`` mode.
 
     Returns:
         ConversionResult with status and details.
@@ -452,29 +455,35 @@ def convert_to_pdfa(
             if not is_ocr_available():
                 warnings.append("OCR not available - pip install pdftopdfa[ocr]")
             else:
-                with pikepdf.open(input_path) as check_pdf:
-                    if needs_ocr(check_pdf):
-                        fd, tmp_path = tempfile.mkstemp(
-                            suffix=".pdf", prefix=f".{input_path.stem}_ocr_"
-                        )
-                        os.close(fd)
-                        ocr_temp_file = Path(tmp_path)
-                        effective_quality = (
-                            ocr_quality
-                            if ocr_quality is not None
-                            else OcrQuality.DEFAULT
-                        )
-                        apply_ocr(
-                            input_path,
-                            ocr_temp_file,
-                            ocr_languages,
-                            quality=effective_quality,
-                        )
-                        actual_input = ocr_temp_file
-                        lang_str = "+".join(ocr_languages)
-                        warnings.append(f"OCR performed (languages: {lang_str})")
-                    else:
-                        logger.debug("PDF already contains text, OCR not necessary")
+                if ocr_force:
+                    do_ocr = True
+                else:
+                    with pikepdf.open(input_path) as check_pdf:
+                        do_ocr = needs_ocr(check_pdf)
+
+                if do_ocr:
+                    fd, tmp_path = tempfile.mkstemp(
+                        suffix=".pdf", prefix=f".{input_path.stem}_ocr_"
+                    )
+                    os.close(fd)
+                    ocr_temp_file = Path(tmp_path)
+                    effective_quality = (
+                        ocr_quality
+                        if ocr_quality is not None
+                        else OcrQuality.DEFAULT
+                    )
+                    apply_ocr(
+                        input_path,
+                        ocr_temp_file,
+                        ocr_languages,
+                        quality=effective_quality,
+                        force=ocr_force,
+                    )
+                    actual_input = ocr_temp_file
+                    lang_str = "+".join(ocr_languages)
+                    warnings.append(f"OCR performed (languages: {lang_str})")
+                else:
+                    logger.debug("PDF already contains text, OCR not necessary")
 
         # Validate that input and output are not the same file
         if actual_input.resolve() == output_path.resolve():
@@ -739,6 +748,7 @@ def convert_files(
     validate: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
+    ocr_force: bool = False,
     force_overwrite: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -755,6 +765,8 @@ def convert_files(
         ocr_languages: Optional list of Tesseract language codes
             (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
+        ocr_force: If True, force OCR even on pages that already contain
+            text.
         force_overwrite: If True, existing output files are overwritten.
             If False, existing outputs are skipped with an error result.
         on_progress: Optional callback(current_idx, total, filename) called
@@ -801,6 +813,7 @@ def convert_files(
                 validate=validate,
                 ocr_languages=ocr_languages,
                 ocr_quality=ocr_quality,
+                ocr_force=ocr_force,
                 convert_calibrated=convert_calibrated,
             )
             results.append(result)
@@ -836,6 +849,7 @@ def convert_directory(
     show_progress: bool = True,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
+    ocr_force: bool = False,
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
 ) -> list[ConversionResult]:
@@ -853,6 +867,8 @@ def convert_directory(
             (e.g., ``["deu", "eng"]``).
             If specified, OCR is applied to image-based pages.
         ocr_quality: OCR quality preset.
+        ocr_force: If True, force OCR even on pages that already contain
+            text.
         force_overwrite: If True, existing output files are overwritten.
 
     Returns:
@@ -923,6 +939,7 @@ def convert_directory(
         validate=validate,
         ocr_languages=ocr_languages,
         ocr_quality=ocr_quality,
+        ocr_force=ocr_force,
         force_overwrite=force_overwrite,
         on_progress=_on_progress if show_progress else None,
         convert_calibrated=convert_calibrated,

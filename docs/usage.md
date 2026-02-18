@@ -63,6 +63,7 @@ See [docs/ocr.md](ocr.md) for details on OCR quality presets.
 | `-q, --quiet` | Only output errors |
 | `--verbose` | Detailed logging output |
 | `--ocr` | Enable OCR for scanned PDFs (requires ocrmypdf) |
+| `--ocr-force` | Force OCR even on pages with existing text (implies `--ocr`) |
 | `--ocr-lang LANG` | OCR language code (default: eng) |
 | `--ocr-quality [fast\|default\|best]` | OCR quality preset (default: default) |
 | `--no-convert-calibrated` | Disable CalGray/CalRGB to ICCBased conversion |
@@ -115,6 +116,7 @@ def convert_to_pdfa(
     validate: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_quality: OcrQuality | None = None,
+    ocr_force: bool = False,
     convert_calibrated: bool = True,
 ) -> ConversionResult
 ```
@@ -129,6 +131,7 @@ def convert_to_pdfa(
 | `validate` | `bool` | `False` | Validate output with veraPDF |
 | `ocr_languages` | `list[str] \| None` | `None` | OCR languages (e.g. `["eng"]`, `["deu", "eng"]`) |
 | `ocr_quality` | `OcrQuality \| None` | `None` | OCR quality preset |
+| `ocr_force` | `bool` | `False` | Force OCR even on pages with existing text |
 | `convert_calibrated` | `bool` | `True` | Convert CalGray/CalRGB to ICCBased |
 
 ### `convert_directory()`
@@ -144,6 +147,7 @@ def convert_directory(
     show_progress: bool = True,
     ocr_languages: list[str] | None = None,
     ocr_quality: OcrQuality | None = None,
+    ocr_force: bool = False,
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
 ) -> list[ConversionResult]
@@ -161,6 +165,7 @@ def convert_directory(
 | `show_progress` | `bool` | `True` | Show tqdm progress bar |
 | `ocr_languages` | `list[str] \| None` | `None` | OCR languages (e.g. `["eng"]`, `["deu", "eng"]`) |
 | `ocr_quality` | `OcrQuality \| None` | `None` | OCR quality preset |
+| `ocr_force` | `bool` | `False` | Force OCR even on pages with existing text |
 | `force_overwrite` | `bool` | `False` | Overwrite existing output files |
 | `convert_calibrated` | `bool` | `True` | Convert CalGray/CalRGB to ICCBased |
 

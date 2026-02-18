@@ -41,6 +41,37 @@ result = convert_to_pdfa(
 )
 ```
 
+## Forcing OCR on Existing Text
+
+By default, pdftopdfa skips OCR when a document already contains text. Use `--ocr-force` to remove the existing OCR layer and re-apply OCR — useful when a previous OCR used the wrong language or produced poor results. Real (vector) text is preserved.
+
+### Command Line
+
+```bash
+# Re-OCR with correct language
+pdftopdfa --ocr-force --ocr-lang deu document.pdf
+
+# Re-OCR with best quality
+pdftopdfa --ocr-force --ocr-quality best document.pdf
+```
+
+### Python API
+
+```python
+from pathlib import Path
+from pdftopdfa import convert_to_pdfa
+from pdftopdfa.ocr import OcrQuality
+
+result = convert_to_pdfa(
+    input_path=Path("scan.pdf"),
+    output_path=Path("scan_pdfa.pdf"),
+    level="2b",
+    ocr_languages=["deu"],
+    ocr_force=True,
+    ocr_quality=OcrQuality.BEST,
+)
+```
+
 ## Quality Presets
 
 | Preset | Description | Alters document visually? |

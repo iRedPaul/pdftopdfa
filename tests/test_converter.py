@@ -335,6 +335,69 @@ class TestConvertToPdfa:
         has_ocr_done_warning = any("OCR performed" in w for w in result.warnings)
         assert not has_ocr_done_warning
 
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.needs_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_convert_ocr_force_skips_needs_ocr_check(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_needs_ocr: MagicMock,
+        mock_apply_ocr: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """ocr_force=True skips needs_ocr() and calls apply_ocr(force=True)."""
+        mock_is_ocr_available.return_value = True
+
+        def create_ocr_output(
+            input_path: Path, output_path: Path, langs: list[str], **kwargs: object
+        ) -> Path:
+            import shutil
+
+            shutil.copy(input_path, output_path)
+            return output_path
+
+        mock_apply_ocr.side_effect = create_ocr_output
+
+        output_path = tmp_dir / "output.pdf"
+
+        result = convert_to_pdfa(
+            sample_pdf, output_path, ocr_languages=["eng"], ocr_force=True
+        )
+
+        assert result.success is True
+        # needs_ocr should NOT have been called
+        mock_needs_ocr.assert_not_called()
+        # apply_ocr should have been called with force=True
+        mock_apply_ocr.assert_called_once()
+        call_kwargs = mock_apply_ocr.call_args[1]
+        assert call_kwargs["force"] is True
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.needs_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_convert_ocr_force_false_checks_needs_ocr(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_needs_ocr: MagicMock,
+        mock_apply_ocr: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """ocr_force=False (default) still calls needs_ocr()."""
+        mock_is_ocr_available.return_value = True
+        mock_needs_ocr.return_value = False
+
+        output_path = tmp_dir / "output.pdf"
+
+        result = convert_to_pdfa(
+            sample_pdf, output_path, ocr_languages=["eng"], ocr_force=False
+        )
+
+        assert result.success is True
+        mock_needs_ocr.assert_called_once()
+        mock_apply_ocr.assert_not_called()
+
     def test_upgrades_pdf_version_and_adds_warning(
         self, sample_pdf: Path, tmp_dir: Path
     ) -> None:

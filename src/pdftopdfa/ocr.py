@@ -332,11 +332,12 @@ def apply_ocr(
     languages: list[str] | None = None,
     *,
     quality: OcrQuality = OcrQuality.DEFAULT,
+    force: bool = False,
 ) -> Path:
     """Performs OCR on a PDF.
 
     Uses ocrmypdf for text recognition. Pages that already contain text
-    are skipped.
+    are skipped unless ``force=True``.
 
     Args:
         input_path: Path to the input PDF.
@@ -344,6 +345,8 @@ def apply_ocr(
         languages: List of Tesseract language codes (default: ``["eng"]``).
             Example: ``["deu", "eng"]`` for German + English.
         quality: OCR quality preset (default: OcrQuality.DEFAULT).
+        force: If True, use ocrmypdf's ``redo_ocr`` mode to remove the
+            existing OCR layer and re-apply OCR (default: False).
 
     Returns:
         Path to the OCR-processed PDF.
@@ -359,14 +362,19 @@ def apply_ocr(
         )
 
     logger.info(
-        "Starting OCR for %s (languages: %s, quality: %s)",
+        "Starting OCR for %s (languages: %s, quality: %s, force: %s)",
         input_path,
         "+".join(languages),
         quality.value,
+        force,
     )
 
     try:
         ocr_kwargs = dict(OCR_SETTINGS[quality])
+
+        if force:
+            ocr_kwargs.pop("skip_text", None)
+            ocr_kwargs["redo_ocr"] = True
 
         if quality in _PREPROCESS_QUALITIES:
             if HAS_OPENCV:

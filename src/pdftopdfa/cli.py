@@ -178,6 +178,14 @@ def _print_validation_result(
     help="OCR language code (default: eng). Examples: deu, deu+eng",
 )
 @click.option(
+    "--ocr-force",
+    "ocr_force",
+    is_flag=True,
+    default=False,
+    help="Force OCR even on pages that already contain text "
+    "(removes existing OCR layer and re-applies). Implies --ocr.",
+)
+@click.option(
     "--ocr-quality",
     "ocr_quality",
     type=click.Choice(["fast", "default", "best"]),
@@ -202,6 +210,7 @@ def main(
     quiet: bool,
     verbose: bool,
     ocr_enabled: bool,
+    ocr_force: bool,
     ocr_lang: str,
     ocr_quality: str,
     convert_calibrated: bool,
@@ -236,6 +245,10 @@ def main(
             sys.exit(EXIT_GENERAL_ERROR)
 
     try:
+        # --ocr-force implies --ocr
+        if ocr_force:
+            ocr_enabled = True
+
         # Determine OCR languages (None if OCR not enabled)
         ocr_languages = ocr_lang.split("+") if ocr_enabled else None
 
@@ -258,6 +271,7 @@ def main(
                 quiet,
                 ocr_languages=ocr_languages,
                 ocr_quality=ocr_quality_enum,
+                ocr_force=ocr_force,
                 convert_calibrated=convert_calibrated,
             )
         elif input_path_obj.is_dir():
@@ -272,6 +286,7 @@ def main(
                 quiet,
                 ocr_languages=ocr_languages,
                 ocr_quality=ocr_quality_enum,
+                ocr_force=ocr_force,
                 convert_calibrated=convert_calibrated,
             )
         else:
@@ -314,6 +329,7 @@ def _convert_single_file(
     *,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
+    ocr_force: bool = False,
     convert_calibrated: bool = True,
 ) -> int:
     """Converts a single PDF file.
@@ -328,6 +344,7 @@ def _convert_single_file(
         ocr_languages: Optional list of Tesseract language codes
             (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
+        ocr_force: If True, force OCR even on pages with existing text.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
 
     Returns:
@@ -357,6 +374,7 @@ def _convert_single_file(
         validate=False,  # Validate manually later
         ocr_languages=ocr_languages,
         ocr_quality=ocr_quality,
+        ocr_force=ocr_force,
         convert_calibrated=convert_calibrated,
     )
 
@@ -409,6 +427,7 @@ def _convert_directory(
     *,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
+    ocr_force: bool = False,
     convert_calibrated: bool = True,
 ) -> int:
     """Converts all PDFs in a directory.
@@ -424,6 +443,7 @@ def _convert_directory(
         ocr_languages: Optional list of Tesseract language codes
             (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
+        ocr_force: If True, force OCR even on pages with existing text.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
 
     Returns:
@@ -444,6 +464,7 @@ def _convert_directory(
         show_progress=not quiet,
         ocr_languages=ocr_languages,
         ocr_quality=ocr_quality,
+        ocr_force=ocr_force,
         force_overwrite=force,
         convert_calibrated=convert_calibrated,
     )

@@ -50,6 +50,13 @@ class TestCliHelp:
         assert result.exit_code == 0
         assert "--ocr" in result.output
 
+    def test_cli_help_shows_ocr_force_option(self, runner: CliRunner) -> None:
+        """--ocr-force option appears in help."""
+        result = runner.invoke(main, ["--help"])
+
+        assert result.exit_code == 0
+        assert "--ocr-force" in result.output
+
 
 class TestCliVersion:
     """Tests for --version option."""
@@ -371,6 +378,96 @@ class TestCliOcr:
         )
 
         assert result.exit_code == 2  # Click rejects invalid choice
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_cli_ocr_force_implies_ocr(
+        self,
+        mock_is_ocr_available,
+        mock_apply_ocr,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """--ocr-force implies --ocr (no need to pass --ocr separately)."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main, [str(sample_pdf), str(output_path), "--ocr-force"]
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert output_path.exists()
+        mock_apply_ocr.assert_called_once()
+        assert mock_apply_ocr.call_args[1]["force"] is True
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_cli_ocr_force_with_lang(
+        self,
+        mock_is_ocr_available,
+        mock_apply_ocr,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """--ocr-force works with --ocr-lang."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [str(sample_pdf), str(output_path), "--ocr-force", "--ocr-lang", "deu"],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert mock_apply_ocr.call_args[0][2] == ["deu"]
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_cli_ocr_force_with_quality(
+        self,
+        mock_is_ocr_available,
+        mock_apply_ocr,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """--ocr-force works with --ocr-quality."""
+        import shutil
+
+        from pdftopdfa.ocr import OcrQuality
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--ocr-force",
+                "--ocr-quality",
+                "fast",
+            ],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert mock_apply_ocr.call_args[1]["quality"] == OcrQuality.FAST
 
 
 class TestDirectoryValidationFailures:
