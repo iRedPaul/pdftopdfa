@@ -78,6 +78,7 @@ from .jpx import sanitize_jpx_color_boxes
 from .notdef_usage import sanitize_notdef_usage
 from .optional_content import sanitize_optional_content
 from .page_boxes import sanitize_page_boxes
+from .pua_actualtext import sanitize_pua_actualtext
 from .rendering_intent import sanitize_rendering_intent
 from .signatures import sanitize_signatures
 from .structure_limits import sanitize_structure_limits
@@ -184,6 +185,8 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "glyphs_added": 0,
         "tounicode_values_fixed": 0,
         "tounicode_gaps_filled": 0,
+        "pua_actualtext_added": 0,
+        "pua_actualtext_warnings": 0,
         "notdef_usage_fixed": 0,
         "signatures_found": 0,
         "signatures_removed": 0,
@@ -413,6 +416,13 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
             "tounicode_gaps_filled", 0
         )
 
+        # Wrap PUA-mapped characters in /ActualText (rule 6.2.11.7.3-1)
+        pua_at_result = sanitize_pua_actualtext(pdf)
+        result["pua_actualtext_added"] = pua_at_result.get("pua_actualtext_added", 0)
+        result["pua_actualtext_warnings"] = pua_at_result.get(
+            "pua_actualtext_warnings", 0
+        )
+
     # Remove .notdef glyph references from content streams (ISO 19005-2, 6.2.11.8)
     notdef_usage_result = sanitize_notdef_usage(pdf)
     result["notdef_usage_fixed"] = notdef_usage_result.get("notdef_usage_fixed", 0)
@@ -477,6 +487,7 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "%d glyph coverage glyphs added, "
         "%d .notdef usage operators fixed, "
         "%d ToUnicode values fixed, "
+        "%d PUA ActualText added, "
         "%d signatures found, %d signatures removed, "
         "%d sigflags fixed, %d signature /Type fixed, "
         "NeedAppearances removed: %s, "
@@ -542,6 +553,7 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         result["glyphs_added"],
         result["notdef_usage_fixed"],
         result["tounicode_values_fixed"],
+        result["pua_actualtext_added"],
         result["signatures_found"],
         result["signatures_removed"],
         result["sigflags_fixed"],
@@ -603,6 +615,7 @@ __all__ = [
     "sanitize_font_widths",
     "sanitize_glyph_coverage",
     "sanitize_notdef_usage",
+    "sanitize_pua_actualtext",
     "sanitize_tounicode_values",
     "sanitize_page_boxes",
     "sanitize_signatures",
