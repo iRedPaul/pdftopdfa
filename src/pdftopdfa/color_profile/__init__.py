@@ -168,11 +168,11 @@ def embed_color_profiles(
             # ISO 19005-2 §6.2.3: multiple output intents must reference
             # the same ICC profile.  Compare full profile bytes and keep
             # only the first when they differ.
+            from ..utils import resolve_indirect as _ri
+
             try:
                 existing = pdf.Root.get("/OutputIntents")
                 if existing is not None and len(existing) > 1:
-                    from ..utils import resolve_indirect as _ri
-
                     profiles: list[bytes | None] = []
                     for oi in existing:
                         oi = _ri(oi)
@@ -211,6 +211,17 @@ def embed_color_profiles(
                         pdf.Root.OutputIntents = Array([first_oi])
             except Exception:
                 pass
+
+            # Rule 6.2.3-3: DestOutputProfileRef shall not be present
+            # in any PDF/X OutputIntent.
+            remaining = pdf.Root.get("/OutputIntents")
+            if remaining is not None:
+                for oi in remaining:
+                    oi = _ri(oi)
+                    if oi.get("/S") == Name("/GTS_PDFX"):
+                        if "/DestOutputProfileRef" in oi:
+                            del oi["/DestOutputProfileRef"]
+
             logger.info("Replacing existing OutputIntents")
         else:
             logger.debug("OutputIntents already present, skipping")

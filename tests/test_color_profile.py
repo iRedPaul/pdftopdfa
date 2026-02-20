@@ -3813,3 +3813,60 @@ class TestSMaskGFormDefaultColorSpaces:
         assert form_resources is not None
         cs = form_resources.get(Name.ColorSpace)
         assert Name.DefaultGray in cs
+
+    def test_pdfx_dest_output_profile_ref_removed(self):
+        """Rule 6.2.3-3: DestOutputProfileRef removed from PDF/X intents."""
+        pdf = new_pdf()
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Contents=pdf.make_stream(b"1 0 0 rg"),
+            )
+        )
+        pdf.pages.append(page)
+
+        oi = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name("/GTS_PDFX"),
+            OutputConditionIdentifier=pikepdf.String("Custom"),
+            DestOutputProfileRef=Dictionary(
+                URL=pikepdf.String("http://example.com/profile.icc"),
+            ),
+        )
+        oi_ref = pdf.make_indirect(oi)
+        pdf.Root.OutputIntents = Array([oi_ref])
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        # The stripping modifies the indirect object in place before the
+        # OutputIntents array is replaced with a new PDF/A intent.
+        assert "/DestOutputProfileRef" not in oi_ref
+
+    def test_pdfa_dest_output_profile_ref_not_removed(self):
+        """DestOutputProfileRef is kept on non-PDF/X OutputIntents."""
+        pdf = new_pdf()
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Contents=pdf.make_stream(b"1 0 0 rg"),
+            )
+        )
+        pdf.pages.append(page)
+
+        oi = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name.GTS_PDFA1,
+            OutputConditionIdentifier=pikepdf.String("sRGB"),
+            DestOutputProfileRef=Dictionary(
+                URL=pikepdf.String("http://example.com/profile.icc"),
+            ),
+        )
+        oi_ref = pdf.make_indirect(oi)
+        pdf.Root.OutputIntents = Array([oi_ref])
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        # Non-PDF/X intents should not have DestOutputProfileRef stripped.
+        assert "/DestOutputProfileRef" in oi_ref
