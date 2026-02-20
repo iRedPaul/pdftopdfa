@@ -347,6 +347,149 @@ def _verify_file_structure(output_path: Path, required_version: str) -> None:
         logger.warning("Post-save verification: could not reopen file: %s", e)
 
 
+def _has_annotations(pdf_path: Path) -> bool:
+    """Check whether any page in the PDF contains annotations.
+
+    Args:
+        pdf_path: Path to the PDF file.
+
+    Returns:
+        ``True`` if at least one page has a non-empty ``/Annots`` array.
+    """
+    try:
+        with pikepdf.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                try:
+                    annots = page.get("/Annots")
+                    if annots is not None and len(annots) > 0:
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        return False
+    return False
+
+
+def _strip_annotations_for_ocr(input_path: Path, clean_path: Path) -> bool:
+    """Remove all annotations from a PDF for clean OCR processing.
+
+    Strips ``/Annots`` from every page and ``/AcroForm`` from the document
+    root so that annotation appearance streams are not rasterized into page
+    images during OCR.
+
+    Args:
+        input_path: Path to the original PDF.
+        clean_path: Path where the cleaned PDF will be saved.
+
+    Returns:
+        ``True`` if any annotations were removed, ``False`` otherwise.
+    """
+    try:
+        removed = False
+        with pikepdf.open(input_path) as pdf:
+            for page in pdf.pages:
+                try:
+                    annots = page.get("/Annots")
+                    if annots is not None and len(annots) > 0:
+                        del page["/Annots"]
+                        removed = True
+                except Exception:
+                    continue
+
+            if "/AcroForm" in pdf.Root:
+                del pdf.Root["/AcroForm"]
+                removed = True
+
+            pdf.save(clean_path)
+        return removed
+    except Exception as exc:
+        logger.warning("Could not strip annotations for OCR: %s", exc)
+        return False
+
+
+def _restore_annotations_after_ocr(
+    original_path: Path, ocr_path: Path, output_path: Path
+) -> int:
+    """Re-inject original annotations into an OCR-processed PDF.
+
+    Copies entire ``/Annots`` arrays (preserving internal cross-references
+    like ``/Popup`` and ``/IRT`` chains) from the original PDF into the
+    OCR output via ``copy_foreign``.  Also restores ``/AcroForm`` if present.
+
+    Args:
+        original_path: Path to the original PDF (with annotations).
+        ocr_path: Path to the OCR-processed PDF (without annotations).
+        output_path: Path where the merged result will be saved.
+
+    Returns:
+        Total number of annotations restored (0 on failure or mismatch).
+    """
+    original_pdf = None
+    ocr_pdf = None
+    try:
+        original_pdf = pikepdf.open(original_path)
+        ocr_pdf = pikepdf.open(ocr_path)
+
+        if len(original_pdf.pages) != len(ocr_pdf.pages):
+            logger.warning(
+                "Page count mismatch after OCR (%d vs %d), "
+                "skipping annotation restoration",
+                len(original_pdf.pages),
+                len(ocr_pdf.pages),
+            )
+            return 0
+
+        total_restored = 0
+        for i, (orig_page, ocr_page) in enumerate(
+            zip(original_pdf.pages, ocr_pdf.pages)
+        ):
+            try:
+                annots = orig_page.get("/Annots")
+                if annots is None or len(annots) == 0:
+                    continue
+            except Exception:
+                continue
+
+            # Ensure annots is indirect so copy_foreign can track it.
+            annots_ref = original_pdf.make_indirect(annots)
+            copied_annots = ocr_pdf.copy_foreign(annots_ref)
+
+            # Remap /P (parent page) references to the target page
+            for annot in copied_annots:
+                try:
+                    resolved = annot.get_object()
+                    if "/P" in resolved:
+                        resolved["/P"] = ocr_page.obj
+                except Exception:
+                    continue
+
+            ocr_page.obj["/Annots"] = copied_annots
+            total_restored += len(copied_annots)
+
+        # Restore /AcroForm if present in original
+        if "/AcroForm" in original_pdf.Root:
+            acroform = original_pdf.Root["/AcroForm"]
+            acroform_ref = original_pdf.make_indirect(acroform)
+            ocr_pdf.Root["/AcroForm"] = ocr_pdf.copy_foreign(acroform_ref)
+
+        ocr_pdf.save(output_path)
+        return total_restored
+    except Exception as exc:
+        logger.warning("Could not restore annotations after OCR: %s", exc)
+        return 0
+    finally:
+        if original_pdf is not None:
+            try:
+                original_pdf.close()
+            except Exception:
+                pass
+        if ocr_pdf is not None:
+            try:
+                ocr_pdf.close()
+            except Exception:
+                pass
+
+
 def convert_to_pdfa(
     input_path: Path,
     output_path: Path,
@@ -470,13 +613,62 @@ def convert_to_pdfa(
                     effective_quality = (
                         ocr_quality if ocr_quality is not None else OcrQuality.DEFAULT
                     )
+
+                    # Strip annotations before OCR so they are not
+                    # rasterized into page images.
+                    preserve_annots = _has_annotations(input_path)
+                    clean_temp_file: Path | None = None
+                    ocr_source = input_path
+                    if preserve_annots:
+                        fd2, clean_tmp = tempfile.mkstemp(
+                            suffix=".pdf",
+                            prefix=f".{input_path.stem}_clean_",
+                        )
+                        os.close(fd2)
+                        clean_temp_file = Path(clean_tmp)
+                        if _strip_annotations_for_ocr(input_path, clean_temp_file):
+                            ocr_source = clean_temp_file
+                        else:
+                            preserve_annots = False
+
                     apply_ocr(
-                        input_path,
+                        ocr_source,
                         ocr_temp_file,
                         ocr_languages,
                         quality=effective_quality,
                         force=ocr_force,
                     )
+
+                    # Re-inject original annotations into OCR output.
+                    if preserve_annots:
+                        fd3, merged_tmp = tempfile.mkstemp(
+                            suffix=".pdf",
+                            prefix=f".{input_path.stem}_merged_",
+                        )
+                        os.close(fd3)
+                        merged_temp_file = Path(merged_tmp)
+                        count = _restore_annotations_after_ocr(
+                            input_path, ocr_temp_file, merged_temp_file
+                        )
+                        if count > 0:
+                            os.replace(str(merged_temp_file), str(ocr_temp_file))
+                            logger.info("%d annotation(s) preserved through OCR", count)
+                            warnings.append(
+                                f"{count} annotation(s) preserved through OCR"
+                            )
+                        else:
+                            try:
+                                Path(merged_tmp).unlink()
+                            except Exception:
+                                pass
+
+                    # Clean up the stripped copy.
+                    if clean_temp_file is not None:
+                        try:
+                            clean_temp_file.unlink()
+                        except Exception:
+                            pass
+
                     actual_input = ocr_temp_file
                     lang_str = "+".join(ocr_languages)
                     warnings.append(f"OCR performed (languages: {lang_str})")
