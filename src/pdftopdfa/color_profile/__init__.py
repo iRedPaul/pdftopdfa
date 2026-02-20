@@ -212,6 +212,20 @@ def embed_color_profiles(
             except Exception:
                 pass
 
+            # Rule 6.2.3-2: all DestOutputProfile entries must reference
+            # the same indirect object.
+            remaining = pdf.Root.get("/OutputIntents")
+            if remaining is not None and len(remaining) > 1:
+                canonical = None
+                for oi in remaining:
+                    oi = _ri(oi)
+                    dest = oi.get("/DestOutputProfile")
+                    if dest is not None:
+                        if canonical is None:
+                            canonical = dest
+                        else:
+                            oi["/DestOutputProfile"] = canonical
+
             # Rule 6.2.3-3: DestOutputProfileRef shall not be present
             # in any PDF/X OutputIntent.
             remaining = pdf.Root.get("/OutputIntents")

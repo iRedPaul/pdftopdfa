@@ -927,6 +927,56 @@ class TestEmbedColorProfiles:
         assert any("different ICC profiles" in r.message for r in caplog.records)
         assert has_output_intent(pdf)
 
+    def test_identical_profiles_unified_to_same_object(self) -> None:
+        """Identical DestOutputProfile streams must share one indirect object.
+
+        Rule 6.2.3-2 requires that when multiple OutputIntents have a
+        DestOutputProfile, they all reference the same indirect object.
+        """
+        pdf = new_pdf()
+
+        profile_data = _make_icc_profile()
+        stream1 = pdf.make_stream(profile_data)
+        stream1[Name.N] = 3
+        stream2 = pdf.make_stream(profile_data)
+        stream2[Name.N] = 3
+
+        # Pre-condition: two separate indirect objects
+        assert stream1.objgen != stream2.objgen
+
+        oi1 = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name.GTS_PDFA1,
+            OutputConditionIdentifier=pikepdf.String("sRGB"),
+            DestOutputProfile=stream1,
+        )
+        oi2 = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name.GTS_PDFA1,
+            OutputConditionIdentifier=pikepdf.String("sRGB"),
+            DestOutputProfile=stream2,
+        )
+        pdf.Root.OutputIntents = Array([oi1, oi2])
+
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        from pdftopdfa.utils import resolve_indirect as _ri
+
+        objgens = set()
+        for oi in pdf.Root.OutputIntents:
+            oi = _ri(oi)
+            dest = oi.get("/DestOutputProfile")
+            if dest is not None:
+                objgens.add(_ri(dest).objgen)
+
+        assert len(objgens) == 1, (
+            f"Expected all DestOutputProfile entries to share one"
+            f" indirect object, got {objgens}"
+        )
+
 
 class TestDefaultColorSpaces:
     """Tests for Default color space entries and image replacement."""
