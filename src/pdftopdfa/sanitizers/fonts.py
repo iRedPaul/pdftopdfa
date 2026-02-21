@@ -507,6 +507,87 @@ def sanitize_fontname_consistency(pdf: Pdf) -> dict[str, int]:
     return {"fontname_fixed": total_fixed}
 
 
+def _check_cid_values_over_65535(cidfont: Dictionary, font_name: str) -> int:
+    """Check /W, /W2, and /CIDToGIDMap for CID values exceeding 65535.
+
+    Logs a warning for each violation found and returns the count.
+    Cannot fix these automatically — out-of-range CID values indicate a
+    severely malformed font (ISO 19005-2 rule 6.1.13-10).
+    """
+    warned = 0
+    for key in ("/W", "/W2"):
+        w = cidfont.get(key)
+        if w is None:
+            continue
+        w = _resolve(w)
+        if not isinstance(w, Array):
+            continue
+        items = list(w)
+        i = 0
+        while i < len(items):
+            item = _resolve(items[i])
+            if isinstance(item, Array):
+                # Unexpected array at top level; skip
+                i += 1
+                continue
+            try:
+                cid = int(item)
+            except Exception:
+                i += 1
+                continue
+            if i + 1 < len(items):
+                nxt = _resolve(items[i + 1])
+                if isinstance(nxt, Array):
+                    # Format 1: cid [w1 w2 ...]
+                    if cid > 65535:
+                        logger.warning(
+                            "CIDFont %s: CID %d in /%s exceeds 65535"
+                            " (ISO 19005-2 rule 6.1.13-10); cannot fix automatically",
+                            font_name,
+                            cid,
+                            key[1:],
+                        )
+                        warned += 1
+                    i += 2
+                else:
+                    # Format 2: cid_first cid_last width
+                    try:
+                        cid_last = int(nxt)
+                    except Exception:
+                        i += 1
+                        continue
+                    if cid > 65535 or cid_last > 65535:
+                        logger.warning(
+                            "CIDFont %s: CID range %d\u2013%d in /%s exceeds 65535"
+                            " (ISO 19005-2 rule 6.1.13-10); cannot fix automatically",
+                            font_name,
+                            cid,
+                            cid_last,
+                            key[1:],
+                        )
+                        warned += 1
+                    i += 3
+            else:
+                i += 1
+
+    # /CIDToGIDMap stream: 2 bytes per CID entry; > 131072 bytes means CIDs > 65535
+    cidtogidmap = cidfont.get("/CIDToGIDMap")
+    if cidtogidmap is not None:
+        resolved = _resolve(cidtogidmap)
+        if isinstance(resolved, Stream):
+            data = resolved.read_bytes()
+            if len(data) > 131072:
+                logger.warning(
+                    "CIDFont %s: /CIDToGIDMap stream length %d implies CID values"
+                    " > 65535 (ISO 19005-2 rule 6.1.13-10); cannot fix automatically",
+                    font_name,
+                    len(data),
+                )
+                warned += 1
+
+    return warned
+
+
 def sanitize_cidfont_structures(pdf: Pdf) -> dict[str, int]:
     """Sanitize CIDFont structures for PDF/A-2 compliance.
 
@@ -530,6 +611,7 @@ def sanitize_cidfont_structures(pdf: Pdf) -> dict[str, int]:
         "type1_charset_removed": 0,
         "cmap_encoding_fixed": 0,
         "cmap_wmode_fixed": 0,
+        "cid_values_over_65535_warned": 0,
     }
 
     for font_name, font_dict in _iter_type0_fonts(pdf):
@@ -593,7 +675,12 @@ def sanitize_cidfont_structures(pdf: Pdf) -> dict[str, int]:
                     font_name,
                 )
 
-        # 4. Remove CIDSet from font descriptor
+        # 4. Check for CID values > 65535 (6.1.13-10) — warn only, cannot fix
+        result["cid_values_over_65535_warned"] += _check_cid_values_over_65535(
+            cidfont, font_name
+        )
+
+        # 5. Remove CIDSet from font descriptor
         font_descriptor = cidfont.get("/FontDescriptor")
         if font_descriptor is not None:
             font_descriptor = _resolve(font_descriptor)
@@ -623,13 +710,14 @@ def sanitize_cidfont_structures(pdf: Pdf) -> dict[str, int]:
             "CIDFont sanitization: %d CIDSystemInfo fixed, "
             "%d CIDToGIDMap fixed, %d CIDSet removed, "
             "%d Type1 /CharSet removed, %d CMap encoding fixed, "
-            "%d CMap WMode fixed",
+            "%d CMap WMode fixed, %d CID-value-over-65535 warned",
             result["cidsysteminfo_fixed"],
             result["cidtogidmap_fixed"],
             result["cidset_removed"],
             result["type1_charset_removed"],
             result["cmap_encoding_fixed"],
             result["cmap_wmode_fixed"],
+            result["cid_values_over_65535_warned"],
         )
 
     return result

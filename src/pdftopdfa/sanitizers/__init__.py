@@ -391,6 +391,9 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
     result["cidtogidmap_fixed"] = cidfont_result.get("cidtogidmap_fixed", 0)
     result["cidset_removed"] = cidfont_result.get("cidset_removed", 0)
     result["type1_charset_removed"] = cidfont_result.get("type1_charset_removed", 0)
+    result["cid_values_over_65535_warned"] = cidfont_result.get(
+        "cid_values_over_65535_warned", 0
+    )
 
     # Fix FontDescriptor /FontName vs /BaseFont mismatch (ISO 19005-2, 6.3.5)
     fontname_result = sanitize_fontname_consistency(pdf)

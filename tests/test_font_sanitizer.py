@@ -4,6 +4,7 @@
 
 """Unit tests for sanitizers/fonts.py (CIDFont sanitizer)."""
 
+import logging
 from io import BytesIO
 
 import pikepdf
@@ -1359,3 +1360,111 @@ class TestFontNameConsistency:
 
         result = sanitize_fontname_consistency(pdf)
         assert result["fontname_fixed"] == 1
+
+
+def _make_type0_with_cidfont(pdf: Pdf, cidfont: Dictionary) -> Dictionary:
+    """Wrap a CIDFont dict in a Type0 font and return the Type0 dict."""
+    return Dictionary(
+        Type=Name.Font,
+        Subtype=Name.Type0,
+        BaseFont=Name("/TestFont"),
+        Encoding=Name("/Identity-H"),
+        DescendantFonts=Array([pdf.make_indirect(cidfont)]),
+    )
+
+
+class TestCIDValuesOver65535:
+    """Tests for CID value range validation (ISO 19005-2 rule 6.1.13-10)."""
+
+    def test_w_format1_cid_over_65535_warns(self, caplog) -> None:
+        """/W format-1 entry with CID > 65535 triggers a warning."""
+        pdf = new_pdf()
+        cidfont = Dictionary(
+            Type=Name.Font,
+            Subtype=Name("/CIDFontType2"),
+            BaseFont=Name("/TestFont"),
+            CIDSystemInfo=Dictionary(
+                Registry=pikepdf.String("Adobe"),
+                Ordering=pikepdf.String("Identity"),
+                Supplement=0,
+            ),
+            W=Array([70000, Array([600, 600])]),  # CID 70000 > 65535
+        )
+        font = _make_type0_with_cidfont(pdf, cidfont)
+        _build_pdf_with_type0_font(pdf, font)
+
+        with caplog.at_level(logging.WARNING):
+            result = sanitize_cidfont_structures(pdf)
+
+        assert result["cid_values_over_65535_warned"] == 1
+        assert any("6.1.13-10" in r.message for r in caplog.records)
+
+    def test_w_format2_range_over_65535_warns(self, caplog) -> None:
+        """/W format-2 range where upper bound > 65535 triggers a warning."""
+        pdf = new_pdf()
+        cidfont = Dictionary(
+            Type=Name.Font,
+            Subtype=Name("/CIDFontType2"),
+            BaseFont=Name("/TestFont"),
+            CIDSystemInfo=Dictionary(
+                Registry=pikepdf.String("Adobe"),
+                Ordering=pikepdf.String("Identity"),
+                Supplement=0,
+            ),
+            W=Array([65500, 65540, 600]),  # range includes CIDs > 65535
+        )
+        font = _make_type0_with_cidfont(pdf, cidfont)
+        _build_pdf_with_type0_font(pdf, font)
+
+        with caplog.at_level(logging.WARNING):
+            result = sanitize_cidfont_structures(pdf)
+
+        assert result["cid_values_over_65535_warned"] == 1
+        assert any("6.1.13-10" in r.message for r in caplog.records)
+
+    def test_cidtogidmap_stream_over_131072_warns(self, caplog) -> None:
+        """/CIDToGIDMap stream longer than 131072 bytes implies CIDs > 65535."""
+        pdf = new_pdf()
+        cidtogidmap_stream = pdf.make_stream(b"\x00" * 131074)
+        cidfont = Dictionary(
+            Type=Name.Font,
+            Subtype=Name("/CIDFontType2"),
+            BaseFont=Name("/TestFont"),
+            CIDSystemInfo=Dictionary(
+                Registry=pikepdf.String("Adobe"),
+                Ordering=pikepdf.String("Identity"),
+                Supplement=0,
+            ),
+            CIDToGIDMap=cidtogidmap_stream,
+        )
+        font = _make_type0_with_cidfont(pdf, cidfont)
+        _build_pdf_with_type0_font(pdf, font)
+
+        with caplog.at_level(logging.WARNING):
+            result = sanitize_cidfont_structures(pdf)
+
+        assert result["cid_values_over_65535_warned"] == 1
+        assert any("6.1.13-10" in r.message for r in caplog.records)
+
+    def test_cid_at_limit_does_not_warn(self, caplog) -> None:
+        """/W entry with CID exactly 65535 should not trigger a warning."""
+        pdf = new_pdf()
+        cidfont = Dictionary(
+            Type=Name.Font,
+            Subtype=Name("/CIDFontType2"),
+            BaseFont=Name("/TestFont"),
+            CIDSystemInfo=Dictionary(
+                Registry=pikepdf.String("Adobe"),
+                Ordering=pikepdf.String("Identity"),
+                Supplement=0,
+            ),
+            W=Array([65535, Array([600])]),  # exactly at limit — should be fine
+        )
+        font = _make_type0_with_cidfont(pdf, cidfont)
+        _build_pdf_with_type0_font(pdf, font)
+
+        with caplog.at_level(logging.WARNING):
+            result = sanitize_cidfont_structures(pdf)
+
+        assert result["cid_values_over_65535_warned"] == 0
+        assert not any("6.1.13-10" in r.message for r in caplog.records)

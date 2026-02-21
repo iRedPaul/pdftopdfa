@@ -61,6 +61,11 @@ _SANITIZE_WARNINGS: list[tuple[str, str]] = [
     ("cidset_removed", "CIDSet entr(y/ies) removed"),
     ("type1_charset_removed", "Type1 /CharSet entr(y/ies) removed"),
     (
+        "cid_values_over_65535_warned",
+        "CIDFont(s) with CID value(s) exceeding 65535 detected (rule 6.1.13-10);"
+        " cannot fix automatically",
+    ),
+    (
         "tt_nonsymbolic_cmap_added",
         "non-symbolic TrueType font program(s) had (3,1) cmap added",
     ),
