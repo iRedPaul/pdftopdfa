@@ -483,8 +483,11 @@ class TestEnsureAppearanceStreams:
         result = ensure_appearance_streams(pdf)
         assert result == 0
 
-    def test_skips_zero_width_annotation(self, make_pdf_with_page):
-        """Zero-width annotations are skipped (invisible)."""
+    def test_adds_ap_to_zero_width_annotation(self, make_pdf_with_page):
+        """Zero-width (but non-zero height) annotation is NOT exempt per spec.
+
+        ISO 19005-2 rule 6.3.3 requires BOTH x1==x2 AND y1==y2 for exemption.
+        """
         pdf = make_pdf_with_page()
         annot = pdf.make_indirect(
             Dictionary(
@@ -496,10 +499,13 @@ class TestEnsureAppearanceStreams:
         pdf.pages[0]["/Annots"] = Array([annot])
         pdf = save_and_reopen(pdf)
         result = ensure_appearance_streams(pdf)
-        assert result == 0
+        assert result == 1
 
-    def test_skips_zero_height_annotation(self, make_pdf_with_page):
-        """Zero-height annotations are skipped (invisible)."""
+    def test_adds_ap_to_zero_height_annotation(self, make_pdf_with_page):
+        """Zero-height (but non-zero width) annotation is NOT exempt per spec.
+
+        ISO 19005-2 rule 6.3.3 requires BOTH x1==x2 AND y1==y2 for exemption.
+        """
         pdf = make_pdf_with_page()
         annot = pdf.make_indirect(
             Dictionary(
@@ -511,7 +517,7 @@ class TestEnsureAppearanceStreams:
         pdf.pages[0]["/Annots"] = Array([annot])
         pdf = save_and_reopen(pdf)
         result = ensure_appearance_streams(pdf)
-        assert result == 0
+        assert result == 1
 
     def test_skips_annotation_with_existing_ap_n(self, make_pdf_with_page):
         """Annotations with existing /AP /N are left alone."""

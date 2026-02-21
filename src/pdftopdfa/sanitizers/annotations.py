@@ -472,12 +472,14 @@ def ensure_appearance_streams(pdf: Pdf, level: str = "3b") -> int:
                 if subtype is not None and str(subtype) == "/Link":
                     continue
 
-                # Skip zero-size annotations (invisible, no /AP needed)
+                # Skip zero-size annotations (invisible, no /AP needed).
+                # Per ISO 19005-2 rule 6.3.3, both pairs must be equal:
+                # "value 1 is equal to value 3 AND value 2 is equal to value 4".
                 rect = resolved.get("/Rect")
                 if rect is not None:
                     try:
                         coords = [float(rect[i]) for i in range(4)]
-                        if coords[0] == coords[2] or coords[1] == coords[3]:
+                        if coords[0] == coords[2] and coords[1] == coords[3]:
                             continue
                     except Exception:
                         pass
