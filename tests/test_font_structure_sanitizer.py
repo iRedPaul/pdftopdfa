@@ -445,6 +445,65 @@ def test_widths_truncated_when_too_long():
     assert len(widths) == 3
 
 
+def test_widths_created_when_missing():
+    pdf = _new_page_pdf()
+    font = Dictionary(
+        Type=Name.Font,
+        Subtype=Name.TrueType,
+        BaseFont=Name.ArialMT,
+        FirstChar=32,
+        LastChar=34,  # expects 3 entries
+        # No Widths
+    )
+    _add_font_to_page(pdf, font)
+
+    result = sanitize_font_structure(pdf)
+
+    assert result["font_widths_size_fixed"] == 1
+    page_font = pdf.pages[0].Resources.Font.F1
+    widths = list(page_font["/Widths"])
+    assert len(widths) == 3
+    assert all(int(w) == 0 for w in widths)
+
+
+def test_widths_not_created_without_firstlast():
+    pdf = _new_page_pdf()
+    font = Dictionary(
+        Type=Name.Font,
+        Subtype=Name.TrueType,
+        BaseFont=Name.ArialMT,
+        # No FirstChar, LastChar, or Widths
+    )
+    _add_font_to_page(pdf, font)
+
+    result = sanitize_font_structure(pdf)
+
+    assert result["font_widths_size_fixed"] == 0
+    page_font = pdf.pages[0].Resources.Font.F1
+    assert page_font.get("/Widths") is None
+
+
+def test_widths_correct_size_not_touched():
+    pdf = _new_page_pdf()
+    font = Dictionary(
+        Type=Name.Font,
+        Subtype=Name.TrueType,
+        BaseFont=Name.ArialMT,
+        FirstChar=32,
+        LastChar=34,  # expects 3 entries
+        Widths=Array([250, 278, 300]),
+    )
+    _add_font_to_page(pdf, font)
+
+    result = sanitize_font_structure(pdf)
+
+    assert result["font_widths_size_fixed"] == 0
+    page_font = pdf.pages[0].Resources.Font.F1
+    widths = list(page_font["/Widths"])
+    assert len(widths) == 3
+    assert int(widths[0]) == 250
+
+
 def test_standard_font_widths_not_fixed():
     pdf = _new_page_pdf()
     # Deliberately wrong Widths size for a Standard-14 font

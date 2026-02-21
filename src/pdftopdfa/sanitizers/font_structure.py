@@ -316,10 +316,25 @@ def _fix_char_range_and_widths(font: pikepdf.Object, result: dict[str, int]) -> 
             if base_name in STANDARD_14_FONTS:
                 return
 
-    # Only fix for simple fonts with Widths
+    # Read existing FirstChar/LastChar/Widths
+    first_obj = font.get("/FirstChar")
+    last_obj = font.get("/LastChar")
     widths_obj = font.get("/Widths")
+
+    # Rule 6.2.11.2-6 (missing Widths): create zero-filled array when the
+    # char range is known.  font_widths.py will correct the values later.
     if widths_obj is None:
-        return  # No Widths → nothing to derive from or fix
+        if first_obj is not None and last_obj is not None:
+            try:
+                first = int(first_obj)
+                last = int(last_obj)
+                expected = last - first + 1
+                if expected > 0:
+                    font[Name.Widths] = Array([0] * expected)
+                    result["font_widths_size_fixed"] += 1
+            except (TypeError, ValueError):
+                pass
+        return  # can't derive char range from a non-existent Widths
 
     try:
         widths_obj = _resolve(widths_obj)
@@ -329,9 +344,7 @@ def _fix_char_range_and_widths(font: pikepdf.Object, result: dict[str, int]) -> 
     except Exception:
         return
 
-    # Read existing FirstChar/LastChar
-    first_obj = font.get("/FirstChar")
-    last_obj = font.get("/LastChar")
+    # Read existing FirstChar/LastChar (widths_obj is present)
 
     first: int | None = None
     last: int | None = None
