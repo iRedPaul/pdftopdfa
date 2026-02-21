@@ -69,6 +69,7 @@ from .filters import (
     remove_external_stream_keys,
 )
 from .font_notdef import sanitize_font_notdef
+from .font_structure import sanitize_font_structure
 from .font_widths import sanitize_font_widths
 from .fonts import sanitize_cidfont_structures, sanitize_fontname_consistency
 from .glyph_coverage import sanitize_glyph_coverage
@@ -211,6 +212,13 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "catalog_version_removed": False,
         "oc_ocg_names_added": 0,
         "image_intents_fixed": 0,
+        "font_type_added": 0,
+        "font_subtype_fixed": 0,
+        "font_basefont_added": 0,
+        "font_firstchar_added": 0,
+        "font_lastchar_added": 0,
+        "font_widths_size_fixed": 0,
+        "font_stream_subtype_removed": 0,
     }
 
     # Convert LZW-compressed streams to FlateDecode (all levels)
@@ -382,6 +390,23 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
     fontname_result = sanitize_fontname_consistency(pdf)
     result["fontname_fixed"] = fontname_result.get("fontname_fixed", 0)
 
+    # Fix broken font dictionary structure (ISO 19005-2, 6.2.11.2)
+    # Must run before notdef/glyph_coverage/font_widths
+    font_structure_result = sanitize_font_structure(pdf)
+    result["font_type_added"] = font_structure_result.get("font_type_added", 0)
+    result["font_subtype_fixed"] = font_structure_result.get("font_subtype_fixed", 0)
+    result["font_basefont_added"] = font_structure_result.get("font_basefont_added", 0)
+    result["font_firstchar_added"] = font_structure_result.get(
+        "font_firstchar_added", 0
+    )
+    result["font_lastchar_added"] = font_structure_result.get("font_lastchar_added", 0)
+    result["font_widths_size_fixed"] = font_structure_result.get(
+        "font_widths_size_fixed", 0
+    )
+    result["font_stream_subtype_removed"] = font_structure_result.get(
+        "font_stream_subtype_removed", 0
+    )
+
     # Ensure .notdef glyph in all embedded fonts (ISO 19005-2, 6.3.3)
     # Must run BEFORE width validation — adds .notdef which changes font programs
     notdef_result = sanitize_font_notdef(pdf)
@@ -494,7 +519,11 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "%d MediaBox inherited, %d boxes normalized, "
         "%d boxes clipped, %d TrimBox added, "
         "%d malformed boxes removed, "
-        "MarkInfo added: %s",
+        "MarkInfo added: %s, "
+        "%d font /Type added, %d font /Subtype fixed, "
+        "%d font /BaseFont added, %d font /FirstChar added, "
+        "%d font /LastChar added, %d font /Widths size fixed, "
+        "%d font stream subtypes removed",
         result["javascript_removed"],
         result["actions_removed"],
         result["invalid_destinations_removed"],
@@ -565,6 +594,13 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         result["trimbox_added"],
         result["malformed_boxes_removed"],
         result["mark_info_added"],
+        result["font_type_added"],
+        result["font_subtype_fixed"],
+        result["font_basefont_added"],
+        result["font_firstchar_added"],
+        result["font_lastchar_added"],
+        result["font_widths_size_fixed"],
+        result["font_stream_subtype_removed"],
     )
 
     return result
@@ -611,6 +647,7 @@ __all__ = [
     "sanitize_structure_limits",
     "sanitize_cidfont_structures",
     "sanitize_fontname_consistency",
+    "sanitize_font_structure",
     "sanitize_font_notdef",
     "sanitize_font_widths",
     "sanitize_glyph_coverage",
