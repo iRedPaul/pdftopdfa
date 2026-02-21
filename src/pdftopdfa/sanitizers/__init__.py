@@ -85,9 +85,9 @@ from .structure_limits import sanitize_structure_limits
 from .tounicode_values import fill_tounicode_gaps, sanitize_tounicode_values
 from .xfa import remove_xfa_forms
 from .xobjects import (
+    fix_bits_per_component,
     fix_image_interpolate,
     remove_forbidden_xobjects,
-    validate_bits_per_component,
 )
 
 logger = logging.getLogger(__name__)
@@ -173,8 +173,8 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "catalog_lang_set": False,
         "mark_info_added": False,
         "image_interpolate_fixed": 0,
-        "invalid_bpc_warned": 0,
-        "mask_bpc_warned": 0,
+        "invalid_bpc_fixed": 0,
+        "mask_bpc_fixed": 0,
         "cidsysteminfo_fixed": 0,
         "cidtogidmap_fixed": 0,
         "cidset_removed": 0,
@@ -300,10 +300,10 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
     # Fix /Interpolate on Image XObjects (ISO 19005-2, 6.2.9)
     result["image_interpolate_fixed"] = fix_image_interpolate(pdf)
 
-    # Validate BitsPerComponent on Image XObjects (ISO 19005-2, 6.2.8)
-    bpc_result = validate_bits_per_component(pdf)
-    result["invalid_bpc_warned"] = bpc_result["invalid_bpc"]
-    result["mask_bpc_warned"] = bpc_result["mask_bpc_invalid"]
+    # Fix BitsPerComponent on Image XObjects (ISO 19005-2, 6.2.8)
+    bpc_result = fix_bits_per_component(pdf)
+    result["invalid_bpc_fixed"] = bpc_result["invalid_bpc_fixed"]
+    result["mask_bpc_fixed"] = bpc_result["mask_bpc_fixed"]
 
     # Ensure annotation appearance streams (all levels)
     result["appearance_streams_added"] = ensure_appearance_streams(pdf, level)
@@ -599,7 +599,7 @@ __all__ = [
     "remove_forbidden_annotations",
     "remove_forbidden_xobjects",
     "fix_image_interpolate",
-    "validate_bits_per_component",
+    "fix_bits_per_component",
     "fix_annotation_flags",
     "fix_annotation_opacity",
     "remove_annotation_colors",

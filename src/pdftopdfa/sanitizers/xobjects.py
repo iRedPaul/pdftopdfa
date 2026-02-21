@@ -586,14 +586,254 @@ def fix_image_interpolate(pdf: Pdf) -> int:
     return fixed_count
 
 
-def _validate_bpc_in_xobjects(
+def _get_num_components(stream: Stream) -> int | None:
+    """Derive number of colour components from PDF /ColorSpace.
+
+    Returns:
+        1 for DeviceGray/CalGray/Separation, 3 for DeviceRGB/CalRGB,
+        4 for DeviceCMYK, N for ICCBased/DeviceN, or None if undetermined.
+    """
+    try:
+        cs = stream.get("/ColorSpace")
+        if cs is None:
+            return None
+
+        cs = _resolve_indirect(cs)
+
+        if isinstance(cs, Name):
+            cs_name = str(cs)
+            if cs_name == "/DeviceGray":
+                return 1
+            if cs_name == "/DeviceRGB":
+                return 3
+            if cs_name == "/DeviceCMYK":
+                return 4
+            return None
+
+        if isinstance(cs, Array) and len(cs) >= 2:
+            cs_type = _resolve_indirect(cs[0])
+            if not isinstance(cs_type, Name):
+                return None
+            cs_type_str = str(cs_type)
+
+            if cs_type_str == "/ICCBased":
+                icc_stream = _resolve_indirect(cs[1])
+                if isinstance(icc_stream, Stream):
+                    n = icc_stream.get("/N")
+                    if n is not None:
+                        return int(n)
+            elif cs_type_str == "/CalGray":
+                return 1
+            elif cs_type_str == "/CalRGB":
+                return 3
+            elif cs_type_str == "/Separation":
+                return 1
+            elif cs_type_str == "/DeviceN":
+                # DeviceN: [/DeviceN names_array ...]
+                if len(cs) >= 2:
+                    names = _resolve_indirect(cs[1])
+                    if isinstance(names, Array):
+                        return len(names)
+            elif cs_type_str == "/Indexed":
+                return None
+            return None
+
+        return None
+    except Exception:
+        return None
+
+
+_SKIP_FILTERS = frozenset(
+    {"/DCTDecode", "/JPXDecode", "/JBIG2Decode", "/CCITTFaxDecode"}
+)
+
+
+def _should_skip_stream(stream: Stream) -> bool:
+    """Return True if the stream uses a filter where BPC is baked into data."""
+    try:
+        filt = stream.get("/Filter")
+        if filt is None:
+            return False
+        filt = _resolve_indirect(filt)
+        if isinstance(filt, Name):
+            return str(filt) in _SKIP_FILTERS
+        if isinstance(filt, Array):
+            return any(str(_resolve_indirect(f)) in _SKIP_FILTERS for f in filt)
+    except Exception:
+        pass
+    return False
+
+
+def _unpack_samples(
+    data: bytes, bpc: int, width: int, height: int, num_components: int
+) -> list[int]:
+    """Unpack raw pixel bytes into integer sample values.
+
+    Processes row-by-row (each row padded to byte boundary).
+    For sub-byte BPC, does bitwise extraction MSB-first.
+    For BPC=16, uses big-endian 2-byte reads.
+    """
+    samples: list[int] = []
+    samples_per_row = width * num_components
+    bits_per_row = samples_per_row * bpc
+    bytes_per_row = (bits_per_row + 7) // 8
+    mask = (1 << bpc) - 1
+
+    for row in range(height):
+        row_start = row * bytes_per_row
+        row_data = data[row_start : row_start + bytes_per_row]
+
+        if bpc == 16:
+            for i in range(samples_per_row):
+                offset = i * 2
+                val = (row_data[offset] << 8) | row_data[offset + 1]
+                samples.append(val)
+        elif bpc == 8:
+            for i in range(samples_per_row):
+                samples.append(row_data[i])
+        elif bpc <= 8:
+            bit_offset = 0
+            for _ in range(samples_per_row):
+                byte_idx = bit_offset >> 3
+                bit_in_byte = bit_offset & 7
+                # MSB-first extraction
+                shift = 8 - bit_in_byte - bpc
+                if shift >= 0:
+                    val = (row_data[byte_idx] >> shift) & mask
+                else:
+                    # Sample spans two bytes
+                    combined = (row_data[byte_idx] << 8) | row_data[byte_idx + 1]
+                    val = (combined >> (8 + shift)) & mask
+                samples.append(val)
+                bit_offset += bpc
+        else:
+            # Unusual BPC > 8 but != 16 (e.g. 12)
+            bit_offset = 0
+            for _ in range(samples_per_row):
+                byte_idx = bit_offset >> 3
+                bit_in_byte = bit_offset & 7
+                # Read enough bytes
+                remaining_bits = bpc
+                val = 0
+                while remaining_bits > 0:
+                    available = 8 - bit_in_byte
+                    take = min(available, remaining_bits)
+                    shift = available - take
+                    bits = (row_data[byte_idx] >> shift) & ((1 << take) - 1)
+                    val = (val << take) | bits
+                    remaining_bits -= take
+                    bit_in_byte = 0
+                    byte_idx += 1
+                samples.append(val)
+                bit_offset += bpc
+
+    return samples
+
+
+def _pack_samples_8bit(
+    samples: list[int], width: int, height: int, num_components: int
+) -> bytes:
+    """Pack samples as 8-bit values (1 byte per sample, clamped to [0,255])."""
+    return bytes(max(0, min(255, s)) for s in samples)
+
+
+def _pack_samples_1bit(samples: list[int], width: int, height: int) -> bytes:
+    """Pack samples as 1-bit values MSB-first, each row padded to byte boundary."""
+    result = bytearray()
+    idx = 0
+    for _row in range(height):
+        byte_val = 0
+        bit_pos = 7
+        for _col in range(width):
+            if samples[idx]:
+                byte_val |= 1 << bit_pos
+            idx += 1
+            bit_pos -= 1
+            if bit_pos < 0:
+                result.append(byte_val)
+                byte_val = 0
+                bit_pos = 7
+        # Pad remaining bits in the last byte of the row
+        if bit_pos < 7:
+            result.append(byte_val)
+    return bytes(result)
+
+
+def _reencode_image_stream(stream: Stream, source_bpc: int, target_bpc: int) -> bool:
+    """Re-encode image pixel data from source_bpc to target_bpc.
+
+    Returns True on success, False if re-encoding cannot be performed.
+    """
+    if _should_skip_stream(stream):
+        return False
+
+    try:
+        width = int(stream.get("/Width", 0))
+        height = int(stream.get("/Height", 0))
+    except (ValueError, TypeError):
+        return False
+
+    if width <= 0 or height <= 0:
+        return False
+
+    is_mask = stream.get("/ImageMask")
+    if is_mask is not None and bool(is_mask):
+        num_components = 1
+    else:
+        num_components = _get_num_components(stream)
+        if num_components is None:
+            return False
+
+    try:
+        data = stream.read_bytes()
+    except Exception:
+        return False
+
+    # Validate data length
+    samples_per_row = width * num_components
+    bits_per_row = samples_per_row * source_bpc
+    bytes_per_row = (bits_per_row + 7) // 8
+    expected_length = bytes_per_row * height
+    if len(data) < expected_length:
+        return False
+
+    try:
+        samples = _unpack_samples(data, source_bpc, width, height, num_components)
+    except Exception:
+        return False
+
+    # Scale samples from source range to target range
+    source_max = (1 << source_bpc) - 1
+    target_max = (1 << target_bpc) - 1
+    if source_max > 0:
+        scaled = [round(s * target_max / source_max) for s in samples]
+    else:
+        scaled = samples
+
+    # Pack into target BPC
+    if target_bpc == 8:
+        new_data = _pack_samples_8bit(scaled, width, height, num_components)
+    elif target_bpc == 1:
+        new_data = _pack_samples_1bit(scaled, width, height)
+    else:
+        return False
+
+    # Write re-encoded data (pikepdf re-compresses with FlateDecode)
+    stream.write(new_data)
+    if stream.get("/DecodeParms") is not None:
+        del stream["/DecodeParms"]
+    stream[Name.BitsPerComponent] = target_bpc
+    return True
+
+
+def _fix_bpc_in_xobjects(
     xobjects: pikepdf.Dictionary,
     visited: set[tuple[int, int]],
 ) -> dict[str, int]:
-    """Validates BitsPerComponent on Image XObjects within an XObject dictionary.
+    """Fixes invalid BitsPerComponent on Image XObjects within an XObject dictionary.
 
-    Recursively processes XObjects: for each Image, checks that BPC is one of
-    the allowed values (1, 2, 4, 8, 16) and that image masks have BPC == 1.
+    Recursively processes XObjects: for each Image with invalid BPC, re-encodes
+    pixel data to a valid BPC value. Image masks are re-encoded to BPC=1.
     Recurses into Form XObjects for nested images.
 
     Args:
@@ -601,9 +841,9 @@ def _validate_bpc_in_xobjects(
         visited: Set of already-visited objgen tuples for cycle detection.
 
     Returns:
-        Dictionary with invalid_bpc and mask_bpc_invalid counts.
+        Dictionary with invalid_bpc_fixed and mask_bpc_fixed counts.
     """
-    result = {"invalid_bpc": 0, "mask_bpc_invalid": 0}
+    result = {"invalid_bpc_fixed": 0, "mask_bpc_fixed": 0}
 
     for key in xobjects.keys():
         try:
@@ -636,29 +876,48 @@ def _validate_bpc_in_xobjects(
                             key,
                             bpc,
                         )
-                        result["invalid_bpc"] += 1
+                        # Can't unpack with non-integer source — skip
                         continue
 
-                    if bpc_val not in VALID_BITS_PER_COMPONENT:
-                        logger.warning(
-                            "Image XObject %s has invalid "
-                            "BitsPerComponent %d "
-                            "(allowed: 1, 2, 4, 8, 16)",
-                            key,
-                            bpc_val,
-                        )
-                        result["invalid_bpc"] += 1
-
-                    # Image masks must have BPC == 1
                     is_mask = xobj.get("/ImageMask")
-                    if is_mask is not None and bool(is_mask):
-                        if bpc_val != 1:
+                    is_mask_flag = is_mask is not None and bool(is_mask)
+
+                    if is_mask_flag and bpc_val != 1:
+                        # Image mask must have BPC == 1
+                        if bpc_val == 0:
                             logger.warning(
-                                "Image mask %s has BitsPerComponent %d (must be 1)",
+                                "Image mask %s has BitsPerComponent 0, cannot fix",
+                                key,
+                            )
+                            continue
+                        if _reencode_image_stream(xobj, bpc_val, 1):
+                            result["mask_bpc_fixed"] += 1
+                            logger.debug("Fixed image mask %s BPC %d → 1", key, bpc_val)
+                        else:
+                            logger.warning(
+                                "Could not fix image mask %s BPC %d → 1",
                                 key,
                                 bpc_val,
                             )
-                            result["mask_bpc_invalid"] += 1
+                    elif not is_mask_flag and bpc_val not in VALID_BITS_PER_COMPONENT:
+                        # Invalid BPC for non-mask image
+                        if bpc_val == 0:
+                            logger.warning(
+                                "Image XObject %s has BitsPerComponent 0, cannot fix",
+                                key,
+                            )
+                            continue
+                        if _reencode_image_stream(xobj, bpc_val, 8):
+                            result["invalid_bpc_fixed"] += 1
+                            logger.debug(
+                                "Fixed Image XObject %s BPC %d → 8", key, bpc_val
+                            )
+                        else:
+                            logger.warning(
+                                "Could not fix Image XObject %s BPC %d → 8",
+                                key,
+                                bpc_val,
+                            )
 
             elif subtype_str == "/Form":
                 nested_resources = xobj.get("/Resources")
@@ -667,30 +926,30 @@ def _validate_bpc_in_xobjects(
                     nested_xobjects = nested_resources.get("/XObject")
                     if nested_xobjects is not None:
                         nested_xobjects = _resolve_indirect(nested_xobjects)
-                        nested = _validate_bpc_in_xobjects(nested_xobjects, visited)
-                        result["invalid_bpc"] += nested["invalid_bpc"]
-                        result["mask_bpc_invalid"] += nested["mask_bpc_invalid"]
+                        nested = _fix_bpc_in_xobjects(nested_xobjects, visited)
+                        result["invalid_bpc_fixed"] += nested["invalid_bpc_fixed"]
+                        result["mask_bpc_fixed"] += nested["mask_bpc_fixed"]
 
         except Exception as e:
-            logger.debug("Error validating BPC on XObject %s: %s", key, e)
+            logger.debug("Error fixing BPC on XObject %s: %s", key, e)
 
     return result
 
 
-def _validate_bpc_in_ap_stream(
+def _fix_bpc_in_ap_stream(
     ap_entry,
     visited: set[tuple[int, int]],
 ) -> dict[str, int]:
-    """Validate BitsPerComponent on images in an annotation AP stream entry.
+    """Fix BitsPerComponent on images in an annotation AP stream entry.
 
     Args:
         ap_entry: An appearance entry (N, R, or D value).
         visited: Set of (objnum, gen) tuples for cycle detection.
 
     Returns:
-        Dictionary with invalid_bpc and mask_bpc_invalid counts.
+        Dictionary with invalid_bpc_fixed and mask_bpc_fixed counts.
     """
-    result = {"invalid_bpc": 0, "mask_bpc_invalid": 0}
+    result = {"invalid_bpc_fixed": 0, "mask_bpc_fixed": 0}
     ap_entry = _resolve_indirect(ap_entry)
 
     if isinstance(ap_entry, Stream):
@@ -700,9 +959,9 @@ def _validate_bpc_in_ap_stream(
             xobjects = resources.get("/XObject")
             if xobjects:
                 xobjects = _resolve_indirect(xobjects)
-                r = _validate_bpc_in_xobjects(xobjects, visited)
-                result["invalid_bpc"] += r["invalid_bpc"]
-                result["mask_bpc_invalid"] += r["mask_bpc_invalid"]
+                r = _fix_bpc_in_xobjects(xobjects, visited)
+                result["invalid_bpc_fixed"] += r["invalid_bpc_fixed"]
+                result["mask_bpc_fixed"] += r["mask_bpc_fixed"]
     elif isinstance(ap_entry, Dictionary):
         for state_name in list(ap_entry.keys()):
             state_stream = _resolve_indirect(ap_entry[state_name])
@@ -713,31 +972,31 @@ def _validate_bpc_in_ap_stream(
                     xobjects = resources.get("/XObject")
                     if xobjects:
                         xobjects = _resolve_indirect(xobjects)
-                        r = _validate_bpc_in_xobjects(xobjects, visited)
-                        result["invalid_bpc"] += r["invalid_bpc"]
-                        result["mask_bpc_invalid"] += r["mask_bpc_invalid"]
+                        r = _fix_bpc_in_xobjects(xobjects, visited)
+                        result["invalid_bpc_fixed"] += r["invalid_bpc_fixed"]
+                        result["mask_bpc_fixed"] += r["mask_bpc_fixed"]
 
     return result
 
 
-def validate_bits_per_component(pdf: Pdf) -> dict[str, int]:
-    """Validates BitsPerComponent on all Image XObjects.
+def fix_bits_per_component(pdf: Pdf) -> dict[str, int]:
+    """Fixes invalid BitsPerComponent on all Image XObjects.
 
     ISO 19005-2, Clause 6.2.8 requires:
-    - BitsPerComponent must be 1, 2, 4, 8, or 16
-    - Image masks (/ImageMask true) must have BitsPerComponent == 1
+    - BitsPerComponent must be 1, 2, 4, 8, or 16 (rule 6.2.8-4)
+    - Image masks (/ImageMask true) must have BitsPerComponent == 1 (rule 6.2.8-5)
 
-    Logs a warning for each invalid value found.
+    Re-encodes image pixel data to valid BPC values where possible.
 
     Args:
-        pdf: Opened pikepdf PDF object.
+        pdf: Opened pikepdf PDF object (modified in place).
 
     Returns:
         Dictionary with keys:
-        - invalid_bpc: Number of images with invalid BitsPerComponent
-        - mask_bpc_invalid: Number of image masks with BPC != 1
+        - invalid_bpc_fixed: Number of images with BPC fixed to 8
+        - mask_bpc_fixed: Number of image masks with BPC fixed to 1
     """
-    total: dict[str, int] = {"invalid_bpc": 0, "mask_bpc_invalid": 0}
+    total: dict[str, int] = {"invalid_bpc_fixed": 0, "mask_bpc_fixed": 0}
     visited: set[tuple[int, int]] = set()
 
     for page_num, page in enumerate(pdf.pages, start=1):
@@ -751,9 +1010,9 @@ def validate_bits_per_component(pdf: Pdf) -> dict[str, int]:
                 xobjects = resources.get("/XObject")
                 if xobjects is not None:
                     xobjects = _resolve_indirect(xobjects)
-                    r = _validate_bpc_in_xobjects(xobjects, visited)
-                    total["invalid_bpc"] += r["invalid_bpc"]
-                    total["mask_bpc_invalid"] += r["mask_bpc_invalid"]
+                    r = _fix_bpc_in_xobjects(xobjects, visited)
+                    total["invalid_bpc_fixed"] += r["invalid_bpc_fixed"]
+                    total["mask_bpc_fixed"] += r["mask_bpc_fixed"]
 
             # Page → Annots → AP streams
             annots = page_dict.get("/Annots")
@@ -772,18 +1031,18 @@ def validate_bits_per_component(pdf: Pdf) -> dict[str, int]:
                     for ap_key in ("/N", "/R", "/D"):
                         ap_entry = ap.get(ap_key)
                         if ap_entry is not None:
-                            r = _validate_bpc_in_ap_stream(ap_entry, visited)
-                            total["invalid_bpc"] += r["invalid_bpc"]
-                            total["mask_bpc_invalid"] += r["mask_bpc_invalid"]
+                            r = _fix_bpc_in_ap_stream(ap_entry, visited)
+                            total["invalid_bpc_fixed"] += r["invalid_bpc_fixed"]
+                            total["mask_bpc_fixed"] += r["mask_bpc_fixed"]
 
         except Exception as e:
-            logger.debug("Error validating BPC on page %d: %s", page_num, e)
+            logger.debug("Error fixing BPC on page %d: %s", page_num, e)
 
-    warnings = total["invalid_bpc"] + total["mask_bpc_invalid"]
-    if warnings > 0:
+    fixed = total["invalid_bpc_fixed"] + total["mask_bpc_fixed"]
+    if fixed > 0:
         logger.info(
-            "BitsPerComponent validation: %d invalid BPC, %d invalid mask BPC",
-            total["invalid_bpc"],
-            total["mask_bpc_invalid"],
+            "BitsPerComponent fixed: %d invalid BPC → 8, %d mask BPC → 1",
+            total["invalid_bpc_fixed"],
+            total["mask_bpc_fixed"],
         )
     return total
