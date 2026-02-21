@@ -271,7 +271,7 @@ class TestRemoveNonCompliantEmbeddedFiles:
 
         result = remove_non_compliant_embedded_files(pdf)
 
-        assert result == {"removed": 0, "kept": 1}
+        assert result == {"removed": 0, "kept": 1, "converted": 0}
         assert "/EmbeddedFiles" in pdf.Root.Names
 
     def test_removes_non_compliant_file(self) -> None:
@@ -280,7 +280,7 @@ class TestRemoveNonCompliantEmbeddedFiles:
 
         result = remove_non_compliant_embedded_files(pdf)
 
-        assert result == {"removed": 1, "kept": 0}
+        assert result == {"removed": 1, "kept": 0, "converted": 0}
         # EmbeddedFiles should be deleted since all files were removed
         names = pdf.Root.Names
         names = _resolve_indirect(names)
@@ -311,7 +311,7 @@ class TestRemoveNonCompliantEmbeddedFiles:
 
         result = remove_non_compliant_embedded_files(pdf)
 
-        assert result == {"removed": 1, "kept": 1}
+        assert result == {"removed": 1, "kept": 1, "converted": 0}
         # EmbeddedFiles should still exist with one entry
         remaining = pdf.Root.Names.EmbeddedFiles.Names
         assert len(remaining) == 2  # [name, filespec]
@@ -324,7 +324,7 @@ class TestRemoveNonCompliantEmbeddedFiles:
 
         result = remove_non_compliant_embedded_files(pdf)
 
-        assert result == {"removed": 0, "kept": 0}
+        assert result == {"removed": 0, "kept": 0, "converted": 0}
 
     def test_removes_non_compliant_file_attachment(self) -> None:
         """Non-compliant FileAttachment annotation is removed."""
@@ -351,6 +351,90 @@ class TestRemoveNonCompliantEmbeddedFiles:
         annots = pdf.pages[0].get("/Annots")
         assert annots is not None
         assert len(annots) == 1
+
+
+# --- Tests for conversion of non-compliant embedded PDFs ---
+
+_TRY_CONVERT = "pdftopdfa.sanitizers.files._try_convert_embedded_pdf_to_pdfa2"
+
+
+class TestConvertNonCompliantEmbeddedFiles:
+    """Tests for the convert-before-remove path (rule 6.8-5)."""
+
+    def test_converts_non_compliant_pdf_to_pdfa2(self) -> None:
+        """Non-compliant embedded PDF is converted to PDF/A-2b instead of removed."""
+        pdf = _make_pdf_with_embedded(b"%PDF-1.4 non-compliant data", "doc.pdf")
+
+        converted_bytes = b"%PDF-1.4 converted content"
+        with patch(_TRY_CONVERT, return_value=converted_bytes):
+            result = remove_non_compliant_embedded_files(pdf)
+
+        assert result["converted"] == 1
+        assert result["removed"] == 0
+        assert result["kept"] == 0
+        # EmbeddedFiles must still exist (file was converted, not removed)
+        assert "/EmbeddedFiles" in pdf.Root.Names
+
+    def test_removes_non_pdf_embedded_file(self) -> None:
+        """Non-PDF embedded file (no %PDF- prefix) is removed without conversion."""
+        pdf = _make_pdf_with_embedded(b"Not a PDF at all", "bad.txt")
+
+        with patch(_TRY_CONVERT) as mock_convert:
+            result = remove_non_compliant_embedded_files(pdf)
+            mock_convert.assert_not_called()
+
+        assert result["removed"] == 1
+        assert result["converted"] == 0
+
+    def test_falls_back_to_removal_when_conversion_fails(self) -> None:
+        """When conversion returns None, the file is removed and /EF is stripped."""
+        pdf = _make_pdf_with_embedded(b"%PDF-1.4 unconvertible", "bad.pdf")
+
+        with patch(_TRY_CONVERT, return_value=None):
+            result = remove_non_compliant_embedded_files(pdf)
+
+        assert result["removed"] == 1
+        assert result["converted"] == 0
+        # EmbeddedFiles should be gone
+        names = _resolve_indirect(pdf.Root.Names)
+        assert "/EmbeddedFiles" not in names
+
+    def test_return_dict_has_converted_key(self) -> None:
+        """Return dict always contains 'converted' key."""
+        pdf = new_pdf()
+        pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
+
+        result = remove_non_compliant_embedded_files(pdf)
+
+        assert "converted" in result
+        assert "removed" in result
+        assert "kept" in result
+        assert isinstance(result["converted"], int)
+
+    def test_converted_file_stream_is_updated(self) -> None:
+        """After conversion the embedded stream contains the new PDF/A-2b bytes."""
+        pdf = _make_pdf_with_embedded(b"%PDF-1.4 original content", "doc.pdf")
+
+        new_data = b"%PDF-1.4 converted content"
+        with patch(_TRY_CONVERT, return_value=new_data):
+            result = remove_non_compliant_embedded_files(pdf)
+
+        assert result["converted"] == 1
+        names_array = pdf.Root.Names.EmbeddedFiles.Names
+        filespec = _resolve_indirect(names_array[1])
+        ef = _resolve_indirect(filespec.get("/EF"))
+        stream_obj = ef.get("/UF") or ef.get("/F")
+        stream = _resolve_indirect(stream_obj)
+        assert bytes(stream.read_bytes()) == new_data
+
+    def test_sanitize_for_pdfa_exposes_converted_count(self) -> None:
+        """sanitize_for_pdfa result dict has 'embedded_files_converted' key."""
+        pdf = _make_pdf_with_embedded(b"Not a PDF", "bad.txt")
+
+        result = sanitize_for_pdfa(pdf, level="2b")
+
+        assert "embedded_files_converted" in result
+        assert isinstance(result["embedded_files_converted"], int)
 
 
 # --- Integration tests for sanitize_for_pdfa ---
@@ -1317,7 +1401,7 @@ class TestRemoveNonCompliantCleanup:
 
         result = remove_non_compliant_embedded_files(pdf)
 
-        assert result == {"removed": 1, "kept": 0}
+        assert result == {"removed": 1, "kept": 0, "converted": 0}
         assert "/AF" not in pdf.Root
 
     def test_preserves_root_af_when_some_kept(self) -> None:
@@ -1345,7 +1429,7 @@ class TestRemoveNonCompliantCleanup:
 
         result = remove_non_compliant_embedded_files(pdf)
 
-        assert result == {"removed": 1, "kept": 1}
+        assert result == {"removed": 1, "kept": 1, "converted": 0}
         assert "/AF" in pdf.Root
 
 

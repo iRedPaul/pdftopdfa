@@ -130,6 +130,81 @@ def _is_pdfa_compliant_embedded(filespec: object) -> bool:
         return False
 
 
+def _try_convert_embedded_pdf_to_pdfa2(data: bytes) -> bytes | None:
+    """Attempt to convert embedded PDF bytes to PDF/A-2b.
+
+    Uses a deferred import of convert_to_pdfa to avoid a circular dependency
+    (converter → sanitizers/__init__ → files → converter).
+
+    Args:
+        data: Raw bytes of an embedded PDF file.
+
+    Returns:
+        Converted PDF/A-2b bytes on success, or None if conversion failed.
+    """
+    # Deferred import breaks the circular dependency at module load time.
+    from ..converter import convert_to_pdfa  # noqa: PLC0415
+
+    tmp_in_path: Path | None = None
+    tmp_out_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_in:
+            tmp_in.write(data)
+            tmp_in_path = Path(tmp_in.name)
+
+        tmp_out_path = tmp_in_path.with_name(tmp_in_path.stem + "_pdfa2b.pdf")
+        result = convert_to_pdfa(tmp_in_path, tmp_out_path, level="2b")
+        if result.success:
+            converted = tmp_out_path.read_bytes()
+            logger.debug(
+                "Converted embedded PDF to PDF/A-2b (%d → %d bytes)",
+                len(data),
+                len(converted),
+            )
+            return converted
+        logger.debug("Embedded PDF conversion failed: %s", result.error)
+        return None
+    except Exception as e:
+        logger.debug("Error converting embedded PDF to PDF/A-2b: %s", e)
+        return None
+    finally:
+        if tmp_in_path is not None:
+            tmp_in_path.unlink(missing_ok=True)
+        if tmp_out_path is not None:
+            tmp_out_path.unlink(missing_ok=True)
+
+
+def _update_embedded_stream(ef: object, new_data: bytes) -> None:
+    """Replace the data in an /EF embedded file stream.
+
+    Updates the /UF (preferred) or /F stream with new_data and refreshes
+    /Params size and modification date if the /Params dictionary is present.
+
+    Args:
+        ef: A resolved /EF dictionary (embedded file streams dictionary).
+        new_data: The replacement bytes (e.g. a converted PDF/A-2b file).
+    """
+    ef = _resolve_indirect(ef)
+
+    # Prefer /UF (Unicode filename stream), fall back to /F
+    stream = ef.get("/UF")
+    if stream is None:
+        stream = ef.get("/F")
+    if stream is None:
+        return
+
+    stream = _resolve_indirect(stream)
+    stream.write(new_data)  # pikepdf re-compresses and updates /Length automatically
+
+    # Refresh /Params metadata if present
+    params = stream.get("/Params")
+    if params is not None:
+        params = _resolve_indirect(params)
+        if isinstance(params, Dictionary):
+            params[Name.Size] = len(new_data)
+            params[Name.ModDate] = pikepdf.String(_format_pdf_date(datetime.now(UTC)))
+
+
 _MAX_NAME_TREE_DEPTH = 32
 
 
@@ -384,16 +459,19 @@ def remove_non_compliant_embedded_files(pdf: Pdf) -> dict[str, int]:
 
     PDF/A-2 (ISO 19005-2) allows embedded files that are themselves
     PDF/A-1 or PDF/A-2 compliant. This function checks each embedded
-    file and only removes those that are not compliant.
+    file, first attempting to convert non-compliant PDFs to PDF/A-2b.
+    Only if conversion fails (or the file is not a PDF) does it fall back
+    to removing the embedded content.
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
 
     Returns:
-        Dictionary with 'removed' and 'kept' counts.
+        Dictionary with 'removed', 'kept', and 'converted' counts.
     """
     removed = 0
     kept = 0
+    converted = 0
     processed_filespecs: set[tuple[int, int]] = set()
 
     # 1. Process EmbeddedFiles from Names (traverse full Name Tree)
@@ -417,17 +495,43 @@ def remove_non_compliant_embedded_files(pdf: Pdf) -> dict[str, int]:
                         kept += 1
                         logger.debug("Kept compliant embedded file: %s", str(name))
                     else:
-                        # Strip /EF so full scan in step 3 won't re-process
+                        # Not compliant — try to convert it to PDF/A-2b first
+                        _converted = False
                         try:
-                            if "/EF" in fs_resolved:
-                                del fs_resolved["/EF"]
+                            ef_obj = fs_resolved.get("/EF")
+                            if ef_obj is not None:
+                                ef = _resolve_indirect(ef_obj)
+                                stream = ef.get("/UF") or ef.get("/F")
+                                if stream is not None:
+                                    raw = bytes(_resolve_indirect(stream).read_bytes())
+                                    if raw[:5] == b"%PDF-":
+                                        new_data = _try_convert_embedded_pdf_to_pdfa2(
+                                            raw
+                                        )
+                                        if new_data is not None:
+                                            _update_embedded_stream(ef, new_data)
+                                            new_names.append(name)
+                                            new_names.append(filespec)
+                                            converted += 1
+                                            logger.debug(
+                                                "Converted non-compliant embedded "
+                                                "file: %s",
+                                                str(name),
+                                            )
+                                            _converted = True
                         except Exception:
                             pass
-                        removed += 1
-                        logger.debug(
-                            "Removed non-compliant embedded file: %s",
-                            str(name),
-                        )
+                        if not _converted:
+                            try:
+                                if "/EF" in fs_resolved:
+                                    del fs_resolved["/EF"]
+                            except Exception:
+                                pass
+                            removed += 1
+                            logger.debug(
+                                "Removed non-compliant embedded file: %s",
+                                str(name),
+                            )
 
                 if new_names:
                     # Flatten tree: store all entries in root /Names
@@ -469,15 +573,45 @@ def remove_non_compliant_embedded_files(pdf: Pdf) -> dict[str, int]:
                         if fs is not None and _is_pdfa_compliant_embedded(fs):
                             kept += 1
                         else:
-                            # Strip /EF so full scan in step 3 won't re-process
+                            # Not compliant — try to convert it to PDF/A-2b first
+                            _converted = False
                             if fs is not None:
                                 try:
-                                    fs_resolved = _resolve_indirect(fs)
-                                    if "/EF" in fs_resolved:
-                                        del fs_resolved["/EF"]
+                                    ef_obj = fs_resolved.get("/EF")
+                                    if ef_obj is not None:
+                                        ef = _resolve_indirect(ef_obj)
+                                        stream = ef.get("/UF") or ef.get("/F")
+                                        if stream is not None:
+                                            raw = bytes(
+                                                _resolve_indirect(stream).read_bytes()
+                                            )
+                                            if raw[:5] == b"%PDF-":
+                                                new_data = (
+                                                    _try_convert_embedded_pdf_to_pdfa2(
+                                                        raw
+                                                    )
+                                                )
+                                                if new_data is not None:
+                                                    _update_embedded_stream(
+                                                        ef, new_data
+                                                    )
+                                                    converted += 1
+                                                    logger.debug(
+                                                        "Converted non-compliant "
+                                                        "FileAttachment: page %d",
+                                                        page_num,
+                                                    )
+                                                    _converted = True
                                 except Exception:
                                     pass
-                            indices_to_remove.append(i)
+                            if not _converted:
+                                if fs is not None:
+                                    try:
+                                        if "/EF" in fs_resolved:
+                                            del fs_resolved["/EF"]
+                                    except Exception:
+                                        pass
+                                indices_to_remove.append(i)
                 except Exception:
                     continue
 
@@ -503,16 +637,36 @@ def remove_non_compliant_embedded_files(pdf: Pdf) -> dict[str, int]:
             if _is_pdfa_compliant_embedded(resolved):
                 kept += 1
                 continue
-            # Strip /EF to convert from embedded to plain file reference
-            del resolved["/EF"]
-            removed += 1
+            # Not compliant — try to convert it to PDF/A-2b first
+            _converted = False
             try:
-                og = resolved.objgen
-            except (AttributeError, ValueError, TypeError):
-                og = (0, 0)
-            if og != (0, 0):
-                removed_objgens.add(og)
-            logger.debug("Stripped /EF from orphan non-compliant FileSpec")
+                ef_obj = resolved.get("/EF")
+                if ef_obj is not None:
+                    ef_r = _resolve_indirect(ef_obj)
+                    stream = ef_r.get("/UF") or ef_r.get("/F")
+                    if stream is not None:
+                        raw = bytes(_resolve_indirect(stream).read_bytes())
+                        if raw[:5] == b"%PDF-":
+                            new_data = _try_convert_embedded_pdf_to_pdfa2(raw)
+                            if new_data is not None:
+                                _update_embedded_stream(ef_r, new_data)
+                                converted += 1
+                                logger.debug(
+                                    "Converted orphan non-compliant embedded FileSpec"
+                                )
+                                _converted = True
+            except Exception:
+                pass
+            if not _converted:
+                del resolved["/EF"]
+                removed += 1
+                try:
+                    og = resolved.objgen
+                except (AttributeError, ValueError, TypeError):
+                    og = (0, 0)
+                if og != (0, 0):
+                    removed_objgens.add(og)
+                logger.debug("Stripped /EF from orphan non-compliant FileSpec")
         except Exception:
             continue
 
@@ -520,18 +674,25 @@ def remove_non_compliant_embedded_files(pdf: Pdf) -> dict[str, int]:
     _cleanup_af_arrays(pdf, removed_objgens)
 
     # Clean up /Root/AF when all embedded files have been removed.
-    # When some files are kept, ensure_af_relationships() will rebuild /Root/AF.
-    if removed > 0 and kept == 0:
+    # When some files are kept or converted, ensure_af_relationships() will
+    # rebuild /Root/AF.
+    if removed > 0 and kept == 0 and converted == 0:
         if "/AF" in pdf.Root:
             del pdf.Root["/AF"]
             logger.debug("Removed /Root/AF (all embedded files were non-compliant)")
 
-    if removed > 0:
-        logger.info("%d non-compliant embedded file(s) removed, %d kept", removed, kept)
+    if removed > 0 or converted > 0:
+        logger.info(
+            "%d non-compliant embedded file(s): %d converted, %d removed, %d kept",
+            removed + converted,
+            converted,
+            removed,
+            kept,
+        )
     elif kept > 0:
         logger.info("%d compliant embedded file(s) kept", kept)
 
-    return {"removed": removed, "kept": kept}
+    return {"removed": removed, "kept": kept, "converted": converted}
 
 
 def ensure_af_relationships(pdf: Pdf) -> int:

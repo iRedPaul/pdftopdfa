@@ -133,6 +133,7 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "javascript_removed": 0,
         "files_removed": 0,
         "embedded_files_kept": 0,
+        "embedded_files_converted": 0,
         "actions_removed": 0,
         "invalid_destinations_removed": 0,
         "xfa_removed": 0,
@@ -490,6 +491,7 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         embed_result = remove_non_compliant_embedded_files(pdf)
         result["files_removed"] = embed_result["removed"]
         result["embedded_files_kept"] = embed_result["kept"]
+        result["embedded_files_converted"] = embed_result.get("converted", 0)
 
     # Ensure AF relationships and embedded file metadata (2b/2u and 3b/3u)
     # PDF/A-2 (ISO 19005-2) and PDF/A-3 (ISO 19005-3) both require:
@@ -512,7 +514,8 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
     logger.info(
         "Sanitization completed: %d JS, %d actions, %d invalid dests, "
         "%d files removed, "
-        "%d embedded files kept, %d XFA, %d forbidden catalog entries, "
+        "%d embedded files converted, %d embedded files kept, "
+        "%d XFA, %d forbidden catalog entries, "
         "%d viewer prefs entries removed, "
         "catalog /Lang set: %s, "
         "%d forbidden annots, %d forbidden XObjects removed, "
@@ -565,6 +568,7 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         result["actions_removed"],
         result["invalid_destinations_removed"],
         result["files_removed"],
+        result["embedded_files_converted"],
         result["embedded_files_kept"],
         result["xfa_removed"],
         result["forbidden_catalog_entries_removed"],
