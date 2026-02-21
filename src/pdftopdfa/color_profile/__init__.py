@@ -25,7 +25,10 @@ from ._profiles import (
     get_profile_for_colorspace,
     get_srgb_profile,
 )
-from ._transparency import _fix_transparency_group_colorspaces
+from ._transparency import (
+    _add_missing_transparency_groups,
+    _fix_transparency_group_colorspaces,
+)
 from ._types import ColorSpaceAnalysis, ColorSpaceType, SpecialColorSpace
 
 logger = logging.getLogger(__name__)
@@ -37,6 +40,7 @@ __all__ = [
     "_analyze_colorspace",
     "_apply_default_colorspaces",
     "_apply_defaults_to_ap_entry",
+    "_add_missing_transparency_groups",
     "_convert_calibrated_colorspaces",
     "_create_icc_colorspace",
     "_fix_transparency_group_colorspaces",
@@ -260,6 +264,14 @@ def embed_color_profiles(
         dominant = ColorSpaceType.DEVICE_GRAY
 
     icc_stream_cache: dict[ColorSpaceType, Stream] = {}
+
+    # Rule 6.2.10-2: add /Group to transparent pages missing one
+    groups_added = _add_missing_transparency_groups(pdf, icc_stream_cache)
+    if groups_added > 0:
+        logger.info(
+            "Added /Group to %d page(s) with transparency (rule 6.2.10-2)",
+            groups_added,
+        )
 
     profile_data = get_profile_for_colorspace(dominant)
     output_intent = create_output_intent_for_colorspace(

@@ -11,6 +11,7 @@ from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from pdftopdfa.color_profile import (
     ColorSpaceType,
+    _add_missing_transparency_groups,
     _create_icc_colorspace,
     _fix_transparency_group_colorspaces,
     embed_color_profiles,
@@ -545,3 +546,364 @@ class TestTransparencyGroupIntegration:
         img_cs = image[Name.ColorSpace]
         assert isinstance(img_cs, Array)
         assert img_cs[0] == Name.ICCBased
+
+
+def _make_page_with_gs(pdf: Pdf, gs_dict: Dictionary) -> None:
+    """Add a page that references an ExtGState with given properties."""
+    gs_indirect = pdf.make_indirect(gs_dict)
+    content = pdf.make_stream(b"/GS0 gs 1 0 0 rg 100 100 200 200 re f")
+    page = pikepdf.Page(
+        Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Contents=content,
+            Resources=Dictionary(
+                ExtGState=Dictionary(GS0=gs_indirect),
+            ),
+        )
+    )
+    pdf.pages.append(page)
+
+
+class TestMissingTransparencyGroupAdded:
+    """Tests for adding /Group to pages with transparency but no /Group."""
+
+    def test_ca_below_one_adds_group(self):
+        """Page with /ca < 1.0 and no /Group gets /Group added."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+        _make_page_with_gs(pdf, Dictionary(Type=Name.ExtGState, ca=0.5))
+
+        added = _add_missing_transparency_groups(pdf, icc_cache)
+
+        assert added == 1
+        group = pdf.pages[0].get(Name.Group)
+        assert group is not None
+        assert group[Name.S] == Name.Transparency
+        cs = group[Name.CS]
+        assert isinstance(cs, Array)
+        assert cs[0] == Name.ICCBased
+
+    def test_stroke_alpha_below_one_adds_group(self):
+        """Page with /CA < 1.0 and no /Group gets /Group added."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+        _make_page_with_gs(pdf, Dictionary(Type=Name.ExtGState, CA=0.8))
+
+        added = _add_missing_transparency_groups(pdf, icc_cache)
+
+        assert added == 1
+        assert pdf.pages[0][Name.Group][Name.S] == Name.Transparency
+
+    def test_bm_multiply_adds_group(self):
+        """Page with /BM /Multiply and no /Group gets /Group added."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+        _make_page_with_gs(pdf, Dictionary(Type=Name.ExtGState, BM=Name.Multiply))
+
+        added = _add_missing_transparency_groups(pdf, icc_cache)
+
+        assert added == 1
+        assert pdf.pages[0][Name.Group][Name.S] == Name.Transparency
+
+    def test_smask_dict_adds_group(self):
+        """Page with /SMask dictionary and no /Group gets /Group added."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+        smask = Dictionary(S=Name.Alpha, G=pdf.make_stream(b"q Q"))
+        _make_page_with_gs(pdf, Dictionary(Type=Name.ExtGState, SMask=smask))
+
+        added = _add_missing_transparency_groups(pdf, icc_cache)
+
+        assert added == 1
+        assert pdf.pages[0][Name.Group][Name.S] == Name.Transparency
+
+    def test_no_transparency_no_group_added(self):
+        """Page without transparency features does not get /Group."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+        content = pdf.make_stream(b"1 0 0 rg 100 100 200 200 re f")
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Contents=content,
+            )
+        )
+        pdf.pages.append(page)
+
+        added = _add_missing_transparency_groups(pdf, icc_cache)
+
+        assert added == 0
+        assert pdf.pages[0].get(Name.Group) is None
+
+    def test_existing_group_untouched(self):
+        """Page with existing /Group is not modified."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+        original_cs = Name.DeviceRGB
+        gs = pdf.make_indirect(Dictionary(Type=Name.ExtGState, ca=0.5))
+        content = pdf.make_stream(b"/GS0 gs 1 0 0 rg 100 100 200 200 re f")
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Contents=content,
+                Group=Dictionary(S=Name.Transparency, CS=original_cs),
+                Resources=Dictionary(
+                    ExtGState=Dictionary(GS0=gs),
+                ),
+            )
+        )
+        pdf.pages.append(page)
+
+        added = _add_missing_transparency_groups(pdf, icc_cache)
+
+        assert added == 0
+        # Original /CS should still be DeviceRGB (untouched by this function)
+        assert pdf.pages[0][Name.Group][Name.CS] == original_cs
+
+    def test_cmyk_page_gets_cmyk_cs(self):
+        """Page with CMYK color operators gets CMYK-based /CS in /Group."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+        gs = pdf.make_indirect(Dictionary(Type=Name.ExtGState, ca=0.5))
+        content = pdf.make_stream(b"/GS0 gs 0 0 0 1 k 100 100 200 200 re f")
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Contents=content,
+                Resources=Dictionary(
+                    ExtGState=Dictionary(GS0=gs),
+                ),
+            )
+        )
+        pdf.pages.append(page)
+
+        _add_missing_transparency_groups(pdf, icc_cache)
+
+        cs = pdf.pages[0][Name.Group][Name.CS]
+        assert isinstance(cs, Array)
+        assert cs[0] == Name.ICCBased
+        # CMYK ICC profile has N=4
+        icc_stream = cs[1]
+        assert int(icc_stream.N) == 4
+
+    def test_rgb_page_gets_rgb_cs(self):
+        """Page with RGB color operators gets RGB-based /CS in /Group."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+        gs = pdf.make_indirect(Dictionary(Type=Name.ExtGState, ca=0.5))
+        content = pdf.make_stream(b"/GS0 gs 1 0 0 rg 100 100 200 200 re f")
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Contents=content,
+                Resources=Dictionary(
+                    ExtGState=Dictionary(GS0=gs),
+                ),
+            )
+        )
+        pdf.pages.append(page)
+
+        _add_missing_transparency_groups(pdf, icc_cache)
+
+        cs = pdf.pages[0][Name.Group][Name.CS]
+        assert isinstance(cs, Array)
+        assert cs[0] == Name.ICCBased
+        # RGB ICC profile has N=3
+        icc_stream = cs[1]
+        assert int(icc_stream.N) == 3
+
+    def test_no_color_ops_defaults_to_rgb(self):
+        """Page with no color operators defaults to RGB-based /CS."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+        gs = pdf.make_indirect(Dictionary(Type=Name.ExtGState, ca=0.5))
+        content = pdf.make_stream(b"/GS0 gs q Q")
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Contents=content,
+                Resources=Dictionary(
+                    ExtGState=Dictionary(GS0=gs),
+                ),
+            )
+        )
+        pdf.pages.append(page)
+
+        _add_missing_transparency_groups(pdf, icc_cache)
+
+        cs = pdf.pages[0][Name.Group][Name.CS]
+        assert isinstance(cs, Array)
+        assert cs[0] == Name.ICCBased
+        icc_stream = cs[1]
+        assert int(icc_stream.N) == 3  # RGB default
+
+    def test_nested_form_xobj_with_transparency_adds_group(self):
+        """Nested Form XObject with transparency group triggers page /Group."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+
+        inner = pdf.make_stream(b"q Q")
+        inner[Name.Type] = Name.XObject
+        inner[Name.Subtype] = Name.Form
+        inner[Name.BBox] = Array([0, 0, 100, 100])
+        inner[Name.Group] = Dictionary(S=Name.Transparency, CS=Name.DeviceRGB)
+
+        content = pdf.make_stream(b"/Fm0 Do")
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Contents=content,
+                Resources=Dictionary(
+                    XObject=Dictionary(Fm0=inner),
+                ),
+            )
+        )
+        pdf.pages.append(page)
+
+        added = _add_missing_transparency_groups(pdf, icc_cache)
+
+        assert added == 1
+        assert pdf.pages[0][Name.Group][Name.S] == Name.Transparency
+
+    def test_bm_compatible_not_transparent(self):
+        """/BM /Compatible is not treated as transparent."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+        _make_page_with_gs(pdf, Dictionary(Type=Name.ExtGState, BM=Name.Compatible))
+
+        added = _add_missing_transparency_groups(pdf, icc_cache)
+
+        assert added == 0
+        assert pdf.pages[0].get(Name.Group) is None
+
+    def test_bm_normal_not_transparent(self):
+        """/BM /Normal is not treated as transparent."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+        _make_page_with_gs(pdf, Dictionary(Type=Name.ExtGState, BM=Name.Normal))
+
+        added = _add_missing_transparency_groups(pdf, icc_cache)
+
+        assert added == 0
+        assert pdf.pages[0].get(Name.Group) is None
+
+    def test_smask_none_not_transparent(self):
+        """/SMask /None is not treated as transparent."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+        _make_page_with_gs(pdf, Dictionary(Type=Name.ExtGState, SMask=Name("/None")))
+
+        added = _add_missing_transparency_groups(pdf, icc_cache)
+
+        assert added == 0
+        assert pdf.pages[0].get(Name.Group) is None
+
+    def test_cyclic_form_xobj_no_infinite_loop(self):
+        """Cyclic Form XObject references do not cause infinite loops."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+
+        form_a = pdf.make_stream(b"/FormB Do")
+        form_a[Name.Type] = Name.XObject
+        form_a[Name.Subtype] = Name.Form
+        form_a[Name.BBox] = Array([0, 0, 100, 100])
+        form_a[Name.Group] = Dictionary(S=Name.Transparency, CS=Name.DeviceRGB)
+
+        form_b = pdf.make_stream(b"/FormA Do")
+        form_b[Name.Type] = Name.XObject
+        form_b[Name.Subtype] = Name.Form
+        form_b[Name.BBox] = Array([0, 0, 100, 100])
+
+        form_a = pdf.make_indirect(form_a)
+        form_b = pdf.make_indirect(form_b)
+
+        form_a[Name.Resources] = Dictionary(XObject=Dictionary(FormB=form_b))
+        form_b[Name.Resources] = Dictionary(XObject=Dictionary(FormA=form_a))
+
+        content = pdf.make_stream(b"/FormA Do")
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Contents=content,
+                Resources=Dictionary(
+                    XObject=Dictionary(FormA=form_a, FormB=form_b),
+                ),
+            )
+        )
+        pdf.pages.append(page)
+
+        # Should terminate without infinite loop
+        added = _add_missing_transparency_groups(pdf, icc_cache)
+
+        assert added == 1
+
+    def test_multi_page_only_transparent_pages_get_group(self):
+        """Only pages with transparency get /Group; others are untouched."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+
+        # Page 1: has transparency
+        gs = pdf.make_indirect(Dictionary(Type=Name.ExtGState, ca=0.5))
+        content1 = pdf.make_stream(b"/GS0 gs 1 0 0 rg 100 100 200 200 re f")
+        page1 = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Contents=content1,
+                Resources=Dictionary(
+                    ExtGState=Dictionary(GS0=gs),
+                ),
+            )
+        )
+        pdf.pages.append(page1)
+
+        # Page 2: no transparency
+        content2 = pdf.make_stream(b"1 0 0 rg 100 100 200 200 re f")
+        page2 = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Contents=content2,
+            )
+        )
+        pdf.pages.append(page2)
+
+        added = _add_missing_transparency_groups(pdf, icc_cache)
+
+        assert added == 1
+        assert pdf.pages[0].get(Name.Group) is not None
+        assert pdf.pages[1].get(Name.Group) is None
+
+    def test_integration_via_embed_color_profiles(self):
+        """embed_color_profiles adds /Group to transparent pages."""
+        pdf = new_pdf()
+        gs = pdf.make_indirect(Dictionary(Type=Name.ExtGState, ca=0.5))
+        content = pdf.make_stream(b"/GS0 gs 1 0 0 rg 100 100 200 200 re f")
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Contents=content,
+                Resources=Dictionary(
+                    ExtGState=Dictionary(GS0=gs),
+                ),
+            )
+        )
+        pdf.pages.append(page)
+
+        embed_color_profiles(pdf, "3b")
+
+        group = pdf.pages[0].get(Name.Group)
+        assert group is not None
+        assert group[Name.S] == Name.Transparency
+        cs = group[Name.CS]
+        assert isinstance(cs, Array)
+        assert cs[0] == Name.ICCBased
