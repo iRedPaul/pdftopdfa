@@ -468,6 +468,20 @@ def ensure_appearance_streams(pdf: Pdf, level: str = "3b") -> int:
                 if subtype is not None and str(subtype) == "/Popup":
                     continue
 
+                # Skip Link annotations (exempt per rule 6.3.3-1)
+                if subtype is not None and str(subtype) == "/Link":
+                    continue
+
+                # Skip zero-size annotations (invisible, no /AP needed)
+                rect = resolved.get("/Rect")
+                if rect is not None:
+                    try:
+                        coords = [float(rect[i]) for i in range(4)]
+                        if coords[0] == coords[2] or coords[1] == coords[3]:
+                            continue
+                    except Exception:
+                        pass
+
                 ap = resolved.get("/AP")
                 if ap is None:
                     # No /AP at all — create /AP dict with /N

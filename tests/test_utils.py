@@ -1649,7 +1649,7 @@ class TestEnsureAppearanceStreams:
         annot = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Link,
+                Subtype=Name.Text,
                 Rect=Array([0, 0, 100, 50]),
             )
         )
@@ -1688,7 +1688,7 @@ class TestEnsureAppearanceStreams:
         annot = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Link,
+                Subtype=Name.Text,
                 Rect=Array([0, 0, 100, 50]),
                 AP=Dictionary(R=r_stream),
             )
@@ -1749,7 +1749,7 @@ class TestEnsureAppearanceStreams:
         annot = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Link,
+                Subtype=Name.Text,
                 Rect=Array([0, 0, 100, 50]),
                 AP=Dictionary(N=n_stream),
             )
@@ -1778,7 +1778,7 @@ class TestEnsureAppearanceStreams:
         annot_with_ap = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Link,
+                Subtype=Name.Text,
                 Rect=Array([0, 0, 50, 50]),
                 AP=Dictionary(N=n_stream),
             )
@@ -1820,7 +1820,7 @@ class TestEnsureAppearanceStreams:
         annot1 = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Link,
+                Subtype=Name.Highlight,
                 Rect=Array([0, 0, 100, 50]),
             )
         )
@@ -1858,7 +1858,7 @@ class TestEnsureAppearanceStreams:
         annot = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Link,
+                Subtype=Name.Text,
                 Rect=Array([100, 200, 300, 250]),
             )
         )
@@ -1890,7 +1890,7 @@ class TestEnsureAppearanceStreams:
         annot = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Link,
+                Subtype=Name.Text,
             )
         )
         pdf.pages[0].Annots = Array([annot])

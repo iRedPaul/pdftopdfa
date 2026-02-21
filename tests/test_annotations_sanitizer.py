@@ -468,6 +468,51 @@ class TestEnsureAppearanceStreams:
         result = ensure_appearance_streams(pdf)
         assert result == 0
 
+    def test_skips_link_annotations(self, make_pdf_with_page):
+        """Link annotations are skipped (exempt per rule 6.3.3-1)."""
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name("/Link"),
+                Rect=Array([0, 0, 100, 100]),
+            )
+        )
+        pdf.pages[0]["/Annots"] = Array([annot])
+        pdf = save_and_reopen(pdf)
+        result = ensure_appearance_streams(pdf)
+        assert result == 0
+
+    def test_skips_zero_width_annotation(self, make_pdf_with_page):
+        """Zero-width annotations are skipped (invisible)."""
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name.Text,
+                Rect=Array([100, 700, 100, 720]),
+            )
+        )
+        pdf.pages[0]["/Annots"] = Array([annot])
+        pdf = save_and_reopen(pdf)
+        result = ensure_appearance_streams(pdf)
+        assert result == 0
+
+    def test_skips_zero_height_annotation(self, make_pdf_with_page):
+        """Zero-height annotations are skipped (invisible)."""
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name.Text,
+                Rect=Array([100, 700, 120, 700]),
+            )
+        )
+        pdf.pages[0]["/Annots"] = Array([annot])
+        pdf = save_and_reopen(pdf)
+        result = ensure_appearance_streams(pdf)
+        assert result == 0
+
     def test_skips_annotation_with_existing_ap_n(self, make_pdf_with_page):
         """Annotations with existing /AP /N are left alone."""
         pdf = make_pdf_with_page()
@@ -529,7 +574,7 @@ class TestEnsureAppearanceStreams:
         without_ap = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Link,
+                Subtype=Name.Text,
                 Rect=Array([0, 0, 50, 50]),
             )
         )
