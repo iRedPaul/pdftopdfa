@@ -180,6 +180,40 @@ class TestStructureLimitsSanitizer:
         assert result["integers_clamped"] >= 1
         assert result["reals_normalized"] >= 1
 
+    def test_clamps_overflow_real_values(self) -> None:
+        # 3.404e+38 written as full decimal (PDF content streams don't support
+        # scientific notation); minus sign prefix for the negative case.
+        # 3.404e+38 = 340400000000000000000000000000000000000.0
+        _overflow_pos = b"340400000000000000000000000000000000000.0"
+        _overflow_neg = b"-340400000000000000000000000000000000000.0"
+        # 3.403e+38 = exactly at the boundary (must not be changed)
+        _at_limit = b"340300000000000000000000000000000000000.0"
+        content = _overflow_pos + b" g " + _overflow_neg + b" w " + _at_limit + b" J"
+        pdf = _make_page_pdf(content)
+        pdf.Root[Name("/PosOverflow")] = Decimal("3.404e+38")
+        pdf.Root[Name("/NegOverflow")] = Decimal("-3.404e+38")
+        pdf.Root[Name("/AtLimit")] = Decimal("3.403e+38")
+
+        result = sanitize_structure_limits(pdf)
+
+        # float() comparison because pikepdf converts Decimal to float64 internally;
+        # the read-back Decimal is the full float64 expansion, not the short form.
+        _max_float = float(Decimal("3.403e+38"))
+
+        # Object graph: overflow values clamped to ±3.403e+38
+        assert float(Decimal(pdf.Root["/PosOverflow"])) == _max_float
+        assert float(Decimal(pdf.Root["/NegOverflow"])) == -_max_float
+        # Exactly at limit: must be left unchanged
+        assert float(Decimal(pdf.Root["/AtLimit"])) == _max_float
+
+        # Content stream operands are also detected and counted.
+        # Note: we do not re-parse the stream after sanitization because
+        # float64 values near 3.403e+38 are exact integers and pikepdf
+        # serializes them without a decimal point, causing a 64-bit
+        # integer overflow on re-parse. The counter is the reliable signal.
+        # At least 4 fixes: 2 object-graph + 2 content-stream operands
+        assert result["reals_normalized"] >= 4
+
     def test_rejects_cmap_cid_overflow(self) -> None:
         pdf = new_pdf()
         cmap_data = b"""

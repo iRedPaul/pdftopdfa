@@ -38,6 +38,7 @@ _MAX_NAME_BYTES = 127
 _MAX_Q_NESTING = 28
 _MAX_CID_VALUE = 65_535
 _MIN_REAL_MAGNITUDE = Decimal("1.175e-38")
+_MAX_REAL_MAGNITUDE = Decimal("3.403e+38")
 
 _TEXT_OPERATORS = frozenset({"Tj", "TJ", "'", '"'})
 _HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
@@ -157,14 +158,24 @@ def _sanitize_integer(value: Any) -> tuple[Any, bool]:
 
 
 def _sanitize_real(value: Any) -> tuple[Any, bool]:
-    """Normalize tiny non-zero real values to exact zero."""
+    """Normalize out-of-range real values.
+
+    Near-zero (abs < 1.175e-38): clamp to 0.
+    Overflow  (abs > 3.403e+38): clamp to ±3.403e+38.
+    """
     if isinstance(value, Decimal):
         if value != 0 and abs(value) < _MIN_REAL_MAGNITUDE:
             return Decimal("0"), True
+        if abs(value) > _MAX_REAL_MAGNITUDE:
+            return (_MAX_REAL_MAGNITUDE if value > 0 else -_MAX_REAL_MAGNITUDE), True
         return value, False
     if isinstance(value, float):
-        if value != 0.0 and abs(value) < float(_MIN_REAL_MAGNITUDE):
+        _min = float(_MIN_REAL_MAGNITUDE)
+        _max = float(_MAX_REAL_MAGNITUDE)
+        if value != 0.0 and abs(value) < _min:
             return 0.0, True
+        if abs(value) > _max:
+            return (_max if value > 0 else -_max), True
         return value, False
     return value, False
 
@@ -605,7 +616,7 @@ def sanitize_structure_limits(pdf: Pdf) -> dict[str, int]:
 
     logger.info(
         "Structure limits sanitized: %d strings truncated, %d names shortened, "
-        "%d UTF-8 names fixed, %d integers clamped, %d tiny reals normalized, "
+        "%d UTF-8 names fixed, %d integers clamped, %d out-of-range reals sanitized, "
         "%d q/Q nesting ops rebalanced, %d odd hex strings fixed",
         stats["strings_truncated"],
         stats["names_shortened"],

@@ -90,7 +90,7 @@ _SANITIZE_WARNINGS: list[tuple[str, str]] = [
     ("structure_names_shortened", "overlong name object(s) shortened"),
     ("structure_utf8_names_fixed", "invalid UTF-8 name object(s) repaired"),
     ("structure_integers_clamped", "out-of-range integer operand(s) clamped"),
-    ("structure_reals_normalized", "near-zero real operand(s) normalized to 0"),
+    ("structure_reals_normalized", "out-of-range real operand(s) clamped/normalized"),
     ("structure_q_nesting_rebalanced", "q/Q graphics-state operator(s) rebalanced"),
     ("structure_hex_odd_fixed", "odd-length hexadecimal string(s) fixed"),
 ]
@@ -128,7 +128,7 @@ _LATE_STRUCTURE_WARNINGS: list[tuple[str, str]] = [
     ("names_shortened", "overlong name object(s) shortened"),
     ("utf8_names_fixed", "invalid UTF-8 name object(s) repaired"),
     ("integers_clamped", "out-of-range integer operand(s) clamped"),
-    ("reals_normalized", "near-zero real operand(s) normalized to 0"),
+    ("reals_normalized", "out-of-range real operand(s) clamped or normalized"),
     ("q_nesting_rebalanced", "q/Q graphics-state operator(s) rebalanced"),
     ("hex_odd_fixed", "odd-length hexadecimal string(s) fixed"),
 ]
