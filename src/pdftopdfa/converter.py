@@ -60,6 +60,23 @@ _SANITIZE_WARNINGS: list[tuple[str, str]] = [
     ("cidtogidmap_fixed", "CIDToGIDMap entr(y/ies) added"),
     ("cidset_removed", "CIDSet entr(y/ies) removed"),
     ("type1_charset_removed", "Type1 /CharSet entr(y/ies) removed"),
+    (
+        "tt_nonsymbolic_cmap_added",
+        "non-symbolic TrueType font program(s) had (3,1) cmap added",
+    ),
+    (
+        "tt_nonsymbolic_encoding_fixed",
+        "non-symbolic TrueType font encoding(s) fixed",
+    ),
+    (
+        "tt_symbolic_encoding_removed",
+        "symbolic TrueType font /Encoding entr(y/ies) removed",
+    ),
+    ("tt_symbolic_flag_set", "symbolic TrueType font /Flags Symbolic bit(s) set"),
+    (
+        "tt_symbolic_cmap_added",
+        "symbolic TrueType font program(s) had (3,0) cmap added",
+    ),
     ("boxes_normalized", "page box(es) normalized"),
     ("boxes_clipped", "page box(es) clipped to MediaBox"),
     ("malformed_boxes_removed", "malformed page box(es) removed"),

@@ -84,6 +84,7 @@ from .rendering_intent import sanitize_rendering_intent
 from .signatures import sanitize_signatures
 from .structure_limits import sanitize_structure_limits
 from .tounicode_values import fill_tounicode_gaps, sanitize_tounicode_values
+from .truetype_encoding import sanitize_truetype_encoding
 from .xfa import remove_xfa_forms
 from .xobjects import (
     fix_bits_per_component,
@@ -219,6 +220,11 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "font_lastchar_added": 0,
         "font_widths_size_fixed": 0,
         "font_stream_subtype_removed": 0,
+        "tt_nonsymbolic_cmap_added": 0,
+        "tt_nonsymbolic_encoding_fixed": 0,
+        "tt_symbolic_encoding_removed": 0,
+        "tt_symbolic_flag_set": 0,
+        "tt_symbolic_cmap_added": 0,
     }
 
     # Convert LZW-compressed streams to FlateDecode (all levels)
@@ -407,6 +413,22 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "font_stream_subtype_removed", 0
     )
 
+    # Fix TrueType font encoding issues (ISO 19005-2, 6.2.11.6)
+    # Must run AFTER font_structure (ensures /Subtype and /FontDescriptor exist)
+    # and BEFORE notdef/glyph_coverage/font_widths
+    tt_enc_result = sanitize_truetype_encoding(pdf)
+    result["tt_nonsymbolic_cmap_added"] = tt_enc_result.get(
+        "tt_nonsymbolic_cmap_added", 0
+    )
+    result["tt_nonsymbolic_encoding_fixed"] = tt_enc_result.get(
+        "tt_nonsymbolic_encoding_fixed", 0
+    )
+    result["tt_symbolic_encoding_removed"] = tt_enc_result.get(
+        "tt_symbolic_encoding_removed", 0
+    )
+    result["tt_symbolic_flag_set"] = tt_enc_result.get("tt_symbolic_flag_set", 0)
+    result["tt_symbolic_cmap_added"] = tt_enc_result.get("tt_symbolic_cmap_added", 0)
+
     # Ensure .notdef glyph in all embedded fonts (ISO 19005-2, 6.3.3)
     # Must run BEFORE width validation — adds .notdef which changes font programs
     notdef_result = sanitize_font_notdef(pdf)
@@ -523,7 +545,12 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "%d font /Type added, %d font /Subtype fixed, "
         "%d font /BaseFont added, %d font /FirstChar added, "
         "%d font /LastChar added, %d font /Widths size fixed, "
-        "%d font stream subtypes removed",
+        "%d font stream subtypes removed, "
+        "%d TT non-symbolic (3,1) cmaps added, "
+        "%d TT non-symbolic encodings fixed, "
+        "%d TT symbolic /Encoding entries removed, "
+        "%d TT symbolic Symbolic flags set, "
+        "%d TT symbolic (3,0) cmaps added",
         result["javascript_removed"],
         result["actions_removed"],
         result["invalid_destinations_removed"],
@@ -601,6 +628,11 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         result["font_lastchar_added"],
         result["font_widths_size_fixed"],
         result["font_stream_subtype_removed"],
+        result["tt_nonsymbolic_cmap_added"],
+        result["tt_nonsymbolic_encoding_fixed"],
+        result["tt_symbolic_encoding_removed"],
+        result["tt_symbolic_flag_set"],
+        result["tt_symbolic_cmap_added"],
     )
 
     return result
@@ -649,6 +681,7 @@ __all__ = [
     "sanitize_fontname_consistency",
     "sanitize_font_structure",
     "sanitize_font_notdef",
+    "sanitize_truetype_encoding",
     "sanitize_font_widths",
     "sanitize_glyph_coverage",
     "sanitize_notdef_usage",
