@@ -13,6 +13,7 @@ from typing import Any
 
 from pikepdf import Pdf
 
+from ..exceptions import ConversionError
 from ..utils import get_required_pdf_version, validate_pdfa_level
 from .actions import remove_actions, validate_destinations
 from .annotations import (
@@ -119,6 +120,12 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         ConversionError: If an invalid level is specified.
     """
     level = validate_pdfa_level(level)
+
+    if len(pdf.objects) > 8_388_607:
+        raise ConversionError(
+            "PDF exceeds the maximum number of indirect objects allowed by "
+            "ISO 19005-2 rule 6.1.13-7 (limit: 8,388,607)"
+        )
 
     logger.info("Sanitizing PDF for PDF/A-%s conformance", level)
 

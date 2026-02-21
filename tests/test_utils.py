@@ -724,6 +724,22 @@ class TestSanitizeForPdfa:
         with pytest.raises(ConversionError, match="Invalid PDF/A level"):
             sanitize_for_pdfa(pdf, level="1b")
 
+    def test_too_many_indirect_objects_raises_error(self) -> None:
+        """Exceeds 8,388,607 indirect objects raises ConversionError (rule 6.1.13-7)."""
+        from unittest.mock import MagicMock, PropertyMock, patch
+
+        pdf = new_pdf()
+        pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
+
+        mock_objects = MagicMock()
+        mock_objects.__len__ = MagicMock(return_value=8_388_608)
+
+        with patch.object(
+            type(pdf), "objects", new_callable=PropertyMock, return_value=mock_objects
+        ):
+            with pytest.raises(ConversionError, match="8,388,607"):
+                sanitize_for_pdfa(pdf)
+
     def test_level_2b_removes_js_keeps_nothing(self) -> None:
         """Level 2b removes JS and files, allows transparency."""
         pdf = new_pdf()
