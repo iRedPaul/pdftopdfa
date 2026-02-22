@@ -335,6 +335,7 @@ def validate_embedded_icc_profiles(
     repaired = 0
     warnings: list[str] = []
     visited: set[tuple[int, int]] = set()
+    fatal_repair_error: ConversionError | None = None
 
     # PDF/A-2+ allows up to ICC v4
     max_major_version = 4
@@ -344,7 +345,7 @@ def validate_embedded_icc_profiles(
 
         Returns True if the stream was repaired successfully.
         """
-        nonlocal repaired
+        nonlocal repaired, fatal_repair_error
         if not repair:
             return False
 
@@ -353,27 +354,56 @@ def validate_embedded_icc_profiles(
         except Exception:
             declared_n = 0
 
+        # Step 1: Try to derive /N from the ICC profile header (bytes 16-19).
+        # If successful this is a clean fix — no lossy warning is needed.
+        header_derived = False
+        try:
+            profile_data = bytes(icc_stream.read_bytes())
+            if len(profile_data) >= 20:
+                icc_colorspace = profile_data[16:20]
+                derived_n = _ICC_COLORSPACE_COMPONENTS.get(icc_colorspace)
+                if derived_n is not None:
+                    if declared_n != derived_n:
+                        icc_stream[Name.N] = derived_n
+                        logger.debug(
+                            "ICC /N corrected at %s: %d → %d (from header %r)",
+                            location,
+                            declared_n,
+                            derived_n,
+                            icc_colorspace,
+                        )
+                        declared_n = derived_n
+                    header_derived = True
+        except Exception:
+            pass
+
+        # Step 2: Find profile getter for the (possibly updated) N.
         getter = _PROFILE_GETTER_BY_N.get(declared_n)
         if getter is None:
-            logger.warning(
-                "ICC repair skipped at %s: unsupported /N=%s",
-                location,
-                declared_n,
+            # Step 3: No sensible default exists — this is unrecoverable.
+            fatal_repair_error = ConversionError(
+                f"ICC profile at {location} cannot be repaired:"
+                f" /N={declared_n} has no built-in default profile"
             )
             return False
 
+        if not header_derived:
+            # Substituting without header confirmation is lossy.
+            logger.warning(
+                "ICC profile at %s: substituting built-in /N=%d profile"
+                " (header colorspace unrecognised or unreadable)",
+                location,
+                declared_n,
+            )
+
         replacement_data = getter()
         icc_stream.write(replacement_data)
-
-        # Ensure /N matches the replacement profile
-        replacement_n = {1: 1, 3: 3, 4: 4}[declared_n]
-        icc_stream[Name.N] = replacement_n
-
+        icc_stream[Name.N] = declared_n
         repaired += 1
         logger.info(
             "ICC profile repaired at %s: replaced with built-in profile (N=%d)",
             location,
-            replacement_n,
+            declared_n,
         )
         return True
 
@@ -525,6 +555,9 @@ def validate_embedded_icc_profiles(
 
         except Exception as e:
             logger.debug("Error validating ICC on page %d: %s", page_num, e)
+
+    if fatal_repair_error is not None:
+        raise fatal_repair_error
 
     if validated > 0:
         logger.debug("%d ICC profile(s) validated", validated)

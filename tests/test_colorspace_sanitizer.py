@@ -491,6 +491,112 @@ class TestICCComponentCountValidation:
         assert len(warnings) == 0
 
 
+def _make_fake_icc(colorspace_sig: bytes, n: int) -> bytes:
+    """Build a minimal 128-byte fake ICC profile.
+
+    The acsp signature is replaced with XXXX so validation always fails
+    and triggers _try_repair.  The colorspace_sig is written at bytes 16-19
+    so Step 1 of _try_repair can (or cannot) derive /N from the header.
+    """
+    data = bytearray(128)
+    # Big-endian profile length at bytes 0-3
+    data[0:4] = (128).to_bytes(4, "big")
+    # Deliberate bad signature at bytes 36-39 (real profiles use b"acsp")
+    data[36:40] = b"XXXX"
+    # Color space signature at bytes 16-19
+    data[16:20] = colorspace_sig
+    return bytes(data)
+
+
+class TestICCRepairUnsupportedN:
+    """Tests for the ordered recovery in _try_repair for unusual /N values."""
+
+    def _make_cs(self, pdf, icc_data: bytes, n: int):
+        """Helper: create an ICCBased color space stream and add it to a page."""
+        icc_stream = pdf.make_stream(icc_data)
+        icc_stream[Name.N] = n
+        icc_cs = Array([Name.ICCBased, pdf.make_indirect(icc_stream)])
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(ColorSpace=Dictionary(CS0=icc_cs)),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+        return icc_stream
+
+    def test_clean_n_correction_from_header(self, caplog):
+        """Step 1 derives /N from RGB header, no lossy warning emitted."""
+        import logging
+
+        pdf = new_pdf()
+        # Fake profile: RGB colorspace sig, but bad acsp → repair triggered.
+        # Declared /N=5 (exotic) will be corrected to 3 via header.
+        icc_data = _make_fake_icc(b"RGB ", 5)
+        icc_stream = self._make_cs(pdf, icc_data, 5)
+
+        with caplog.at_level(logging.DEBUG, logger="pdftopdfa"):
+            icc_stream.stream_dict[Name.N] = 5  # ensure declared N is 5
+            validated, warnings, repaired = validate_embedded_icc_profiles(
+                pdf, "3b", repair=True
+            )
+
+        assert repaired == 1
+        assert int(icc_stream[Name.N]) == 3
+        # Step 1 is clean — no "substituting" warning should have been emitted
+        assert not any(
+            "substituting" in record.message
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        )
+
+    def test_lossy_substitution_with_warning(self, caplog):
+        """Step 2 substitutes profile when header colorspace unrecognised, warns."""
+        import logging
+
+        pdf = new_pdf()
+        # Fake profile: unknown colorspace sig → header_derived stays False.
+        # Declared /N=3 → getter found → substitution with warning.
+        icc_data = _make_fake_icc(b"XYZ ", 3)
+        self._make_cs(pdf, icc_data, 3)
+
+        with caplog.at_level(logging.WARNING, logger="pdftopdfa"):
+            validated, warnings, repaired = validate_embedded_icc_profiles(
+                pdf, "3b", repair=True
+            )
+
+        assert repaired == 1
+        assert any(
+            "substituting" in record.message
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        )
+
+    def test_conversion_error_for_exotic_n_no_default(self):
+        """Step 3 raises ConversionError when no default profile exists for /N."""
+        pdf = new_pdf()
+        # Unknown colorspace sig → header_derived stays False.
+        # Declared /N=5 → no getter → ConversionError.
+        icc_data = _make_fake_icc(b"XYZ ", 5)
+        self._make_cs(pdf, icc_data, 5)
+
+        with pytest.raises(ConversionError, match=r"/N=5"):
+            validate_embedded_icc_profiles(pdf, "3b", repair=True)
+
+    def test_repaired_stream_has_valid_icc_and_correct_n(self):
+        """After repair the stream contains a valid ICC profile with correct /N."""
+        pdf = new_pdf()
+        # RGB header → Step 1 corrects /N to 3 and substitutes sRGB profile.
+        icc_data = _make_fake_icc(b"RGB ", 5)
+        icc_stream = self._make_cs(pdf, icc_data, 5)
+
+        validate_embedded_icc_profiles(pdf, "3b", repair=True)
+
+        repaired_data = bytes(icc_stream.read_bytes())
+        assert len(repaired_data) >= 128
+        assert repaired_data[36:40] == b"acsp"
+        assert int(icc_stream[Name.N]) == 3
+
+
 class TestFullSanitization:
     """Tests for complete color space sanitization."""
 
@@ -1017,12 +1123,12 @@ class TestICCProfileRepair:
         cs = pdf.pages[0].Resources.ColorSpace.CS0
         assert int(cs[1].N) == 3
 
-    def test_unknown_n_skipped(self):
-        """Stream with unsupported /N (e.g. 5) is not repaired."""
+    def test_unknown_n_raises_conversion_error(self):
+        """Stream with unsupported /N (e.g. 5) raises ConversionError."""
         pdf = new_pdf()
 
         icc_stream = Stream(pdf, b"\x00" * 64)
-        icc_stream.N = 5  # Unsupported component count
+        icc_stream.N = 5  # Unsupported component count — no built-in profile
 
         icc_cs = Array([Name.ICCBased, pdf.make_indirect(icc_stream)])
 
@@ -1036,11 +1142,8 @@ class TestICCProfileRepair:
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
 
-        validated, warnings, repaired = validate_embedded_icc_profiles(
-            pdf, "3b", repair=True
-        )
-        assert repaired == 0
-        assert any("too small" in w for w in warnings)
+        with pytest.raises(ConversionError, match=r"/N=5"):
+            validate_embedded_icc_profiles(pdf, "3b", repair=True)
 
     def test_valid_profile_untouched_with_repair(self):
         """Valid ICC profile is not modified when repair=True."""
