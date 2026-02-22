@@ -687,7 +687,10 @@ def _sanitize_extension_schema_blocks(
     they must be an rdf:Seq of ValueType entries, each requiring non-empty
     pdfaType:type, pdfaType:namespaceURI, pdfaType:prefix, and
     pdfaType:description fields. Optional pdfaType:field, when present, must
-    itself be an rdf:Seq.
+    itself be an rdf:Seq and each field entry must have non-empty
+    pdfaField:name, pdfaField:valueType, and pdfaField:description; field
+    value types must resolve to known XMP types or declared custom types in
+    the same schema block.
     """
     ns_rdf = NAMESPACES["rdf"]
     schema_tag = f"{{{_NS_PDFA_SCHEMA}}}schema"
@@ -706,6 +709,50 @@ def _sanitize_extension_schema_blocks(
     type_prefix_tag = f"{{{_NS_PDFA_TYPE}}}prefix"
     type_description_tag = f"{{{_NS_PDFA_TYPE}}}description"
     type_field_tag = f"{{{_NS_PDFA_TYPE}}}field"
+    field_name_tag = f"{{{_NS_PDFA_FIELD}}}name"
+    field_value_type_tag = f"{{{_NS_PDFA_FIELD}}}valueType"
+    field_description_tag = f"{{{_NS_PDFA_FIELD}}}description"
+
+    known_field_base_value_types = frozenset(
+        {
+            "Text",
+            "Date",
+            "URI",
+            "Integer",
+            "Real",
+            "Boolean",
+            "AgentName",
+            "GUID",
+            "URL",
+            # Keep Rational accepted for compatibility with existing extension data.
+            "Rational",
+        }
+    )
+    container_prefixes = frozenset({"Bag", "Seq", "Alt"})
+
+    def _is_recognized_field_value_type(
+        raw_value_type: str,
+        declared_value_types: set[str],
+    ) -> bool:
+        """Check whether a pdfaField:valueType references a recognized type."""
+        normalized = " ".join(raw_value_type.split())
+        if not normalized:
+            return False
+
+        if (
+            normalized in known_field_base_value_types
+            or normalized in declared_value_types
+        ):
+            return True
+
+        parts = normalized.split(" ")
+        if len(parts) != 2 or parts[0] not in container_prefixes:
+            return False
+
+        subtype = parts[1]
+        return (
+            subtype in known_field_base_value_types or subtype in declared_value_types
+        )
 
     result: dict[str, etree._Element] = {}
 
@@ -825,6 +872,8 @@ def _sanitize_extension_schema_blocks(
                 li_elem.remove(schema_value_type_elem)
             else:
                 value_types_to_remove = []
+                valid_value_type_entries: list[tuple[etree._Element, str]] = []
+
                 for value_type_li in value_type_seq.findall(li_tag):
                     type_name_elem = value_type_li.find(type_name_tag)
                     type_name = (
@@ -884,14 +933,101 @@ def _sanitize_extension_schema_blocks(
                         value_types_to_remove.append(value_type_li)
                         continue
 
+                    valid_value_type_entries.append((value_type_li, type_name))
+
+                declared_type_names = {
+                    type_name for _, type_name in valid_value_type_entries
+                }
+
+                for value_type_li, type_name in valid_value_type_entries:
                     type_field_elem = value_type_li.find(type_field_tag)
-                    if (
-                        type_field_elem is not None
-                        and type_field_elem.find(seq_tag) is None
-                    ):
+                    if type_field_elem is None:
+                        continue
+
+                    field_seq = type_field_elem.find(seq_tag)
+                    if field_seq is None:
                         logger.warning(
                             "Extension schema %s: removing pdfaType:field from"
                             " ValueType '%s' — expected rdf:Seq",
+                            uri,
+                            type_name,
+                        )
+                        value_type_li.remove(type_field_elem)
+                        continue
+
+                    field_entries_to_remove = []
+                    for field_li in field_seq.findall(li_tag):
+                        field_name_elem = field_li.find(field_name_tag)
+                        field_name = (
+                            (field_name_elem.text or "").strip()
+                            if field_name_elem is not None
+                            else ""
+                        )
+                        field_value_type_elem = field_li.find(field_value_type_tag)
+                        field_value_type = (
+                            (field_value_type_elem.text or "").strip()
+                            if field_value_type_elem is not None
+                            else ""
+                        )
+                        field_description_elem = field_li.find(field_description_tag)
+
+                        if field_name_elem is None or not field_name:
+                            logger.warning(
+                                "Extension schema %s: removing field entry from"
+                                " ValueType '%s' — missing pdfaField:name",
+                                uri,
+                                type_name,
+                            )
+                            field_entries_to_remove.append(field_li)
+                            continue
+
+                        if field_value_type_elem is None or not field_value_type:
+                            logger.warning(
+                                "Extension schema %s: removing field '%s' from"
+                                " ValueType '%s' — missing pdfaField:valueType",
+                                uri,
+                                field_name,
+                                type_name,
+                            )
+                            field_entries_to_remove.append(field_li)
+                            continue
+
+                        if not _is_recognized_field_value_type(
+                            field_value_type,
+                            declared_type_names,
+                        ):
+                            logger.warning(
+                                "Extension schema %s: removing field '%s' from"
+                                " ValueType '%s' — invalid pdfaField:valueType '%s'",
+                                uri,
+                                field_name,
+                                type_name,
+                                field_value_type,
+                            )
+                            field_entries_to_remove.append(field_li)
+                            continue
+
+                        if (
+                            field_description_elem is None
+                            or not (field_description_elem.text or "").strip()
+                        ):
+                            logger.warning(
+                                "Extension schema %s: removing field '%s' from"
+                                " ValueType '%s' — missing pdfaField:description",
+                                uri,
+                                field_name,
+                                type_name,
+                            )
+                            field_entries_to_remove.append(field_li)
+                            continue
+
+                    for field_li in field_entries_to_remove:
+                        field_seq.remove(field_li)
+
+                    if not field_seq.findall(li_tag):
+                        logger.warning(
+                            "Extension schema %s: removing pdfaType:field from"
+                            " ValueType '%s' — no valid field entries remain",
                             uri,
                             type_name,
                         )

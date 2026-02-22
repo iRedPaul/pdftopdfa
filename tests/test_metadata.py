@@ -16,6 +16,7 @@ from pikepdf import Array, Dictionary, Name, Pdf
 from pdftopdfa.exceptions import ConversionError
 from pdftopdfa.metadata import (
     _NS_PDFA_EXTENSION,
+    _NS_PDFA_FIELD,
     _NS_PDFA_PROPERTY,
     _NS_PDFA_SCHEMA,
     _NS_PDFA_TYPE,
@@ -3119,6 +3120,30 @@ def _add_value_type_entry(
     return value_type_li
 
 
+def _add_value_type_field_seq(value_type_li: etree._Element) -> etree._Element:
+    """Append a pdfaType:field/rdf:Seq to a ValueType entry and return the Seq."""
+    ns_rdf = NAMESPACES["rdf"]
+    field_elem = etree.SubElement(value_type_li, f"{{{_NS_PDFA_TYPE}}}field")
+    return etree.SubElement(field_elem, f"{{{ns_rdf}}}Seq")
+
+
+def _add_value_type_field_entry(
+    field_seq: etree._Element,
+    *,
+    name: str = "FieldOne",
+    value_type: str = "Text",
+    description: str = "Field description",
+) -> etree._Element:
+    """Append one pdfaField entry under a ValueType field Seq and return it."""
+    ns_rdf = NAMESPACES["rdf"]
+    field_li = etree.SubElement(field_seq, f"{{{ns_rdf}}}li")
+    field_li.set(f"{{{ns_rdf}}}parseType", "Resource")
+    etree.SubElement(field_li, f"{{{_NS_PDFA_FIELD}}}name").text = name
+    etree.SubElement(field_li, f"{{{_NS_PDFA_FIELD}}}valueType").text = value_type
+    etree.SubElement(field_li, f"{{{_NS_PDFA_FIELD}}}description").text = description
+    return field_li
+
+
 class TestSanitizeExtensionSchemaBlocks:
     """Tests for _sanitize_extension_schema_blocks."""
 
@@ -3311,6 +3336,177 @@ class TestSanitizeExtensionSchemaBlocks:
         result = _sanitize_extension_schema_blocks({uri: li})
         assert uri in result
         assert result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}valueType") is None
+
+    def test_missing_field_name_removes_field_entry(self) -> None:
+        """Field entry without pdfaField:name is removed."""
+        uri = "http://example.com/ns/"
+        ns_rdf = NAMESPACES["rdf"]
+        li = _make_valid_schema_li(uri=uri)
+        value_type_entry = _add_value_type_entry(li, type_name="ContainerType")
+        field_seq = _add_value_type_field_seq(value_type_entry)
+
+        _add_value_type_field_entry(field_seq, name="GoodField")
+        bad_field = _add_value_type_field_entry(field_seq, name="BadField")
+        name_elem = bad_field.find(f"{{{_NS_PDFA_FIELD}}}name")
+        assert name_elem is not None
+        bad_field.remove(name_elem)
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+
+        value_type_seq = (
+            result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}valueType").find(f"{{{ns_rdf}}}Seq")
+        )
+        assert value_type_seq is not None
+        entry = value_type_seq.find(f"{{{ns_rdf}}}li")
+        assert entry is not None
+        out_field_seq = entry.find(f"{{{_NS_PDFA_TYPE}}}field").find(f"{{{ns_rdf}}}Seq")
+        assert out_field_seq is not None
+        names = [
+            e.find(f"{{{_NS_PDFA_FIELD}}}name").text
+            for e in out_field_seq.findall(f"{{{ns_rdf}}}li")
+        ]
+        assert "GoodField" in names
+        assert "BadField" not in names
+
+    def test_missing_field_value_type_removes_field_entry(self) -> None:
+        """Field entry without pdfaField:valueType is removed."""
+        uri = "http://example.com/ns/"
+        ns_rdf = NAMESPACES["rdf"]
+        li = _make_valid_schema_li(uri=uri)
+        value_type_entry = _add_value_type_entry(li, type_name="ContainerType")
+        field_seq = _add_value_type_field_seq(value_type_entry)
+
+        _add_value_type_field_entry(field_seq, name="GoodField")
+        bad_field = _add_value_type_field_entry(field_seq, name="BadField")
+        value_type_elem = bad_field.find(f"{{{_NS_PDFA_FIELD}}}valueType")
+        assert value_type_elem is not None
+        bad_field.remove(value_type_elem)
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+
+        value_type_seq = (
+            result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}valueType").find(f"{{{ns_rdf}}}Seq")
+        )
+        assert value_type_seq is not None
+        entry = value_type_seq.find(f"{{{ns_rdf}}}li")
+        assert entry is not None
+        out_field_seq = entry.find(f"{{{_NS_PDFA_TYPE}}}field").find(f"{{{ns_rdf}}}Seq")
+        assert out_field_seq is not None
+        names = [
+            e.find(f"{{{_NS_PDFA_FIELD}}}name").text
+            for e in out_field_seq.findall(f"{{{ns_rdf}}}li")
+        ]
+        assert "GoodField" in names
+        assert "BadField" not in names
+
+    def test_invalid_field_value_type_removes_field_entry(self) -> None:
+        """Field entry with unknown pdfaField:valueType is removed."""
+        uri = "http://example.com/ns/"
+        ns_rdf = NAMESPACES["rdf"]
+        li = _make_valid_schema_li(uri=uri)
+        _add_value_type_entry(li, type_name="CustomFieldType")
+        value_type_entry = _add_value_type_entry(li, type_name="ContainerType")
+        field_seq = _add_value_type_field_seq(value_type_entry)
+
+        _add_value_type_field_entry(
+            field_seq,
+            name="GoodBuiltIn",
+            value_type="Seq Text",
+        )
+        _add_value_type_field_entry(
+            field_seq,
+            name="GoodCustom",
+            value_type="CustomFieldType",
+        )
+        _add_value_type_field_entry(
+            field_seq,
+            name="BadUnknown",
+            value_type="NoSuchType",
+        )
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+
+        value_type_seq = (
+            result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}valueType").find(f"{{{ns_rdf}}}Seq")
+        )
+        assert value_type_seq is not None
+
+        entry = None
+        for candidate in value_type_seq.findall(f"{{{ns_rdf}}}li"):
+            type_elem = candidate.find(f"{{{_NS_PDFA_TYPE}}}type")
+            if type_elem is not None and type_elem.text == "ContainerType":
+                entry = candidate
+                break
+        assert entry is not None
+        out_field_seq = entry.find(f"{{{_NS_PDFA_TYPE}}}field").find(f"{{{ns_rdf}}}Seq")
+        assert out_field_seq is not None
+        names = [
+            e.find(f"{{{_NS_PDFA_FIELD}}}name").text
+            for e in out_field_seq.findall(f"{{{ns_rdf}}}li")
+        ]
+        assert "GoodBuiltIn" in names
+        assert "GoodCustom" in names
+        assert "BadUnknown" not in names
+
+    def test_missing_field_description_removes_field_entry(self) -> None:
+        """Field entry without pdfaField:description is removed."""
+        uri = "http://example.com/ns/"
+        ns_rdf = NAMESPACES["rdf"]
+        li = _make_valid_schema_li(uri=uri)
+        value_type_entry = _add_value_type_entry(li, type_name="ContainerType")
+        field_seq = _add_value_type_field_seq(value_type_entry)
+
+        _add_value_type_field_entry(field_seq, name="GoodField")
+        bad_field = _add_value_type_field_entry(field_seq, name="BadField")
+        description_elem = bad_field.find(f"{{{_NS_PDFA_FIELD}}}description")
+        assert description_elem is not None
+        bad_field.remove(description_elem)
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+
+        value_type_seq = (
+            result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}valueType").find(f"{{{ns_rdf}}}Seq")
+        )
+        assert value_type_seq is not None
+        entry = value_type_seq.find(f"{{{ns_rdf}}}li")
+        assert entry is not None
+        out_field_seq = entry.find(f"{{{_NS_PDFA_TYPE}}}field").find(f"{{{ns_rdf}}}Seq")
+        assert out_field_seq is not None
+        names = [
+            e.find(f"{{{_NS_PDFA_FIELD}}}name").text
+            for e in out_field_seq.findall(f"{{{ns_rdf}}}li")
+        ]
+        assert "GoodField" in names
+        assert "BadField" not in names
+
+    def test_field_removed_when_all_field_entries_invalid(self) -> None:
+        """pdfaType:field is removed when all field entries are invalid."""
+        uri = "http://example.com/ns/"
+        ns_rdf = NAMESPACES["rdf"]
+        li = _make_valid_schema_li(uri=uri)
+        value_type_entry = _add_value_type_entry(li, type_name="ContainerType")
+        field_seq = _add_value_type_field_seq(value_type_entry)
+
+        _add_value_type_field_entry(
+            field_seq,
+            name="BadUnknown",
+            value_type="UnknownType",
+        )
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+
+        value_type_seq = (
+            result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}valueType").find(f"{{{ns_rdf}}}Seq")
+        )
+        assert value_type_seq is not None
+        entry = value_type_seq.find(f"{{{ns_rdf}}}li")
+        assert entry is not None
+        assert entry.find(f"{{{_NS_PDFA_TYPE}}}field") is None
 
     def test_no_schemas_returns_empty(self) -> None:
         """Empty input returns empty result."""
