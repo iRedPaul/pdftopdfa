@@ -11,10 +11,12 @@ header and /Root/Version, so the catalog /Version must be removed or
 overwritten to prevent it from elevating the effective version beyond
 what ``force_version`` sets in the header.
 
-ISO 19005-2, clauses 6.1.10–6.1.13 forbid the /Perms, /Requirements,
-and /Collection keys in the Document Catalog.  /NeedsRendering
-(ISO 32000-1, Table 28) is also removed as it is incompatible with
-PDF/A archival requirements.
+ISO 19005-2, clauses 6.1.10–6.1.13 forbid /Requirements and /Collection
+keys in the Document Catalog. /Perms is sanitized to keep only /UR3 and
+/DocMDP entries (clause 6.1.12-1). If /DocMDP remains in /Perms, digest
+keys are removed from Signature Reference dictionaries per clause 6.1.12-2.
+/NeedsRendering (ISO 32000-1, Table 28) is also removed as it is
+incompatible with PDF/A archival requirements.
 
 ISO 19005-2, clause 6.1.2 forbids the /ViewArea, /ViewClip, /PrintArea,
 and /PrintClip keys in the /ViewerPreferences dictionary.
@@ -32,7 +34,7 @@ import logging
 import re
 
 from lxml import etree
-from pikepdf import Dictionary, Pdf, String
+from pikepdf import Dictionary, Name, Pdf, String
 
 from ..utils import resolve_indirect as _resolve_indirect
 
@@ -72,13 +74,18 @@ def _is_valid_bcp47(tag: str) -> bool:
 # plus /NeedsRendering (ISO 32000-1, Table 28),
 # /Threads (article threads) and /SpiderInfo (web capture)
 FORBIDDEN_CATALOG_KEYS = (
-    "/Perms",
     "/Requirements",
     "/Collection",
     "/NeedsRendering",
     "/Threads",
     "/SpiderInfo",
 )
+
+# /Perms keys allowed by ISO 19005-2, clause 6.1.12-1
+ALLOWED_PERMS_KEYS = ("/UR3", "/DocMDP")
+
+# Signature Reference digest keys forbidden by ISO 19005-2, clause 6.1.12-2
+FORBIDDEN_SIGREF_DIGEST_KEYS = ("/DigestLocation", "/DigestMethod", "/DigestValue")
 
 
 # ViewerPreferences keys forbidden by ISO 19005-2, clause 6.1.2
@@ -196,11 +203,143 @@ def remove_forbidden_viewer_preferences(pdf: Pdf) -> int:
     return removed_count
 
 
-def remove_forbidden_catalog_entries(pdf: Pdf) -> int:
-    """Removes forbidden entries from the Document Catalog.
+def _sanitize_catalog_perms(pdf: Pdf) -> tuple[int, bool]:
+    """Sanitize Catalog /Perms in place.
 
-    PDF/A-2 and PDF/A-3 forbid the following keys in the Catalog:
-    - /Perms (clause 6.1.12)
+    Keeps only /UR3 and /DocMDP entries (ISO 19005-2, clause 6.1.12-1).
+    If /Perms is not a dictionary or becomes empty after filtering, /Perms
+    is removed from the Catalog.
+
+    Args:
+        pdf: Opened pikepdf PDF object (modified in place).
+
+    Returns:
+        Tuple ``(removed_count, has_doc_mdp)`` where ``has_doc_mdp`` is True
+        only if sanitized /Perms still contains /DocMDP.
+    """
+    try:
+        perms = pdf.Root.get("/Perms")
+    except Exception:
+        return 0, False
+
+    if perms is None:
+        return 0, False
+
+    removed_count = 0
+    perms = _resolve_indirect(perms)
+
+    if not isinstance(perms, Dictionary):
+        del pdf.Root["/Perms"]
+        logger.debug("Catalog /Perms removed because it is not a dictionary")
+        return 1, False
+
+    for key in tuple(perms.keys()):
+        key_name = str(key)
+        if key_name in ALLOWED_PERMS_KEYS:
+            continue
+        try:
+            del perms[key]
+            removed_count += 1
+            logger.debug("Forbidden /Perms entry %s removed", key_name)
+        except Exception:
+            continue
+
+    if len(perms) == 0:
+        del pdf.Root["/Perms"]
+        logger.debug("Catalog /Perms removed because it became empty")
+        return removed_count + 1, False
+
+    has_doc_mdp = False
+    try:
+        has_doc_mdp = perms.get("/DocMDP") is not None
+    except Exception:
+        has_doc_mdp = False
+
+    return removed_count, has_doc_mdp
+
+
+def _remove_docmdp_sigref_digest_keys(pdf: Pdf) -> int:
+    """Remove forbidden digest keys from Signature Reference dictionaries.
+
+    This helper enforces ISO 19005-2, clause 6.1.12-2 by removing
+    /DigestLocation, /DigestMethod, and /DigestValue from dictionaries
+    inside /Reference arrays of signature dictionaries (/Type /Sig).
+
+    Args:
+        pdf: Opened pikepdf PDF object (modified in place).
+
+    Returns:
+        Number of forbidden Signature Reference digest keys removed.
+    """
+    removed_count = 0
+
+    for obj in pdf.objects:
+        try:
+            candidate = _resolve_indirect(obj)
+        except Exception:
+            continue
+
+        if not isinstance(candidate, Dictionary):
+            continue
+
+        try:
+            sig_type = candidate.get("/Type")
+            if sig_type is None or Name(sig_type) != Name.Sig:
+                continue
+        except Exception:
+            continue
+
+        try:
+            references = candidate.get("/Reference")
+        except Exception:
+            continue
+
+        if references is None:
+            continue
+
+        try:
+            references = _resolve_indirect(references)
+            sig_references = tuple(references)
+        except Exception:
+            continue
+
+        for sig_ref in sig_references:
+            try:
+                sig_ref_dict = _resolve_indirect(sig_ref)
+            except Exception:
+                continue
+
+            if not isinstance(sig_ref_dict, Dictionary):
+                continue
+
+            for digest_key in FORBIDDEN_SIGREF_DIGEST_KEYS:
+                try:
+                    if digest_key in sig_ref_dict:
+                        del sig_ref_dict[digest_key]
+                        removed_count += 1
+                        logger.debug(
+                            "Forbidden Signature Reference key %s removed",
+                            digest_key,
+                        )
+                except Exception:
+                    continue
+
+    if removed_count > 0:
+        logger.info(
+            "%d forbidden Signature Reference digest key(s) removed",
+            removed_count,
+        )
+
+    return removed_count
+
+
+def remove_forbidden_catalog_entries(pdf: Pdf) -> int:
+    """Remove forbidden entries from the Document Catalog.
+
+    PDF/A-2 and PDF/A-3 require the following Catalog cleanup:
+    - /Perms is sanitized to keep only /UR3 and /DocMDP (clause 6.1.12-1)
+    - When sanitized /Perms contains /DocMDP, Signature Reference digest
+      keys are removed (clause 6.1.12-2)
     - /Requirements (clause 6.1.10)
     - /Collection (clause 6.1.13)
     - /NeedsRendering (ISO 32000-1, Table 28)
@@ -214,6 +353,12 @@ def remove_forbidden_catalog_entries(pdf: Pdf) -> int:
         Number of forbidden catalog entries removed.
     """
     removed_count = 0
+
+    perms_removed, has_doc_mdp = _sanitize_catalog_perms(pdf)
+    removed_count += perms_removed
+
+    if has_doc_mdp:
+        removed_count += _remove_docmdp_sigref_digest_keys(pdf)
 
     for key in FORBIDDEN_CATALOG_KEYS:
         if key in pdf.Root:

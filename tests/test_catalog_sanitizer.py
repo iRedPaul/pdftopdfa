@@ -27,7 +27,6 @@ class TestRemoveForbiddenCatalogEntries:
     @pytest.mark.parametrize(
         ("key", "value"),
         [
-            ("/Perms", pikepdf.Dictionary()),
             (
                 "/Requirements",
                 pikepdf.Array(
@@ -47,16 +46,14 @@ class TestRemoveForbiddenCatalogEntries:
         assert remove_forbidden_catalog_entries(pdf) == 1
         assert key not in pdf.Root
 
-    def test_remove_all_six(self):
+    def test_remove_all_five(self):
         pdf = new_pdf()
-        pdf.Root["/Perms"] = pikepdf.Dictionary()
         pdf.Root["/Requirements"] = pikepdf.Array()
         pdf.Root["/Collection"] = pikepdf.Dictionary()
         pdf.Root["/NeedsRendering"] = True
         pdf.Root["/Threads"] = pikepdf.Array()
         pdf.Root["/SpiderInfo"] = pikepdf.Dictionary()
-        assert remove_forbidden_catalog_entries(pdf) == 6
-        assert "/Perms" not in pdf.Root
+        assert remove_forbidden_catalog_entries(pdf) == 5
         assert "/Requirements" not in pdf.Root
         assert "/Collection" not in pdf.Root
         assert "/NeedsRendering" not in pdf.Root
@@ -69,11 +66,112 @@ class TestRemoveForbiddenCatalogEntries:
 
     def test_other_keys_preserved(self):
         pdf = new_pdf()
-        pdf.Root["/Perms"] = pikepdf.Dictionary()
+        pdf.Root["/Requirements"] = pikepdf.Array()
         pdf.Root["/MarkInfo"] = pikepdf.Dictionary()
         remove_forbidden_catalog_entries(pdf)
         assert "/MarkInfo" in pdf.Root
         assert "/Perms" not in pdf.Root
+        assert "/Requirements" not in pdf.Root
+
+    def test_perms_with_only_ur3_is_preserved(self):
+        pdf = new_pdf()
+        pdf.Root["/Perms"] = pikepdf.Dictionary({"/UR3": pikepdf.Dictionary()})
+        assert remove_forbidden_catalog_entries(pdf) == 0
+        assert "/Perms" in pdf.Root
+        assert "/UR3" in pdf.Root["/Perms"]
+
+    def test_perms_with_only_docmdp_is_preserved(self):
+        pdf = new_pdf()
+        pdf.Root["/Perms"] = pikepdf.Dictionary({"/DocMDP": pikepdf.Dictionary()})
+        assert remove_forbidden_catalog_entries(pdf) == 0
+        assert "/Perms" in pdf.Root
+        assert "/DocMDP" in pdf.Root["/Perms"]
+
+    def test_perms_with_ur3_and_docmdp_is_preserved(self):
+        pdf = new_pdf()
+        pdf.Root["/Perms"] = pikepdf.Dictionary(
+            {
+                "/UR3": pikepdf.Dictionary(),
+                "/DocMDP": pikepdf.Dictionary(),
+            }
+        )
+        assert remove_forbidden_catalog_entries(pdf) == 0
+        assert "/Perms" in pdf.Root
+        assert "/UR3" in pdf.Root["/Perms"]
+        assert "/DocMDP" in pdf.Root["/Perms"]
+
+    def test_perms_mixed_allowed_and_forbidden_removes_only_forbidden(self):
+        pdf = new_pdf()
+        pdf.Root["/Perms"] = pikepdf.Dictionary(
+            {
+                "/UR3": pikepdf.Dictionary(),
+                "/DocMDP": pikepdf.Dictionary(),
+                "/UR": pikepdf.Dictionary(),
+            }
+        )
+        assert remove_forbidden_catalog_entries(pdf) == 1
+        assert "/Perms" in pdf.Root
+        assert "/UR3" in pdf.Root["/Perms"]
+        assert "/DocMDP" in pdf.Root["/Perms"]
+        assert "/UR" not in pdf.Root["/Perms"]
+
+    def test_perms_with_only_forbidden_keys_is_removed(self):
+        pdf = new_pdf()
+        pdf.Root["/Perms"] = pikepdf.Dictionary(
+            {
+                "/UR": pikepdf.Dictionary(),
+                "/Foo": pikepdf.Dictionary(),
+            }
+        )
+        assert remove_forbidden_catalog_entries(pdf) == 3
+        assert "/Perms" not in pdf.Root
+
+    def test_docmdp_removes_sigref_digest_keys_only(self):
+        pdf = new_pdf()
+
+        sig_ref = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/SigRef"),
+                "/TransformMethod": pikepdf.Name("/DocMDP"),
+                "/DigestLocation": pikepdf.Array([0, 10]),
+                "/DigestMethod": pikepdf.Name("/MD5"),
+                "/DigestValue": pikepdf.String("digest"),
+                "/TransformParams": pikepdf.Dictionary({"/P": 2}),
+            }
+        )
+        sig_ref_indirect = pdf.make_indirect(sig_ref)
+
+        sig_dict = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name.Sig,
+                "/Reference": pikepdf.Array([sig_ref_indirect]),
+            }
+        )
+        sig_dict_indirect = pdf.make_indirect(sig_dict)
+
+        sig_field = pikepdf.Dictionary(
+            {
+                "/FT": pikepdf.Name("/Sig"),
+                "/V": sig_dict_indirect,
+            }
+        )
+        pdf.Root["/AcroForm"] = pikepdf.Dictionary(
+            {"/Fields": pikepdf.Array([pdf.make_indirect(sig_field)])}
+        )
+        pdf.Root["/Perms"] = pikepdf.Dictionary({"/DocMDP": pikepdf.Dictionary()})
+
+        assert remove_forbidden_catalog_entries(pdf) == 3
+
+        ref_dict = sig_dict_indirect["/Reference"][0]
+        try:
+            ref_dict = ref_dict.get_object()
+        except Exception:
+            pass
+        assert "/DigestLocation" not in ref_dict
+        assert "/DigestMethod" not in ref_dict
+        assert "/DigestValue" not in ref_dict
+        assert "/TransformMethod" in ref_dict
+        assert "/TransformParams" in ref_dict
 
 
 class TestRemoveCatalogVersion:
