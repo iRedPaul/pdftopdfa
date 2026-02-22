@@ -1460,7 +1460,7 @@ class TestIndexedLookupSizeValidation:
         assert "lookup table size mismatch" not in caplog.text
 
     def test_wrong_size_logs_warning(self, caplog):
-        """Incorrectly sized lookup logs a warning."""
+        """Incorrectly sized (too short) lookup is padded and a warning is logged."""
         import logging
 
         pdf = new_pdf()
@@ -1483,11 +1483,14 @@ class TestIndexedLookupSizeValidation:
 
         with caplog.at_level(logging.WARNING, logger="pdftopdfa"):
             validate_embedded_icc_profiles(pdf, "3b", repair=False)
-        assert "lookup table size mismatch" in caplog.text
-        assert "expected 6" in caplog.text
+        assert "too short" in caplog.text
+        assert "padded" in caplog.text
+        # Lookup is fixed in-place: should now be 6 bytes
+        cs = pdf.pages[0].Resources.ColorSpace.CS0
+        assert len(bytes(cs[3])) == 6
 
     def test_stream_lookup_validated(self, caplog):
-        """Lookup as a stream is validated too."""
+        """Lookup as a stream is padded when too short."""
         import logging
 
         pdf = new_pdf()
@@ -1510,10 +1513,14 @@ class TestIndexedLookupSizeValidation:
 
         with caplog.at_level(logging.WARNING, logger="pdftopdfa"):
             validate_embedded_icc_profiles(pdf, "3b", repair=False)
-        assert "lookup table size mismatch" in caplog.text
+        assert "too short" in caplog.text
+        assert "padded" in caplog.text
+        # Stream data is fixed in-place: should now be 3 bytes
+        cs = pdf.pages[0].Resources.ColorSpace.CS0
+        assert len(bytes(cs[3].read_bytes())) == 3
 
     def test_image_xobject_indexed_validated(self, caplog):
-        """Indexed color space on Image XObject is also validated."""
+        """Indexed color space on Image XObject is padded when too short."""
         import logging
 
         pdf = new_pdf()
@@ -1544,7 +1551,126 @@ class TestIndexedLookupSizeValidation:
 
         with caplog.at_level(logging.WARNING, logger="pdftopdfa"):
             validate_embedded_icc_profiles(pdf, "3b", repair=False)
-        assert "lookup table size mismatch" in caplog.text
+        assert "too short" in caplog.text
+        assert "padded" in caplog.text
+
+    def test_too_long_table_is_truncated(self, caplog):
+        """Overlong lookup table is truncated to the correct size."""
+        import logging
+
+        from pdftopdfa.sanitizers.colorspaces import _fix_indexed_lookup_size
+
+        pdf = new_pdf()
+        # DeviceRGB base, hival=1 -> expected 6 bytes, give 10
+        lookup_data = b"\xff\x00\x00\x00\xff\x00\xaa\xbb\xcc\xdd"
+        indexed_cs = Array(
+            [
+                Name.Indexed,
+                Name.DeviceRGB,
+                1,
+                pikepdf.String(lookup_data),
+            ]
+        )
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(ColorSpace=Dictionary(CS0=indexed_cs)),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+        cs = pdf.pages[0].Resources.ColorSpace.CS0
+
+        with caplog.at_level(logging.WARNING, logger="pdftopdfa"):
+            _fix_indexed_lookup_size(cs, "Page 1/ColorSpace/CS0")
+
+        assert "truncated" in caplog.text
+        assert len(bytes(cs[3])) == 6
+
+    def test_too_short_table_is_padded(self, caplog):
+        """Short lookup table is padded with zero bytes to the correct size."""
+        import logging
+
+        from pdftopdfa.sanitizers.colorspaces import _fix_indexed_lookup_size
+
+        pdf = new_pdf()
+        # DeviceRGB base, hival=1 -> expected 6 bytes, give 3
+        lookup_data = b"\xff\x00\x00"
+        indexed_cs = Array(
+            [
+                Name.Indexed,
+                Name.DeviceRGB,
+                1,
+                pikepdf.String(lookup_data),
+            ]
+        )
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(ColorSpace=Dictionary(CS0=indexed_cs)),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+        cs = pdf.pages[0].Resources.ColorSpace.CS0
+
+        with caplog.at_level(logging.WARNING, logger="pdftopdfa"):
+            _fix_indexed_lookup_size(cs, "Page 1/ColorSpace/CS0")
+
+        assert "padded" in caplog.text
+        fixed = bytes(cs[3])
+        assert len(fixed) == 6
+        assert fixed[:3] == lookup_data
+        assert fixed[3:] == b"\x00\x00\x00"
+
+    def test_malformed_raises_conversion_error(self):
+        """Indexed array with unreadable hival raises ConversionError."""
+        from pdftopdfa.sanitizers.colorspaces import _fix_indexed_lookup_size
+
+        pdf = new_pdf()
+        # hival is a Name, not convertible to int — structurally malformed
+        indexed_cs = Array(
+            [
+                Name.Indexed,
+                Name.DeviceRGB,
+                Name("/bad"),
+                pikepdf.String(b"\xff\x00\x00"),
+            ]
+        )
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(ColorSpace=Dictionary(CS0=indexed_cs)),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+        cs = pdf.pages[0].Resources.ColorSpace.CS0
+
+        with pytest.raises(ConversionError, match="malformed"):
+            _fix_indexed_lookup_size(cs, "Page 1/ColorSpace/CS0")
+
+    def test_after_fix_lookup_length_equals_expected(self, caplog):
+        """After sanitize_colorspaces(), lookup length equals (hival+1)*components."""
+        import logging
+
+        pdf = new_pdf()
+        # DeviceRGB base, hival=3 -> expected (3+1)*3 = 12 bytes, give 5
+        lookup_data = b"\xff\x00\x00\x00\xff"
+        indexed_cs = Array(
+            [
+                Name.Indexed,
+                Name.DeviceRGB,
+                3,
+                pikepdf.String(lookup_data),
+            ]
+        )
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(ColorSpace=Dictionary(CS0=indexed_cs)),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+
+        with caplog.at_level(logging.WARNING, logger="pdftopdfa"):
+            sanitize_colorspaces(pdf, "3b")
+
+        cs = pdf.pages[0].Resources.ColorSpace.CS0
+        assert len(bytes(cs[3])) == 12
 
 
 class TestIntegrationWithSanitizeForPdfa:

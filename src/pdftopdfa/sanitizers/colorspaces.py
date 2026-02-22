@@ -13,7 +13,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from pikepdf import Array, Dictionary, Name, Pdf, Stream
+from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
 
 from ..color_profile import get_cmyk_profile, get_gray_profile, get_srgb_profile
 from ..exceptions import ConversionError
@@ -67,9 +67,7 @@ def _validate_icc_in_resources(resources, location_prefix: str, validate_icc_str
                     location = f"{location_prefix}/ColorSpace/{name}"
                     validate_icc_stream(cs[1], location)
                 elif cs_type_str == "/Indexed":
-                    _validate_indexed_lookup_size(
-                        cs, f"{location_prefix}/ColorSpace/{name}"
-                    )
+                    _fix_indexed_lookup_size(cs, f"{location_prefix}/ColorSpace/{name}")
 
     # Check XObjects for Image XObjects with ICCBased ColorSpace
     xobjects = resources.get("/XObject")
@@ -91,7 +89,7 @@ def _validate_icc_in_resources(resources, location_prefix: str, validate_icc_str
                             location = f"{location_prefix}/XObject/{xname}"
                             validate_icc_stream(cs[1], location)
                         elif cs_type_str == "/Indexed":
-                            _validate_indexed_lookup_size(
+                            _fix_indexed_lookup_size(
                                 cs,
                                 f"{location_prefix}/XObject/{xname}",
                             )
@@ -220,11 +218,11 @@ def _validate_icc_in_type3_fonts(
         )
 
 
-def _validate_indexed_lookup_size(cs, location: str) -> None:
-    """Validate that an Indexed color space lookup table has correct size.
+def _fix_indexed_lookup_size(cs, location: str) -> None:
+    """Validate and fix an Indexed color space lookup table size.
 
     Expected size is ``(hival + 1) * num_base_components`` bytes.
-    Logs a warning if the size mismatches but does not modify the PDF.
+    Truncates overlong tables or pads short tables with ``\\x00`` bytes.
 
     Args:
         cs: A resolved Array starting with /Indexed.
@@ -238,8 +236,10 @@ def _validate_indexed_lookup_size(cs, location: str) -> None:
     try:
         base = _resolve_indirect(cs[1])
         hival = int(cs[2])
-    except Exception:
-        return
+    except Exception as e:
+        raise ConversionError(
+            f"{location}: Indexed colour space array is malformed: {e}"
+        ) from e
 
     # Determine the number of components of the base color space
     num_components = None
@@ -265,34 +265,47 @@ def _validate_indexed_lookup_size(cs, location: str) -> None:
             num_components = 3
 
     if num_components is None or num_components == 0:
-        return
+        raise ConversionError(
+            f"{location}: Cannot determine component count"
+            " for Indexed base colour space"
+        )
 
     expected_size = (hival + 1) * num_components
     lookup = _resolve_indirect(cs[3])
 
     try:
         if isinstance(lookup, Stream):
-            actual_size = len(bytes(lookup.read_bytes()))
-        elif isinstance(lookup, bytes):
-            actual_size = len(lookup)
-        elif isinstance(lookup, str):
-            actual_size = len(lookup)
+            data = bytes(lookup.read_bytes())
         else:
-            # pikepdf.String or other object — try bytes() conversion
-            actual_size = len(bytes(lookup))
+            data = bytes(lookup)
+        actual_size = len(data)
     except Exception:
         return
 
     if actual_size != expected_size:
-        logger.warning(
-            "%s: Indexed lookup table size mismatch: expected %d bytes"
-            " ((hival %d + 1) * %d components) but got %d",
-            location,
-            expected_size,
-            hival,
-            num_components,
-            actual_size,
-        )
+        if actual_size > expected_size:
+            fixed = data[:expected_size]
+            logger.warning(
+                "%s: Indexed lookup table too long: truncated from %d to %d bytes"
+                " (lossy)",
+                location,
+                actual_size,
+                expected_size,
+            )
+        else:
+            fixed = data + b"\x00" * (expected_size - actual_size)
+            logger.warning(
+                "%s: Indexed lookup table too short: padded from %d to %d bytes"
+                " with zeros (lossy)",
+                location,
+                actual_size,
+                expected_size,
+            )
+
+        if isinstance(lookup, Stream):
+            lookup.write(fixed)
+        else:
+            cs[3] = String(fixed)
 
 
 def validate_embedded_icc_profiles(
