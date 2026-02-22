@@ -90,6 +90,8 @@ NAMESPACES = {
 _NS_PDFA_EXTENSION = "http://www.aiim.org/pdfa/ns/extension/"
 _NS_PDFA_SCHEMA = "http://www.aiim.org/pdfa/ns/schema#"
 _NS_PDFA_PROPERTY = "http://www.aiim.org/pdfa/ns/property#"
+_NS_PDFA_TYPE = "http://www.aiim.org/pdfa/ns/type#"
+_NS_PDFA_FIELD = "http://www.aiim.org/pdfa/ns/field#"
 
 # Register all namespaces globally so lxml serializes them with canonical prefixes
 for _prefix, _uri in NAMESPACES.items():
@@ -97,6 +99,8 @@ for _prefix, _uri in NAMESPACES.items():
 etree.register_namespace("pdfaExtension", _NS_PDFA_EXTENSION)
 etree.register_namespace("pdfaSchema", _NS_PDFA_SCHEMA)
 etree.register_namespace("pdfaProperty", _NS_PDFA_PROPERTY)
+etree.register_namespace("pdfaType", _NS_PDFA_TYPE)
+etree.register_namespace("pdfaField", _NS_PDFA_FIELD)
 
 # XMP packet header and trailer
 XMP_HEADER = b'<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
@@ -678,18 +682,30 @@ def _sanitize_extension_schema_blocks(
     Required property-level fields: pdfaProperty:name (non-empty),
     pdfaProperty:valueType (non-empty), pdfaProperty:category (internal/external),
     pdfaProperty:description (non-empty).
+
+    Optional value-type declarations (pdfaSchema:valueType) are also sanitized:
+    they must be an rdf:Seq of ValueType entries, each requiring non-empty
+    pdfaType:type, pdfaType:namespaceURI, pdfaType:prefix, and
+    pdfaType:description fields. Optional pdfaType:field, when present, must
+    itself be an rdf:Seq.
     """
     ns_rdf = NAMESPACES["rdf"]
     schema_tag = f"{{{_NS_PDFA_SCHEMA}}}schema"
     ns_uri_tag = f"{{{_NS_PDFA_SCHEMA}}}namespaceURI"
     prefix_tag = f"{{{_NS_PDFA_SCHEMA}}}prefix"
     property_tag = f"{{{_NS_PDFA_SCHEMA}}}property"
+    schema_value_type_tag = f"{{{_NS_PDFA_SCHEMA}}}valueType"
     seq_tag = f"{{{ns_rdf}}}Seq"
     li_tag = f"{{{ns_rdf}}}li"
     name_tag = f"{{{_NS_PDFA_PROPERTY}}}name"
     value_type_tag = f"{{{_NS_PDFA_PROPERTY}}}valueType"
     category_tag = f"{{{_NS_PDFA_PROPERTY}}}category"
     description_tag = f"{{{_NS_PDFA_PROPERTY}}}description"
+    type_name_tag = f"{{{_NS_PDFA_TYPE}}}type"
+    type_ns_uri_tag = f"{{{_NS_PDFA_TYPE}}}namespaceURI"
+    type_prefix_tag = f"{{{_NS_PDFA_TYPE}}}prefix"
+    type_description_tag = f"{{{_NS_PDFA_TYPE}}}description"
+    type_field_tag = f"{{{_NS_PDFA_TYPE}}}field"
 
     result: dict[str, etree._Element] = {}
 
@@ -795,6 +811,102 @@ def _sanitize_extension_schema_blocks(
                 "Extension schema block for %s dropped: no valid properties remain", uri
             )
             continue
+
+        # Optional pdfaSchema:valueType checks
+        schema_value_type_elem = li_elem.find(schema_value_type_tag)
+        if schema_value_type_elem is not None:
+            value_type_seq = schema_value_type_elem.find(seq_tag)
+            if value_type_seq is None:
+                logger.warning(
+                    "Extension schema %s: removing pdfaSchema:valueType"
+                    " — no rdf:Seq child",
+                    uri,
+                )
+                li_elem.remove(schema_value_type_elem)
+            else:
+                value_types_to_remove = []
+                for value_type_li in value_type_seq.findall(li_tag):
+                    type_name_elem = value_type_li.find(type_name_tag)
+                    type_name = (
+                        (type_name_elem.text or "").strip()
+                        if type_name_elem is not None
+                        else ""
+                    )
+                    type_ns_uri_elem = value_type_li.find(type_ns_uri_tag)
+                    type_prefix_elem = value_type_li.find(type_prefix_tag)
+                    type_description_elem = value_type_li.find(type_description_tag)
+
+                    if type_name_elem is None or not type_name:
+                        logger.warning(
+                            "Extension schema %s: removing ValueType entry"
+                            " — missing pdfaType:type",
+                            uri,
+                        )
+                        value_types_to_remove.append(value_type_li)
+                        continue
+
+                    if (
+                        type_ns_uri_elem is None
+                        or not (type_ns_uri_elem.text or "").strip()
+                    ):
+                        logger.warning(
+                            "Extension schema %s: removing ValueType '%s'"
+                            " — missing pdfaType:namespaceURI",
+                            uri,
+                            type_name,
+                        )
+                        value_types_to_remove.append(value_type_li)
+                        continue
+
+                    if (
+                        type_prefix_elem is None
+                        or not (type_prefix_elem.text or "").strip()
+                    ):
+                        logger.warning(
+                            "Extension schema %s: removing ValueType '%s'"
+                            " — missing pdfaType:prefix",
+                            uri,
+                            type_name,
+                        )
+                        value_types_to_remove.append(value_type_li)
+                        continue
+
+                    if (
+                        type_description_elem is None
+                        or not (type_description_elem.text or "").strip()
+                    ):
+                        logger.warning(
+                            "Extension schema %s: removing ValueType '%s'"
+                            " — missing pdfaType:description",
+                            uri,
+                            type_name,
+                        )
+                        value_types_to_remove.append(value_type_li)
+                        continue
+
+                    type_field_elem = value_type_li.find(type_field_tag)
+                    if (
+                        type_field_elem is not None
+                        and type_field_elem.find(seq_tag) is None
+                    ):
+                        logger.warning(
+                            "Extension schema %s: removing pdfaType:field from"
+                            " ValueType '%s' — expected rdf:Seq",
+                            uri,
+                            type_name,
+                        )
+                        value_type_li.remove(type_field_elem)
+
+                for value_type_li in value_types_to_remove:
+                    value_type_seq.remove(value_type_li)
+
+                if not value_type_seq.findall(li_tag):
+                    logger.warning(
+                        "Extension schema %s: removing pdfaSchema:valueType"
+                        " — no valid ValueType entries remain",
+                        uri,
+                    )
+                    li_elem.remove(schema_value_type_elem)
 
         result[uri] = li_elem
 

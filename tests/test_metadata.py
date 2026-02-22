@@ -18,6 +18,7 @@ from pdftopdfa.metadata import (
     _NS_PDFA_EXTENSION,
     _NS_PDFA_PROPERTY,
     _NS_PDFA_SCHEMA,
+    _NS_PDFA_TYPE,
     NAMESPACES,
     XMP_HEADER,
     XMP_TRAILER,
@@ -3082,6 +3083,42 @@ def _make_valid_schema_li(
     return li
 
 
+def _add_value_type_entry(
+    schema_li: etree._Element,
+    *,
+    type_name: str = "MyCustomType",
+    namespace_uri: str = "http://example.com/types/",
+    prefix: str = "extype",
+    description: str = "custom type",
+) -> etree._Element:
+    """Append one valid pdfaSchema:valueType rdf:li entry and return it."""
+    ns_rdf = NAMESPACES["rdf"]
+    value_type_tag = f"{{{_NS_PDFA_SCHEMA}}}valueType"
+    seq_tag = f"{{{ns_rdf}}}Seq"
+    li_tag = f"{{{ns_rdf}}}li"
+
+    value_type_elem = schema_li.find(value_type_tag)
+    if value_type_elem is None:
+        value_type_elem = etree.SubElement(schema_li, value_type_tag)
+
+    seq = value_type_elem.find(seq_tag)
+    if seq is None:
+        seq = etree.SubElement(value_type_elem, seq_tag)
+
+    value_type_li = etree.SubElement(seq, li_tag)
+    value_type_li.set(f"{{{ns_rdf}}}parseType", "Resource")
+    etree.SubElement(value_type_li, f"{{{_NS_PDFA_TYPE}}}type").text = type_name
+    etree.SubElement(
+        value_type_li, f"{{{_NS_PDFA_TYPE}}}namespaceURI"
+    ).text = namespace_uri
+    etree.SubElement(value_type_li, f"{{{_NS_PDFA_TYPE}}}prefix").text = prefix
+    etree.SubElement(
+        value_type_li, f"{{{_NS_PDFA_TYPE}}}description"
+    ).text = description
+
+    return value_type_li
+
+
 class TestSanitizeExtensionSchemaBlocks:
     """Tests for _sanitize_extension_schema_blocks."""
 
@@ -3190,6 +3227,90 @@ class TestSanitizeExtensionSchemaBlocks:
 
         result = _sanitize_extension_schema_blocks({uri: li})
         assert uri not in result
+
+    def test_value_type_without_seq_removed(self) -> None:
+        """pdfaSchema:valueType without rdf:Seq is removed."""
+        uri = "http://example.com/ns/"
+        li = _make_valid_schema_li(uri=uri)
+        etree.SubElement(li, f"{{{_NS_PDFA_SCHEMA}}}valueType")
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+        assert result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}valueType") is None
+
+    @pytest.mark.parametrize(
+        ("field_tag", "field_label"),
+        [
+            (f"{{{_NS_PDFA_TYPE}}}type", "type"),
+            (f"{{{_NS_PDFA_TYPE}}}namespaceURI", "namespaceURI"),
+            (f"{{{_NS_PDFA_TYPE}}}prefix", "prefix"),
+            (f"{{{_NS_PDFA_TYPE}}}description", "description"),
+        ],
+    )
+    def test_missing_required_value_type_field_removes_entry(
+        self,
+        field_tag: str,
+        field_label: str,
+    ) -> None:
+        """Missing required pdfaType fields remove only malformed ValueType entries."""
+        uri = "http://example.com/ns/"
+        ns_rdf = NAMESPACES["rdf"]
+        li = _make_valid_schema_li(uri=uri)
+
+        _add_value_type_entry(li, type_name="GoodType")
+        bad_entry = _add_value_type_entry(li, type_name="BadType")
+        missing_field = bad_entry.find(field_tag)
+        assert missing_field is not None
+        bad_entry.remove(missing_field)
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result, f"schema block unexpectedly dropped for {field_label}"
+
+        value_type_elem = result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}valueType")
+        assert value_type_elem is not None
+        seq = value_type_elem.find(f"{{{ns_rdf}}}Seq")
+        assert seq is not None
+
+        entries = seq.findall(f"{{{ns_rdf}}}li")
+        assert len(entries) == 1
+        type_elem = entries[0].find(f"{{{_NS_PDFA_TYPE}}}type")
+        assert type_elem is not None
+        assert type_elem.text == "GoodType"
+
+    def test_invalid_value_type_field_structure_removed(self) -> None:
+        """pdfaType:field without rdf:Seq is removed from an otherwise valid entry."""
+        uri = "http://example.com/ns/"
+        li = _make_valid_schema_li(uri=uri)
+        value_type_entry = _add_value_type_entry(li, type_name="TypeWithBadField")
+
+        field_elem = etree.SubElement(value_type_entry, f"{{{_NS_PDFA_TYPE}}}field")
+        field_elem.text = "not-a-seq"
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+
+        ns_rdf = NAMESPACES["rdf"]
+        value_type_elem = result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}valueType")
+        assert value_type_elem is not None
+        seq = value_type_elem.find(f"{{{ns_rdf}}}Seq")
+        assert seq is not None
+        entry = seq.find(f"{{{ns_rdf}}}li")
+        assert entry is not None
+        assert entry.find(f"{{{_NS_PDFA_TYPE}}}field") is None
+
+    def test_value_type_removed_when_all_entries_invalid(self) -> None:
+        """pdfaSchema:valueType is removed when all ValueType entries are invalid."""
+        uri = "http://example.com/ns/"
+        li = _make_valid_schema_li(uri=uri)
+
+        bad_entry = _add_value_type_entry(li, type_name="BadType")
+        prefix_elem = bad_entry.find(f"{{{_NS_PDFA_TYPE}}}prefix")
+        assert prefix_elem is not None
+        bad_entry.remove(prefix_elem)
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+        assert result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}valueType") is None
 
     def test_no_schemas_returns_empty(self) -> None:
         """Empty input returns empty result."""
