@@ -68,6 +68,7 @@ from .filters import (
     fix_stream_lengths,
     remove_crypt_streams,
     remove_external_stream_keys,
+    sanitize_nonstandard_inline_filters,
 )
 from .font_notdef import sanitize_font_notdef
 from .font_structure import sanitize_font_structure
@@ -146,6 +147,7 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "crypt_streams_removed": 0,
         "external_stream_keys_removed": 0,
         "stream_lengths_fixed": 0,
+        "nonstandard_inline_filters_fixed": 0,
         "jbig2_converted": 0,
         "jbig2_reencoded": 0,
         "jbig2_failed": 0,
@@ -246,6 +248,11 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
 
     # Force re-encoding of non-image streams to repair /Length mismatches (6.1.7.1)
     result["stream_lengths_fixed"] = fix_stream_lengths(pdf)
+
+    # Re-encode inline images with non-Table-6 filters (6.1.10-1)
+    result["nonstandard_inline_filters_fixed"] = sanitize_nonstandard_inline_filters(
+        pdf
+    )
 
     # Convert JBIG2 streams with external globals (all levels)
     jbig2_result = convert_jbig2_external_globals(pdf)
@@ -524,6 +531,7 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "%d Btn AP subdicts fixed, "
         "%d LZW streams converted, %d Crypt filters removed, "
         "%d external stream keys removed, "
+        "%d non-standard inline filters fixed, "
         "%d JBIG2 streams converted, %d JBIG2 reencoded, %d JBIG2 failed, "
         "%d JPX colr fixed, %d JPX wrapped, %d JPX reencoded, %d JPX failed, "
         "%d OC AS entries removed, %d OC intents fixed, "
@@ -585,6 +593,7 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         result["lzw_streams_converted"],
         result["crypt_streams_removed"],
         result["external_stream_keys_removed"],
+        result["nonstandard_inline_filters_fixed"],
         result["jbig2_converted"],
         result["jbig2_reencoded"],
         result["jbig2_failed"],
@@ -707,6 +716,7 @@ __all__ = [
     "remove_crypt_streams",
     "remove_external_stream_keys",
     "fix_stream_lengths",
+    "sanitize_nonstandard_inline_filters",
     "convert_jbig2_external_globals",
     "sanitize_jpx_color_boxes",
     # Constants

@@ -23,6 +23,7 @@ from pdftopdfa.sanitizers.filters import (
     fix_stream_lengths,
     remove_crypt_streams,
     remove_external_stream_keys,
+    sanitize_nonstandard_inline_filters,
 )
 
 
@@ -640,3 +641,112 @@ class TestFixStreamLengths:
         with pikepdf.open(out) as reopened:
             page_contents = reopened.pages[0]["/Contents"]
             assert page_contents.read_bytes() == data
+
+
+# --- sanitize_nonstandard_inline_filters tests ---
+
+
+class TestNonstandardInlineImageFilters:
+    """Tests for sanitize_nonstandard_inline_filters (rule 6.1.10-1)."""
+
+    def test_jbig2_inline_filter_converted(
+        self,
+        pdf: Pdf,
+        monkeypatch,
+    ) -> None:
+        page = pdf.pages[0]
+        page[Name("/Contents")] = pdf.make_stream(
+            b"q\nBI\n/W 3 /H 3 /BPC 8 /CS /G /F /JBIG2Decode\nID\nrawdata\nEI\nQ\n"
+        )
+
+        monkeypatch.setattr(
+            "pdftopdfa.sanitizers.filters._decode_inline_image_payload",
+            lambda *_args, **_kwargs: b"\x00\x01\x02\x03",
+        )
+
+        assert sanitize_nonstandard_inline_filters(pdf) >= 1
+
+        inline_image = _first_inline_image(page)
+        assert _normalized_inline_filters(inline_image) == ["/FlateDecode"]
+        payload = inline_image._data._inline_image_raw_bytes().rstrip(b"\t\n\f\r ")
+        assert zlib.decompress(payload) == b"\x00\x01\x02\x03"
+
+    def test_jpx_inline_filter_converted(
+        self,
+        pdf: Pdf,
+        monkeypatch,
+    ) -> None:
+        page = pdf.pages[0]
+        page[Name("/Contents")] = pdf.make_stream(
+            b"q\nBI\n/W 3 /H 3 /BPC 8 /CS /G /F /JPXDecode\nID\nrawdata\nEI\nQ\n"
+        )
+
+        monkeypatch.setattr(
+            "pdftopdfa.sanitizers.filters._decode_inline_image_payload",
+            lambda *_args, **_kwargs: b"\xaa\xbb\xcc",
+        )
+
+        assert sanitize_nonstandard_inline_filters(pdf) >= 1
+
+        inline_image = _first_inline_image(page)
+        assert _normalized_inline_filters(inline_image) == ["/FlateDecode"]
+        payload = inline_image._data._inline_image_raw_bytes().rstrip(b"\t\n\f\r ")
+        assert zlib.decompress(payload) == b"\xaa\xbb\xcc"
+
+    def test_unknown_inline_filter_converted(
+        self,
+        pdf: Pdf,
+        monkeypatch,
+    ) -> None:
+        page = pdf.pages[0]
+        page[Name("/Contents")] = pdf.make_stream(
+            b"q\nBI\n/W 3 /H 3 /BPC 8 /CS /G /F /UnknownFilter\nID\nrawdata\nEI\nQ\n"
+        )
+
+        monkeypatch.setattr(
+            "pdftopdfa.sanitizers.filters._decode_inline_image_payload",
+            lambda *_args, **_kwargs: b"\x10\x20\x30",
+        )
+
+        assert sanitize_nonstandard_inline_filters(pdf) >= 1
+
+        inline_image = _first_inline_image(page)
+        assert _normalized_inline_filters(inline_image) == ["/FlateDecode"]
+        payload = inline_image._data._inline_image_raw_bytes().rstrip(b"\t\n\f\r ")
+        assert zlib.decompress(payload) == b"\x10\x20\x30"
+
+    def test_array_with_nonstandard_filter_converted(
+        self,
+        pdf: Pdf,
+        monkeypatch,
+    ) -> None:
+        page = pdf.pages[0]
+        page[Name("/Contents")] = pdf.make_stream(
+            b"q\nBI\n/W 3 /H 3 /BPC 8 /CS /G"
+            b" /F [/Fl /JBIG2Decode]\nID\nrawdata\nEI\nQ\n"
+        )
+
+        monkeypatch.setattr(
+            "pdftopdfa.sanitizers.filters._decode_inline_image_payload",
+            lambda *_args, **_kwargs: b"\xde\xad\xbe\xef",
+        )
+
+        assert sanitize_nonstandard_inline_filters(pdf) >= 1
+
+        inline_image = _first_inline_image(page)
+        assert _normalized_inline_filters(inline_image) == ["/FlateDecode"]
+        payload = inline_image._data._inline_image_raw_bytes().rstrip(b"\t\n\f\r ")
+        assert zlib.decompress(payload) == b"\xde\xad\xbe\xef"
+
+    def test_allowed_inline_filter_unchanged(
+        self,
+        pdf: Pdf,
+    ) -> None:
+        page = pdf.pages[0]
+        page[Name("/Contents")] = pdf.make_stream(
+            b"q\nBI\n/W 3 /H 3 /BPC 8 /CS /G /F /Fl\nID\n"
+            + zlib.compress(b"\x00\x01\x02")
+            + b"\nEI\nQ\n"
+        )
+
+        assert sanitize_nonstandard_inline_filters(pdf) == 0

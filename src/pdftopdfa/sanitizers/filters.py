@@ -7,7 +7,8 @@
 This module converts LZW-compressed streams to FlateDecode, removes /Crypt
 filters (both forbidden per ISO 19005-2, 6.1.8), strips external stream
 keys /F, /FFilter, /FDecodeParms (forbidden per ISO 19005-2, 6.1.7.1),
-and re-encodes non-image streams to fix /Length mismatches (rule 6.1.7.1).
+re-encodes non-image streams to fix /Length mismatches (rule 6.1.7.1),
+and re-encodes inline images with non-Table-6 filters (rule 6.1.10-1).
 """
 
 import logging
@@ -43,6 +44,17 @@ _CANONICAL_FILTER_NAMES_BY_LOWER: dict[str, str] = {
 
 _INLINE_FILTER_KEYS = frozenset({"/F", "/Filter"})
 _INLINE_DECODE_PARMS_KEYS = frozenset({"/DP", "/DecodeParms"})
+
+_INLINE_IMAGE_ALLOWED_FILTER_NAMES: frozenset[str] = frozenset(
+    {
+        "/ASCIIHexDecode",
+        "/ASCII85Decode",
+        "/FlateDecode",
+        "/RunLengthDecode",
+        "/CCITTFaxDecode",
+        "/DCTDecode",
+    }
+)
 
 
 def _normalize_inline_filter_name(filter_name: str) -> str:
@@ -247,23 +259,31 @@ def _sanitize_inline_image_filters(
     *,
     convert_lzw: bool,
     remove_crypt: bool,
+    sanitize_nonstandard: bool = False,
 ):
-    """Sanitize forbidden LZW/Crypt filters in one inline image."""
+    """Sanitize forbidden LZW/Crypt/non-Table-6 filters in one inline image."""
     filter_obj = inline_image.obj.get("/Filter")
     if filter_obj is None:
-        return None, False, False
+        return None, False, False, False
 
     normalized = _normalize_inline_filter_object(filter_obj)
     if normalized is None:
-        return None, False, False
+        return None, False, False, False
 
     normalized_names, normalized_filter_obj, normalized_changed = normalized
     has_lzw = "/LZWDecode" in normalized_names
     has_crypt = "/Crypt" in normalized_names
+    has_nonstandard = sanitize_nonstandard and any(
+        n not in _INLINE_IMAGE_ALLOWED_FILTER_NAMES
+        for n in normalized_names
+        if n not in ("/LZWDecode", "/Crypt")
+    )
 
-    should_process = (convert_lzw and has_lzw) or (remove_crypt and has_crypt)
+    should_process = (
+        (convert_lzw and has_lzw) or (remove_crypt and has_crypt) or has_nonstandard
+    )
     if not should_process and not normalized_changed:
-        return None, False, False
+        return None, False, False, False
 
     decode_parms = inline_image.obj.get("/DecodeParms")
     # Private pikepdf API (tested with pikepdf 8.x–9.x).
@@ -290,7 +310,7 @@ def _sanitize_inline_image_filters(
             replacement_tokens,
             raw_payload,
         )
-        return replacement, False, False
+        return replacement, False, False, False
 
     try:
         decoded = _decode_inline_image_payload(
@@ -299,19 +319,21 @@ def _sanitize_inline_image_filters(
         rewritten_payload = zlib.compress(decoded) + b"\n"
         replacement_filter: Name | Array | None = Name("/FlateDecode")
         replacement_decode_parms = None
+        nonstandard_fixed = has_nonstandard
     except Exception as e:
         if remove_crypt and has_crypt and not has_lzw:
             replacement_filter, replacement_decode_parms = (
                 _strip_crypt_from_filter_chain(normalized_names, decode_parms)
             )
             rewritten_payload = raw_payload
+            nonstandard_fixed = False
             logger.debug(
                 "Removed inline-image Crypt filter without payload rewrite: %s",
                 e,
             )
         else:
             logger.warning("Failed to sanitize inline image filters: %s", e)
-            return None, False, False
+            return None, False, False, False
 
     # Private pikepdf API: _image_object (see note above)
     replacement_tokens = _replace_inline_filter_tokens(
@@ -323,7 +345,12 @@ def _sanitize_inline_image_filters(
         replacement_tokens,
         rewritten_payload,
     )
-    return replacement, has_lzw and convert_lzw, has_crypt and remove_crypt
+    return (
+        replacement,
+        has_lzw and convert_lzw,
+        has_crypt and remove_crypt,
+        nonstandard_fixed,
+    )
 
 
 def _sanitize_inline_images_in_stream(
@@ -331,7 +358,8 @@ def _sanitize_inline_images_in_stream(
     *,
     convert_lzw: bool,
     remove_crypt: bool,
-) -> tuple[bool, bool]:
+    sanitize_nonstandard: bool = False,
+) -> tuple[bool, bool, bool]:
     """Sanitize inline-image filters inside one content stream."""
     try:
         with warnings.catch_warnings():
@@ -340,20 +368,24 @@ def _sanitize_inline_images_in_stream(
             )
             instructions = list(parse_content_stream(stream))
     except Exception:
-        return False, False
+        return False, False, False
 
     changed = False
     lzw_changed = False
     crypt_changed = False
+    nonstandard_changed = False
 
     for index, (operands, operator) in enumerate(instructions):
         if str(operator) != "INLINE IMAGE" or not operands:
             continue
 
-        replacement, replaced_lzw, replaced_crypt = _sanitize_inline_image_filters(
-            operands[0],
-            convert_lzw=convert_lzw,
-            remove_crypt=remove_crypt,
+        replacement, replaced_lzw, replaced_crypt, replaced_nonstandard = (
+            _sanitize_inline_image_filters(
+                operands[0],
+                convert_lzw=convert_lzw,
+                remove_crypt=remove_crypt,
+                sanitize_nonstandard=sanitize_nonstandard,
+            )
         )
         if replacement is None:
             continue
@@ -362,11 +394,12 @@ def _sanitize_inline_images_in_stream(
         changed = True
         lzw_changed = lzw_changed or replaced_lzw
         crypt_changed = crypt_changed or replaced_crypt
+        nonstandard_changed = nonstandard_changed or replaced_nonstandard
 
     if changed:
         stream.write(_unparse_content_stream(instructions))
 
-    return lzw_changed, crypt_changed
+    return lzw_changed, crypt_changed, nonstandard_changed
 
 
 def _may_contain_inline_images(stream: Stream) -> bool:
@@ -490,7 +523,7 @@ def convert_lzw_streams(pdf: Pdf) -> int:
                     logger.debug("Converted LZW stream: %s", obj.objgen)
 
             if _may_contain_inline_images(obj):
-                inline_lzw_changed, _ = _sanitize_inline_images_in_stream(
+                inline_lzw_changed, _, _ = _sanitize_inline_images_in_stream(
                     obj,
                     convert_lzw=True,
                     remove_crypt=False,
@@ -613,7 +646,7 @@ def remove_crypt_streams(pdf: Pdf) -> int:
                     logger.debug("Removed Crypt filter from stream: %s", obj.objgen)
 
             if _may_contain_inline_images(obj):
-                _, inline_crypt_removed = _sanitize_inline_images_in_stream(
+                _, inline_crypt_removed, _ = _sanitize_inline_images_in_stream(
                     obj,
                     convert_lzw=False,
                     remove_crypt=True,
@@ -717,6 +750,50 @@ def remove_external_stream_keys(pdf: Pdf) -> int:
     if fixed > 0:
         logger.info("%d stream(s) had forbidden external keys removed", fixed)
 
+    return fixed
+
+
+def sanitize_nonstandard_inline_filters(pdf: Pdf) -> int:
+    """Re-encode inline images that use filters not in ISO 32000-1, Table 6.
+
+    ISO 19005-2 rule 6.1.10-1 restricts inline image filters to the six
+    filters listed in Table 6. Any other filter (e.g. JBIG2Decode, JPXDecode,
+    or an unrecognised name) is re-encoded to FlateDecode.
+
+    Args:
+        pdf: pikepdf Pdf object (modified in place).
+
+    Returns:
+        Number of content streams containing modified inline images.
+    """
+    fixed = 0
+    for obj in pdf.objects:
+        try:
+            obj = _resolve_indirect(obj)
+            if not isinstance(obj, Stream):
+                continue
+            if not _may_contain_inline_images(obj):
+                continue
+            _, _, nonstandard_changed = _sanitize_inline_images_in_stream(
+                obj,
+                convert_lzw=False,
+                remove_crypt=False,
+                sanitize_nonstandard=True,
+            )
+            if nonstandard_changed:
+                fixed += 1
+                logger.debug(
+                    "Re-encoded non-standard inline-image filter(s) in stream: %s",
+                    obj.objgen,
+                )
+        except Exception as e:
+            logger.debug("Error processing object: %s", e)
+
+    if fixed > 0:
+        logger.info(
+            "%d stream(s) with non-standard inline-image filters re-encoded",
+            fixed,
+        )
     return fixed
 
 
