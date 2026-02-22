@@ -663,6 +663,144 @@ def _extract_extension_schema_blocks(
     return result
 
 
+def _sanitize_extension_schema_blocks(
+    blocks: dict[str, etree._Element],
+) -> dict[str, etree._Element]:
+    """Validate and repair extension schema rdf:li blocks.
+
+    Drops entire blocks missing required schema-level fields, removes individual
+    property entries that are missing required property-level fields, and drops
+    blocks whose property Seq becomes empty after sanitization.
+
+    Required schema-level fields: pdfaSchema:schema, pdfaSchema:namespaceURI,
+    pdfaSchema:prefix, pdfaSchema:property (with rdf:Seq child).
+
+    Required property-level fields: pdfaProperty:name (non-empty),
+    pdfaProperty:valueType (non-empty), pdfaProperty:category (internal/external),
+    pdfaProperty:description (non-empty).
+    """
+    ns_rdf = NAMESPACES["rdf"]
+    schema_tag = f"{{{_NS_PDFA_SCHEMA}}}schema"
+    ns_uri_tag = f"{{{_NS_PDFA_SCHEMA}}}namespaceURI"
+    prefix_tag = f"{{{_NS_PDFA_SCHEMA}}}prefix"
+    property_tag = f"{{{_NS_PDFA_SCHEMA}}}property"
+    seq_tag = f"{{{ns_rdf}}}Seq"
+    li_tag = f"{{{ns_rdf}}}li"
+    name_tag = f"{{{_NS_PDFA_PROPERTY}}}name"
+    value_type_tag = f"{{{_NS_PDFA_PROPERTY}}}valueType"
+    category_tag = f"{{{_NS_PDFA_PROPERTY}}}category"
+    description_tag = f"{{{_NS_PDFA_PROPERTY}}}description"
+
+    result: dict[str, etree._Element] = {}
+
+    for uri, li_elem in blocks.items():
+        # Schema-level checks
+        schema_elem = li_elem.find(schema_tag)
+        if schema_elem is None or not (schema_elem.text or "").strip():
+            logger.warning(
+                "Extension schema block for %s dropped: missing pdfaSchema:schema", uri
+            )
+            continue
+
+        ns_uri_elem = li_elem.find(ns_uri_tag)
+        if ns_uri_elem is None or not (ns_uri_elem.text or "").strip():
+            logger.warning(
+                "Extension schema block for %s dropped:"
+                " missing pdfaSchema:namespaceURI",
+                uri,
+            )
+            continue
+
+        prefix_elem = li_elem.find(prefix_tag)
+        if prefix_elem is None or not (prefix_elem.text or "").strip():
+            logger.warning(
+                "Extension schema block for %s dropped: missing pdfaSchema:prefix", uri
+            )
+            continue
+
+        property_elem = li_elem.find(property_tag)
+        if property_elem is None:
+            logger.warning(
+                "Extension schema block for %s dropped: missing pdfaSchema:property",
+                uri,
+            )
+            continue
+
+        seq = property_elem.find(seq_tag)
+        if seq is None:
+            logger.warning(
+                "Extension schema block for %s dropped:"
+                " pdfaSchema:property has no rdf:Seq",
+                uri,
+            )
+            continue
+
+        # Property-level checks
+        to_remove = []
+        for prop_li in seq.findall(li_tag):
+            name_elem = prop_li.find(name_tag)
+            prop_name = (name_elem.text or "").strip() if name_elem is not None else ""
+
+            vt_elem = prop_li.find(value_type_tag)
+            cat_elem = prop_li.find(category_tag)
+            desc_elem = prop_li.find(description_tag)
+
+            if name_elem is None or not prop_name:
+                logger.warning(
+                    "Extension schema %s: removing property entry with missing name",
+                    uri,
+                )
+                to_remove.append(prop_li)
+                continue
+
+            if vt_elem is None or not (vt_elem.text or "").strip():
+                logger.warning(
+                    "Extension schema %s: removing property '%s'"
+                    " — missing pdfaProperty:valueType",
+                    uri,
+                    prop_name,
+                )
+                to_remove.append(prop_li)
+                continue
+
+            if cat_elem is None or (cat_elem.text or "").strip() not in {
+                "internal",
+                "external",
+            }:
+                logger.warning(
+                    "Extension schema %s: removing property '%s'"
+                    " — invalid pdfaProperty:category",
+                    uri,
+                    prop_name,
+                )
+                to_remove.append(prop_li)
+                continue
+
+            if desc_elem is None or not (desc_elem.text or "").strip():
+                logger.warning(
+                    "Extension schema %s: removing property '%s'"
+                    " — missing pdfaProperty:description",
+                    uri,
+                    prop_name,
+                )
+                to_remove.append(prop_li)
+                continue
+
+        for prop_li in to_remove:
+            seq.remove(prop_li)
+
+        # Post-property check: drop block if Seq is now empty
+        if not seq.findall(li_tag):
+            logger.warning(
+                "Extension schema block for %s dropped: no valid properties remain", uri
+            )
+            continue
+
+        result[uri] = li_elem
+
+    return result
+
+
 def _detect_structure(elem: etree._Element, ns_rdf: str) -> str:
     """Detect the actual XMP structure type of a property element.
 
@@ -1577,6 +1715,8 @@ def create_xmp_metadata(
     original_blocks: dict[str, etree._Element] | None = None
     if existing_xmp_tree is not None and non_catalog_extension_needs:
         original_blocks = _extract_extension_schema_blocks(existing_xmp_tree)
+        if original_blocks:
+            original_blocks = _sanitize_extension_schema_blocks(original_blocks)
 
     # Build extension schemas for non-predefined properties
     # (includes properties from non-catalog XMP that lack their own

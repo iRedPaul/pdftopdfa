@@ -32,6 +32,7 @@ from pdftopdfa.metadata import (
     _parse_pdf_date,
     _parse_xmp_bytes,
     _reserialize_xmp,
+    _sanitize_extension_schema_blocks,
     _sanitize_non_catalog_metadata,
     create_xmp_metadata,
     embed_xmp_metadata,
@@ -2940,3 +2941,256 @@ class TestNonCatalogExtensionInCatalogXMP:
         xmp_bytes = create_xmp_metadata(info, 2, "B")
         xmp_str = xmp_bytes.decode("utf-8")
         assert "pdfaExtension:schemas" not in xmp_str
+
+    def test_malformed_original_block_regenerated(self) -> None:
+        """Malformed original extension schema block is dropped and regenerated."""
+        # Build source XMP with a pdfaExtension:schemas entry that is malformed
+        # (property missing pdfaProperty:category)
+        existing_xmp = (
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about=""'
+            b' xmlns:pdfaExtension="http://www.aiim.org/pdfa/ns/extension/"'
+            b' xmlns:pdfaSchema="http://www.aiim.org/pdfa/ns/schema#"'
+            b' xmlns:pdfaProperty="http://www.aiim.org/pdfa/ns/property#">'
+            b"<pdfaExtension:schemas><rdf:Bag>"
+            b'<rdf:li rdf:parseType="Resource">'
+            b"<pdfaSchema:schema>Custom</pdfaSchema:schema>"
+            b"<pdfaSchema:namespaceURI>http://example.com/custom/</pdfaSchema:namespaceURI>"
+            b"<pdfaSchema:prefix>custom</pdfaSchema:prefix>"
+            b"<pdfaSchema:property><rdf:Seq>"
+            b'<rdf:li rdf:parseType="Resource">'
+            b"<pdfaProperty:name>Foo</pdfaProperty:name>"
+            b"<pdfaProperty:valueType>Text</pdfaProperty:valueType>"
+            # pdfaProperty:category intentionally missing
+            b"<pdfaProperty:description>Foo property</pdfaProperty:description>"
+            b"</rdf:li>"
+            b"</rdf:Seq></pdfaSchema:property>"
+            b"</rdf:li>"
+            b"</rdf:Bag></pdfaExtension:schemas>"
+            b"</rdf:Description>"
+            b"</rdf:RDF></x:xmpmeta>"
+        )
+        existing_tree = etree.fromstring(existing_xmp)
+
+        info = {"title": "Test"}
+        extra = {"http://example.com/custom/": {"Foo"}}
+        xmp_bytes = create_xmp_metadata(
+            info,
+            2,
+            "B",
+            existing_xmp_tree=existing_tree,
+            non_catalog_extension_needs=extra,
+        )
+        parsed = _parse_xmp_xml(xmp_bytes)
+        ns_rdf = NAMESPACES["rdf"]
+
+        # Find the Foo property entry in the output extension schema
+        category_tag = f"{{{_NS_PDFA_PROPERTY}}}category"
+        name_tag = f"{{{_NS_PDFA_PROPERTY}}}name"
+        for li in parsed.iter(f"{{{ns_rdf}}}li"):
+            name_elem = li.find(name_tag)
+            if name_elem is not None and name_elem.text == "Foo":
+                cat_elem = li.find(category_tag)
+                # Freshly generated block uses "external" as default category
+                assert cat_elem is not None
+                assert cat_elem.text == "external"
+                return
+        pytest.fail("Foo property not found in output extension schema")
+
+    def test_valid_original_block_preserved(self) -> None:
+        """Valid original extension schema block is reused (preserves valueType)."""
+        existing_xmp = (
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about=""'
+            b' xmlns:pdfaExtension="http://www.aiim.org/pdfa/ns/extension/"'
+            b' xmlns:pdfaSchema="http://www.aiim.org/pdfa/ns/schema#"'
+            b' xmlns:pdfaProperty="http://www.aiim.org/pdfa/ns/property#">'
+            b"<pdfaExtension:schemas><rdf:Bag>"
+            b'<rdf:li rdf:parseType="Resource">'
+            b"<pdfaSchema:schema>Custom</pdfaSchema:schema>"
+            b"<pdfaSchema:namespaceURI>http://example.com/custom/</pdfaSchema:namespaceURI>"
+            b"<pdfaSchema:prefix>custom</pdfaSchema:prefix>"
+            b"<pdfaSchema:property><rdf:Seq>"
+            b'<rdf:li rdf:parseType="Resource">'
+            b"<pdfaProperty:name>Foo</pdfaProperty:name>"
+            b"<pdfaProperty:valueType>Date</pdfaProperty:valueType>"
+            b"<pdfaProperty:category>internal</pdfaProperty:category>"
+            b"<pdfaProperty:description>Foo property</pdfaProperty:description>"
+            b"</rdf:li>"
+            b"</rdf:Seq></pdfaSchema:property>"
+            b"</rdf:li>"
+            b"</rdf:Bag></pdfaExtension:schemas>"
+            b"</rdf:Description>"
+            b"</rdf:RDF></x:xmpmeta>"
+        )
+        existing_tree = etree.fromstring(existing_xmp)
+
+        info = {"title": "Test"}
+        extra = {"http://example.com/custom/": {"Foo"}}
+        xmp_bytes = create_xmp_metadata(
+            info,
+            2,
+            "B",
+            existing_xmp_tree=existing_tree,
+            non_catalog_extension_needs=extra,
+        )
+        parsed = _parse_xmp_xml(xmp_bytes)
+        ns_rdf = NAMESPACES["rdf"]
+
+        value_type_tag = f"{{{_NS_PDFA_PROPERTY}}}valueType"
+        name_tag = f"{{{_NS_PDFA_PROPERTY}}}name"
+        for li in parsed.iter(f"{{{ns_rdf}}}li"):
+            name_elem = li.find(name_tag)
+            if name_elem is not None and name_elem.text == "Foo":
+                vt_elem = li.find(value_type_tag)
+                # Original block declared Date; fresh generation would use Text
+                assert vt_elem is not None
+                assert vt_elem.text == "Date"
+                return
+        pytest.fail("Foo property not found in output extension schema")
+
+
+def _make_valid_schema_li(
+    uri: str = "http://example.com/ns/",
+    schema_name: str = "Test",
+    prefix: str = "ex",
+    prop_name: str = "MyProp",
+    value_type: str = "Text",
+    category: str = "external",
+    description: str = "My property",
+) -> etree._Element:
+    """Build a fully valid extension schema rdf:li element."""
+    ns_rdf = NAMESPACES["rdf"]
+    li = etree.Element(f"{{{ns_rdf}}}li")
+    li.set(f"{{{ns_rdf}}}parseType", "Resource")
+
+    etree.SubElement(li, f"{{{_NS_PDFA_SCHEMA}}}schema").text = schema_name
+    etree.SubElement(li, f"{{{_NS_PDFA_SCHEMA}}}namespaceURI").text = uri
+    etree.SubElement(li, f"{{{_NS_PDFA_SCHEMA}}}prefix").text = prefix
+
+    prop_elem = etree.SubElement(li, f"{{{_NS_PDFA_SCHEMA}}}property")
+    seq = etree.SubElement(prop_elem, f"{{{ns_rdf}}}Seq")
+    prop_li = etree.SubElement(seq, f"{{{ns_rdf}}}li")
+    prop_li.set(f"{{{ns_rdf}}}parseType", "Resource")
+    etree.SubElement(prop_li, f"{{{_NS_PDFA_PROPERTY}}}name").text = prop_name
+    etree.SubElement(prop_li, f"{{{_NS_PDFA_PROPERTY}}}valueType").text = value_type
+    etree.SubElement(prop_li, f"{{{_NS_PDFA_PROPERTY}}}category").text = category
+    etree.SubElement(prop_li, f"{{{_NS_PDFA_PROPERTY}}}description").text = description
+
+    return li
+
+
+class TestSanitizeExtensionSchemaBlocks:
+    """Tests for _sanitize_extension_schema_blocks."""
+
+    def test_well_formed_block_preserved(self) -> None:
+        """A fully valid block passes through unchanged."""
+        uri = "http://example.com/ns/"
+        li = _make_valid_schema_li(uri=uri)
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+
+    def test_missing_schema_name_drops_block(self) -> None:
+        """Block without pdfaSchema:schema is dropped."""
+        uri = "http://example.com/ns/"
+        li = _make_valid_schema_li(uri=uri)
+        schema_elem = li.find(f"{{{_NS_PDFA_SCHEMA}}}schema")
+        li.remove(schema_elem)
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri not in result
+
+    def test_missing_prefix_drops_block(self) -> None:
+        """Block without pdfaSchema:prefix is dropped."""
+        uri = "http://example.com/ns/"
+        li = _make_valid_schema_li(uri=uri)
+        prefix_elem = li.find(f"{{{_NS_PDFA_SCHEMA}}}prefix")
+        li.remove(prefix_elem)
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri not in result
+
+    def test_missing_property_element_drops_block(self) -> None:
+        """Block without any pdfaSchema:property child is dropped."""
+        uri = "http://example.com/ns/"
+        li = _make_valid_schema_li(uri=uri)
+        prop_elem = li.find(f"{{{_NS_PDFA_SCHEMA}}}property")
+        li.remove(prop_elem)
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri not in result
+
+    def test_invalid_category_removes_property(self) -> None:
+        """Property with invalid category is removed.
+
+        Block is kept when at least one valid property remains.
+        """
+        uri = "http://example.com/ns/"
+        ns_rdf = NAMESPACES["rdf"]
+        li = _make_valid_schema_li(uri=uri, prop_name="GoodProp")
+
+        # Add a second property with bad category
+        seq = li.find(f"{{{_NS_PDFA_SCHEMA}}}property").find(f"{{{ns_rdf}}}Seq")
+        bad_li = etree.SubElement(seq, f"{{{ns_rdf}}}li")
+        bad_li.set(f"{{{ns_rdf}}}parseType", "Resource")
+        etree.SubElement(bad_li, f"{{{_NS_PDFA_PROPERTY}}}name").text = "BadProp"
+        etree.SubElement(bad_li, f"{{{_NS_PDFA_PROPERTY}}}valueType").text = "Text"
+        etree.SubElement(bad_li, f"{{{_NS_PDFA_PROPERTY}}}category").text = "wrong"
+        etree.SubElement(bad_li, f"{{{_NS_PDFA_PROPERTY}}}description").text = "desc"
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+        # Only GoodProp should remain
+        seq_out = (
+            result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}property").find(f"{{{ns_rdf}}}Seq")
+        )
+        names = [
+            e.find(f"{{{_NS_PDFA_PROPERTY}}}name").text
+            for e in seq_out.findall(f"{{{ns_rdf}}}li")
+        ]
+        assert "GoodProp" in names
+        assert "BadProp" not in names
+
+    def test_missing_value_type_removes_property(self) -> None:
+        """Property missing pdfaProperty:valueType is removed."""
+        uri = "http://example.com/ns/"
+        ns_rdf = NAMESPACES["rdf"]
+        li = _make_valid_schema_li(uri=uri, prop_name="GoodProp")
+
+        seq = li.find(f"{{{_NS_PDFA_SCHEMA}}}property").find(f"{{{ns_rdf}}}Seq")
+        bad_li = etree.SubElement(seq, f"{{{ns_rdf}}}li")
+        bad_li.set(f"{{{ns_rdf}}}parseType", "Resource")
+        etree.SubElement(bad_li, f"{{{_NS_PDFA_PROPERTY}}}name").text = "BadProp"
+        # valueType intentionally omitted
+        etree.SubElement(bad_li, f"{{{_NS_PDFA_PROPERTY}}}category").text = "external"
+        etree.SubElement(bad_li, f"{{{_NS_PDFA_PROPERTY}}}description").text = "desc"
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+        seq_out = (
+            result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}property").find(f"{{{ns_rdf}}}Seq")
+        )
+        names = [
+            e.find(f"{{{_NS_PDFA_PROPERTY}}}name").text
+            for e in seq_out.findall(f"{{{ns_rdf}}}li")
+        ]
+        assert "GoodProp" in names
+        assert "BadProp" not in names
+
+    def test_all_properties_malformed_drops_block(self) -> None:
+        """Block whose every property is invalid is dropped after Seq becomes empty."""
+        uri = "http://example.com/ns/"
+        li = _make_valid_schema_li(uri=uri, prop_name="BadProp")
+
+        # Make the single property malformed by removing its valueType
+        ns_rdf = NAMESPACES["rdf"]
+        seq = li.find(f"{{{_NS_PDFA_SCHEMA}}}property").find(f"{{{ns_rdf}}}Seq")
+        prop_li = seq.find(f"{{{ns_rdf}}}li")
+        vt = prop_li.find(f"{{{_NS_PDFA_PROPERTY}}}valueType")
+        prop_li.remove(vt)
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri not in result
+
+    def test_no_schemas_returns_empty(self) -> None:
+        """Empty input returns empty result."""
+        assert _sanitize_extension_schema_blocks({}) == {}
