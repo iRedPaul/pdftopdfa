@@ -16,6 +16,7 @@ from typing import Any
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..color_profile import get_cmyk_profile, get_gray_profile, get_srgb_profile
+from ..exceptions import ConversionError
 from ..utils import iter_type3_fonts as _iter_type3_fonts
 from ..utils import resolve_indirect as _resolve_indirect
 
@@ -707,23 +708,25 @@ def _sanitize_colorspace_array(
     cs,
     canonical_by_name: dict[str, tuple[object, object, object]],
     visited_cs: set[tuple[int, int]],
-) -> tuple[int, int, int]:
+) -> tuple[int, int, object | None]:
     """Sanitize DeviceN/Separation consistency inside a color space object.
 
-    Returns (colorants_added, separation_arrays_normalized, devicen_over_32_warned).
+    Returns (colorants_added, separation_arrays_normalized, replacement).
+    When DeviceN has > 32 colorants the alternate colour space is returned as
+    the third element so the caller can substitute it in place of the DeviceN.
+    Otherwise the third element is None.
     """
     colorants_added = 0
     separations_normalized = 0
-    devicen_over_32_warned = 0
 
     cs = _resolve_indirect(cs)
     if not isinstance(cs, Array) or len(cs) == 0:
-        return 0, 0, 0
+        return 0, 0, None
 
     objgen = getattr(cs, "objgen", (0, 0))
     if objgen != (0, 0):
         if objgen in visited_cs:
-            return 0, 0, 0
+            return 0, 0, None
         visited_cs.add(objgen)
 
     cs_type = str(cs[0])
@@ -733,28 +736,49 @@ def _sanitize_colorspace_array(
         if len(cs) >= 3:
             alt = _resolve_indirect(cs[2])
             if isinstance(alt, Array):
-                a, b, c = _sanitize_colorspace_array(alt, canonical_by_name, visited_cs)
+                a, b, repl = _sanitize_colorspace_array(
+                    alt, canonical_by_name, visited_cs
+                )
                 colorants_added += a
                 separations_normalized += b
-                devicen_over_32_warned += c
-        return colorants_added, separations_normalized, devicen_over_32_warned
+                if repl is not None:
+                    cs[2] = repl
+        return colorants_added, separations_normalized, None
 
     if cs_type == "/DeviceN":
-        if len(cs) < 4:
-            return colorants_added, separations_normalized, devicen_over_32_warned
-
-        names = _resolve_indirect(cs[1])
+        names = _resolve_indirect(cs[1]) if len(cs) >= 2 else None
         if not isinstance(names, Array):
-            return colorants_added, separations_normalized, devicen_over_32_warned
+            return colorants_added, separations_normalized, None
 
         if len(names) > 32:
+            alternate = _resolve_indirect(cs[2]) if len(cs) >= 3 else None
+            if alternate is None:
+                raise ConversionError(
+                    f"PDF contains a DeviceN colour space with {len(names)} colorants "
+                    "(exceeds 32 per ISO 19005-2 rule 6.1.13-9) and has no alternate "
+                    "colour space; cannot repair"
+                )
+            if isinstance(alternate, Array):
+                if len(alternate) >= 1 and str(alternate[0]) == "/DeviceN":
+                    alt_names = (
+                        _resolve_indirect(alternate[1]) if len(alternate) >= 2 else None
+                    )
+                    if isinstance(alt_names, Array) and len(alt_names) > 32:
+                        raise ConversionError(
+                            f"PDF contains a DeviceN colour space with {len(names)} "
+                            "colorants (exceeds 32 per ISO 19005-2 rule 6.1.13-9); "
+                            "its alternate is also a DeviceN with too many colorants; "
+                            "cannot repair"
+                        )
             logger.warning(
-                "DeviceN color space has %d colorants (max 32 per ISO 19005-2"
-                " rule 6.1.13-9); cannot fix automatically without altering"
-                " visual appearance",
+                "DeviceN colour space has %d colorants (exceeds 32, ISO 19005-2 "
+                "rule 6.1.13-9); replacing with alternate colour space (lossy)",
                 len(names),
             )
-            devicen_over_32_warned += 1
+            return 0, 0, cs[2]
+
+        if len(cs) < 4:
+            return colorants_added, separations_normalized, None
 
         # DeviceN attributes dictionary (index 4) is optional.
         attrs = _resolve_indirect(cs[4]) if len(cs) >= 5 else None
@@ -798,60 +822,68 @@ def _sanitize_colorspace_array(
         for cname in list(colorants.keys()):
             cspace = _resolve_indirect(colorants[cname])
             if isinstance(cspace, Array):
-                a, b, c = _sanitize_colorspace_array(
+                a, b, repl = _sanitize_colorspace_array(
                     cspace, canonical_by_name, visited_cs
                 )
                 colorants_added += a
                 separations_normalized += b
-                devicen_over_32_warned += c
+                if repl is not None:
+                    colorants[Name(cname)] = repl
 
         alt = _resolve_indirect(alternate)
         if isinstance(alt, Array):
-            a, b, c = _sanitize_colorspace_array(alt, canonical_by_name, visited_cs)
+            a, b, repl = _sanitize_colorspace_array(alt, canonical_by_name, visited_cs)
             colorants_added += a
             separations_normalized += b
-            devicen_over_32_warned += c
+            if repl is not None:
+                cs[2] = repl
 
-        return colorants_added, separations_normalized, devicen_over_32_warned
+        return colorants_added, separations_normalized, None
 
     if cs_type == "/Indexed" and len(cs) >= 2:
         base = _resolve_indirect(cs[1])
         if isinstance(base, Array):
-            return _sanitize_colorspace_array(base, canonical_by_name, visited_cs)
-        return 0, 0, 0
+            a, b, repl = _sanitize_colorspace_array(base, canonical_by_name, visited_cs)
+            if repl is not None:
+                cs[1] = repl
+            return a, b, None
+        return 0, 0, None
 
     if cs_type == "/Pattern" and len(cs) >= 2:
         base = _resolve_indirect(cs[1])
         if isinstance(base, Array):
-            return _sanitize_colorspace_array(base, canonical_by_name, visited_cs)
-        return 0, 0, 0
+            a, b, repl = _sanitize_colorspace_array(base, canonical_by_name, visited_cs)
+            if repl is not None:
+                cs[1] = repl
+            return a, b, None
+        return 0, 0, None
 
-    return 0, 0, 0
+    return 0, 0, None
 
 
 def _sanitize_special_colorspaces_in_resources(
     resources,
     canonical_by_name: dict[str, tuple[object, object, object]],
     visited_cs: set[tuple[int, int]],
-) -> tuple[int, int, int]:
+) -> tuple[int, int]:
     """Sanitize DeviceN/Separation rules in one Resources dictionary."""
     colorants_added = 0
     separations_normalized = 0
-    devicen_over_32_warned = 0
 
     resources = _resolve_indirect(resources)
     if not isinstance(resources, Dictionary):
-        return 0, 0, 0
+        return 0, 0
 
     colorspaces = _resolve_indirect(resources.get("/ColorSpace"))
     if isinstance(colorspaces, Dictionary):
         for cs_name in list(colorspaces.keys()):
-            a, b, c = _sanitize_colorspace_array(
+            a, b, repl = _sanitize_colorspace_array(
                 colorspaces[cs_name], canonical_by_name, visited_cs
             )
             colorants_added += a
             separations_normalized += b
-            devicen_over_32_warned += c
+            if repl is not None:
+                colorspaces[cs_name] = repl
 
     xobjects = _resolve_indirect(resources.get("/XObject"))
     if isinstance(xobjects, Dictionary):
@@ -864,12 +896,13 @@ def _sanitize_special_colorspaces_in_resources(
             cs = xobj.get("/ColorSpace")
             if not cs:
                 continue
-            a, b, c = _sanitize_colorspace_array(cs, canonical_by_name, visited_cs)
+            a, b, repl = _sanitize_colorspace_array(cs, canonical_by_name, visited_cs)
             colorants_added += a
             separations_normalized += b
-            devicen_over_32_warned += c
+            if repl is not None:
+                xobj[Name.ColorSpace] = repl
 
-    return colorants_added, separations_normalized, devicen_over_32_warned
+    return colorants_added, separations_normalized
 
 
 def _sanitize_special_colorspaces_in_forms_recursive(
@@ -877,19 +910,18 @@ def _sanitize_special_colorspaces_in_forms_recursive(
     visited_forms: set[tuple[int, int]],
     canonical_by_name: dict[str, tuple[object, object, object]],
     visited_cs: set[tuple[int, int]],
-) -> tuple[int, int, int]:
+) -> tuple[int, int]:
     """Recurse into Form XObjects and sanitize their nested resources."""
     colorants_added = 0
     separations_normalized = 0
-    devicen_over_32_warned = 0
 
     resources = _resolve_indirect(resources)
     if not isinstance(resources, Dictionary):
-        return 0, 0, 0
+        return 0, 0
 
     xobjects = _resolve_indirect(resources.get("/XObject"))
     if not isinstance(xobjects, Dictionary):
-        return 0, 0, 0
+        return 0, 0
 
     for xobj_name in list(xobjects.keys()):
         xobj = _resolve_indirect(xobjects[xobj_name])
@@ -910,21 +942,19 @@ def _sanitize_special_colorspaces_in_forms_recursive(
             continue
         form_resources = _resolve_indirect(form_resources)
 
-        a, b, c = _sanitize_special_colorspaces_in_resources(
+        a, b = _sanitize_special_colorspaces_in_resources(
             form_resources, canonical_by_name, visited_cs
         )
         colorants_added += a
         separations_normalized += b
-        devicen_over_32_warned += c
 
-        a, b, c = _sanitize_special_colorspaces_in_forms_recursive(
+        a, b = _sanitize_special_colorspaces_in_forms_recursive(
             form_resources, visited_forms, canonical_by_name, visited_cs
         )
         colorants_added += a
         separations_normalized += b
-        devicen_over_32_warned += c
 
-    return colorants_added, separations_normalized, devicen_over_32_warned
+    return colorants_added, separations_normalized
 
 
 def _sanitize_special_colorspaces_in_ap_stream(
@@ -932,11 +962,10 @@ def _sanitize_special_colorspaces_in_ap_stream(
     visited_forms: set[tuple[int, int]],
     canonical_by_name: dict[str, tuple[object, object, object]],
     visited_cs: set[tuple[int, int]],
-) -> tuple[int, int, int]:
+) -> tuple[int, int]:
     """Sanitize DeviceN/Separation rules in annotation AP stream resources."""
     colorants_added = 0
     separations_normalized = 0
-    devicen_over_32_warned = 0
 
     ap_entry = _resolve_indirect(ap_entry)
 
@@ -944,18 +973,16 @@ def _sanitize_special_colorspaces_in_ap_stream(
         form_resources = ap_entry.get("/Resources")
         if form_resources:
             form_resources = _resolve_indirect(form_resources)
-            a, b, c = _sanitize_special_colorspaces_in_resources(
+            a, b = _sanitize_special_colorspaces_in_resources(
                 form_resources, canonical_by_name, visited_cs
             )
             colorants_added += a
             separations_normalized += b
-            devicen_over_32_warned += c
-            a, b, c = _sanitize_special_colorspaces_in_forms_recursive(
+            a, b = _sanitize_special_colorspaces_in_forms_recursive(
                 form_resources, visited_forms, canonical_by_name, visited_cs
             )
             colorants_added += a
             separations_normalized += b
-            devicen_over_32_warned += c
     elif isinstance(ap_entry, Dictionary):
         for state_name in list(ap_entry.keys()):
             state_stream = _resolve_indirect(ap_entry[state_name])
@@ -965,20 +992,18 @@ def _sanitize_special_colorspaces_in_ap_stream(
             if not form_resources:
                 continue
             form_resources = _resolve_indirect(form_resources)
-            a, b, c = _sanitize_special_colorspaces_in_resources(
+            a, b = _sanitize_special_colorspaces_in_resources(
                 form_resources, canonical_by_name, visited_cs
             )
             colorants_added += a
             separations_normalized += b
-            devicen_over_32_warned += c
-            a, b, c = _sanitize_special_colorspaces_in_forms_recursive(
+            a, b = _sanitize_special_colorspaces_in_forms_recursive(
                 form_resources, visited_forms, canonical_by_name, visited_cs
             )
             colorants_added += a
             separations_normalized += b
-            devicen_over_32_warned += c
 
-    return colorants_added, separations_normalized, devicen_over_32_warned
+    return colorants_added, separations_normalized
 
 
 def _sanitize_special_colorspaces_in_type3_fonts(
@@ -986,11 +1011,10 @@ def _sanitize_special_colorspaces_in_type3_fonts(
     visited_forms: set[tuple[int, int]],
     canonical_by_name: dict[str, tuple[object, object, object]],
     visited_cs: set[tuple[int, int]],
-) -> tuple[int, int, int]:
+) -> tuple[int, int]:
     """Sanitize DeviceN/Separation rules in Type3 font resources."""
     colorants_added = 0
     separations_normalized = 0
-    devicen_over_32_warned = 0
 
     for _font_name, font in _iter_type3_fonts(resources, visited_forms):
         font_resources = font.get("/Resources")
@@ -1000,33 +1024,29 @@ def _sanitize_special_colorspaces_in_type3_fonts(
         if not isinstance(font_resources, Dictionary):
             continue
 
-        a, b, c = _sanitize_special_colorspaces_in_resources(
+        a, b = _sanitize_special_colorspaces_in_resources(
             font_resources, canonical_by_name, visited_cs
         )
         colorants_added += a
         separations_normalized += b
-        devicen_over_32_warned += c
 
-        a, b, c = _sanitize_special_colorspaces_in_forms_recursive(
+        a, b = _sanitize_special_colorspaces_in_forms_recursive(
             font_resources, visited_forms, canonical_by_name, visited_cs
         )
         colorants_added += a
         separations_normalized += b
-        devicen_over_32_warned += c
 
-    return colorants_added, separations_normalized, devicen_over_32_warned
+    return colorants_added, separations_normalized
 
 
-def sanitize_special_colorspace_consistency(pdf: Pdf) -> tuple[int, int, int]:
+def sanitize_special_colorspace_consistency(pdf: Pdf) -> tuple[int, int]:
     """Fix DeviceN Colorants completeness and Separation consistency.
 
     Returns:
-        Tuple of (device_n_colorants_added, separation_arrays_normalized,
-        devicen_over_32_warned).
+        Tuple of (device_n_colorants_added, separation_arrays_normalized).
     """
     colorants_added = 0
     separations_normalized = 0
-    devicen_over_32_warned = 0
     visited_forms: set[tuple[int, int]] = set()
     visited_cs: set[tuple[int, int]] = set()
     canonical_by_name: dict[str, tuple[object, object, object]] = {}
@@ -1038,26 +1058,23 @@ def sanitize_special_colorspace_consistency(pdf: Pdf) -> tuple[int, int, int]:
             if resources:
                 resources = _resolve_indirect(resources)
 
-                a, b, c = _sanitize_special_colorspaces_in_resources(
+                a, b = _sanitize_special_colorspaces_in_resources(
                     resources, canonical_by_name, visited_cs
                 )
                 colorants_added += a
                 separations_normalized += b
-                devicen_over_32_warned += c
 
-                a, b, c = _sanitize_special_colorspaces_in_forms_recursive(
+                a, b = _sanitize_special_colorspaces_in_forms_recursive(
                     resources, visited_forms, canonical_by_name, visited_cs
                 )
                 colorants_added += a
                 separations_normalized += b
-                devicen_over_32_warned += c
 
-                a, b, c = _sanitize_special_colorspaces_in_type3_fonts(
+                a, b = _sanitize_special_colorspaces_in_type3_fonts(
                     resources, visited_forms, canonical_by_name, visited_cs
                 )
                 colorants_added += a
                 separations_normalized += b
-                devicen_over_32_warned += c
 
             annots = page_dict.get("/Annots")
             if annots:
@@ -1076,28 +1093,28 @@ def sanitize_special_colorspace_consistency(pdf: Pdf) -> tuple[int, int, int]:
                             ap_entry = ap.get(ap_key)
                             if not ap_entry:
                                 continue
-                            a, b, c = _sanitize_special_colorspaces_in_ap_stream(
+                            a, b = _sanitize_special_colorspaces_in_ap_stream(
                                 ap_entry, visited_forms, canonical_by_name, visited_cs
                             )
                             colorants_added += a
                             separations_normalized += b
-                            devicen_over_32_warned += c
 
+        except ConversionError:
+            raise
         except Exception as e:
             logger.debug(
                 "Error sanitizing special color spaces on page %d: %s", page_num, e
             )
 
-    if colorants_added or separations_normalized or devicen_over_32_warned:
+    if colorants_added or separations_normalized:
         logger.info(
             "Special color spaces sanitized: colorants_added=%d, "
-            "separations_normalized=%d, devicen_over_32_warned=%d",
+            "separations_normalized=%d",
             colorants_added,
             separations_normalized,
-            devicen_over_32_warned,
         )
 
-    return colorants_added, separations_normalized, devicen_over_32_warned
+    return colorants_added, separations_normalized
 
 
 def _warn_device_dependent_alternates(pdf: Pdf) -> int:
@@ -1185,13 +1202,12 @@ def sanitize_colorspaces(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         - devicen_colorants_added: int
         - separation_arrays_normalized: int
         - device_dependent_alternates: int
-        - devicen_over_32_warned: int
     """
     validated, warnings, repaired = validate_embedded_icc_profiles(
         pdf, level, repair=True
     )
-    colorants_added, separations_normalized, devicen_over_32_warned = (
-        sanitize_special_colorspace_consistency(pdf)
+    colorants_added, separations_normalized = sanitize_special_colorspace_consistency(
+        pdf
     )
     device_dep = _warn_device_dependent_alternates(pdf)
 
@@ -1201,5 +1217,4 @@ def sanitize_colorspaces(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "devicen_colorants_added": colorants_added,
         "separation_arrays_normalized": separations_normalized,
         "device_dependent_alternates": device_dep,
-        "devicen_over_32_warned": devicen_over_32_warned,
     }

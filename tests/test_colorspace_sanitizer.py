@@ -18,6 +18,7 @@ from pdftopdfa.color_profile import (
     detect_color_spaces,
     get_srgb_profile,
 )
+from pdftopdfa.exceptions import ConversionError
 from pdftopdfa.sanitizers.colorspaces import (
     sanitize_colorspaces,
     validate_embedded_icc_profiles,
@@ -1247,8 +1248,8 @@ class TestSpecialColorSpaceConsistency:
         assert str(colorant_sep[2]) == str(canonical_out[2])
         assert colorant_sep[3].objgen == canonical_out[3].objgen
 
-    def test_devicen_over_32_colorants_warns(self, caplog):
-        """DeviceN with more than 32 colorants emits a warning (rule 6.1.13-9)."""
+    def test_devicen_over_32_colorants_replaced_by_alternate(self, caplog):
+        """DeviceN > 32 colorants replaced by alternate (lossy, rule 6.1.13-9)."""
         import logging
 
         pdf = new_pdf()
@@ -1259,15 +1260,7 @@ class TestSpecialColorSpaceConsistency:
         tint_func[Name.Range] = Array([0, 1, 0, 1, 0, 1, 0, 1])
 
         spot_names = Array([Name(f"/Spot{i}") for i in range(33)])
-
-        devicen_cs = Array(
-            [
-                Name.DeviceN,
-                spot_names,
-                Name.DeviceCMYK,
-                tint_func,
-            ]
-        )
+        devicen_cs = Array([Name.DeviceN, spot_names, Name.DeviceCMYK, tint_func])
 
         page_dict = Dictionary(
             Type=Name.Page,
@@ -1276,11 +1269,77 @@ class TestSpecialColorSpaceConsistency:
         )
         pdf.pages.append(pikepdf.Page(page_dict))
 
-        with caplog.at_level(logging.WARNING):
-            result = sanitize_colorspaces(pdf, "3b")
+        with caplog.at_level(logging.WARNING, logger="pdftopdfa"):
+            sanitize_colorspaces(pdf, "3b")
 
-        assert result["devicen_over_32_warned"] == 1
-        assert any("6.1.13-9" in record.message for record in caplog.records)
+        assert "6.1.13-9" in caplog.text
+        cs0 = pdf.pages[0].Resources.ColorSpace.CS0
+        assert str(cs0) != "/DeviceN"
+
+    def test_devicen_over_32_colorants_missing_alternate_raises(self):
+        """DeviceN > 32 colorants with no alternate raises ConversionError."""
+        pdf = new_pdf()
+
+        spot_names = Array([Name(f"/Spot{i}") for i in range(33)])
+        # Only 2-element array: [/DeviceN, [names]] — no alternate
+        devicen_cs = Array([Name.DeviceN, spot_names])
+
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(ColorSpace=Dictionary(CS0=devicen_cs)),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+
+        with pytest.raises(ConversionError, match="6.1.13-9"):
+            sanitize_colorspaces(pdf, "3b")
+
+    def test_devicen_over_32_colorants_bad_alternate_raises(self):
+        """DeviceN > 32 colorants with DeviceN > 32 alternate raises ConversionError."""
+        pdf = new_pdf()
+
+        tint_func = pdf.make_stream(b"{ " + b"pop " * 33 + b"0 0 0 1 }")
+        tint_func[Name.FunctionType] = 4
+        tint_func[Name.Domain] = Array([0, 1] * 33)
+        tint_func[Name.Range] = Array([0, 1, 0, 1, 0, 1, 0, 1])
+
+        alt_names = Array([Name(f"/AltSpot{i}") for i in range(33)])
+        bad_alternate = Array([Name.DeviceN, alt_names, Name.DeviceCMYK, tint_func])
+
+        spot_names = Array([Name(f"/Spot{i}") for i in range(33)])
+        devicen_cs = Array([Name.DeviceN, spot_names, bad_alternate, tint_func])
+
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(ColorSpace=Dictionary(CS0=devicen_cs)),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+
+        with pytest.raises(ConversionError, match="6.1.13-9"):
+            sanitize_colorspaces(pdf, "3b")
+
+    def test_devicen_exactly_32_colorants_passes(self):
+        """DeviceN with exactly 32 colorants does not raise (rule 6.1.13-9 boundary)."""
+        pdf = new_pdf()
+
+        tint_func = pdf.make_stream(b"{ " + b"pop " * 32 + b"0 0 0 1 }")
+        tint_func[Name.FunctionType] = 4
+        tint_func[Name.Domain] = Array([0, 1] * 32)
+        tint_func[Name.Range] = Array([0, 1, 0, 1, 0, 1, 0, 1])
+
+        spot_names = Array([Name(f"/Spot{i}") for i in range(32)])
+        devicen_cs = Array([Name.DeviceN, spot_names, Name.DeviceCMYK, tint_func])
+
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(ColorSpace=Dictionary(CS0=devicen_cs)),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+
+        # Should not raise
+        sanitize_colorspaces(pdf, "3b")
 
 
 class TestICCMissingNDerivedFromProfile:
