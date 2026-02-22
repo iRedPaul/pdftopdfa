@@ -66,11 +66,39 @@ class TestStructureLimitsSanitizer:
         assert bytes(text_op.operands[0]) == b"HEP"
         assert result["hex_odd_fixed"] == 1
 
-    def test_raises_for_non_hexadecimal_string_in_text_operator(self) -> None:
+    def test_strips_invalid_chars_from_hex_string_in_text_operator(self) -> None:
+        # <48G5>: 'G' is not a valid hex digit — strip it → <485> (odd) → <4850> = b"HP"
         pdf = _make_page_pdf(b"BT <48G5> Tj ET")
 
-        with pytest.raises(UnsupportedPDFError, match="Malformed hexadecimal"):
-            sanitize_structure_limits(pdf)
+        result = sanitize_structure_limits(pdf)
+
+        instructions = list(pikepdf.parse_content_stream(pdf.pages[0].Contents))
+        text_op = next(
+            i
+            for i in instructions
+            if not isinstance(i, pikepdf.ContentStreamInlineImage)
+            and str(i.operator) == "Tj"
+        )
+        assert bytes(text_op.operands[0]) == b"HP"
+        assert result["hex_invalid_fixed"] == 1
+        assert result["hex_odd_fixed"] == 1  # odd after stripping
+
+    def test_strips_all_invalid_chars_leaves_empty_hex_string(self) -> None:
+        # <GGG>: all chars invalid — stripped to <> (empty string = b"")
+        pdf = _make_page_pdf(b"BT <GGG> Tj ET")
+
+        result = sanitize_structure_limits(pdf)
+
+        instructions = list(pikepdf.parse_content_stream(pdf.pages[0].Contents))
+        text_op = next(
+            i
+            for i in instructions
+            if not isinstance(i, pikepdf.ContentStreamInlineImage)
+            and str(i.operator) == "Tj"
+        )
+        assert bytes(text_op.operands[0]) == b""
+        assert result["hex_invalid_fixed"] == 1
+        assert result["hex_odd_fixed"] == 0  # empty is even-length (0)
 
     def test_rebalances_q_q_nesting_to_28(self) -> None:
         q_count = 29
@@ -249,11 +277,12 @@ end
         with pytest.raises(UnsupportedPDFError, match="CID values greater than 65535"):
             sanitize_structure_limits(pdf)
 
-    def test_pipeline_raises_for_non_hex_text_stream(self) -> None:
+    def test_pipeline_fixes_non_hex_text_stream(self) -> None:
         pdf = _make_page_pdf(b"BT <48G5> Tj ET")
 
-        with pytest.raises(UnsupportedPDFError, match="Malformed hexadecimal"):
-            sanitize_for_pdfa(pdf, "2b")
+        result = sanitize_for_pdfa(pdf, "2b")
+
+        assert result["structure_hex_invalid_fixed"] == 1
 
     def test_tolerates_cross_stream_boundary_text_operator(self) -> None:
         """A Contents array may split a TJ instruction across streams."""

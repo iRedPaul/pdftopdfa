@@ -93,6 +93,7 @@ _SANITIZE_WARNINGS: list[tuple[str, str]] = [
     ("structure_reals_normalized", "out-of-range real operand(s) clamped/normalized"),
     ("structure_q_nesting_rebalanced", "q/Q graphics-state operator(s) rebalanced"),
     ("structure_hex_odd_fixed", "odd-length hexadecimal string(s) fixed"),
+    ("structure_hex_invalid_fixed", "invalid hexadecimal string(s) repaired"),
 ]
 
 # Sanitization keys that indicate fatal failures.
@@ -131,6 +132,7 @@ _LATE_STRUCTURE_WARNINGS: list[tuple[str, str]] = [
     ("reals_normalized", "out-of-range real operand(s) clamped or normalized"),
     ("q_nesting_rebalanced", "q/Q graphics-state operator(s) rebalanced"),
     ("hex_odd_fixed", "odd-length hexadecimal string(s) fixed"),
+    ("hex_invalid_fixed", "invalid hexadecimal string(s) repaired"),
 ]
 
 

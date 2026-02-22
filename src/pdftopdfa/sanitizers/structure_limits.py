@@ -307,6 +307,26 @@ def _count_odd_hex_string_tokens(stream_data: bytes) -> int:
     return odd
 
 
+def _strip_invalid_hex_chars(stream_data: bytes) -> tuple[bytes, int]:
+    """Remove non-hexadecimal characters from hex string tokens.
+
+    Returns (modified_bytes, count_of_fixed_tokens).
+    Whitespace inside hex strings is preserved (it is already valid per spec).
+    """
+    count = 0
+
+    def _fix(m: re.Match[bytes]) -> bytes:
+        nonlocal count
+        inner = m.group(1)
+        cleaned = bytes(b for b in inner if b in _HEX_DIGITS or b in b" \t\n\r")
+        if cleaned != inner:
+            count += 1
+            return b"<" + cleaned + b">"
+        return m.group(0)
+
+    return re.sub(rb"(?<!<)<([^<>]*)>(?!>)", _fix, stream_data), count
+
+
 def _sanitize_content_stream(stream_obj: Stream, stats: dict[str, int]) -> None:
     """Sanitize one parsed content stream."""
     try:
@@ -314,6 +334,13 @@ def _sanitize_content_stream(stream_obj: Stream, stats: dict[str, int]) -> None:
     except Exception as e:
         logger.debug("Skipping unreadable content stream %s: %s", stream_obj.objgen, e)
         return
+
+    # Strip non-hex chars before counting or parsing (rule 6.1.6-2).
+    raw, invalid_hex = _strip_invalid_hex_chars(raw)
+    if invalid_hex > 0:
+        stats["hex_invalid_fixed"] += invalid_hex
+        stream_obj.write(raw)  # update stream so pikepdf parser sees clean bytes
+
     odd_hex = _count_odd_hex_string_tokens(raw)
     if odd_hex > 0:
         stats["hex_odd_fixed"] += odd_hex
@@ -326,29 +353,6 @@ def _sanitize_content_stream(stream_obj: Stream, stats: dict[str, int]) -> None:
             instructions = list(pikepdf.parse_content_stream(stream_obj))
     except Exception:
         return
-
-    inside_bt = False
-    for instruction in instructions:
-        if isinstance(instruction, pikepdf.ContentStreamInlineImage):
-            continue
-        op_name = str(instruction.operator)
-        if op_name == "BT":
-            inside_bt = True
-            continue
-        if op_name == "ET":
-            inside_bt = False
-            continue
-        if op_name not in _TEXT_OPERATORS:
-            continue
-        if not inside_bt and len(instruction.operands) == 0:
-            # Cross-stream boundary: operator split across Contents array
-            # entries — the operands reside in the preceding stream.
-            continue
-        if not _validate_text_operands(op_name, instruction.operands):
-            raise UnsupportedPDFError(
-                "Malformed hexadecimal string in text operator "
-                "(contains non-hexadecimal characters) is not safely repairable."
-            )
 
     depth = 0
     suppressed_q = 0
@@ -392,7 +396,7 @@ def _sanitize_content_stream(stream_obj: Stream, stats: dict[str, int]) -> None:
         else:
             rewritten.append(instruction)
 
-    if changed or odd_hex > 0:
+    if changed or odd_hex > 0 or invalid_hex > 0:
         stream_obj.write(pikepdf.unparse_content_stream(rewritten))
 
 
@@ -586,6 +590,7 @@ def sanitize_structure_limits(pdf: Pdf) -> dict[str, int]:
         "reals_normalized": 0,
         "q_nesting_rebalanced": 0,
         "hex_odd_fixed": 0,
+        "hex_invalid_fixed": 0,
     }
 
     _ensure_no_cid_overflow(pdf)
@@ -617,7 +622,8 @@ def sanitize_structure_limits(pdf: Pdf) -> dict[str, int]:
     logger.info(
         "Structure limits sanitized: %d strings truncated, %d names shortened, "
         "%d UTF-8 names fixed, %d integers clamped, %d out-of-range reals sanitized, "
-        "%d q/Q nesting ops rebalanced, %d odd hex strings fixed",
+        "%d q/Q nesting ops rebalanced, %d odd hex strings fixed, "
+        "%d invalid hex strings repaired",
         stats["strings_truncated"],
         stats["names_shortened"],
         stats["utf8_names_fixed"],
@@ -625,6 +631,7 @@ def sanitize_structure_limits(pdf: Pdf) -> dict[str, int]:
         stats["reals_normalized"],
         stats["q_nesting_rebalanced"],
         stats["hex_odd_fixed"],
+        stats["hex_invalid_fixed"],
     )
 
     return stats
