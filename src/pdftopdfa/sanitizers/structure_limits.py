@@ -193,6 +193,31 @@ def _sanitize_string(value: Any) -> tuple[Any, bool]:
     return pikepdf.String(raw[:_MAX_STRING_BYTES]), True
 
 
+def _fix_odd_hex_string(value: pikepdf.String) -> pikepdf.String:
+    """Pad odd-length hexadecimal string literals with a trailing zero."""
+    try:
+        literal = value.unparse()
+    except Exception:
+        return value
+
+    if not (literal.startswith(b"<") and literal.endswith(b">")):
+        return value
+
+    inner = literal[1:-1]
+    normalized = re.sub(rb"\s+", b"", inner)
+    if not normalized:
+        return value
+    if any(char not in _HEX_DIGITS for char in normalized):
+        return value
+    if len(normalized) % 2 == 0:
+        return value
+
+    try:
+        return pikepdf.String.parse(b"<" + inner + b"0>")
+    except Exception:
+        return value
+
+
 def _sanitize_operand(value: Any, stats: dict[str, int]) -> tuple[Any, bool]:
     """Sanitize an operand in a parsed content stream instruction."""
     value = _resolve(value)
@@ -484,6 +509,12 @@ def _sanitize_object_graph(
             stats["utf8_names_fixed"] += 1
         return replacement
 
+    if isinstance(obj, pikepdf.String):
+        fixed_string = _fix_odd_hex_string(obj)
+        if fixed_string is not obj:
+            stats["hex_odd_obj_fixed"] += 1
+            obj = fixed_string
+
     obj, string_changed = _sanitize_string(obj)
     if string_changed:
         stats["strings_truncated"] += 1
@@ -590,6 +621,7 @@ def sanitize_structure_limits(pdf: Pdf) -> dict[str, int]:
         "reals_normalized": 0,
         "q_nesting_rebalanced": 0,
         "hex_odd_fixed": 0,
+        "hex_odd_obj_fixed": 0,
         "hex_invalid_fixed": 0,
     }
 
@@ -623,6 +655,7 @@ def sanitize_structure_limits(pdf: Pdf) -> dict[str, int]:
         "Structure limits sanitized: %d strings truncated, %d names shortened, "
         "%d UTF-8 names fixed, %d integers clamped, %d out-of-range reals sanitized, "
         "%d q/Q nesting ops rebalanced, %d odd hex strings fixed, "
+        "%d odd hex object strings fixed, "
         "%d invalid hex strings repaired",
         stats["strings_truncated"],
         stats["names_shortened"],
@@ -631,6 +664,7 @@ def sanitize_structure_limits(pdf: Pdf) -> dict[str, int]:
         stats["reals_normalized"],
         stats["q_nesting_rebalanced"],
         stats["hex_odd_fixed"],
+        stats["hex_odd_obj_fixed"],
         stats["hex_invalid_fixed"],
     )
 

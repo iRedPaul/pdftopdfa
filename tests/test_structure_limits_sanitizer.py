@@ -51,6 +51,25 @@ def _max_q_depth(stream_obj: pikepdf.Stream) -> int:
 class TestStructureLimitsSanitizer:
     """Tests for structure limit repairs and unsupported detection."""
 
+    @staticmethod
+    def _patch_string_unparse(
+        monkeypatch: pytest.MonkeyPatch, sentinel: bytes, token: bytes
+    ) -> None:
+        """Patch Object.unparse so one sentinel string emits a chosen raw token."""
+        object_type = type(pikepdf.String(b""))
+        original_unparse = object_type.unparse
+
+        def _patched_unparse(obj) -> bytes:
+            if isinstance(obj, pikepdf.String):
+                try:
+                    if bytes(obj) == sentinel:
+                        return token
+                except Exception:
+                    pass
+            return original_unparse(obj)
+
+        monkeypatch.setattr(object_type, "unparse", _patched_unparse)
+
     def test_fixes_odd_hex_string_in_text_operator(self) -> None:
         pdf = _make_page_pdf(b"BT <48455> Tj ET")
 
@@ -99,6 +118,58 @@ class TestStructureLimitsSanitizer:
         assert bytes(text_op.operands[0]) == b""
         assert result["hex_invalid_fixed"] == 1
         assert result["hex_odd_fixed"] == 0  # empty is even-length (0)
+
+    def test_fixes_odd_hex_string_in_dictionary_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pdf = new_pdf()
+        sentinel = b"__ODD_HEX_OBJ_SENTINEL__"
+        pdf.Root[Name("/HexValue")] = pikepdf.String(sentinel)
+        self._patch_string_unparse(monkeypatch, sentinel, b"<ABC>")
+
+        result = sanitize_structure_limits(pdf)
+
+        assert bytes(pdf.Root["/HexValue"]) == b"\xab\xc0"
+        assert result["hex_odd_obj_fixed"] == 1
+
+    def test_keeps_even_hex_string_in_dictionary_value_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pdf = new_pdf()
+        sentinel = b"__EVEN_HEX_OBJ_SENTINEL__"
+        pdf.Root[Name("/HexValue")] = pikepdf.String(sentinel)
+        self._patch_string_unparse(monkeypatch, sentinel, b"<ABCD>")
+
+        result = sanitize_structure_limits(pdf)
+
+        assert bytes(pdf.Root["/HexValue"]) == sentinel
+        assert result["hex_odd_obj_fixed"] == 0
+
+    def test_keeps_literal_string_in_dictionary_value_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pdf = new_pdf()
+        sentinel = b"__LITERAL_OBJ_SENTINEL__"
+        pdf.Root[Name("/HexValue")] = pikepdf.String(sentinel)
+        self._patch_string_unparse(monkeypatch, sentinel, b"(ABC)")
+
+        result = sanitize_structure_limits(pdf)
+
+        assert bytes(pdf.Root["/HexValue"]) == sentinel
+        assert result["hex_odd_obj_fixed"] == 0
+
+    def test_fixes_odd_hex_string_with_embedded_whitespace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pdf = new_pdf()
+        sentinel = b"__WHITESPACE_HEX_OBJ_SENTINEL__"
+        pdf.Root[Name("/HexValue")] = pikepdf.String(sentinel)
+        self._patch_string_unparse(monkeypatch, sentinel, b"<41 4>")
+
+        result = sanitize_structure_limits(pdf)
+
+        assert bytes(pdf.Root["/HexValue"]) == b"A@"
+        assert result["hex_odd_obj_fixed"] == 1
 
     def test_rebalances_q_q_nesting_to_28(self) -> None:
         q_count = 29
