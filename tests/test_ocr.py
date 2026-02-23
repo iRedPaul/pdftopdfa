@@ -682,6 +682,7 @@ class TestOcrQuality:
         assert settings["skip_text"] is True
         assert settings["deskew"] is True
         assert settings["rotate_pages"] is True
+        assert settings["rotate_pages_threshold"] == 5.0
         assert settings["oversample"] == 200
         assert settings["optimize"] == 0
         assert settings["progress_bar"] is False

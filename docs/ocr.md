@@ -89,11 +89,14 @@ The presets map to the following ocrmypdf parameters:
 | `skip_text` | True | True | True |
 | `deskew` | False | False | True |
 | `rotate_pages` | False | False | True |
+| `rotate_pages_threshold` | - | - | 5.0 |
 | `oversample` | - | 300 | 200 |
 | OpenCV preprocessing | No | Yes | Yes |
 
 `best` uses a lower oversampling target than `default` because deskew/rotation can
 trigger full image transcoding; this helps keep output file sizes more stable.
+It also lowers `rotate_pages_threshold` to improve rotation detection for
+sideways scanned pages.
 
 ## Image Preprocessing
 

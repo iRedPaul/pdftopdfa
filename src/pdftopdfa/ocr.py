@@ -120,6 +120,8 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
         "skip_text": True,
         "deskew": True,
         "rotate_pages": True,
+        # Lower threshold so sideways scanned pages are rotated more reliably.
+        "rotate_pages_threshold": 5.0,
         # Keep a moderate upsampling target to avoid excessive output growth
         # when deskew/rotation trigger image transcoding.
         "oversample": 200,
