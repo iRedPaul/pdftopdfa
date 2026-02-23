@@ -192,7 +192,7 @@ def _print_validation_result(
     default="default",
     help="OCR quality preset (default: default). "
     "fast=minimal processing, default=best quality without visual changes, "
-    "best=best quality (may alter document visually).",
+    "best=best quality (may alter document visually and increase file size).",
 )
 @click.option(
     "--convert-calibrated/--no-convert-calibrated",

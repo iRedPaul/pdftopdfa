@@ -120,7 +120,9 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
         "skip_text": True,
         "deskew": True,
         "rotate_pages": True,
-        "oversample": 300,
+        # Keep a moderate upsampling target to avoid excessive output growth
+        # when deskew/rotation trigger image transcoding.
+        "oversample": 200,
         "optimize": 0,
         "tesseract_timeout": 120,
         "progress_bar": False,

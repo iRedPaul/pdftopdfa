@@ -46,7 +46,7 @@ pdftopdfa --ocr --ocr-lang deu document.pdf
 # Multilingual
 pdftopdfa --ocr --ocr-lang deu+eng document.pdf
 
-# Best quality (may deskew/rotate pages)
+# Best quality (may deskew/rotate pages and increase file size)
 pdftopdfa --ocr --ocr-quality best document.pdf
 ```
 
