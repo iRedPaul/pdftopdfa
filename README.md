@@ -8,8 +8,6 @@ Ghostscript uses a dual license (AGPL/commercial) that makes it difficult to use
 pdftopdfa is licensed under the permissive [MPL-2.0](https://www.mozilla.org/en-US/MPL/2.0/) and can be freely used in commercial projects.
 Instead of re-rendering via Ghostscript, it modifies the PDF structure directly using [pikepdf](https://pikepdf.readthedocs.io/) (based on [QPDF](https://qpdf.sourceforge.io/)), preserving the original content, fonts, and layout.                                                                                                                                  
 
-This project was built with the help of AI.
-
 ## Highlights
 
 - **No Ghostscript required** -- direct PDF manipulation via pikepdf/QPDF
