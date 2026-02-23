@@ -21,8 +21,6 @@
 - Fix missing /Widths array for ISO 19005-2 rule 6.2.11.2-6
 - Fix invalid BitsPerComponent by re-encoding image pixel data for rules 6.2.8-4 and 6.2.8-5
 - Fix Indexed colour space lookup table size mismatch with lossy repair
-- Fix OCR language parameter to pass list to ocrmypdf instead of string
-- Preserve image metadata (DPI) in OCR preprocessing so ocrmypdf receives correct resolution
 
 ### Changes
 
@@ -38,11 +36,6 @@
 - Unify DestOutputProfile indirect objects across OutputIntents (rule 6.2.3-2)
 - Strip DestOutputProfileRef from PDF/X OutputIntents for PDF/A compliance
 - Preserve annotations through OCR by stripping before and restoring after
-- Disable ocrmypdf optimizer to avoid missing tool errors on Windows
-
-### CI / Build
-
-- Add macOS to CI test matrix
 
 ## [0.1.4] - 2026-02-18
 
