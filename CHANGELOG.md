@@ -44,6 +44,31 @@
 
 - Add macOS to CI test matrix
 
+## [0.1.4] - 2026-02-18
+
+### Bug Fixes
+
+- Preserve image metadata (DPI) in OCR preprocessing so ocrmypdf receives correct resolution
+
+### Changes
+
+- Fix E501 line-too-long lint errors in docstrings and tests
+
+### Documentation
+
+- Simplify installation section in README
+
+### CI / Build
+
+- Add macOS to CI test matrix
+
+## [0.1.3] - 2026-02-17
+
+### Bug Fixes
+
+- Fix OCR language parameter to pass list to ocrmypdf instead of string
+- Disable ocrmypdf optimizer to avoid missing tool errors on Windows
+
 ## [0.1.2] - 2026-02-17
 
 ### Changes
