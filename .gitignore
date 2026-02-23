@@ -25,3 +25,6 @@ AGENTS.md
 # Test data
 veraPDF-corpus-staging/
 run_corpus_test.py
+
+# Local sample/output PDFs
+*.pdf
