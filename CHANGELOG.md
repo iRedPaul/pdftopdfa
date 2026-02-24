@@ -4,6 +4,7 @@
 
 ### Changes
 
+- Reduce `best` OCR preset oversampling target to limit output file size growth
 - Update OCR best rotation confidence threshold
 
 ### Documentation
