@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.1] - 2026-02-24
+
+### Changes
+
+- Update OCR best rotation confidence threshold
+
+### Documentation
+
+- Update OCR documentation and usage explanations
+- Update README
+
+### CI / Build
+
+- Add `.pdf` files to `.gitignore`
+
 ## [0.2.0] - 2026-02-23
 
 ### Features
