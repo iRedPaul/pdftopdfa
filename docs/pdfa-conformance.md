@@ -5,6 +5,10 @@ produce ISO 19005-2 (PDF/A-2) and ISO 19005-3 (PDF/A-3) compliant files.
 
 Supported conformance levels: **2b**, **2u**, **3b**, **3u**.
 
+This is a technical reference.
+For command examples and API usage, see [usage.md](usage.md).
+For OCR setup and quality presets, see [ocr.md](ocr.md).
+
 ---
 
 ## Table of Contents

@@ -118,7 +118,7 @@ ruff format src/  # Formatting
 Additional documentation is available in the [docs/](docs/) folder:
 
 - [Usage Guide (CLI & Python API)](docs/usage.md)
-- [OCR Usage & Quality Presets](docs/ocr.md)
+- [OCR Guide](docs/ocr.md)
 - [PDF/A Conformance Actions](docs/pdfa-conformance.md)
 
 ## Contributing

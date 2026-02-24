@@ -1,91 +1,94 @@
 # Usage Guide
 
-## Command Line
+This guide covers everyday usage of `pdftopdfa` from the command line and Python.
 
-### Basic Usage
+For OCR-specific setup and tuning, see [OCR Guide](ocr.md).
+For low-level technical details of all compliance actions, see [PDF/A Conformance Actions](pdfa-conformance.md).
+
+## Basic Usage
+
+### Convert One File
 
 ```bash
-# Convert a single file (creates document_pdfa.pdf)
-pdftopdfa document.pdf
+# Creates input_pdfa.pdf next to input.pdf
+pdftopdfa input.pdf
 
-# With explicit output path
+# Explicit output file
 pdftopdfa input.pdf output.pdf
 
-# Specific PDF/A level
-pdftopdfa -l 2b document.pdf
+# Target a specific level
+pdftopdfa -l 2b input.pdf
 
-# With validation via veraPDF
-pdftopdfa -v document.pdf
+# Validate output with veraPDF
+pdftopdfa -v input.pdf
 
-# Force overwrite existing output
-pdftopdfa -f document.pdf
+# Overwrite an existing output
+pdftopdfa -f input.pdf output.pdf
 ```
 
 ### Batch Processing
 
 ```bash
 # Convert all PDFs in a directory
-pdftopdfa ./input-folder/ ./output-folder/
+pdftopdfa ./input-dir/ ./output-dir/
 
-# Recursive directory processing
+# Convert recursively
 pdftopdfa -r ./documents/
 
-# Force overwrite + verbose output
+# Recursive, verbose, and overwrite existing outputs
 pdftopdfa -r -f --verbose ./documents/ ./output/
 ```
 
-### OCR for Scanned PDFs
+## Output Paths and Overwrite Rules
 
-```bash
-# English (default language)
-pdftopdfa --ocr document.pdf
+- Default output filename is `<input_stem>_pdfa.pdf`.
+- Single-file conversion without explicit output writes next to the input file.
+- Directory conversion without explicit output writes into the same directory.
+- Recursive directory conversion with an explicit output directory preserves subdirectory structure.
+- When converting in-place (`output_dir=None`), files already ending in `_pdfa.pdf` are skipped to avoid reconversion loops.
+- Existing output files are not overwritten unless `-f/--force` (CLI) or `force_overwrite=True` (API) is used.
 
-# German
-pdftopdfa --ocr --ocr-lang deu document.pdf
+## CLI Reference
 
-# Multilingual
-pdftopdfa --ocr --ocr-lang deu+eng document.pdf
+### Arguments
 
-# Best quality (may deskew/rotate pages and increase file size)
-pdftopdfa --ocr --ocr-quality best document.pdf
-```
+| Argument | Description |
+|---|---|
+| `input_path` | Input PDF file or input directory |
+| `output` | Optional output PDF file or output directory |
 
-See [docs/ocr.md](ocr.md) for details on OCR quality presets.
-
-### CLI Options
+### Options
 
 | Option | Description |
-|--------|-------------|
-| `-l, --level [2b\|2u\|3b\|3u]` | PDF/A conformance level (default: 3b) |
-| `-v, --validate` | Validate output with veraPDF after conversion |
+|---|---|
+| `-l, --level [2b|2u|3b|3u]` | Target PDF/A level (default: `3b`) |
+| `-v, --validate` | Validate output with veraPDF |
 | `-r, --recursive` | Process directories recursively |
 | `-f, --force` | Overwrite existing output files |
-| `-q, --quiet` | Only output errors |
-| `--verbose` | Detailed logging output |
-| `--ocr` | Enable OCR for scanned PDFs (requires ocrmypdf) |
-| `--ocr-force` | Force OCR even on pages with existing text (implies `--ocr`) |
-| `--ocr-lang LANG` | OCR language code (default: eng) |
-| `--ocr-quality [fast\|default\|best]` | OCR quality preset (default: default) |
-| `--no-convert-calibrated` | Disable CalGray/CalRGB to ICCBased conversion |
+| `-q, --quiet` | Show only errors |
+| `--verbose` | Enable detailed logs |
+| `--ocr` | Enable OCR for scanned/image-based PDFs |
+| `--ocr-force` | Force OCR even if text is present (implies `--ocr`) |
+| `--ocr-lang LANG` | OCR language code (default: `eng`), for example `deu` or `deu+eng` |
+| `--ocr-quality [fast|default|best]` | OCR quality preset (default: `default`) |
+| `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
 | `--version` | Show version and exit |
-| `--help` | Show help message and exit |
+| `--help` | Show help and exit |
 
 ### Exit Codes
 
 | Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | General error (invalid arguments, missing dependencies) |
-| 2 | Input file not found |
-| 3 | Conversion failed |
-| 4 | Validation failed (veraPDF returned non-compliant) |
-| 5 | Insufficient permissions |
-
----
+|---|---|
+| `0` | Success |
+| `1` | General error |
+| `2` | Input path not found |
+| `3` | Conversion failed |
+| `4` | Validation failed |
+| `5` | Permission error |
 
 ## Python API
 
-### Single File Conversion
+### `convert_to_pdfa()`
 
 ```python
 from pathlib import Path
@@ -95,17 +98,16 @@ result = convert_to_pdfa(
     input_path=Path("input.pdf"),
     output_path=Path("output.pdf"),
     level="2b",
+    validate=False,
 )
 
 if result.success:
-    print(f"Converted in {result.processing_time:.2f}s")
-    for warning in result.warnings:
-        print(f"Warning: {warning}")
+    print("Done")
 else:
-    print(f"Error: {result.error}")
+    print(result.error)
 ```
 
-### `convert_to_pdfa()`
+Signature:
 
 ```python
 def convert_to_pdfa(
@@ -121,20 +123,24 @@ def convert_to_pdfa(
 ) -> ConversionResult
 ```
 
-**Parameters:**
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `input_path` | `Path` | *required* | Path to the input PDF |
-| `output_path` | `Path` | *required* | Path for the output PDF/A |
-| `level` | `str` | `"3b"` | PDF/A level: `"2b"`, `"2u"`, `"3b"`, or `"3u"` |
-| `validate` | `bool` | `False` | Validate output with veraPDF |
-| `ocr_languages` | `list[str] \| None` | `None` | OCR languages (e.g. `["eng"]`, `["deu", "eng"]`) |
-| `ocr_quality` | `OcrQuality \| None` | `None` | OCR quality preset |
-| `ocr_force` | `bool` | `False` | Force OCR even on pages with existing text |
-| `convert_calibrated` | `bool` | `True` | Convert CalGray/CalRGB to ICCBased |
-
 ### `convert_directory()`
+
+```python
+from pathlib import Path
+from pdftopdfa import convert_directory
+
+results = convert_directory(
+    input_dir=Path("./input"),
+    output_dir=Path("./output"),
+    level="3b",
+    recursive=True,
+)
+
+for r in results:
+    print(r.input_path.name, "OK" if r.success else r.error)
+```
+
+Signature:
 
 ```python
 def convert_directory(
@@ -153,183 +159,125 @@ def convert_directory(
 ) -> list[ConversionResult]
 ```
 
-**Parameters:**
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `input_dir` | `Path` | *required* | Directory containing PDF files |
-| `output_dir` | `Path \| None` | `None` | Output directory (defaults to input directory) |
-| `level` | `str` | `"3b"` | PDF/A level: `"2b"`, `"2u"`, `"3b"`, or `"3u"` |
-| `recursive` | `bool` | `False` | Process subdirectories |
-| `validate` | `bool` | `False` | Validate output with veraPDF |
-| `show_progress` | `bool` | `True` | Show tqdm progress bar |
-| `ocr_languages` | `list[str] \| None` | `None` | OCR languages (e.g. `["eng"]`, `["deu", "eng"]`) |
-| `ocr_quality` | `OcrQuality \| None` | `None` | OCR quality preset |
-| `ocr_force` | `bool` | `False` | Force OCR even on pages with existing text |
-| `force_overwrite` | `bool` | `False` | Overwrite existing output files |
-| `convert_calibrated` | `bool` | `True` | Convert CalGray/CalRGB to ICCBased |
-
-**Example:**
+### `convert_files()`
 
 ```python
 from pathlib import Path
-from pdftopdfa import convert_directory
+from pdftopdfa import convert_files
 
-results = convert_directory(
-    input_dir=Path("./input-pdfs/"),
-    output_dir=Path("./output-pdfs/"),
-    level="3b",
-    recursive=True,
-)
+pairs = [
+    (Path("a.pdf"), Path("a_pdfa.pdf")),
+    (Path("b.pdf"), Path("b_pdfa.pdf")),
+]
 
-for result in results:
-    status = "OK" if result.success else f"FAILED: {result.error}"
-    print(f"{result.input_path.name}: {status}")
+results = convert_files(pairs, level="3b", force_overwrite=True)
 ```
 
-### `generate_output_path()`
+Signature:
 
 ```python
-def generate_output_path(
-    input_path: Path,
-    output_dir: Path | None = None,
-) -> Path
-```
-
-Generates an output path by appending `_pdfa` to the input filename. If `output_dir` is provided, the output is placed in that directory.
-
-```python
-from pdftopdfa.converter import generate_output_path
-
-generate_output_path(Path("report.pdf"))
-# => Path("report_pdfa.pdf")
-
-generate_output_path(Path("report.pdf"), Path("./output/"))
-# => Path("output/report_pdfa.pdf")
+def convert_files(
+    file_pairs: list[tuple[Path, Path]],
+    level: str = "3b",
+    *,
+    validate: bool = False,
+    ocr_languages: list[str] | None = None,
+    ocr_quality: OcrQuality | None = None,
+    ocr_force: bool = False,
+    force_overwrite: bool = False,
+    on_progress: Callable[[int, int, str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    convert_calibrated: bool = True,
+) -> list[ConversionResult]
 ```
 
 ### `ConversionResult`
 
-Dataclass returned by `convert_to_pdfa()` and `convert_directory()`.
+`ConversionResult` is returned by all conversion APIs.
 
 | Field | Type | Description |
-|-------|------|-------------|
+|---|---|---|
 | `success` | `bool` | `True` if conversion succeeded |
-| `input_path` | `Path` | Path to the input PDF |
-| `output_path` | `Path` | Path to the output PDF/A |
-| `level` | `str` | PDF/A level used (e.g. `"3b"`) |
-| `warnings` | `list[str]` | Warning messages from conversion |
-| `processing_time` | `float` | Processing time in seconds |
-| `error` | `str \| None` | Error message if `success=False` |
-| `validation_failed` | `bool` | `True` if veraPDF validation failed |
-
-### OCR Quality Presets
-
-```python
-from pdftopdfa.ocr import OcrQuality
-
-OcrQuality.FAST     # Minimal processing, fastest
-OcrQuality.DEFAULT  # Best quality without visual changes
-OcrQuality.BEST     # Best quality, may deskew/rotate pages
-```
-
----
+| `input_path` | `Path` | Input file path |
+| `output_path` | `Path` | Output file path |
+| `level` | `str` | Effective PDF/A level |
+| `warnings` | `list[str]` | Non-fatal conversion warnings |
+| `processing_time` | `float` | Runtime in seconds |
+| `error` | `str \\| None` | Error message if failed |
+| `validation_failed` | `bool` | `True` if veraPDF reported non-compliance |
 
 ## Exceptions
 
-All exceptions inherit from `PDFToPDFAError`:
+All custom exceptions inherit from `PDFToPDFAError`:
 
-```python
-from pdftopdfa.exceptions import (
-    PDFToPDFAError,       # Base exception
-    ConversionError,      # General conversion failure
-    ValidationError,      # Validation failed
-    FontEmbeddingError,   # Font embedding failed
-    UnsupportedPDFError,  # Encrypted or unsupported PDF
-    OCRError,             # OCR processing failed
-    VeraPDFError,         # veraPDF integration error
-)
-```
+- `ConversionError`
+- `ValidationError`
+- `FontEmbeddingError`
+- `UnsupportedPDFError`
+- `OCRError`
+- `VeraPDFError`
 
-**Example:**
+Example:
 
 ```python
 from pathlib import Path
 from pdftopdfa import convert_to_pdfa
-from pdftopdfa.exceptions import UnsupportedPDFError, ConversionError
+from pdftopdfa.exceptions import ConversionError, UnsupportedPDFError
 
 try:
-    result = convert_to_pdfa(Path("input.pdf"), Path("output.pdf"))
+    convert_to_pdfa(Path("input.pdf"), Path("output.pdf"))
 except UnsupportedPDFError:
-    print("PDF is encrypted or unsupported")
-except ConversionError as e:
-    print(f"Conversion failed: {e}")
+    print("Unsupported PDF (for example encrypted)")
+except ConversionError as exc:
+    print(f"Conversion failed: {exc}")
 ```
-
----
 
 ## PDF/A Levels
 
 | Level | ISO Standard | Attachments | Unicode Required | Recommended For |
-|-------|--------------|-------------|------------------|-----------------|
-| **2b** | ISO 19005-2 | PDF/A-1 only | No | Basic archiving |
-| **2u** | ISO 19005-2 | PDF/A-1 only | Yes | Searchable archives |
-| **3b** | ISO 19005-3 | Any format | No | Embedding original data (e.g. XML invoices) |
-| **3u** | ISO 19005-3 | Any format | Yes | Searchable archives with attachments |
+|---|---|---|---|---|
+| `2b` | ISO 19005-2 | PDF/A attachments only | No | Basic archiving |
+| `2u` | ISO 19005-2 | PDF/A attachments only | Yes | Searchable archives |
+| `3b` | ISO 19005-3 | Any format | No | Hybrid documents (for example PDF + XML) |
+| `3u` | ISO 19005-3 | Any format | Yes | Searchable hybrid archives |
 
-The default level is **3b**.
-
-- **"b" levels** (basic) ensure visual reproduction.
-- **"u" levels** (unicode) additionally require every text glyph to have a Unicode mapping, enabling reliable text extraction and search.
-
----
+Default level: `3b`.
 
 ## Already Compliant PDFs
 
-Before converting, pdftopdfa checks whether the input PDF is already PDF/A compliant. If [veraPDF](https://verapdf.org/) is available, it validates the detected level. The behavior depends on the relationship between the detected and the target level:
+Before conversion, `pdftopdfa` checks whether a file already claims a PDF/A level.
+If veraPDF is available, it validates that claim before deciding to skip conversion.
 
-| Detected level | Target level | Behavior |
-|----------------|--------------|----------|
-| Same (e.g. 2b -> 2b) | -- | **Skipped.** File is copied without conversion. |
-| Higher conformance, same part (e.g. 2u -> 2b) | -- | **Skipped.** The existing higher conformance satisfies the target. |
-| Lower conformance, same part (e.g. 2b -> 2u) | -- | **Converted.** The "u" level requires additional Unicode mappings. |
-| Different part (e.g. 2b -> 3b or 3b -> 2b) | -- | **Converted.** PDF/A parts are not interchangeable (e.g. part 3 allows arbitrary embedded files that part 2 does not). |
+| Detected | Target | Behavior |
+|---|---|---|
+| Same level (`2b` -> `2b`) | Any | Skip conversion |
+| Higher conformance in same part (`2u` -> `2b`) | Any | Skip conversion |
+| Lower conformance in same part (`2b` -> `2u`) | Any | Convert |
+| Different part (`2x` <-> `3x`) | Any | Convert |
 
-**Important details:**
+Notes:
 
-- The pre-check only skips conversion when veraPDF confirms the PDF is actually valid. If the PDF claims a level in its XMP metadata but fails validation, it is converted normally.
-- If veraPDF is not installed, the pre-check is skipped entirely and the PDF is always converted.
-- When conversion is skipped, the result includes the warning `"Conversion skipped: PDF already valid PDF/A"` and the `level` field reflects the detected level (not the requested target).
-
-**Conformance hierarchy (within the same part):** a > u > b. For example, a PDF/A-2a file satisfies a target of 2u or 2b, but a PDF/A-2b file does not satisfy a target of 2u.
-
----
+- If the metadata claim fails veraPDF validation, conversion is not skipped.
+- If veraPDF is unavailable, conversion is not skipped based only on metadata.
+- Skipped files return warning: `Conversion skipped: PDF already valid PDF/A`.
 
 ## Validation
 
-pdftopdfa uses [veraPDF](https://verapdf.org/) for ISO-compliant PDF/A validation. veraPDF must be installed separately and available in `PATH`, or you can set the `VERAPDF_PATH` environment variable.
+`pdftopdfa` integrates with [veraPDF](https://verapdf.org/) for PDF/A validation.
 
-```bash
-# Validate after conversion
-pdftopdfa -v document.pdf
-```
+- CLI: `pdftopdfa -v input.pdf`
+- API: pass `validate=True`
 
-```python
-result = convert_to_pdfa(
-    input_path=Path("input.pdf"),
-    output_path=Path("output.pdf"),
-    validate=True,
-)
-
-if result.validation_failed:
-    print("Output did not pass veraPDF validation")
-```
-
----
+If veraPDF is missing, conversion still runs, and validation is reported as skipped.
 
 ## Environment Variables
 
 | Variable | Description |
-|----------|-------------|
-| `VERAPDF_PATH` | Custom path to the veraPDF executable or its parent directory |
-| `TESSERACT_PATH` | Custom path to the Tesseract executable or its parent directory (for OCR) |
+|---|---|
+| `VERAPDF_PATH` | Path to `verapdf` executable or its parent directory |
+| `TESSERACT_PATH` | Path to `tesseract` executable or its parent directory |
+
+## Related Docs
+
+- OCR details: [ocr.md](ocr.md)
+- Full technical action list: [pdfa-conformance.md](pdfa-conformance.md)
