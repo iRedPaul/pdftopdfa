@@ -3,6 +3,7 @@
 This guide covers everyday usage of `pdftopdfa` from the command line and Python.
 
 For OCR-specific setup and tuning, see [OCR Guide](ocr.md).
+
 For the full list of PDF/A-2/3 compliance rules, see the [veraPDF PDF/A-2 and PDF/A-3 rules reference](https://github.com/veraPDF/veraPDF-validation-profiles/wiki/PDFA-Parts-2-and-3-rules).
 
 ## Basic Usage
