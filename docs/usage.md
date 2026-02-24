@@ -3,7 +3,7 @@
 This guide covers everyday usage of `pdftopdfa` from the command line and Python.
 
 For OCR-specific setup and tuning, see [OCR Guide](ocr.md).
-For low-level technical details of all compliance actions, see [PDF/A Conformance Actions](pdfa-conformance.md).
+For the full list of PDF/A-2/3 compliance rules, see the [veraPDF PDF/A-2 and PDF/A-3 rules reference](https://github.com/veraPDF/veraPDF-validation-profiles/wiki/PDFA-Parts-2-and-3-rules).
 
 ## Basic Usage
 
@@ -61,7 +61,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 
 | Option | Description |
 |---|---|
-| `-l, --level [2b|2u|3b|3u]` | Target PDF/A level (default: `3b`) |
+| `-l, --level [2b\|2u\|3b\|3u]` | Target PDF/A level (default: `3b`) |
 | `-v, --validate` | Validate output with veraPDF |
 | `-r, --recursive` | Process directories recursively |
 | `-f, --force` | Overwrite existing output files |
@@ -70,7 +70,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `--ocr` | Enable OCR for scanned/image-based PDFs |
 | `--ocr-force` | Force OCR even if text is present (implies `--ocr`) |
 | `--ocr-lang LANG` | OCR language code (default: `eng`), for example `deu` or `deu+eng` |
-| `--ocr-quality [fast|default|best]` | OCR quality preset (default: `default`) |
+| `--ocr-quality [fast\|default\|best]` | OCR quality preset (default: `default`) |
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
 | `--version` | Show version and exit |
 | `--help` | Show help and exit |
@@ -248,12 +248,12 @@ Default level: `3b`.
 Before conversion, `pdftopdfa` checks whether a file already claims a PDF/A level.
 If veraPDF is available, it validates that claim before deciding to skip conversion.
 
-| Detected | Target | Behavior |
-|---|---|---|
-| Same level (`2b` -> `2b`) | Any | Skip conversion |
-| Higher conformance in same part (`2u` -> `2b`) | Any | Skip conversion |
-| Lower conformance in same part (`2b` -> `2u`) | Any | Convert |
-| Different part (`2x` <-> `3x`) | Any | Convert |
+| Detected | Behavior |
+|---|---|
+| Same level (`2b` -> `2b`) | Skip conversion |
+| Higher conformance in same part (`2u` -> `2b`) | Skip conversion |
+| Lower conformance in same part (`2b` -> `2u`) | Convert |
+| Different part (`2x` <-> `3x`) | Convert |
 
 Notes:
 
@@ -280,4 +280,4 @@ If veraPDF is missing, conversion still runs, and validation is reported as skip
 ## Related Docs
 
 - OCR details: [ocr.md](ocr.md)
-- Full technical action list: [pdfa-conformance.md](pdfa-conformance.md)
+- PDF/A-2/3 rules reference: [veraPDF validation profiles wiki](https://github.com/veraPDF/veraPDF-validation-profiles/wiki/PDFA-Parts-2-and-3-rules)

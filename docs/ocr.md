@@ -106,7 +106,6 @@ Internal OCR settings:
 
 | Parameter | `fast` | `default` | `best` |
 |---|---|---|---|
-| `skip_text` | True | True | True |
 | `deskew` | False | False | True |
 | `rotate_pages` | False | False | True |
 | `rotate_pages_threshold` | - | - | 5.0 |

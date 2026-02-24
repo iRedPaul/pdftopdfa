@@ -89,8 +89,6 @@ See [docs/usage.md](docs/usage.md) for the full CLI reference, Python API docume
 - **No PDF/A-1 support** -- only PDF/A-2 and PDF/A-3 levels are supported
 - **Encrypted PDFs** -- password-protected PDFs cannot be converted
 - **Font replacement** -- fonts without a suitable metrically compatible replacement produce a warning; the resulting file may not be fully compliant
-- **Platform** -- supported on macOS, Linux, and Windows
-- **Python versions** -- tested on Python 3.12, 3.13, and 3.14
 
 ## Development
 
@@ -104,13 +102,13 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The test suite contains 2400+ tests covering fonts, color profiles, metadata, sanitization, and end-to-end conversion.
+The test suite contains 2600+ tests covering fonts, color profiles, metadata, sanitization, and end-to-end conversion.
 
 ### Code Quality
 
 ```bash
-ruff check src/   # Linting
-ruff format src/  # Formatting
+ruff check src/ tests/   # Linting
+ruff format src/ tests/  # Formatting
 ```
 
 ## Documentation
@@ -119,7 +117,7 @@ Additional documentation is available in the [docs/](docs/) folder:
 
 - [Usage Guide (CLI & Python API)](docs/usage.md)
 - [OCR Guide](docs/ocr.md)
-- [PDF/A Conformance Actions](docs/pdfa-conformance.md)
+- [PDF/A-2/3 rules reference (veraPDF)](https://github.com/veraPDF/veraPDF-validation-profiles/wiki/PDFA-Parts-2-and-3-rules)
 
 ## Contributing
 
