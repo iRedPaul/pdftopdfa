@@ -466,10 +466,8 @@ class TestOcrAnnotationIntegration:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
-    @patch("pdftopdfa.ocr.needs_ocr", return_value=True)
     def test_ocr_preserves_annotations(
         self,
-        mock_needs_ocr: MagicMock,
         mock_is_available: MagicMock,
         mock_apply_ocr: MagicMock,
         tmp_dir: Path,
@@ -499,10 +497,8 @@ class TestOcrAnnotationIntegration:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
-    @patch("pdftopdfa.ocr.needs_ocr", return_value=True)
     def test_no_annotations_no_overhead(
         self,
-        mock_needs_ocr: MagicMock,
         mock_is_available: MagicMock,
         mock_apply_ocr: MagicMock,
         tmp_dir: Path,
@@ -528,10 +524,8 @@ class TestOcrAnnotationIntegration:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
-    @patch("pdftopdfa.ocr.needs_ocr", return_value=True)
     def test_warning_message_includes_count(
         self,
-        mock_needs_ocr: MagicMock,
         mock_is_available: MagicMock,
         mock_apply_ocr: MagicMock,
         tmp_dir: Path,
@@ -558,10 +552,8 @@ class TestOcrAnnotationIntegration:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
-    @patch("pdftopdfa.ocr.needs_ocr", return_value=True)
     def test_temp_files_cleaned_up(
         self,
-        mock_needs_ocr: MagicMock,
         mock_is_available: MagicMock,
         mock_apply_ocr: MagicMock,
         tmp_dir: Path,

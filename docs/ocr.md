@@ -55,12 +55,11 @@ result = convert_to_pdfa(
 
 ## When OCR Runs
 
-If OCR is enabled (`--ocr` or `ocr_languages` is set), `pdftopdfa` checks whether OCR is needed:
+If OCR is enabled (`--ocr` or `ocr_languages` is set), `pdftopdfa` always invokes OCR processing for the document:
 
-- A page is considered OCR-relevant if it has images and no text operators.
-- OCR runs if at least 50% of pages are OCR-relevant.
-
-If OCR is not needed, conversion continues without OCR.
+- Pages that already contain text are skipped automatically.
+- Pages without a text layer are OCRed.
+- This makes mixed documents work page by page instead of using a document-wide threshold.
 
 ## Force OCR
 

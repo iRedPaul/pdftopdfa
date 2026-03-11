@@ -242,19 +242,16 @@ class TestConvertToPdfa:
         assert has_ocr_warning
 
     @patch("pdftopdfa.ocr.apply_ocr")
-    @patch("pdftopdfa.ocr.needs_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_with_ocr_languages_parameter(
         self,
         mock_is_ocr_available: MagicMock,
-        mock_needs_ocr: MagicMock,
         mock_apply_ocr: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
         """ocr_languages is passed through to apply_ocr."""
         mock_is_ocr_available.return_value = True
-        mock_needs_ocr.return_value = True
 
         # apply_ocr should create the temporary file
         def create_ocr_output(
@@ -279,19 +276,16 @@ class TestConvertToPdfa:
         assert call_args[0][2] == ["eng"]  # Languages parameter
 
     @patch("pdftopdfa.ocr.apply_ocr")
-    @patch("pdftopdfa.ocr.needs_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_with_ocr_adds_warning_message(
         self,
         mock_is_ocr_available: MagicMock,
-        mock_needs_ocr: MagicMock,
         mock_apply_ocr: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
         """OCR execution adds warning with language info."""
         mock_is_ocr_available.return_value = True
-        mock_needs_ocr.return_value = True
 
         def create_ocr_output(
             input_path: Path, output_path: Path, langs: list[str], **kwargs: object
@@ -313,40 +307,46 @@ class TestConvertToPdfa:
         )
         assert has_ocr_done_warning
 
-    @patch("pdftopdfa.ocr.needs_ocr")
+    @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_convert_skips_ocr_when_not_needed(
+    def test_convert_runs_ocr_even_for_text_pdf(
         self,
         mock_is_ocr_available: MagicMock,
-        mock_needs_ocr: MagicMock,
+        mock_apply_ocr: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """OCR is skipped when PDF already contains text."""
+        """OCR is invoked and lets ocrmypdf skip text pages per page."""
         mock_is_ocr_available.return_value = True
-        mock_needs_ocr.return_value = False  # PDF doesn't need OCR
+
+        def create_ocr_output(
+            input_path: Path, output_path: Path, langs: list[str], **kwargs: object
+        ) -> Path:
+            import shutil
+
+            shutil.copy(input_path, output_path)
+            return output_path
+
+        mock_apply_ocr.side_effect = create_ocr_output
 
         output_path = tmp_dir / "output.pdf"
 
         result = convert_to_pdfa(sample_pdf, output_path, ocr_languages=["deu"])
 
         assert result.success is True
-        # No OCR warning should be present
-        has_ocr_done_warning = any("OCR performed" in w for w in result.warnings)
-        assert not has_ocr_done_warning
+        mock_apply_ocr.assert_called_once()
+        assert any("OCR performed" in w for w in result.warnings)
 
     @patch("pdftopdfa.ocr.apply_ocr")
-    @patch("pdftopdfa.ocr.needs_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_convert_ocr_force_skips_needs_ocr_check(
+    def test_convert_ocr_force_calls_apply_ocr_with_force(
         self,
         mock_is_ocr_available: MagicMock,
-        mock_needs_ocr: MagicMock,
         mock_apply_ocr: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """ocr_force=True skips needs_ocr() and calls apply_ocr(force=True)."""
+        """ocr_force=True calls apply_ocr(force=True)."""
         mock_is_ocr_available.return_value = True
 
         def create_ocr_output(
@@ -366,27 +366,31 @@ class TestConvertToPdfa:
         )
 
         assert result.success is True
-        # needs_ocr should NOT have been called
-        mock_needs_ocr.assert_not_called()
-        # apply_ocr should have been called with force=True
         mock_apply_ocr.assert_called_once()
         call_kwargs = mock_apply_ocr.call_args[1]
         assert call_kwargs["force"] is True
 
     @patch("pdftopdfa.ocr.apply_ocr")
-    @patch("pdftopdfa.ocr.needs_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_convert_ocr_force_false_checks_needs_ocr(
+    def test_convert_ocr_force_false_still_calls_apply_ocr(
         self,
         mock_is_ocr_available: MagicMock,
-        mock_needs_ocr: MagicMock,
         mock_apply_ocr: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """ocr_force=False (default) still calls needs_ocr()."""
+        """ocr_force=False still delegates page skipping to apply_ocr."""
         mock_is_ocr_available.return_value = True
-        mock_needs_ocr.return_value = False
+
+        def create_ocr_output(
+            input_path: Path, output_path: Path, langs: list[str], **kwargs: object
+        ) -> Path:
+            import shutil
+
+            shutil.copy(input_path, output_path)
+            return output_path
+
+        mock_apply_ocr.side_effect = create_ocr_output
 
         output_path = tmp_dir / "output.pdf"
 
@@ -395,8 +399,8 @@ class TestConvertToPdfa:
         )
 
         assert result.success is True
-        mock_needs_ocr.assert_called_once()
-        mock_apply_ocr.assert_not_called()
+        mock_apply_ocr.assert_called_once()
+        assert mock_apply_ocr.call_args[1]["force"] is False
 
     def test_upgrades_pdf_version_and_adds_warning(
         self, sample_pdf: Path, tmp_dir: Path

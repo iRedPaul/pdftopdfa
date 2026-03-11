@@ -270,23 +270,48 @@ class TestCliValidation:
 class TestCliOcr:
     """Tests for --ocr option."""
 
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
     def test_cli_ocr_flag_default_language(
-        self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
+        self,
+        mock_is_ocr_available,
+        mock_apply_ocr,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
     ) -> None:
         """--ocr without --ocr-lang uses 'eng' as default language."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(main, [str(sample_pdf), str(output_path), "--ocr"])
 
-        # Conversion should succeed
-        # (OCR is only applied when needed or warning is issued)
         assert result.exit_code == EXIT_SUCCESS
         assert output_path.exists()
+        assert mock_apply_ocr.call_args[0][2] == ["eng"]
 
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
     def test_cli_ocr_with_custom_language(
-        self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
+        self,
+        mock_is_ocr_available,
+        mock_apply_ocr,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
     ) -> None:
         """--ocr --ocr-lang eng uses 'eng' as language."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
@@ -295,11 +320,25 @@ class TestCliOcr:
 
         assert result.exit_code == EXIT_SUCCESS
         assert output_path.exists()
+        assert mock_apply_ocr.call_args[0][2] == ["eng"]
 
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
     def test_cli_ocr_with_multiple_languages(
-        self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
+        self,
+        mock_is_ocr_available,
+        mock_apply_ocr,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
     ) -> None:
         """--ocr --ocr-lang deu+eng uses multiple languages."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
@@ -308,11 +347,25 @@ class TestCliOcr:
 
         assert result.exit_code == EXIT_SUCCESS
         assert output_path.exists()
+        assert mock_apply_ocr.call_args[0][2] == ["deu", "eng"]
 
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
     def test_cli_directory_with_ocr(
-        self, runner: CliRunner, tmp_dir: Path, sample_pdf_bytes: bytes
+        self,
+        mock_is_ocr_available,
+        mock_apply_ocr,
+        runner: CliRunner,
+        tmp_dir: Path,
+        sample_pdf_bytes: bytes,
     ) -> None:
         """--ocr also works with directory conversion."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
         input_dir = tmp_dir / "input"
         input_dir.mkdir()
 
@@ -330,20 +383,46 @@ class TestCliOcr:
         assert result.exit_code == 0
         assert "--ocr-quality" in result.output
 
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
     def test_cli_ocr_quality_default(
-        self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
+        self,
+        mock_is_ocr_available,
+        mock_apply_ocr,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
     ) -> None:
         """--ocr-quality defaults to 'default'."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(main, [str(sample_pdf), str(output_path), "--ocr"])
 
         assert result.exit_code == EXIT_SUCCESS
 
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
     def test_cli_ocr_quality_fast(
-        self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
+        self,
+        mock_is_ocr_available,
+        mock_apply_ocr,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
     ) -> None:
         """--ocr-quality fast is accepted."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
@@ -353,10 +432,23 @@ class TestCliOcr:
 
         assert result.exit_code == EXIT_SUCCESS
 
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
     def test_cli_ocr_quality_best(
-        self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
+        self,
+        mock_is_ocr_available,
+        mock_apply_ocr,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
     ) -> None:
         """--ocr-quality best is accepted."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(

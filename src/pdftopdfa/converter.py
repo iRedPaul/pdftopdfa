@@ -617,87 +617,76 @@ def convert_to_pdfa(
         # 1. Optional: Perform OCR
         actual_input = input_path
         if ocr_languages is not None:
-            from .ocr import OcrQuality, apply_ocr, is_ocr_available, needs_ocr
+            from .ocr import OcrQuality, apply_ocr, is_ocr_available
 
             if not is_ocr_available():
                 warnings.append("OCR not available - pip install pdftopdfa[ocr]")
             else:
-                if ocr_force:
-                    do_ocr = True
-                else:
-                    with pikepdf.open(input_path) as check_pdf:
-                        do_ocr = needs_ocr(check_pdf)
+                fd, tmp_path = tempfile.mkstemp(
+                    suffix=".pdf", prefix=f".{input_path.stem}_ocr_"
+                )
+                os.close(fd)
+                ocr_temp_file = Path(tmp_path)
+                effective_quality = (
+                    ocr_quality if ocr_quality is not None else OcrQuality.DEFAULT
+                )
 
-                if do_ocr:
-                    fd, tmp_path = tempfile.mkstemp(
-                        suffix=".pdf", prefix=f".{input_path.stem}_ocr_"
+                # Strip annotations before OCR so they are not
+                # rasterized into page images.
+                preserve_annots = _has_annotations(input_path)
+                clean_temp_file: Path | None = None
+                ocr_source = input_path
+                if preserve_annots:
+                    fd2, clean_tmp = tempfile.mkstemp(
+                        suffix=".pdf",
+                        prefix=f".{input_path.stem}_clean_",
                     )
-                    os.close(fd)
-                    ocr_temp_file = Path(tmp_path)
-                    effective_quality = (
-                        ocr_quality if ocr_quality is not None else OcrQuality.DEFAULT
+                    os.close(fd2)
+                    clean_temp_file = Path(clean_tmp)
+                    if _strip_annotations_for_ocr(input_path, clean_temp_file):
+                        ocr_source = clean_temp_file
+                    else:
+                        preserve_annots = False
+
+                apply_ocr(
+                    ocr_source,
+                    ocr_temp_file,
+                    ocr_languages,
+                    quality=effective_quality,
+                    force=ocr_force,
+                )
+
+                # Re-inject original annotations into OCR output.
+                if preserve_annots:
+                    fd3, merged_tmp = tempfile.mkstemp(
+                        suffix=".pdf",
+                        prefix=f".{input_path.stem}_merged_",
                     )
-
-                    # Strip annotations before OCR so they are not
-                    # rasterized into page images.
-                    preserve_annots = _has_annotations(input_path)
-                    clean_temp_file: Path | None = None
-                    ocr_source = input_path
-                    if preserve_annots:
-                        fd2, clean_tmp = tempfile.mkstemp(
-                            suffix=".pdf",
-                            prefix=f".{input_path.stem}_clean_",
-                        )
-                        os.close(fd2)
-                        clean_temp_file = Path(clean_tmp)
-                        if _strip_annotations_for_ocr(input_path, clean_temp_file):
-                            ocr_source = clean_temp_file
-                        else:
-                            preserve_annots = False
-
-                    apply_ocr(
-                        ocr_source,
-                        ocr_temp_file,
-                        ocr_languages,
-                        quality=effective_quality,
-                        force=ocr_force,
+                    os.close(fd3)
+                    merged_temp_file = Path(merged_tmp)
+                    count = _restore_annotations_after_ocr(
+                        input_path, ocr_temp_file, merged_temp_file
                     )
-
-                    # Re-inject original annotations into OCR output.
-                    if preserve_annots:
-                        fd3, merged_tmp = tempfile.mkstemp(
-                            suffix=".pdf",
-                            prefix=f".{input_path.stem}_merged_",
-                        )
-                        os.close(fd3)
-                        merged_temp_file = Path(merged_tmp)
-                        count = _restore_annotations_after_ocr(
-                            input_path, ocr_temp_file, merged_temp_file
-                        )
-                        if count > 0:
-                            os.replace(str(merged_temp_file), str(ocr_temp_file))
-                            logger.info("%d annotation(s) preserved through OCR", count)
-                            warnings.append(
-                                f"{count} annotation(s) preserved through OCR"
-                            )
-                        else:
-                            try:
-                                Path(merged_tmp).unlink()
-                            except Exception:
-                                pass
-
-                    # Clean up the stripped copy.
-                    if clean_temp_file is not None:
+                    if count > 0:
+                        os.replace(str(merged_temp_file), str(ocr_temp_file))
+                        logger.info("%d annotation(s) preserved through OCR", count)
+                        warnings.append(f"{count} annotation(s) preserved through OCR")
+                    else:
                         try:
-                            clean_temp_file.unlink()
+                            Path(merged_tmp).unlink()
                         except Exception:
                             pass
 
-                    actual_input = ocr_temp_file
-                    lang_str = "+".join(ocr_languages)
-                    warnings.append(f"OCR performed (languages: {lang_str})")
-                else:
-                    logger.debug("PDF already contains text, OCR not necessary")
+                # Clean up the stripped copy.
+                if clean_temp_file is not None:
+                    try:
+                        clean_temp_file.unlink()
+                    except Exception:
+                        pass
+
+                actual_input = ocr_temp_file
+                lang_str = "+".join(ocr_languages)
+                warnings.append(f"OCR performed (languages: {lang_str})")
 
         # Validate that input and output are not the same file
         if actual_input.resolve() == output_path.resolve():
