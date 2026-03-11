@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.2] - 2026-03-11
+
+### Bug Fixes
+
+- Remove invalid non-catalog XMP metadata
+
+### Changes
+
+- Switch OCR activation to per-page behavior
+- Log non-compliant veraPDF results as ERROR
+
 ## [0.2.1] - 2026-02-24
 
 ### Changes
