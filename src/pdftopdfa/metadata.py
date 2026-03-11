@@ -2061,6 +2061,23 @@ def _parse_xmp_bytes(data: bytes) -> etree._Element | None:
         return None
 
 
+def _has_unqualified_xml_names(tree: etree._Element) -> bool:
+    """Return True if the XML tree contains unqualified element/attribute names.
+
+    veraPDF rejects XMP packets that contain bare RDF property names without a
+    namespace prefix/default namespace, even if the XML is otherwise well-formed.
+    """
+    for elem in tree.iter():
+        if not isinstance(elem.tag, str):
+            continue
+        if not elem.tag.startswith("{"):
+            return True
+        for attr_name in elem.attrib:
+            if not attr_name.startswith("{"):
+                return True
+    return False
+
+
 def _reserialize_xmp(tree: etree._Element) -> bytes:
     """Re-serialize a parsed XMP tree to bytes with packet wrapper."""
     xml_bytes = etree.tostring(
@@ -2109,6 +2126,12 @@ def _collect_non_catalog_extension_needs(
 
             tree = _parse_xmp_bytes(raw)
             if tree is None:
+                continue
+            if _has_unqualified_xml_names(tree):
+                logger.debug(
+                    "Ignoring non-catalog /Metadata with unqualified XML names: %s",
+                    meta_stream.objgen,
+                )
                 continue
 
             # Collect non-predefined properties from all rdf:Description
@@ -2181,6 +2204,10 @@ def _sanitize_non_catalog_metadata(pdf: pikepdf.Pdf) -> tuple[int, int]:
             # Try to parse as XMP
             tree = _parse_xmp_bytes(raw)
             if tree is None:
+                del obj["/Metadata"]
+                removed += 1
+                continue
+            if _has_unqualified_xml_names(tree):
                 del obj["/Metadata"]
                 removed += 1
                 continue

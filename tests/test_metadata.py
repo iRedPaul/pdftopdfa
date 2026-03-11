@@ -2673,7 +2673,17 @@ class TestSanitizeNonCatalogMetadata:
         from io import BytesIO
 
         pdf = open_pdf(BytesIO(sample_pdf_bytes))
-        valid_xmp = b"<root>valid</root>"
+        valid_xmp = (
+            b'<?xpacket begin="\xef\xbb\xbf"'
+            b' id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b"<rdf:RDF xmlns:rdf="
+            b'"http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about=""/>'
+            b"</rdf:RDF>"
+            b"</x:xmpmeta>\n"
+            b'<?xpacket end="w"?>'
+        )
         # Create a genuinely compressed stream
         compressed = zlib.compress(valid_xmp)
         meta = pikepdf.Stream(pdf, compressed)
@@ -2691,7 +2701,39 @@ class TestSanitizeNonCatalogMetadata:
         assert Name.Filter not in page_meta
         # Re-serialized content should be readable
         content = bytes(page_meta.read_bytes())
-        assert b"root" in content
+        assert b"rdf:RDF" in content
+
+    def test_removes_metadata_with_unqualified_rdf_properties(
+        self,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """Metadata with bare XML names is removed as non-conformant XMP."""
+        from io import BytesIO
+
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
+        invalid_xmp = (
+            b'<?xpacket begin="\xef\xbb\xbf"'
+            b' id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b"<rdf:RDF xmlns:rdf="
+            b'"http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about=""'
+            b' xmlns:xmp="http://ns.adobe.com/xap/4.0/">'
+            b"<Annotations><Annotation><Type>Bad</Type></Annotation></Annotations>"
+            b"</rdf:Description>"
+            b"</rdf:RDF>"
+            b"</x:xmpmeta>\n"
+            b'<?xpacket end="w"?>'
+        )
+        meta = pikepdf.Stream(pdf, invalid_xmp)
+        meta.Type = Name.Metadata
+        meta.Subtype = Name.XML
+        pdf.pages[0].obj["/Metadata"] = pdf.make_indirect(meta)
+
+        sanitized, removed = _sanitize_non_catalog_metadata(pdf)
+        assert sanitized == 0
+        assert removed == 1
+        assert "/Metadata" not in pdf.pages[0].obj
 
     def test_does_not_touch_catalog_metadata(
         self,
@@ -2722,7 +2764,17 @@ class TestSanitizeNonCatalogMetadata:
         pdf = open_pdf(BytesIO(sample_pdf_bytes))
 
         # Add valid metadata to page
-        valid_xmp = b"<root>good</root>"
+        valid_xmp = (
+            b'<?xpacket begin="\xef\xbb\xbf"'
+            b' id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b"<rdf:RDF xmlns:rdf="
+            b'"http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about=""/>'
+            b"</rdf:RDF>"
+            b"</x:xmpmeta>\n"
+            b'<?xpacket end="w"?>'
+        )
         meta_good = pikepdf.Stream(pdf, valid_xmp)
         meta_good.Type = Name.Metadata
         meta_good.Subtype = Name.XML
