@@ -4,6 +4,7 @@
 
 """Unit tests for verapdf.py."""
 
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -464,6 +465,66 @@ class TestValidateWithVerapdf:
 
         assert isinstance(result, VeraPDFResult)
         assert result.compliant is False
+
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available")
+    def test_logs_compliant_result_as_info(
+        self,
+        mock_available: MagicMock,
+        mock_run: MagicMock,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Compliant validation results are logged at INFO level."""
+        mock_available.return_value = True
+        xml_response = (
+            "<report><jobs><job>"
+            '<validationReport isCompliant="true" profileName="PDF/A-2B">'
+            '<details passedRules="100" failedRules="0"></details>'
+            "</validationReport></job></jobs></report>"
+        )
+        mock_run.return_value = MagicMock(stdout=xml_response, stderr="", returncode=0)
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.touch()
+
+        with caplog.at_level(logging.INFO, logger="pdftopdfa.verapdf"):
+            validate_with_verapdf(pdf_path, flavour="2b")
+
+        assert any(
+            record.levelno == logging.INFO
+            and "veraPDF validation: compliant" in record.message
+            for record in caplog.records
+        )
+
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available")
+    def test_logs_non_compliant_result_as_error(
+        self,
+        mock_available: MagicMock,
+        mock_run: MagicMock,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Non-compliant validation results are logged at ERROR level."""
+        mock_available.return_value = True
+        xml_response = (
+            "<report><jobs><job>"
+            '<validationReport isCompliant="false" profileName="PDF/A-2B">'
+            '<details passedRules="90" failedRules="5"></details>'
+            "</validationReport></job></jobs></report>"
+        )
+        mock_run.return_value = MagicMock(stdout=xml_response, stderr="", returncode=1)
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.touch()
+
+        with caplog.at_level(logging.ERROR, logger="pdftopdfa.verapdf"):
+            validate_with_verapdf(pdf_path, flavour="2b")
+
+        assert any(
+            record.levelno == logging.ERROR
+            and "veraPDF validation: non-compliant" in record.message
+            for record in caplog.records
+        )
 
 
 class TestVerapdfResult:

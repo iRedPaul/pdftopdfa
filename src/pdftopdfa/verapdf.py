@@ -336,7 +336,9 @@ def validate_with_verapdf(
             errors=[f"XML parsing failed: {e}"],
         )
 
-    logger.info(
+    log_level = logging.INFO if verapdf_result.compliant else logging.ERROR
+    logger.log(
+        log_level,
         "veraPDF validation: %s (flavour: %s, %d/%d rules passed)",
         "compliant" if verapdf_result.compliant else "non-compliant",
         verapdf_result.flavour or "unknown",
