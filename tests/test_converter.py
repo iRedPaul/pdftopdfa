@@ -4,8 +4,10 @@
 
 """Unit tests for converter.py."""
 
+import logging
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -510,6 +512,118 @@ class TestConvertToPdfa:
 
         assert result.success is True
         assert output_path.exists()
+
+    @patch("pdftopdfa.converter.check_font_compliance")
+    @patch("pdftopdfa.fonts.FontEmbedder")
+    def test_font_progress_logs_are_debug_only(
+        self,
+        mock_font_embedder: MagicMock,
+        mock_check_font_compliance: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Font progress logs are hidden at INFO and shown at DEBUG."""
+        mock_check_font_compliance.return_value = (False, ["Unknown"])
+
+        embedder = MagicMock()
+        embedder.__enter__.return_value = embedder
+        embedder.__exit__.return_value = None
+        embedder.embed_missing_fonts.return_value = SimpleNamespace(
+            fonts_embedded=["FrutigerNextLTW1G-Medium", "Unknown"],
+            fonts_failed=[],
+            warnings=[],
+        )
+        embedder.add_tounicode_to_embedded_fonts.return_value = SimpleNamespace(
+            fonts_embedded=["Arial"],
+            fonts_failed=[],
+            warnings=[],
+        )
+        embedder.subset_embedded_fonts.return_value = SimpleNamespace(
+            fonts_subsetted=["Arial", "Unknown"],
+            bytes_saved=12871064,
+            warnings=[],
+        )
+        embedder.fix_font_encodings.return_value = 2
+        mock_font_embedder.return_value = embedder
+
+        info_output = tmp_dir / "info_output.pdf"
+        with caplog.at_level(logging.INFO, logger="pdftopdfa.converter"):
+            result = convert_to_pdfa(sample_pdf, info_output, level="2b")
+
+        assert result.success is True
+        assert not any(
+            record.message.startswith("Attempting to embed missing fonts:")
+            or record.message.startswith("Fonts embedded:")
+            or record.message.startswith("ToUnicode added to fonts:")
+            or record.message.startswith("Fonts subsetted:")
+            or record.message.startswith("Fixed encoding on ")
+            for record in caplog.records
+        )
+
+        caplog.clear()
+
+        debug_output = tmp_dir / "debug_output.pdf"
+        with caplog.at_level(logging.DEBUG, logger="pdftopdfa.converter"):
+            result = convert_to_pdfa(sample_pdf, debug_output, level="2b")
+
+        assert result.success is True
+        assert any(
+            record.message == "Attempting to embed missing fonts: Unknown"
+            for record in caplog.records
+        )
+        assert any(
+            record.message == "Fonts embedded: FrutigerNextLTW1G-Medium, Unknown"
+            for record in caplog.records
+        )
+        assert any(
+            record.message == "ToUnicode added to fonts: Arial"
+            for record in caplog.records
+        )
+        assert any(
+            record.message == "Fonts subsetted: Arial, Unknown (saved 12871064 bytes)"
+            for record in caplog.records
+        )
+        assert any(
+            record.message == "Fixed encoding on 2 font(s) (rule 6.2.11.6)"
+            for record in caplog.records
+        )
+
+    @patch("pdftopdfa.converter.detect_iso_standards")
+    def test_iso_standard_logs_are_debug_only(
+        self,
+        mock_detect_iso_standards: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """ISO standard detection logs are hidden at INFO and shown at DEBUG."""
+        mock_detect_iso_standards.return_value = [
+            SimpleNamespace(standard="PDF/X", version="4")
+        ]
+
+        info_output = tmp_dir / "iso_info_output.pdf"
+        with caplog.at_level(logging.INFO, logger="pdftopdfa.converter"):
+            result = convert_to_pdfa(sample_pdf, info_output, level="2b")
+
+        assert result.success is True
+        assert "ISO standard detected: PDF/X 4" in result.warnings
+        assert not any(
+            record.message == "ISO standard detected: PDF/X 4"
+            for record in caplog.records
+        )
+
+        caplog.clear()
+
+        debug_output = tmp_dir / "iso_debug_output.pdf"
+        with caplog.at_level(logging.DEBUG, logger="pdftopdfa.converter"):
+            result = convert_to_pdfa(sample_pdf, debug_output, level="2b")
+
+        assert result.success is True
+        assert any(
+            record.message == "ISO standard detected: PDF/X 4"
+            for record in caplog.records
+        )
 
 
 class TestConvertDirectory:

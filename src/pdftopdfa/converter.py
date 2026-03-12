@@ -669,7 +669,7 @@ def convert_to_pdfa(
                     )
                     if count > 0:
                         os.replace(str(merged_temp_file), str(ocr_temp_file))
-                        logger.info("%d annotation(s) preserved through OCR", count)
+                        logger.debug("%d annotation(s) preserved through OCR", count)
                         warnings.append(f"{count} annotation(s) preserved through OCR")
                     else:
                         try:
@@ -701,7 +701,7 @@ def convert_to_pdfa(
         if iso_standards:
             for std in iso_standards:
                 msg = f"ISO standard detected: {std.standard} {std.version}"
-                logger.info(msg)
+                logger.debug(msg)
                 warnings.append(msg)
 
         # 3. Check font compliance and embed missing fonts
@@ -710,7 +710,7 @@ def convert_to_pdfa(
         logger.debug("Checking font compliance")
         is_compliant, missing_fonts = check_font_compliance(pdf, raise_on_error=False)
         if not is_compliant:
-            logger.info(
+            logger.debug(
                 "Attempting to embed missing fonts: %s",
                 ", ".join(missing_fonts),
             )
@@ -718,7 +718,7 @@ def convert_to_pdfa(
                 embed_result = embedder.embed_missing_fonts()
 
             if embed_result.fonts_embedded:
-                logger.info(
+                logger.debug(
                     "Fonts embedded: %s",
                     ", ".join(embed_result.fonts_embedded),
                 )
@@ -741,7 +741,7 @@ def convert_to_pdfa(
             tounicode_result = embedder.add_tounicode_to_embedded_fonts()
 
         if tounicode_result.fonts_embedded:
-            logger.info(
+            logger.debug(
                 "ToUnicode added to fonts: %s",
                 ", ".join(tounicode_result.fonts_embedded),
             )
@@ -762,7 +762,7 @@ def convert_to_pdfa(
             subset_result = embedder.subset_embedded_fonts()
 
         if subset_result.fonts_subsetted:
-            logger.info(
+            logger.debug(
                 "Fonts subsetted: %s (saved %d bytes)",
                 ", ".join(subset_result.fonts_subsetted),
                 subset_result.bytes_saved,
@@ -780,7 +780,7 @@ def convert_to_pdfa(
             encoding_fixes = embedder.fix_font_encodings()
 
         if encoding_fixes:
-            logger.info(
+            logger.debug(
                 "Fixed encoding on %d font(s) (rule 6.2.11.6)",
                 encoding_fixes,
             )
