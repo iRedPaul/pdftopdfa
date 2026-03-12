@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.3] - 2026-03-12
+
+### Changes
+
+- Improve veraPDF launcher discovery when `VERAPDF_PATH` points to an installation directory
+- Reduce converter progress logging for OCR, ISO detection, and font repair details to DEBUG level
+
+### Bug Fixes
+
+- Fix console-safe status output on Windows consoles with limited encodings
+- Fix veraPDF error reporting when the configured executable cannot be started
+
 ## [0.2.2] - 2026-03-11
 
 ### Bug Fixes
