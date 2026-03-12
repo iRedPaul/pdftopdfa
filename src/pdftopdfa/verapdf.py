@@ -50,6 +50,17 @@ VALID_FLAVOURS = frozenset(
 )
 
 
+def _get_verapdf_candidates(platform_name: str | None = None) -> tuple[str, ...]:
+    """Returns candidate launcher names for the current platform."""
+    if platform_name is None:
+        platform_name = os.name
+
+    if platform_name == "nt":
+        return ("verapdf.bat", "verapdf.cmd", "verapdf.exe", "verapdf")
+
+    return ("verapdf", "verapdf.sh", "verapdf.bat", "verapdf.cmd")
+
+
 def _get_verapdf_cmd() -> str:
     """Returns the veraPDF command from VERAPDF_PATH or falls back to 'verapdf'."""
     verapdf_path = os.environ.get("VERAPDF_PATH")
@@ -57,12 +68,7 @@ def _get_verapdf_cmd() -> str:
         return "verapdf"
     p = Path(verapdf_path)
     if p.is_dir():
-        candidates = (
-            ("verapdf.bat", "verapdf.cmd", "verapdf.exe", "verapdf")
-            if os.name == "nt"
-            else ("verapdf", "verapdf.sh", "verapdf.bat", "verapdf.cmd")
-        )
-        for candidate in candidates:
+        for candidate in _get_verapdf_candidates():
             candidate_path = p / candidate
             if candidate_path.is_file():
                 return str(candidate_path)

@@ -15,6 +15,7 @@ from pdftopdfa.verapdf import (
     VALID_FLAVOURS,
     VeraPDFResult,
     _extract_flavour_from_profile,
+    _get_verapdf_candidates,
     _get_verapdf_cmd,
     _normalize_flavour,
     _parse_verapdf_xml,
@@ -79,7 +80,10 @@ class TestGetVerapdfCmd:
         launcher.write_text("@echo off\n")
 
         with (
-            patch("pdftopdfa.verapdf.os.name", "nt"),
+            patch(
+                "pdftopdfa.verapdf._get_verapdf_candidates",
+                return_value=_get_verapdf_candidates("nt"),
+            ),
             patch.dict("os.environ", {"VERAPDF_PATH": str(tmp_path)}),
         ):
             assert _get_verapdf_cmd() == str(launcher)
