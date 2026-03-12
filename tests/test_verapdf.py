@@ -38,17 +38,19 @@ class TestIsVerapdfAvailable:
         """Returns True when verapdf is found in PATH."""
         mock_which.return_value = "/usr/local/bin/verapdf"
 
-        result = is_verapdf_available()
+        with patch.dict("os.environ", {}, clear=True):
+            result = is_verapdf_available()
 
         assert result is True
-        mock_which.assert_called_once_with(_get_verapdf_cmd())
+        mock_which.assert_called_once_with("verapdf")
 
     @patch("pdftopdfa.verapdf.shutil.which")
     def test_returns_false_when_not_found(self, mock_which: MagicMock) -> None:
         """Returns False when verapdf is not in PATH."""
         mock_which.return_value = None
 
-        result = is_verapdf_available()
+        with patch.dict("os.environ", {}, clear=True):
+            result = is_verapdf_available()
 
         assert result is False
 
@@ -71,6 +73,17 @@ class TestGetVerapdfCmd:
         with patch.dict("os.environ", {"VERAPDF_PATH": str(tmp_path)}):
             assert _get_verapdf_cmd() == str(tmp_path / "verapdf")
 
+    def test_prefers_windows_launcher_when_present(self, tmp_path: Path) -> None:
+        """Returns verapdf.bat from a directory on Windows."""
+        launcher = tmp_path / "verapdf.bat"
+        launcher.write_text("@echo off\n")
+
+        with (
+            patch("pdftopdfa.verapdf.os.name", "nt"),
+            patch.dict("os.environ", {"VERAPDF_PATH": str(tmp_path)}),
+        ):
+            assert _get_verapdf_cmd() == str(launcher)
+
     @patch("pdftopdfa.verapdf.shutil.which")
     def test_is_available_uses_custom_path(self, mock_which: MagicMock) -> None:
         """is_verapdf_available uses VERAPDF_PATH."""
@@ -80,6 +93,20 @@ class TestGetVerapdfCmd:
 
         assert result is True
         mock_which.assert_called_once_with("/opt/verapdf/bin/verapdf")
+
+    @patch("pdftopdfa.verapdf.shutil.which")
+    def test_is_available_accepts_existing_file_path(
+        self, mock_which: MagicMock
+    ) -> None:
+        """Direct executable paths do not require shutil.which."""
+        with patch.dict("os.environ", {}, clear=True):
+            with patch("pdftopdfa.verapdf._get_verapdf_cmd") as mock_get_cmd:
+                mock_get_cmd.return_value = str(Path(__file__))
+
+                result = is_verapdf_available()
+
+        assert result is True
+        mock_which.assert_not_called()
 
     @patch("pdftopdfa.verapdf.subprocess.run")
     @patch("pdftopdfa.verapdf.is_verapdf_available")
@@ -352,7 +379,7 @@ class TestValidateWithVerapdf:
         mock_run.assert_called_once()
         call_args = mock_run.call_args
         cmd = call_args[0][0]
-        assert "verapdf" in cmd
+        assert Path(cmd[0]).name.lower().startswith("verapdf")
         assert "--format" in cmd
         assert "xml" in cmd
         assert "--flavour" in cmd
@@ -374,6 +401,20 @@ class TestValidateWithVerapdf:
 
         with pytest.raises(VeraPDFError, match="timeout"):
             validate_with_verapdf(pdf_path, timeout=300)
+
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available")
+    def test_raises_clear_error_when_executable_missing(
+        self, mock_available: MagicMock, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
+        """Raises VeraPDFError when the resolved executable cannot be started."""
+        mock_available.return_value = True
+        mock_run.side_effect = FileNotFoundError("missing executable")
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.touch()
+
+        with pytest.raises(VeraPDFError, match="executable not found"):
+            validate_with_verapdf(pdf_path)
 
     @patch("pdftopdfa.verapdf.subprocess.run")
     @patch("pdftopdfa.verapdf.is_verapdf_available")

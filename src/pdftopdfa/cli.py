@@ -51,13 +51,33 @@ EXIT_PERMISSION_ERROR = 5
 logger = logging.getLogger(__name__)
 
 
+def _encode_for_console(text: str, *, err: bool = False) -> str:
+    """Coerces text to the active console encoding when needed."""
+    stream = sys.stderr if err else sys.stdout
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        return text
+
+    try:
+        text.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return text.encode(encoding, errors="replace").decode(encoding)
+
+    return text
+
+
+def _status_message(prefix: str, msg: str, *, color: str, err: bool = False) -> str:
+    """Builds a console-safe status message."""
+    return _encode_for_console(f"{color}{prefix}{Style.RESET_ALL} {msg}", err=err)
+
+
 def print_success(msg: str) -> None:
     """Prints a success message in green.
 
     Args:
         msg: The message to output.
     """
-    click.echo(f"{Fore.GREEN}\u2713{Style.RESET_ALL} {msg}")
+    click.echo(_status_message("Success:", msg, color=Fore.GREEN))
 
 
 def print_error(msg: str) -> None:
@@ -66,7 +86,7 @@ def print_error(msg: str) -> None:
     Args:
         msg: The error message to output.
     """
-    click.echo(f"{Fore.RED}\u2717 Error:{Style.RESET_ALL} {msg}", err=True)
+    click.echo(_status_message("Error:", msg, color=Fore.RED, err=True), err=True)
 
 
 def print_warning(msg: str) -> None:
@@ -75,7 +95,7 @@ def print_warning(msg: str) -> None:
     Args:
         msg: The warning to output.
     """
-    click.echo(f"{Fore.YELLOW}\u26a0{Style.RESET_ALL} {msg}")
+    click.echo(_status_message("Warning:", msg, color=Fore.YELLOW))
 
 
 def _print_result(result: ConversionResult, quiet: bool) -> None:

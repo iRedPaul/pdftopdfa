@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
+from colorama import Fore, Style
 
+import pdftopdfa.cli as cli_module
 from pdftopdfa import __version__
 from pdftopdfa.cli import (
     EXIT_CONVERSION_FAILED,
@@ -67,6 +69,45 @@ class TestCliVersion:
 
         assert result.exit_code == 0
         assert __version__ in result.output
+
+
+class TestCliConsoleOutput:
+    """Tests for console-safe output formatting."""
+
+    def test_print_success_uses_plain_prefix(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Success output uses a plain text prefix."""
+
+        class FakeStream:
+            encoding = "cp1252"
+
+        monkeypatch.setattr(cli_module.sys, "stdout", FakeStream())
+
+        with patch("pdftopdfa.cli.click.echo") as mock_echo:
+            cli_module.print_success("Converted")
+
+        mock_echo.assert_called_once_with(
+            f"{Fore.GREEN}Success:{Style.RESET_ALL} Converted"
+        )
+
+    def test_print_error_sanitizes_unencodable_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Error output replaces unsupported characters instead of crashing."""
+
+        class FakeStream:
+            encoding = "ascii"
+
+        monkeypatch.setattr(cli_module.sys, "stderr", FakeStream())
+
+        with patch("pdftopdfa.cli.click.echo") as mock_echo:
+            cli_module.print_error("Fehler mit Umlaut: ä")
+
+        mock_echo.assert_called_once_with(
+            f"{Fore.RED}Error:{Style.RESET_ALL} Fehler mit Umlaut: ?",
+            err=True,
+        )
 
 
 class TestCliConvert:

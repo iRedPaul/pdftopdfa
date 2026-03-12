@@ -57,6 +57,15 @@ def _get_verapdf_cmd() -> str:
         return "verapdf"
     p = Path(verapdf_path)
     if p.is_dir():
+        candidates = (
+            ("verapdf.bat", "verapdf.cmd", "verapdf.exe", "verapdf")
+            if os.name == "nt"
+            else ("verapdf", "verapdf.sh", "verapdf.bat", "verapdf.cmd")
+        )
+        for candidate in candidates:
+            candidate_path = p / candidate
+            if candidate_path.is_file():
+                return str(candidate_path)
         return str(p / "verapdf")
     return verapdf_path
 
@@ -90,7 +99,10 @@ def is_verapdf_available() -> bool:
     Returns:
         True if verapdf is found and executable.
     """
-    return shutil.which(_get_verapdf_cmd()) is not None
+    cmd = _get_verapdf_cmd()
+    if Path(cmd).is_file():
+        return True
+    return shutil.which(cmd) is not None
 
 
 def get_verapdf_version() -> str | None:
@@ -114,6 +126,9 @@ def get_verapdf_version() -> str | None:
         if output:
             # Typical output: "veraPDF 1.24.1"
             return output
+        return None
+    except FileNotFoundError as e:
+        logger.debug("veraPDF executable not found: %s", e)
         return None
     except (subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
         logger.debug("Error getting veraPDF version: %s", e)
@@ -302,6 +317,12 @@ def validate_with_verapdf(
             text=True,
             timeout=timeout,
         )
+    except FileNotFoundError as e:
+        raise VeraPDFError(
+            "veraPDF executable not found. "
+            "Set VERAPDF_PATH to the executable itself "
+            "or to the installation directory containing it."
+        ) from e
     except subprocess.TimeoutExpired as e:
         raise VeraPDFError(f"veraPDF timeout after {timeout} seconds.") from e
     except subprocess.SubprocessError as e:
