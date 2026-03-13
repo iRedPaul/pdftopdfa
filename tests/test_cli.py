@@ -22,6 +22,7 @@ from pdftopdfa.cli import (
     main,
 )
 from pdftopdfa.converter import ConversionResult
+from pdftopdfa.verapdf import is_verapdf_available
 
 
 @pytest.fixture
@@ -292,7 +293,7 @@ class TestCliValidation:
     """Tests for --validate option."""
 
     @pytest.mark.skipif(
-        not __import__("shutil").which("verapdf"),
+        not is_verapdf_available(),
         reason="veraPDF not installed",
     )
     def test_cli_convert_with_validate(

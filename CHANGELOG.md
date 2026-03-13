@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.5] - 2026-03-13
+
+### Bug Fixes
+
+- Fix OCR autorotation for pages with existing `/Rotate` when OSD applies a 180 degree correction
+- Fix CLI veraPDF validation detection when veraPDF is configured through `VERAPDF_PATH`
+
+### Changes
+
+- Add visible-page OCR rotation normalization and regression coverage for rotated OCR pages
+
 ## [0.2.4] - 2026-03-13
 
 ### Bug Fixes

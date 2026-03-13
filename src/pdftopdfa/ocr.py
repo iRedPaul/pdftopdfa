@@ -59,6 +59,8 @@ from .exceptions import OCRError
 logger = logging.getLogger(__name__)
 
 _path_lock = threading.Lock()
+_ROTATION_FIX_PLUGIN = "pdftopdfa.ocr_rotation_fix"
+_PREPROCESS_PLUGIN = "pdftopdfa.ocr_preprocess"
 
 
 @contextlib.contextmanager
@@ -133,6 +135,17 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
 
 # Quality levels that benefit from OpenCV preprocessing
 _PREPROCESS_QUALITIES = frozenset({OcrQuality.DEFAULT, OcrQuality.BEST})
+
+
+def _get_ocr_plugins(quality: OcrQuality) -> list[str]:
+    """Build the plugin list for the current OCR run."""
+    if quality not in _PREPROCESS_QUALITIES:
+        return []
+
+    plugins = [_ROTATION_FIX_PLUGIN]
+    if HAS_OPENCV:
+        plugins.append(_PREPROCESS_PLUGIN)
+    return plugins
 
 
 def is_ocr_available() -> bool:
@@ -375,16 +388,17 @@ def apply_ocr(
 
     try:
         ocr_kwargs = dict(OCR_SETTINGS[quality])
+        plugins = _get_ocr_plugins(quality)
 
         if force:
             ocr_kwargs.pop("skip_text", None)
             ocr_kwargs["redo_ocr"] = True
 
-        if quality in _PREPROCESS_QUALITIES:
-            if HAS_OPENCV:
-                ocr_kwargs["plugins"] = ["pdftopdfa.ocr_preprocess"]
+        if plugins:
+            ocr_kwargs["plugins"] = plugins
+            if quality in _PREPROCESS_QUALITIES and HAS_OPENCV:
                 logger.debug("OpenCV preprocessing plugin enabled")
-            else:
+            elif quality in _PREPROCESS_QUALITIES:
                 logger.warning(
                     "OpenCV not available; skipping image preprocessing. "
                     "Install opencv-python-headless for better OCR quality."

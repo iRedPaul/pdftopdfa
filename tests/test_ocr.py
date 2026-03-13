@@ -7,6 +7,7 @@
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pikepdf
@@ -25,6 +26,10 @@ from pdftopdfa.ocr import (
     apply_ocr,
     is_ocr_available,
     needs_ocr,
+)
+from pdftopdfa.ocr_rotation_fix import (
+    _should_swap_visible_page_axis,
+    filter_pdf_page,
 )
 
 
@@ -432,6 +437,7 @@ class TestApplyOcr:
             language=["eng"],
             output_type="pdf",
             rasterizer="pypdfium",
+            plugins=["pdftopdfa.ocr_rotation_fix"],
             **OCR_SETTINGS[OcrQuality.DEFAULT],
         )
 
@@ -724,6 +730,7 @@ class TestOcrQuality:
             language=["eng"],
             output_type="pdf",
             rasterizer="pypdfium",
+            plugins=["pdftopdfa.ocr_rotation_fix"],
             **OCR_SETTINGS[OcrQuality.DEFAULT],
         )
 
@@ -744,6 +751,7 @@ class TestOcrQuality:
             language=["eng"],
             output_type="pdf",
             rasterizer="pypdfium",
+            plugins=["pdftopdfa.ocr_rotation_fix"],
             **OCR_SETTINGS[OcrQuality.BEST],
         )
 
@@ -848,7 +856,10 @@ class TestOpenCVPlugin:
         apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.DEFAULT)
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert call_kwargs["plugins"] == ["pdftopdfa.ocr_preprocess"]
+        assert call_kwargs["plugins"] == [
+            "pdftopdfa.ocr_rotation_fix",
+            "pdftopdfa.ocr_preprocess",
+        ]
 
     @patch("pdftopdfa.ocr.HAS_OPENCV", True)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
@@ -862,7 +873,10 @@ class TestOpenCVPlugin:
         apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert call_kwargs["plugins"] == ["pdftopdfa.ocr_preprocess"]
+        assert call_kwargs["plugins"] == [
+            "pdftopdfa.ocr_rotation_fix",
+            "pdftopdfa.ocr_preprocess",
+        ]
 
     @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
@@ -870,13 +884,13 @@ class TestOpenCVPlugin:
     def test_apply_ocr_no_opencv_no_plugin(
         self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
     ) -> None:
-        """No plugins kwarg when OpenCV is not available."""
+        """Rotation fix stays enabled even when OpenCV preprocessing is unavailable."""
         output_path = tmp_dir / "output.pdf"
 
         apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.DEFAULT)
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert "plugins" not in call_kwargs
+        assert call_kwargs["plugins"] == ["pdftopdfa.ocr_rotation_fix"]
 
     @patch("pdftopdfa.ocr.HAS_OPENCV", True)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
@@ -949,3 +963,115 @@ class TestFilterOcrImage:
         pixels = np.array(result)
         unique_values = set(np.unique(pixels))
         assert unique_values <= {0, 255}
+
+
+class TestVisiblePageRotationFix:
+    """Tests for visible-page rotation normalization during OCR."""
+
+    def _make_page_context(
+        self,
+        *,
+        width_points: float,
+        height_points: float,
+        rotation: int,
+    ) -> SimpleNamespace:
+        media_box = [0.0, 0.0, width_points, height_points]
+        pageinfo = SimpleNamespace(
+            width_inches=width_points / 72.0,
+            height_inches=height_points / 72.0,
+            rotation=rotation,
+            mediabox=media_box,
+            cropbox=media_box,
+            trimbox=media_box,
+            artbox=media_box,
+            bleedbox=media_box,
+        )
+        return SimpleNamespace(pageinfo=pageinfo)
+
+    @pytest.mark.parametrize(
+        ("page_size", "image_size", "expected_swap"),
+        [
+            ((595.0, 842.0), (300, 200), True),
+            ((842.0, 595.0), (200, 300), True),
+            ((842.0, 595.0), (300, 200), False),
+        ],
+    )
+    def test_should_swap_visible_page_axis(
+        self,
+        page_size: tuple[float, float],
+        image_size: tuple[int, int],
+        expected_swap: bool,
+    ) -> None:
+        """Axis swapping follows the actual rendered image orientation."""
+        assert (
+            _should_swap_visible_page_axis(
+                page_size[0],
+                page_size[1],
+                image_size[0],
+                image_size[1],
+            )
+            is expected_swap
+        )
+
+    def test_filter_pdf_page_fixes_rotate_270_plus_180_regression(
+        self, tmp_dir: Path
+    ) -> None:
+        """A /Rotate=270 page stays in the rendered orientation after 180° OCR fix."""
+        image_path = tmp_dir / "rendered.png"
+        output_pdf = tmp_dir / "visible.pdf"
+
+        # Represents the rendered bitmap after OCRmyPDF applied /Rotate=270 and
+        # then an additional 180 degree autorotation correction.
+        Image.new("RGB", (300, 200), color="white").save(image_path)
+        with Pdf.new() as pdf:
+            pdf.add_blank_page(page_size=(595.0, 842.0))
+            pdf.save(output_pdf)
+
+        page_context = self._make_page_context(
+            width_points=842.0,
+            height_points=595.0,
+            rotation=270,
+        )
+
+        filter_pdf_page(page_context, image_path, output_pdf)
+
+        with Pdf.open(output_pdf) as pdf:
+            mediabox = [float(value) for value in pdf.pages[0].mediabox]
+
+        assert mediabox == [0.0, 0.0, 842.0, 595.0]
+
+    @pytest.mark.parametrize(
+        ("page_size", "image_size", "expected_mediabox"),
+        [
+            ((595.0, 842.0), (300, 200), [0.0, 0.0, 842.0, 595.0]),
+            ((842.0, 595.0), (200, 300), [0.0, 0.0, 595.0, 842.0]),
+        ],
+    )
+    def test_filter_pdf_page_preserves_90_and_270_autorotate_cases(
+        self,
+        tmp_dir: Path,
+        page_size: tuple[float, float],
+        image_size: tuple[int, int],
+        expected_mediabox: list[float],
+    ) -> None:
+        """Regular 90°/270° autorotation still produces the correct page geometry."""
+        image_path = tmp_dir / f"rendered_{image_size[0]}x{image_size[1]}.png"
+        output_pdf = tmp_dir / f"visible_{page_size[0]}x{page_size[1]}.pdf"
+
+        Image.new("RGB", image_size, color="white").save(image_path)
+        with Pdf.new() as pdf:
+            pdf.add_blank_page(page_size=page_size)
+            pdf.save(output_pdf)
+
+        page_context = self._make_page_context(
+            width_points=page_size[0],
+            height_points=page_size[1],
+            rotation=0,
+        )
+
+        filter_pdf_page(page_context, image_path, output_pdf)
+
+        with Pdf.open(output_pdf) as pdf:
+            mediabox = [float(value) for value in pdf.pages[0].mediabox]
+
+        assert mediabox == expected_mediabox
