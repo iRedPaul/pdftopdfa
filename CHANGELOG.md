@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.4] - 2026-03-13
+
+### Bug Fixes
+
+- Fix OCR preprocessing for boolean and non-uint8 image arrays
+
 ## [0.2.3] - 2026-03-12
 
 ### Changes
