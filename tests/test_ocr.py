@@ -28,8 +28,10 @@ from pdftopdfa.ocr import (
     needs_ocr,
 )
 from pdftopdfa.ocr_rotation_fix import (
+    _compose_page_rotation,
     _should_swap_visible_page_axis,
     filter_pdf_page,
+    rasterize_pdf_page,
 )
 
 
@@ -1075,3 +1077,85 @@ class TestVisiblePageRotationFix:
             mediabox = [float(value) for value in pdf.pages[0].mediabox]
 
         assert mediabox == expected_mediabox
+
+
+class TestPypdfiumRotationFix:
+    """Tests for pypdfium raster rotation composition."""
+
+    def test_compose_page_rotation_preserves_existing_rotate(self) -> None:
+        """The requested OCR correction is composed with the existing /Rotate."""
+        assert _compose_page_rotation(270, 180) == 90
+        assert _compose_page_rotation(270, 0) == 270
+        assert _compose_page_rotation(0, 90) == 90
+
+    @patch("ocrmypdf.builtin_plugins.pypdfium.rasterize_pdf_page")
+    def test_rasterize_pdf_page_composes_existing_rotate_for_pypdfium(
+        self, mock_rasterize: MagicMock, tmp_dir: Path
+    ) -> None:
+        """A /Rotate=270 page plus 180° OCR correction is rendered as /Rotate=90."""
+        input_pdf = tmp_dir / "input.pdf"
+        output_png = tmp_dir / "output.png"
+
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(595.0, 842.0))
+            page.Rotate = 270
+            pdf.save(input_pdf)
+
+        captured: dict[str, Path] = {}
+
+        def capture_temp_pdf(*args, **kwargs):
+            captured["temp_pdf"] = Path(args[0])
+            return output_png
+
+        mock_rasterize.side_effect = capture_temp_pdf
+        options = SimpleNamespace(rasterizer="pypdfium", keep_temporary_files=True)
+
+        result = rasterize_pdf_page(
+            input_pdf,
+            output_png,
+            "png16m",
+            SimpleNamespace(),
+            1,
+            None,
+            180,
+            False,
+            True,
+            options,
+            False,
+        )
+
+        assert result == output_png
+        assert mock_rasterize.call_args.args[6] == 0
+        with Pdf.open(captured["temp_pdf"]) as pdf:
+            assert int(pdf.pages[0].obj.get("/Rotate", 0)) == 90
+
+    @patch("ocrmypdf.builtin_plugins.pypdfium.rasterize_pdf_page")
+    def test_rasterize_pdf_page_skips_when_no_existing_rotate(
+        self, mock_rasterize: MagicMock, tmp_dir: Path
+    ) -> None:
+        """Pages without /Rotate fall back to OCRmyPDF's default pypdfium hook."""
+        input_pdf = tmp_dir / "input.pdf"
+        output_png = tmp_dir / "output.png"
+
+        with Pdf.new() as pdf:
+            pdf.add_blank_page(page_size=(595.0, 842.0))
+            pdf.save(input_pdf)
+
+        options = SimpleNamespace(rasterizer="pypdfium", keep_temporary_files=False)
+
+        result = rasterize_pdf_page(
+            input_pdf,
+            output_png,
+            "png16m",
+            SimpleNamespace(),
+            1,
+            None,
+            180,
+            False,
+            True,
+            options,
+            False,
+        )
+
+        assert result is None
+        mock_rasterize.assert_not_called()

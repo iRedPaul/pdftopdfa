@@ -2,17 +2,20 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-"""ocrmypdf plugin to normalize visible OCR page orientation.
+"""ocrmypdf plugin to normalize OCR page rotation handling.
 
 The visible page image produced by OCRmyPDF already has the PDF page's
 ``/Rotate`` value and any OCR autorotation baked into the rasterized pixels.
 This plugin derives the replacement PDF page size from the actual rendered
 image orientation instead of re-computing it from internal rotation metadata.
+It also compensates for pypdfium rasterization paths that overwrite an
+existing page rotation instead of composing with it.
 """
 
 from __future__ import annotations
 
 import logging
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -24,6 +27,33 @@ if TYPE_CHECKING:
     from ocrmypdf._jobcontext import PageContext
 
 logger = logging.getLogger(__name__)
+
+
+def _read_page_rotate(input_file: Path, pageno: int) -> int:
+    """Read the existing PDF /Rotate value for a page."""
+    with pikepdf.open(input_file) as pdf:
+        return int(pdf.pages[pageno - 1].obj.get("/Rotate", 0)) % 360
+
+
+def _compose_page_rotation(existing_rotate: int, requested_rotate: int | None) -> int:
+    """Compose OCRmyPDF's requested rotation with the page's existing /Rotate."""
+    if not requested_rotate:
+        return existing_rotate % 360
+    return (existing_rotate + requested_rotate) % 360
+
+
+def _write_rotated_temp_pdf(
+    input_file: Path,
+    *,
+    pageno: int,
+    composed_rotation: int,
+    temp_pdf: Path,
+) -> Path:
+    """Write a temporary PDF with a composed /Rotate value for the target page."""
+    with pikepdf.open(input_file) as pdf:
+        pdf.pages[pageno - 1].Rotate = composed_rotation
+        pdf.save(temp_pdf)
+    return temp_pdf
 
 
 def _is_landscape(width: float, height: float) -> bool | None:
@@ -98,6 +128,77 @@ def _rewrite_visible_page_boxes(
         pdf.save(temp_output_pdf)
 
     temp_output_pdf.replace(output_pdf)
+
+
+@ocrmypdf.hookimpl(tryfirst=True)
+def rasterize_pdf_page(
+    input_file: Path,
+    output_file: Path,
+    raster_device: str,
+    raster_dpi,
+    pageno: int,
+    page_dpi,
+    rotation: int | None,
+    filter_vector: bool,
+    stop_on_soft_error: bool,
+    options,
+    use_cropbox: bool,
+) -> Path | None:
+    """Compose existing /Rotate with OCR autorotation for pypdfium rasterization."""
+    if options is not None and options.rasterizer == "ghostscript":
+        return None
+    if not rotation:
+        return None
+
+    existing_rotate = _read_page_rotate(input_file, pageno)
+    if existing_rotate == 0:
+        return None
+
+    from ocrmypdf.builtin_plugins import pypdfium as pypdfium_plugin
+
+    if pypdfium_plugin.pdfium is None:
+        return None
+
+    composed_rotation = _compose_page_rotation(existing_rotate, rotation)
+    temp_pdf = output_file.with_name(f"{output_file.stem}_rotfix_input.pdf")
+    _write_rotated_temp_pdf(
+        input_file,
+        pageno=pageno,
+        composed_rotation=composed_rotation,
+        temp_pdf=temp_pdf,
+    )
+
+    adjusted_page_dpi = page_dpi
+    if page_dpi is not None and rotation % 180 == 90:
+        adjusted_page_dpi = page_dpi.flip_axis()
+
+    logger.debug(
+        "OCR raster rotation normalization: original_rotate=%s, "
+        "requested_correction=%s, composed_rotation=%s, page=%s",
+        existing_rotate,
+        rotation,
+        composed_rotation,
+        pageno,
+    )
+
+    try:
+        return pypdfium_plugin.rasterize_pdf_page(
+            temp_pdf,
+            output_file,
+            raster_device,
+            raster_dpi,
+            pageno,
+            adjusted_page_dpi,
+            0,
+            filter_vector,
+            stop_on_soft_error,
+            options,
+            use_cropbox,
+        )
+    finally:
+        if not getattr(options, "keep_temporary_files", False):
+            with suppress(FileNotFoundError):
+                temp_pdf.unlink()
 
 
 @ocrmypdf.hookimpl
