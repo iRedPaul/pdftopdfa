@@ -32,6 +32,13 @@ def filter_ocr_image(page, image):  # noqa: ARG001 – page required by hook spe
 
     img = np.array(image)
 
+    # OCRmyPDF can hand us bilevel images as boolean arrays, but OpenCV's
+    # denoising/thresholding functions expect numeric image dtypes.
+    if img.dtype == np.bool_:
+        img = img.astype(np.uint8) * 255
+    elif img.dtype != np.uint8:
+        img = img.astype(np.uint8)
+
     # Convert to grayscale if needed
     if img.ndim == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
