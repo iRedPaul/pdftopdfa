@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.6] - 2026-03-13
+
+### Bug Fixes
+
+- Fix remaining OCR autorotation error for pypdfium when existing `/Rotate` must be composed with a 180 degree OSD correction
+
+### Changes
+
+- Add regression coverage for pypdfium rotation composition with existing page rotation
+
 ## [0.2.5] - 2026-03-13
 
 ### Bug Fixes
