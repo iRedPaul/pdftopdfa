@@ -279,6 +279,7 @@ def validate_with_verapdf(
     path: Path,
     flavour: str | None = None,
     timeout: int = 300,
+    non_compliant_log_level: int = logging.ERROR,
 ) -> VeraPDFResult:
     """Validates a PDF file with veraPDF.
 
@@ -287,6 +288,8 @@ def validate_with_verapdf(
         flavour: Optional PDF/A flavour for validation (e.g. "2b").
             If not specified, veraPDF detects automatically.
         timeout: Timeout in seconds (default: 300).
+        non_compliant_log_level: Log level used when veraPDF reports a
+            non-compliant result. Defaults to ``logging.ERROR``.
 
     Returns:
         VeraPDFResult with the validation result.
@@ -363,7 +366,7 @@ def validate_with_verapdf(
             errors=[f"XML parsing failed: {e}"],
         )
 
-    log_level = logging.INFO if verapdf_result.compliant else logging.ERROR
+    log_level = logging.INFO if verapdf_result.compliant else non_compliant_log_level
     logger.log(
         log_level,
         "veraPDF validation: %s (flavour: %s, %d/%d rules passed)",

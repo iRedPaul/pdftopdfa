@@ -571,6 +571,40 @@ class TestValidateWithVerapdf:
             for record in caplog.records
         )
 
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available")
+    def test_logs_non_compliant_result_as_warning_when_requested(
+        self,
+        mock_available: MagicMock,
+        mock_run: MagicMock,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Non-compliant results can be logged at WARNING level."""
+        mock_available.return_value = True
+        xml_response = (
+            "<report><jobs><job>"
+            '<validationReport isCompliant="false" profileName="PDF/A-2B">'
+            '<details passedRules="90" failedRules="5"></details>'
+            "</validationReport></job></jobs></report>"
+        )
+        mock_run.return_value = MagicMock(stdout=xml_response, stderr="", returncode=1)
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.touch()
+
+        with caplog.at_level(logging.WARNING, logger="pdftopdfa.verapdf"):
+            validate_with_verapdf(
+                pdf_path,
+                flavour="2b",
+                non_compliant_log_level=logging.WARNING,
+            )
+
+        assert any(
+            record.levelno == logging.WARNING
+            and "veraPDF validation: non-compliant" in record.message
+            for record in caplog.records
+        )
+
 
 class TestVerapdfResult:
     """Tests for the VeraPDFResult data class."""

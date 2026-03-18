@@ -491,6 +491,11 @@ class TestConvertToPdfa:
         assert result.level == "2b"
         assert any("already valid" in w for w in result.warnings)
         assert output_path.exists()
+        mock_verapdf.assert_called_once_with(
+            sample_pdf,
+            flavour="2b",
+            non_compliant_log_level=logging.WARNING,
+        )
 
     def test_corrupt_pdf_raises_conversion_error(self, tmp_dir: Path) -> None:
         """Corrupt PDF triggers PdfError which is wrapped as ConversionError."""

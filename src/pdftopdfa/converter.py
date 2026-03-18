@@ -575,7 +575,9 @@ def convert_to_pdfa(
             if level_cmp >= 0:  # Same or higher level
                 try:
                     verapdf_result = validate_with_verapdf(
-                        input_path, flavour=detected_level
+                        input_path,
+                        flavour=detected_level,
+                        non_compliant_log_level=logging.WARNING,
                     )
                 except VeraPDFError:
                     logger.debug("veraPDF not available, skipping pre-check")
