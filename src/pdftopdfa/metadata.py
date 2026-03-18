@@ -528,6 +528,11 @@ _EXTENSION_VALUE_TYPE_MAP: dict[str, str] = {
     "Boolean": "B",
     "Date": "d",
     "Rational": "r",
+    "Real": "f",
+    "URI": "s",
+    "URL": "s",
+    "AgentName": "s",
+    "GUID": "s",
 }
 
 # Known extension schemas with full property definitions.
@@ -730,6 +735,35 @@ def _sanitize_extension_schema_blocks(
     )
     container_prefixes = frozenset({"Bag", "Seq", "Alt"})
 
+    def _strip_unexpected_attrs(
+        elem: etree._Element,
+        allowed_attrs: set[str],
+    ) -> None:
+        for attr_name in list(elem.attrib):
+            if attr_name not in allowed_attrs:
+                del elem.attrib[attr_name]
+
+    def _strip_unexpected_children(
+        elem: etree._Element,
+        allowed_tags: set[str],
+    ) -> None:
+        for child in list(elem):
+            if child.tag not in allowed_tags:
+                elem.remove(child)
+
+    def _remove_duplicate_children(
+        elem: etree._Element,
+        tag: str,
+    ) -> None:
+        seen_first = False
+        for child in list(elem):
+            if child.tag != tag:
+                continue
+            if not seen_first:
+                seen_first = True
+                continue
+            elem.remove(child)
+
     def _is_recognized_field_value_type(
         raw_value_type: str,
         declared_value_types: set[str],
@@ -757,6 +791,23 @@ def _sanitize_extension_schema_blocks(
     result: dict[str, etree._Element] = {}
 
     for uri, li_elem in blocks.items():
+        _strip_unexpected_attrs(li_elem, {f"{{{ns_rdf}}}parseType"})
+        _strip_unexpected_children(
+            li_elem,
+            {
+                schema_tag,
+                ns_uri_tag,
+                prefix_tag,
+                property_tag,
+                schema_value_type_tag,
+            },
+        )
+        _remove_duplicate_children(li_elem, schema_tag)
+        _remove_duplicate_children(li_elem, ns_uri_tag)
+        _remove_duplicate_children(li_elem, prefix_tag)
+        _remove_duplicate_children(li_elem, property_tag)
+        _remove_duplicate_children(li_elem, schema_value_type_tag)
+
         # Schema-level checks
         schema_elem = li_elem.find(schema_tag)
         if schema_elem is None or not (schema_elem.text or "").strip():
@@ -788,6 +839,9 @@ def _sanitize_extension_schema_blocks(
                 uri,
             )
             continue
+        _strip_unexpected_attrs(property_elem, set())
+        _strip_unexpected_children(property_elem, {seq_tag})
+        _remove_duplicate_children(property_elem, seq_tag)
 
         seq = property_elem.find(seq_tag)
         if seq is None:
@@ -801,6 +855,21 @@ def _sanitize_extension_schema_blocks(
         # Property-level checks
         to_remove = []
         for prop_li in seq.findall(li_tag):
+            _strip_unexpected_attrs(prop_li, {f"{{{ns_rdf}}}parseType"})
+            _strip_unexpected_children(
+                prop_li,
+                {
+                    name_tag,
+                    value_type_tag,
+                    category_tag,
+                    description_tag,
+                },
+            )
+            _remove_duplicate_children(prop_li, name_tag)
+            _remove_duplicate_children(prop_li, value_type_tag)
+            _remove_duplicate_children(prop_li, category_tag)
+            _remove_duplicate_children(prop_li, description_tag)
+
             name_elem = prop_li.find(name_tag)
             prop_name = (name_elem.text or "").strip() if name_elem is not None else ""
 
@@ -862,6 +931,9 @@ def _sanitize_extension_schema_blocks(
         # Optional pdfaSchema:valueType checks
         schema_value_type_elem = li_elem.find(schema_value_type_tag)
         if schema_value_type_elem is not None:
+            _strip_unexpected_attrs(schema_value_type_elem, set())
+            _strip_unexpected_children(schema_value_type_elem, {seq_tag})
+            _remove_duplicate_children(schema_value_type_elem, seq_tag)
             value_type_seq = schema_value_type_elem.find(seq_tag)
             if value_type_seq is None:
                 logger.warning(
@@ -875,6 +947,23 @@ def _sanitize_extension_schema_blocks(
                 valid_value_type_entries: list[tuple[etree._Element, str]] = []
 
                 for value_type_li in value_type_seq.findall(li_tag):
+                    _strip_unexpected_attrs(value_type_li, {f"{{{ns_rdf}}}parseType"})
+                    _strip_unexpected_children(
+                        value_type_li,
+                        {
+                            type_name_tag,
+                            type_ns_uri_tag,
+                            type_prefix_tag,
+                            type_description_tag,
+                            type_field_tag,
+                        },
+                    )
+                    _remove_duplicate_children(value_type_li, type_name_tag)
+                    _remove_duplicate_children(value_type_li, type_ns_uri_tag)
+                    _remove_duplicate_children(value_type_li, type_prefix_tag)
+                    _remove_duplicate_children(value_type_li, type_description_tag)
+                    _remove_duplicate_children(value_type_li, type_field_tag)
+
                     type_name_elem = value_type_li.find(type_name_tag)
                     type_name = (
                         (type_name_elem.text or "").strip()
@@ -943,6 +1032,9 @@ def _sanitize_extension_schema_blocks(
                     type_field_elem = value_type_li.find(type_field_tag)
                     if type_field_elem is None:
                         continue
+                    _strip_unexpected_attrs(type_field_elem, set())
+                    _strip_unexpected_children(type_field_elem, {seq_tag})
+                    _remove_duplicate_children(type_field_elem, seq_tag)
 
                     field_seq = type_field_elem.find(seq_tag)
                     if field_seq is None:
@@ -957,6 +1049,19 @@ def _sanitize_extension_schema_blocks(
 
                     field_entries_to_remove = []
                     for field_li in field_seq.findall(li_tag):
+                        _strip_unexpected_attrs(field_li, {f"{{{ns_rdf}}}parseType"})
+                        _strip_unexpected_children(
+                            field_li,
+                            {
+                                field_name_tag,
+                                field_value_type_tag,
+                                field_description_tag,
+                            },
+                        )
+                        _remove_duplicate_children(field_li, field_name_tag)
+                        _remove_duplicate_children(field_li, field_value_type_tag)
+                        _remove_duplicate_children(field_li, field_description_tag)
+
                         field_name_elem = field_li.find(field_name_tag)
                         field_name = (
                             (field_name_elem.text or "").strip()
@@ -1049,6 +1154,130 @@ def _sanitize_extension_schema_blocks(
     return result
 
 
+def _collect_declared_extension_properties(
+    blocks: dict[str, etree._Element],
+) -> dict[str, set[str]]:
+    """Collect locally declared extension properties from sanitized blocks."""
+    ns_rdf = NAMESPACES["rdf"]
+    property_tag = f"{{{_NS_PDFA_SCHEMA}}}property"
+    seq_tag = f"{{{ns_rdf}}}Seq"
+    li_tag = f"{{{ns_rdf}}}li"
+    name_tag = f"{{{_NS_PDFA_PROPERTY}}}name"
+    declared: dict[str, set[str]] = {}
+
+    for uri, block in blocks.items():
+        prop_elem = block.find(property_tag)
+        if prop_elem is None:
+            continue
+        seq = prop_elem.find(seq_tag)
+        if seq is None:
+            continue
+        for prop_li in seq.findall(li_tag):
+            name_elem = prop_li.find(name_tag)
+            prop_name = (name_elem.text or "").strip() if name_elem is not None else ""
+            if prop_name:
+                declared.setdefault(uri, set()).add(prop_name)
+
+    return declared
+
+
+def _collect_declared_extension_schema_details(
+    blocks: dict[str, etree._Element],
+) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, dict[str, str]]]]:
+    """Collect declared property and custom type definitions from schema blocks."""
+    ns_rdf = NAMESPACES["rdf"]
+    property_tag = f"{{{_NS_PDFA_SCHEMA}}}property"
+    schema_value_type_tag = f"{{{_NS_PDFA_SCHEMA}}}valueType"
+    seq_tag = f"{{{ns_rdf}}}Seq"
+    li_tag = f"{{{ns_rdf}}}li"
+    name_tag = f"{{{_NS_PDFA_PROPERTY}}}name"
+    value_type_tag = f"{{{_NS_PDFA_PROPERTY}}}valueType"
+    type_name_tag = f"{{{_NS_PDFA_TYPE}}}type"
+    type_field_tag = f"{{{_NS_PDFA_TYPE}}}field"
+    field_name_tag = f"{{{_NS_PDFA_FIELD}}}name"
+    field_value_type_tag = f"{{{_NS_PDFA_FIELD}}}valueType"
+
+    property_types: dict[str, dict[str, str]] = {}
+    custom_types: dict[str, dict[str, dict[str, str]]] = {}
+
+    for uri, block in blocks.items():
+        prop_elem = block.find(property_tag)
+        if prop_elem is not None:
+            seq = prop_elem.find(seq_tag)
+            if seq is not None:
+                for prop_li in seq.findall(li_tag):
+                    name_elem = prop_li.find(name_tag)
+                    value_type_elem = prop_li.find(value_type_tag)
+                    prop_name = (
+                        (name_elem.text or "").strip() if name_elem is not None else ""
+                    )
+                    prop_value_type = (
+                        (value_type_elem.text or "").strip()
+                        if value_type_elem is not None
+                        else ""
+                    )
+                    if prop_name and prop_value_type:
+                        property_types.setdefault(uri, {})[prop_name] = prop_value_type
+
+        schema_value_type_elem = block.find(schema_value_type_tag)
+        if schema_value_type_elem is None:
+            continue
+        value_type_seq = schema_value_type_elem.find(seq_tag)
+        if value_type_seq is None:
+            continue
+        for value_type_li in value_type_seq.findall(li_tag):
+            type_name_elem = value_type_li.find(type_name_tag)
+            type_name = (
+                (type_name_elem.text or "").strip()
+                if type_name_elem is not None
+                else ""
+            )
+            if not type_name:
+                continue
+
+            fields: dict[str, str] = {}
+            type_field_elem = value_type_li.find(type_field_tag)
+            if type_field_elem is not None:
+                field_seq = type_field_elem.find(seq_tag)
+                if field_seq is not None:
+                    for field_li in field_seq.findall(li_tag):
+                        field_name_elem = field_li.find(field_name_tag)
+                        field_value_type_elem = field_li.find(field_value_type_tag)
+                        field_name = (
+                            (field_name_elem.text or "").strip()
+                            if field_name_elem is not None
+                            else ""
+                        )
+                        field_value_type = (
+                            (field_value_type_elem.text or "").strip()
+                            if field_value_type_elem is not None
+                            else ""
+                        )
+                        if field_name and field_value_type:
+                            fields[field_name] = field_value_type
+
+            custom_types.setdefault(uri, {})[type_name] = fields
+
+    return property_types, custom_types
+
+
+def _build_extension_schemas_from_blocks(
+    blocks: dict[str, etree._Element],
+) -> etree._Element | None:
+    """Build a pdfaExtension:schemas element from sanitized schema blocks."""
+    if not blocks:
+        return None
+
+    ns_rdf = NAMESPACES["rdf"]
+    schemas_elem = etree.Element(f"{{{_NS_PDFA_EXTENSION}}}schemas")
+    bag = etree.SubElement(schemas_elem, f"{{{ns_rdf}}}Bag")
+
+    for uri in sorted(blocks):
+        bag.append(copy.deepcopy(blocks[uri]))
+
+    return schemas_elem
+
+
 def _detect_structure(elem: etree._Element, ns_rdf: str) -> str:
     """Detect the actual XMP structure type of a property element.
 
@@ -1105,6 +1334,12 @@ def _is_valid_simple_value(text: str, type_code: str) -> bool:
         return False
     if type_code == "i":
         return text.lstrip("-").isdigit()
+    if type_code == "f":
+        try:
+            float(text)
+        except ValueError:
+            return False
+        return True
     if type_code == "r":
         parts = text.split("/")
         if len(parts) != 2 or not parts[0] or not parts[1]:
@@ -1147,6 +1382,160 @@ def _validate_alt_lang(elem: etree._Element, ns_rdf: str) -> bool:
                     return False
             return True
     return False  # No Alt found
+
+
+def _normalize_extension_value_type(value_type: str) -> str:
+    """Normalize XMP extension valueType whitespace."""
+    return " ".join(value_type.split())
+
+
+def _split_extension_container_type(value_type: str) -> tuple[str, str] | None:
+    """Split a container valueType into (container, subtype)."""
+    normalized = _normalize_extension_value_type(value_type)
+    parts = normalized.split(" ", 1)
+    if len(parts) != 2 or parts[0] not in {"Bag", "Seq", "Alt"}:
+        return None
+    return parts[0], parts[1]
+
+
+def _validate_extension_attribute_value(
+    value: str,
+    value_type: str,
+) -> bool:
+    """Validate an attribute-form extension property against its valueType."""
+    normalized = _normalize_extension_value_type(value_type)
+    type_code = _EXTENSION_VALUE_TYPE_MAP.get(normalized)
+    if type_code is None:
+        return False
+    return _is_valid_simple_value(value.strip(), type_code)
+
+
+def _validate_extension_struct_fields(
+    elem: etree._Element,
+    field_types: dict[str, str],
+    custom_types: dict[str, dict[str, str]],
+) -> bool:
+    """Validate a structured extension value against its declared fields."""
+    ns_rdf = NAMESPACES["rdf"]
+    rdf_desc_tag = f"{{{ns_rdf}}}Description"
+    source = elem
+    rdf_descriptions = [child for child in elem if child.tag == rdf_desc_tag]
+    if len(rdf_descriptions) > 1:
+        return False
+    if rdf_descriptions:
+        if len(elem) != 1:
+            return False
+        source = rdf_descriptions[0]
+
+    for attr_name, attr_value in source.attrib.items():
+        if not attr_name.startswith("{"):
+            return False
+        attr_uri, attr_local = attr_name[1:].split("}", 1)
+        if attr_uri == ns_rdf:
+            continue
+        declared_type = field_types.get(attr_local)
+        if declared_type is None:
+            return False
+        if not _validate_extension_attribute_value(attr_value, declared_type):
+            return False
+
+    for child in source:
+        if not isinstance(child.tag, str) or not child.tag.startswith("{"):
+            return False
+        child_uri, child_local = child.tag[1:].split("}", 1)
+        if child_uri == ns_rdf:
+            return False
+        declared_type = field_types.get(child_local)
+        if declared_type is None:
+            return False
+        if not _is_valid_extension_property_value(
+            child,
+            declared_type,
+            custom_types,
+        ):
+            return False
+
+    return True
+
+
+def _validate_extension_container_items(
+    elem: etree._Element,
+    expected_container: str,
+    item_value_type: str,
+    custom_types: dict[str, dict[str, str]],
+) -> bool:
+    """Validate items inside a Bag/Seq/Alt extension property."""
+    ns_rdf = NAMESPACES["rdf"]
+    container_tag = f"{{{ns_rdf}}}{expected_container}"
+    li_tag = f"{{{ns_rdf}}}li"
+    xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
+
+    for child in elem:
+        if child.tag != container_tag:
+            continue
+        for li in child:
+            if li.tag != li_tag:
+                continue
+            if expected_container == "Alt" and item_value_type == "Lang Alt":
+                if li.get(xml_lang) is None:
+                    return False
+            type_code = _EXTENSION_VALUE_TYPE_MAP.get(item_value_type)
+            if type_code is not None:
+                if any(isinstance(grand.tag, str) for grand in li):
+                    return False
+                if not _is_valid_simple_value((li.text or "").strip(), type_code):
+                    return False
+                continue
+            custom_field_types = custom_types.get(item_value_type)
+            if custom_field_types is None:
+                return False
+            if not _validate_extension_struct_fields(
+                li, custom_field_types, custom_types
+            ):
+                return False
+        return True
+
+    return False
+
+
+def _is_valid_extension_property_value(
+    elem: etree._Element,
+    value_type: str,
+    custom_types: dict[str, dict[str, str]],
+) -> bool:
+    """Validate an XMP property against its declared extension valueType."""
+    normalized = _normalize_extension_value_type(value_type)
+    ns_rdf = NAMESPACES["rdf"]
+    actual = _detect_structure(elem, ns_rdf)
+
+    if normalized == "Lang Alt":
+        return actual == "a" and _validate_alt_lang(elem, ns_rdf)
+
+    type_code = _EXTENSION_VALUE_TYPE_MAP.get(normalized)
+    if type_code is not None:
+        if actual != "s":
+            return False
+        return _is_valid_simple_value((elem.text or "").strip(), type_code)
+
+    container_info = _split_extension_container_type(normalized)
+    if container_info is not None:
+        container_name, item_value_type = container_info
+        expected_structure = {"Bag": "b", "Seq": "q", "Alt": "a"}[container_name]
+        if actual != expected_structure:
+            return False
+        return _validate_extension_container_items(
+            elem,
+            container_name,
+            item_value_type,
+            custom_types,
+        )
+
+    custom_field_types = custom_types.get(normalized)
+    if custom_field_types is None:
+        return False
+    if actual != "x":
+        return False
+    return _validate_extension_struct_fields(elem, custom_field_types, custom_types)
 
 
 def _get_extension_type_code(uri: str, local_name: str) -> str | None:
@@ -1433,6 +1822,12 @@ def _collect_preserved_elements(
 
     # Invert NAMESPACES for URI->prefix lookup
     uri_to_prefix = {uri: prefix for prefix, uri in NAMESPACES.items()}
+    schema_blocks = _sanitize_extension_schema_blocks(
+        _extract_extension_schema_blocks(old_tree)
+    )
+    declared_property_types, declared_custom_types = (
+        _collect_declared_extension_schema_details(schema_blocks)
+    )
 
     # Only preserve properties from top-level rdf:Description nodes directly
     # under rdf:RDF. Nested rdf:Description nodes are property value structs.
@@ -1453,7 +1848,22 @@ def _collect_preserved_elements(
                 # Validate property structure/value against predefined schema
                 if isinstance(tag, str) and tag.startswith("{"):
                     uri, local = tag[1:].split("}", 1)
-                    if not _is_valid_preserved_property(child, uri, local):
+                    declared_value_type = declared_property_types.get(uri, {}).get(
+                        local
+                    )
+                    if declared_value_type is not None:
+                        if not _is_valid_extension_property_value(
+                            child,
+                            declared_value_type,
+                            declared_custom_types.get(uri, {}),
+                        ):
+                            logger.debug(
+                                "Stripping extension property with invalid"
+                                " valueType: %s",
+                                tag,
+                            )
+                            continue
+                    elif not _is_valid_preserved_property(child, uri, local):
                         logger.debug(
                             "Stripping non-conforming property: %s",
                             tag,
@@ -1481,21 +1891,37 @@ def _collect_preserved_elements(
                 if attr_name.startswith("{"):
                     a_uri, a_local = attr_name[1:].split("}", 1)
                     text = attr_value.strip()
-                    # Check predefined property types first
-                    type_code = _PREDEFINED_PROPERTY_TYPES.get(
-                        (a_uri, a_local),
+                    declared_value_type = declared_property_types.get(a_uri, {}).get(
+                        a_local
                     )
-                    if type_code is None:
-                        # Check extension schema types
-                        type_code = _get_extension_type_code(a_uri, a_local)
-                    if type_code is not None:
-                        if not _is_valid_simple_value(text, type_code):
+                    if declared_value_type is not None:
+                        if not _validate_extension_attribute_value(
+                            text,
+                            declared_value_type,
+                        ):
                             logger.debug(
-                                "Stripping non-conforming attribute: %s=%r",
+                                "Stripping extension attribute with invalid valueType:"
+                                " %s=%r",
                                 attr_name,
                                 attr_value,
                             )
                             continue
+                    else:
+                        # Check predefined property types first
+                        type_code = _PREDEFINED_PROPERTY_TYPES.get(
+                            (a_uri, a_local),
+                        )
+                        if type_code is None:
+                            # Check extension schema types
+                            type_code = _get_extension_type_code(a_uri, a_local)
+                        if type_code is not None:
+                            if not _is_valid_simple_value(text, type_code):
+                                logger.debug(
+                                    "Stripping non-conforming attribute: %s=%r",
+                                    attr_name,
+                                    attr_value,
+                                )
+                                continue
                 preserved_attrs[attr_name] = attr_value
 
                 # Track namespace
@@ -2089,6 +2515,106 @@ def _reserialize_xmp(tree: etree._Element) -> bytes:
     return XMP_HEADER + xml_bytes + XMP_TRAILER
 
 
+def _sanitize_non_catalog_xmp_tree(tree: etree._Element) -> None:
+    """Strip undeclared custom properties from a non-catalog XMP packet."""
+    ns_rdf = NAMESPACES["rdf"]
+    ext_tag = f"{{{_NS_PDFA_EXTENSION}}}schemas"
+    top_level_descriptions: list[etree._Element] = []
+
+    for rdf_root in tree.iter(f"{{{ns_rdf}}}RDF"):
+        top_level_descriptions.extend(rdf_root.findall(f"{{{ns_rdf}}}Description"))
+
+    if not top_level_descriptions:
+        return
+
+    sanitized_blocks = _sanitize_extension_schema_blocks(
+        _extract_extension_schema_blocks(tree)
+    )
+    declared_property_types, declared_custom_types = (
+        _collect_declared_extension_schema_details(sanitized_blocks)
+    )
+
+    for desc in top_level_descriptions:
+        for ext_elem in desc.findall(ext_tag):
+            desc.remove(ext_elem)
+
+    extension_elem = _build_extension_schemas_from_blocks(sanitized_blocks)
+    if extension_elem is not None:
+        top_level_descriptions[0].append(extension_elem)
+
+    for desc in top_level_descriptions:
+        for child in list(desc):
+            tag = child.tag
+            if not isinstance(tag, str):
+                continue
+            if tag == ext_tag:
+                continue
+            if tag.startswith(f"{{{ns_rdf}}}"):
+                continue
+            if not tag.startswith("{"):
+                desc.remove(child)
+                continue
+
+            uri, local = tag[1:].split("}", 1)
+            predefined = _PREDEFINED_PROPERTIES.get(uri)
+            declared_value_type = declared_property_types.get(uri, {}).get(local)
+
+            if predefined is not None and local in predefined:
+                if _is_valid_preserved_property(child, uri, local):
+                    continue
+                desc.remove(child)
+                continue
+
+            if declared_value_type is not None and _is_valid_extension_property_value(
+                child,
+                declared_value_type,
+                declared_custom_types.get(uri, {}),
+            ):
+                continue
+
+            desc.remove(child)
+
+        for attr_name in list(desc.attrib):
+            if attr_name == f"{{{ns_rdf}}}about":
+                continue
+            if attr_name in ("about", "ID", "nodeID"):
+                del desc.attrib[attr_name]
+                continue
+            if not attr_name.startswith("{"):
+                del desc.attrib[attr_name]
+                continue
+
+            uri, local = attr_name[1:].split("}", 1)
+            if uri == ns_rdf:
+                del desc.attrib[attr_name]
+                continue
+
+            predefined = _PREDEFINED_PROPERTIES.get(uri)
+            declared_value_type = declared_property_types.get(uri, {}).get(local)
+            if predefined is None and declared_value_type is None:
+                del desc.attrib[attr_name]
+                continue
+            if (
+                predefined is not None
+                and local not in predefined
+                and declared_value_type is None
+            ):
+                del desc.attrib[attr_name]
+                continue
+
+            text = (desc.attrib[attr_name] or "").strip()
+            if declared_value_type is not None:
+                if not _validate_extension_attribute_value(text, declared_value_type):
+                    del desc.attrib[attr_name]
+                continue
+
+            type_code = _PREDEFINED_PROPERTY_TYPES.get((uri, local))
+            if type_code is None:
+                type_code = _get_extension_type_code(uri, local)
+            if type_code is not None and not _is_valid_simple_value(text, type_code):
+                del desc.attrib[attr_name]
+
+
 def _collect_non_catalog_extension_needs(
     pdf: pikepdf.Pdf,
 ) -> dict[str, set[str]]:
@@ -2211,6 +2737,8 @@ def _sanitize_non_catalog_metadata(pdf: pikepdf.Pdf) -> tuple[int, int]:
                 del obj["/Metadata"]
                 removed += 1
                 continue
+
+            _sanitize_non_catalog_xmp_tree(tree)
 
             # Valid XMP — re-serialize cleanly and ensure uncompressed
             clean_bytes = _reserialize_xmp(tree)

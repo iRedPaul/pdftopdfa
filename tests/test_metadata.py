@@ -1943,6 +1943,56 @@ class TestPreservationValidation:
         )
         assert b"doc123" not in xmp
 
+    def test_extension_property_wrong_declared_text_type_stripped(self) -> None:
+        """Custom property declared as Text is stripped when stored as rdf:Bag."""
+        custom_ns = "http://example.com/custom/"
+        xmp_xml = f"""\
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}"
+           xmlns:pdfaid="{NAMESPACES["pdfaid"]}"
+           xmlns:custom="{custom_ns}"
+           xmlns:pdfaExtension="{_NS_PDFA_EXTENSION}"
+           xmlns:pdfaSchema="{_NS_PDFA_SCHEMA}"
+           xmlns:pdfaProperty="{_NS_PDFA_PROPERTY}">
+    <rdf:Description rdf:about="">
+      <pdfaid:part>2</pdfaid:part>
+      <pdfaid:conformance>B</pdfaid:conformance>
+      <custom:Foo>
+        <rdf:Bag>
+          <rdf:li>bar</rdf:li>
+        </rdf:Bag>
+      </custom:Foo>
+      <pdfaExtension:schemas>
+        <rdf:Bag>
+          <rdf:li rdf:parseType="Resource">
+            <pdfaSchema:schema>Custom</pdfaSchema:schema>
+            <pdfaSchema:namespaceURI>{custom_ns}</pdfaSchema:namespaceURI>
+            <pdfaSchema:prefix>custom</pdfaSchema:prefix>
+            <pdfaSchema:property>
+              <rdf:Seq>
+                <rdf:li rdf:parseType="Resource">
+                  <pdfaProperty:name>Foo</pdfaProperty:name>
+                  <pdfaProperty:valueType>Text</pdfaProperty:valueType>
+                  <pdfaProperty:category>external</pdfaProperty:category>
+                  <pdfaProperty:description>Foo property</pdfaProperty:description>
+                </rdf:li>
+              </rdf:Seq>
+            </pdfaSchema:property>
+          </rdf:li>
+        </rdf:Bag>
+      </pdfaExtension:schemas>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"""
+        tree = etree.fromstring(xmp_xml.encode("utf-8"))
+        xmp = create_xmp_metadata(
+            {"title": "Test"},
+            pdfa_part=2,
+            pdfa_conformance="B",
+            existing_xmp_tree=tree,
+        )
+        assert b"custom:Foo" not in xmp
+
     def test_invalid_integer_stripped(self) -> None:
         """tiff:ImageWidth with non-integer value is stripped."""
         tiff = "http://ns.adobe.com/tiff/1.0/"
@@ -2794,6 +2844,155 @@ class TestSanitizeNonCatalogMetadata:
         assert removed == 1
         assert "/Metadata" in pdf.pages[0].obj
 
+    def test_strips_undeclared_custom_properties(
+        self,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """Undeclared custom properties are removed from non-catalog XMP."""
+        from io import BytesIO
+
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
+        custom_ns = "http://example.com/custom/"
+        xmp_data = (
+            b'<?xpacket begin="\xef\xbb\xbf"'
+            b' id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b"<rdf:RDF xmlns:rdf="
+            b'"http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about=""'
+            b' xmlns:xmp="http://ns.adobe.com/xap/1.0/"'
+            + f' xmlns:custom="{custom_ns}">'.encode()
+            + b"<xmp:CreatorTool>scanner</xmp:CreatorTool>"
+            + b"<custom:Foo>bar</custom:Foo>"
+            + b"</rdf:Description>"
+            + b"</rdf:RDF>"
+            + b"</x:xmpmeta>\n"
+            + b'<?xpacket end="w"?>'
+        )
+        meta = pikepdf.Stream(pdf, xmp_data)
+        meta.Type = Name.Metadata
+        meta.Subtype = Name.XML
+        ref = pdf.make_indirect(meta)
+        pdf.pages[0].obj["/Metadata"] = ref
+
+        sanitized, removed = _sanitize_non_catalog_metadata(pdf)
+        assert sanitized == 1
+        assert removed == 0
+
+        page_meta = pdf.get_object(ref.objgen)
+        content = bytes(page_meta.read_bytes())
+        assert b"xmp:CreatorTool" in content
+        assert b"custom:Foo" not in content
+
+    def test_preserves_locally_declared_custom_properties(
+        self,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """Custom properties with a local valid extension schema are preserved."""
+        from io import BytesIO
+
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
+        xmp_data = (
+            b'<?xpacket begin="\xef\xbb\xbf"'
+            b' id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b"<rdf:RDF xmlns:rdf="
+            b'"http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about=""'
+            b' xmlns:custom="http://example.com/custom/"'
+            b' xmlns:pdfaExtension="http://www.aiim.org/pdfa/ns/extension/"'
+            b' xmlns:pdfaSchema="http://www.aiim.org/pdfa/ns/schema#"'
+            b' xmlns:pdfaProperty="http://www.aiim.org/pdfa/ns/property#">'
+            b"<custom:Foo>bar</custom:Foo>"
+            b"<pdfaExtension:schemas><rdf:Bag>"
+            b'<rdf:li rdf:parseType="Resource">'
+            b"<pdfaSchema:schema>Custom</pdfaSchema:schema>"
+            b"<pdfaSchema:namespaceURI>http://example.com/custom/</pdfaSchema:namespaceURI>"
+            b"<pdfaSchema:prefix>custom</pdfaSchema:prefix>"
+            b"<pdfaSchema:property><rdf:Seq>"
+            b'<rdf:li rdf:parseType="Resource">'
+            b"<pdfaProperty:name>Foo</pdfaProperty:name>"
+            b"<pdfaProperty:valueType>Text</pdfaProperty:valueType>"
+            b"<pdfaProperty:category>external</pdfaProperty:category>"
+            b"<pdfaProperty:description>Foo property</pdfaProperty:description>"
+            b"</rdf:li>"
+            b"</rdf:Seq></pdfaSchema:property>"
+            b"</rdf:li>"
+            b"</rdf:Bag></pdfaExtension:schemas>"
+            b"</rdf:Description>"
+            b"</rdf:RDF>"
+            b"</x:xmpmeta>\n"
+            b'<?xpacket end="w"?>'
+        )
+        meta = pikepdf.Stream(pdf, xmp_data)
+        meta.Type = Name.Metadata
+        meta.Subtype = Name.XML
+        ref = pdf.make_indirect(meta)
+        pdf.pages[0].obj["/Metadata"] = ref
+
+        sanitized, removed = _sanitize_non_catalog_metadata(pdf)
+        assert sanitized == 1
+        assert removed == 0
+
+        page_meta = pdf.get_object(ref.objgen)
+        content = bytes(page_meta.read_bytes())
+        assert b"custom:Foo" in content
+        assert b"pdfaExtension:schemas" in content
+
+    def test_strips_custom_property_with_wrong_declared_value_type(
+        self,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """Locally declared custom properties are removed when valueType mismatches."""
+        from io import BytesIO
+
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
+        xmp_data = (
+            b'<?xpacket begin="\xef\xbb\xbf"'
+            b' id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b"<rdf:RDF xmlns:rdf="
+            b'"http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about=""'
+            b' xmlns:custom="http://example.com/custom/"'
+            b' xmlns:pdfaExtension="http://www.aiim.org/pdfa/ns/extension/"'
+            b' xmlns:pdfaSchema="http://www.aiim.org/pdfa/ns/schema#"'
+            b' xmlns:pdfaProperty="http://www.aiim.org/pdfa/ns/property#">'
+            b"<custom:Foo><rdf:Bag><rdf:li>bar</rdf:li></rdf:Bag></custom:Foo>"
+            b"<pdfaExtension:schemas><rdf:Bag>"
+            b'<rdf:li rdf:parseType="Resource">'
+            b"<pdfaSchema:schema>Custom</pdfaSchema:schema>"
+            b"<pdfaSchema:namespaceURI>http://example.com/custom/</pdfaSchema:namespaceURI>"
+            b"<pdfaSchema:prefix>custom</pdfaSchema:prefix>"
+            b"<pdfaSchema:property><rdf:Seq>"
+            b'<rdf:li rdf:parseType="Resource">'
+            b"<pdfaProperty:name>Foo</pdfaProperty:name>"
+            b"<pdfaProperty:valueType>Text</pdfaProperty:valueType>"
+            b"<pdfaProperty:category>external</pdfaProperty:category>"
+            b"<pdfaProperty:description>Foo property</pdfaProperty:description>"
+            b"</rdf:li>"
+            b"</rdf:Seq></pdfaSchema:property>"
+            b"</rdf:li>"
+            b"</rdf:Bag></pdfaExtension:schemas>"
+            b"</rdf:Description>"
+            b"</rdf:RDF>"
+            b"</x:xmpmeta>\n"
+            b'<?xpacket end="w"?>'
+        )
+        meta = pikepdf.Stream(pdf, xmp_data)
+        meta.Type = Name.Metadata
+        meta.Subtype = Name.XML
+        ref = pdf.make_indirect(meta)
+        pdf.pages[0].obj["/Metadata"] = ref
+
+        sanitized, removed = _sanitize_non_catalog_metadata(pdf)
+        assert sanitized == 1
+        assert removed == 0
+
+        page_meta = pdf.get_object(ref.objgen)
+        content = bytes(page_meta.read_bytes())
+        assert b"custom:Foo" not in content
+
 
 class TestExtractExtensionSchemaBlocks:
     """Tests for _extract_extension_schema_blocks."""
@@ -3206,6 +3405,16 @@ class TestSanitizeExtensionSchemaBlocks:
         result = _sanitize_extension_schema_blocks({uri: li})
         assert uri in result
 
+    def test_undefined_schema_field_removed(self) -> None:
+        """Unknown fields on the schema object are removed."""
+        uri = "http://example.com/ns/"
+        li = _make_valid_schema_li(uri=uri)
+        etree.SubElement(li, f"{{{_NS_PDFA_SCHEMA}}}bogus").text = "bad"
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+        assert result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}bogus") is None
+
     def test_missing_schema_name_drops_block(self) -> None:
         """Block without pdfaSchema:schema is dropped."""
         uri = "http://example.com/ns/"
@@ -3289,6 +3498,23 @@ class TestSanitizeExtensionSchemaBlocks:
         ]
         assert "GoodProp" in names
         assert "BadProp" not in names
+
+    def test_undefined_property_field_removed(self) -> None:
+        """Unknown fields on a property object are removed."""
+        uri = "http://example.com/ns/"
+        ns_rdf = NAMESPACES["rdf"]
+        li = _make_valid_schema_li(uri=uri)
+        seq = li.find(f"{{{_NS_PDFA_SCHEMA}}}property").find(f"{{{ns_rdf}}}Seq")
+        prop_li = seq.find(f"{{{ns_rdf}}}li")
+        etree.SubElement(prop_li, f"{{{_NS_PDFA_PROPERTY}}}bogus").text = "bad"
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+        out_seq = (
+            result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}property").find(f"{{{ns_rdf}}}Seq")
+        )
+        out_prop_li = out_seq.find(f"{{{ns_rdf}}}li")
+        assert out_prop_li.find(f"{{{_NS_PDFA_PROPERTY}}}bogus") is None
 
     def test_all_properties_malformed_drops_block(self) -> None:
         """Block whose every property is invalid is dropped after Seq becomes empty."""
@@ -3374,6 +3600,25 @@ class TestSanitizeExtensionSchemaBlocks:
         entry = seq.find(f"{{{ns_rdf}}}li")
         assert entry is not None
         assert entry.find(f"{{{_NS_PDFA_TYPE}}}field") is None
+
+    def test_undefined_value_type_field_removed(self) -> None:
+        """Unknown fields on a ValueType object are removed."""
+        uri = "http://example.com/ns/"
+        ns_rdf = NAMESPACES["rdf"]
+        li = _make_valid_schema_li(uri=uri)
+        value_type_entry = _add_value_type_entry(li, type_name="TypeWithExtra")
+        etree.SubElement(value_type_entry, f"{{{_NS_PDFA_TYPE}}}bogus").text = "bad"
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+
+        value_type_elem = result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}valueType")
+        assert value_type_elem is not None
+        seq = value_type_elem.find(f"{{{ns_rdf}}}Seq")
+        assert seq is not None
+        entry = seq.find(f"{{{ns_rdf}}}li")
+        assert entry is not None
+        assert entry.find(f"{{{_NS_PDFA_TYPE}}}bogus") is None
 
     def test_value_type_removed_when_all_entries_invalid(self) -> None:
         """pdfaSchema:valueType is removed when all ValueType entries are invalid."""
@@ -3534,6 +3779,31 @@ class TestSanitizeExtensionSchemaBlocks:
         ]
         assert "GoodField" in names
         assert "BadField" not in names
+
+    def test_undefined_field_entry_field_removed(self) -> None:
+        """Unknown fields on a pdfaField object are removed."""
+        uri = "http://example.com/ns/"
+        ns_rdf = NAMESPACES["rdf"]
+        li = _make_valid_schema_li(uri=uri)
+        value_type_entry = _add_value_type_entry(li, type_name="ContainerType")
+        field_seq = _add_value_type_field_seq(value_type_entry)
+        field_li = _add_value_type_field_entry(field_seq, name="GoodField")
+        etree.SubElement(field_li, f"{{{_NS_PDFA_FIELD}}}bogus").text = "bad"
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+        assert uri in result
+
+        value_type_seq = (
+            result[uri].find(f"{{{_NS_PDFA_SCHEMA}}}valueType").find(f"{{{ns_rdf}}}Seq")
+        )
+        assert value_type_seq is not None
+        entry = value_type_seq.find(f"{{{ns_rdf}}}li")
+        assert entry is not None
+        out_field_seq = entry.find(f"{{{_NS_PDFA_TYPE}}}field").find(f"{{{ns_rdf}}}Seq")
+        assert out_field_seq is not None
+        out_field_li = out_field_seq.find(f"{{{ns_rdf}}}li")
+        assert out_field_li is not None
+        assert out_field_li.find(f"{{{_NS_PDFA_FIELD}}}bogus") is None
 
     def test_field_removed_when_all_field_entries_invalid(self) -> None:
         """pdfaType:field is removed when all field entries are invalid."""
