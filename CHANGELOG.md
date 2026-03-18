@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.7] - 2026-03-18
+
+### Changes
+
+- Tighten XMP extension schema validation for PDF/A
+- Log non-compliant veraPDF prechecks as warnings
+
 ## [0.2.6] - 2026-03-13
 
 ### Bug Fixes
