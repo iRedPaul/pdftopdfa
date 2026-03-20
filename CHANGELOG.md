@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.8] - 2026-03-20
+
+### Bug Fixes
+
+- Fix forced OCR to avoid conflicting redo OCR options
+
 ## [0.2.7] - 2026-03-18
 
 ### Changes
