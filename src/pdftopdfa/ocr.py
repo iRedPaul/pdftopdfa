@@ -133,6 +133,11 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
     },
 }
 
+# ocrmypdf rejects these options when redo_ocr is enabled.
+_REDO_OCR_INCOMPATIBLE_OPTIONS = frozenset(
+    {"deskew", "clean_final", "remove_background"}
+)
+
 # Quality levels that benefit from OpenCV preprocessing
 _PREPROCESS_QUALITIES = frozenset({OcrQuality.DEFAULT, OcrQuality.BEST})
 
@@ -146,6 +151,21 @@ def _get_ocr_plugins(quality: OcrQuality) -> list[str]:
     if HAS_OPENCV:
         plugins.append(_PREPROCESS_PLUGIN)
     return plugins
+
+
+def _remove_redo_ocr_incompatible_options(ocr_kwargs: dict[str, object]) -> list[str]:
+    """Remove options that ocrmypdf rejects together with redo_ocr."""
+    removed_options: list[str] = []
+
+    for option in sorted(_REDO_OCR_INCOMPATIBLE_OPTIONS):
+        if option not in ocr_kwargs:
+            continue
+
+        value = ocr_kwargs.pop(option)
+        if value:
+            removed_options.append(option)
+
+    return removed_options
 
 
 def is_ocr_available() -> bool:
@@ -363,7 +383,8 @@ def apply_ocr(
             Example: ``["deu", "eng"]`` for German + English.
         quality: OCR quality preset (default: OcrQuality.DEFAULT).
         force: If True, use ocrmypdf's ``redo_ocr`` mode to remove the
-            existing OCR layer and re-apply OCR (default: False).
+            existing OCR layer and re-apply OCR. Options incompatible with
+            ``redo_ocr`` are disabled automatically (default: False).
 
     Returns:
         Path to the OCR-processed PDF.
@@ -392,6 +413,12 @@ def apply_ocr(
 
         if force:
             ocr_kwargs.pop("skip_text", None)
+            removed_options = _remove_redo_ocr_incompatible_options(ocr_kwargs)
+            if removed_options:
+                logger.info(
+                    "force=True disables redo_ocr-incompatible OCR options: %s",
+                    ", ".join(removed_options),
+                )
             ocr_kwargs["redo_ocr"] = True
 
         if plugins:

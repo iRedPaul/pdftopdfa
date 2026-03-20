@@ -825,7 +825,7 @@ class TestApplyOcrForce:
     def test_apply_ocr_force_with_best_quality(
         self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
     ) -> None:
-        """force=True with BEST quality preserves other settings."""
+        """force=True with BEST quality removes redo_ocr conflicts only."""
         output_path = tmp_dir / "output.pdf"
 
         apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST, force=True)
@@ -833,8 +833,60 @@ class TestApplyOcrForce:
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
         assert call_kwargs["redo_ocr"] is True
         assert "skip_text" not in call_kwargs
-        assert call_kwargs["deskew"] is True
+        assert "deskew" not in call_kwargs
         assert call_kwargs["rotate_pages"] is True
+
+    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_force_removes_all_redo_ocr_incompatible_options(
+        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """force=True strips all ocrmypdf options incompatible with redo_ocr."""
+        output_path = tmp_dir / "output.pdf"
+        forced_best_settings = {
+            **OCR_SETTINGS[OcrQuality.BEST],
+            "clean_final": True,
+            "remove_background": True,
+        }
+
+        with patch.dict(
+            "pdftopdfa.ocr.OCR_SETTINGS",
+            {OcrQuality.BEST: forced_best_settings},
+            clear=False,
+        ):
+            apply_ocr(
+                sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST, force=True
+            )
+
+        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
+        assert "deskew" not in call_kwargs
+        assert "clean_final" not in call_kwargs
+        assert "remove_background" not in call_kwargs
+        assert call_kwargs["rotate_pages"] is True
+
+    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_force_logs_removed_incompatible_options(
+        self,
+        mock_ocrmypdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """force=True logs when redo_ocr-incompatible options are disabled."""
+        output_path = tmp_dir / "output.pdf"
+
+        with caplog.at_level(logging.INFO, logger="pdftopdfa.ocr"):
+            apply_ocr(
+                sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST, force=True
+            )
+
+        assert (
+            "force=True disables redo_ocr-incompatible OCR options: deskew"
+            in caplog.text
+        )
 
 
 class TestOpenCVPlugin:

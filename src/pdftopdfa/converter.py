@@ -537,7 +537,8 @@ def convert_to_pdfa(
             image-based pages.
         ocr_quality: OCR quality preset. If None, uses OcrQuality.DEFAULT.
         ocr_force: If True, force OCR even on pages that already contain
-            text by using ocrmypdf's ``redo_ocr`` mode.
+            text by using ocrmypdf's ``redo_ocr`` mode. Options
+            incompatible with ``redo_ocr`` are disabled automatically.
 
     Returns:
         ConversionResult with status and details.
@@ -971,7 +972,8 @@ def convert_files(
             (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
         ocr_force: If True, force OCR even on pages that already contain
-            text.
+            text. Options incompatible with ocrmypdf's ``redo_ocr``
+            mode are disabled automatically.
         force_overwrite: If True, existing output files are overwritten.
             If False, existing outputs are skipped with an error result.
         on_progress: Optional callback(current_idx, total, filename) called
@@ -1073,7 +1075,8 @@ def convert_directory(
             If specified, OCR is applied to image-based pages.
         ocr_quality: OCR quality preset.
         ocr_force: If True, force OCR even on pages that already contain
-            text.
+            text. Options incompatible with ocrmypdf's ``redo_ocr``
+            mode are disabled automatically.
         force_overwrite: If True, existing output files are overwritten.
 
     Returns:

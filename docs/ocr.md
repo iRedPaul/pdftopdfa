@@ -91,6 +91,8 @@ Behavior notes:
 
 - `--ocr-force` implies `--ocr`.
 - Existing OCR text layers are replaced.
+- With forced OCR, options incompatible with ocrmypdf's `redo_ocr`
+  mode are disabled automatically.
 - Original annotations are preserved when possible.
 
 ## Quality Presets
@@ -113,6 +115,8 @@ Internal OCR settings:
 
 `default` and `best` use OpenCV preprocessing when available.
 If OpenCV is unavailable, OCR still runs and preprocessing is skipped.
+When OCR is forced, redo-ocr-incompatible options such as `deskew`
+are disabled automatically.
 
 ## Troubleshooting
 
