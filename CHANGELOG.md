@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.9] - 2026-03-24
+
+### Changes
+
+- Skip encrypted PDFs by copying them unchanged
+
+### Documentation
+
+- Document skipped conversion results for encrypted PDFs
+
 ## [0.2.8] - 2026-03-20
 
 ### Bug Fixes
