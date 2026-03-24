@@ -401,6 +401,31 @@ class TestFontEmbedderIntegration:
         assert is_compliant
         assert missing == []
 
+    @pytest.mark.skipif(
+        not _liberation_fonts_available(),
+        reason="Liberation fonts not installed",
+    )
+    def test_replace_subsetted_standard14_font(self, pdf_with_helvetica):
+        """Subsetted embedded Standard-14 fonts are refreshed to full fonts."""
+        embedder = FontEmbedder(pdf_with_helvetica)
+        result = embedder.embed_missing_fonts()
+        assert "Helvetica" in result.fonts_embedded
+
+        font = _resolve_indirect(pdf_with_helvetica.pages[0].Resources["/Font"]["/F1"])
+        font[Name.BaseFont] = Name("/ABCDEF+Helvetica")
+        font_descriptor = _resolve_indirect(font["/FontDescriptor"])
+        font_descriptor[Name.FontName] = Name("/ABCDEF+Helvetica")
+
+        refreshed = FontEmbedder(
+            pdf_with_helvetica
+        ).replace_subsetted_standard14_fonts()
+        font_descriptor = _resolve_indirect(font["/FontDescriptor"])
+
+        assert "Helvetica" in refreshed.fonts_embedded
+        assert font.get("/BaseFont") == Name("/Helvetica")
+        assert font_descriptor.get("/FontName") == Name("/Helvetica")
+        assert is_font_embedded(font)
+
 
 class TestCIDFontEmbedding:
     """Tests for CIDFont/Type0 embedding."""

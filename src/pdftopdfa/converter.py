@@ -814,6 +814,15 @@ def convert_to_pdfa(
                 encoding_fixes,
             )
 
+        # Replace embedded subsetted Standard-14 fonts with full bundled
+        # replacements after subsetting so incomplete original subsets are not
+        # carried forward into the final PDF/A output.
+        logger.debug("Refreshing subsetted Standard-14 fonts")
+        with FontEmbedder(pdf) as embedder:
+            refresh_result = embedder.replace_subsetted_standard14_fonts()
+
+        warnings.extend(refresh_result.warnings)
+
         # 4. Sanitize PDF for PDF/A
         logger.debug("Sanitizing PDF for PDF/A-%s", level)
         sanitize_result = sanitize_for_pdfa(pdf, level)

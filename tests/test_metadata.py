@@ -339,12 +339,11 @@ class TestCreateXmpMetadata:
         xmp = create_xmp_metadata(info, pdfa_part=2, pdfa_conformance="B")
         assert b"Keywords" not in xmp
 
-    def test_xmp_contains_trapped(self) -> None:
-        """XMP contains pdf:Trapped when trapped is set in info."""
+    def test_xmp_omits_trapped(self) -> None:
+        """XMP omits pdf:Trapped even when trapped is set in info."""
         info = {"title": "Test", "trapped": "True"}
         xmp = create_xmp_metadata(info, pdfa_part=2, pdfa_conformance="B")
-        assert b"Trapped" in xmp
-        assert b">True<" in xmp
+        assert b"Trapped" not in xmp
 
     def test_xmp_trapped_not_present_when_unset(self) -> None:
         """XMP does not contain Trapped when not provided in info."""
@@ -529,7 +528,7 @@ class TestSyncMetadata:
             assert b"Test Title" in xmp_bytes
 
     def test_sync_normalizes_trapped_in_docinfo(self, sample_pdf_bytes: bytes) -> None:
-        """Normalizes /Trapped in DocInfo, writes pdf:Trapped to XMP."""
+        """Normalizes /Trapped in DocInfo without writing pdf:Trapped to XMP."""
         from io import BytesIO
 
         pdf = open_pdf(BytesIO(sample_pdf_bytes))
@@ -540,12 +539,12 @@ class TestSyncMetadata:
         assert "/Trapped" in pdf.docinfo
         assert str(pdf.docinfo["/Trapped"]) == "/Unknown"
 
-        # pdf:Trapped is present in XMP
+        # pdf:Trapped is intentionally omitted from XMP
         xmp_bytes = bytes(pdf.Root.Metadata.read_bytes())
-        assert b"Trapped" in xmp_bytes
+        assert b"Trapped" not in xmp_bytes
 
     def test_sync_keeps_trapped_true(self, tmp_dir: Path) -> None:
-        """Keeps /Trapped True in DocInfo, writes pdf:Trapped to XMP."""
+        """Keeps /Trapped True in DocInfo without writing pdf:Trapped to XMP."""
         pdf = new_pdf()
         page = pikepdf.Page(
             Dictionary(
@@ -566,9 +565,9 @@ class TestSyncMetadata:
             assert "/Trapped" in pdf.docinfo
             assert str(pdf.docinfo["/Trapped"]) == "/True"
 
-            # pdf:Trapped is present in XMP
+            # pdf:Trapped is intentionally omitted from XMP
             xmp_bytes = bytes(pdf.Root.Metadata.read_bytes())
-            assert b"Trapped" in xmp_bytes
+            assert b"Trapped" not in xmp_bytes
 
     def test_sync_trapped_not_added_when_absent(self, sample_pdf_bytes: bytes) -> None:
         """When /Trapped is absent, it is not added to DocInfo or XMP."""

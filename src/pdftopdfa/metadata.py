@@ -163,7 +163,6 @@ _PREDEFINED_PROPERTIES: dict[str, set[str]] = {
     NAMESPACES["pdf"]: {
         "Producer",
         "Keywords",
-        "Trapped",
         "PDFVersion",
     },
     NAMESPACES["pdfaid"]: {
@@ -352,7 +351,6 @@ _PREDEFINED_PROPERTY_TYPES: dict[tuple[str, str], str] = {
     # pdf
     (_PDF, "Producer"): "s",
     (_PDF, "Keywords"): "s",
-    (_PDF, "Trapped"): "s",
     (_PDF, "PDFVersion"): "s",
     # pdfaid
     (_PDFAID, "part"): "i",
@@ -2340,12 +2338,6 @@ def create_xmp_metadata(
     if keywords:
         keywords_elem = etree.SubElement(description, f"{{{ns_pdf}}}Keywords")
         keywords_elem.text = keywords
-
-    # Add pdf:Trapped (synchronized with DocInfo /Trapped)
-    trapped = info.get("trapped")
-    if trapped:
-        trapped_elem = etree.SubElement(description, f"{{{ns_pdf}}}Trapped")
-        trapped_elem.text = trapped
 
     # Merge preserved elements from existing XMP
     if existing_xmp_tree is not None:

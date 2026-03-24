@@ -14,6 +14,7 @@ from pikepdf import Array, Dictionary, Name, Stream
 from ..exceptions import FontEmbeddingError
 from ..utils import resolve_indirect as _resolve_indirect
 from .analysis import (
+    _is_subset_font,
     get_base_font_name,
     get_font_name,
     get_font_type,
@@ -306,6 +307,83 @@ class FontEmbedder:
         """
         subsetter = FontSubsetter(self.pdf)
         return subsetter.subset_all_fonts()
+
+    def replace_subsetted_standard14_fonts(self) -> EmbeddingResult:
+        """Replace embedded subsetted Standard-14 fonts with full replacements.
+
+        Some generators embed incomplete subsets of the Standard 14 fonts.
+        veraPDF may still flag these subsets for missing rendered glyphs even
+        though the PDF technically embeds a font program. Replacing them with
+        the bundled metrically compatible full fonts gives later sanitizers a
+        stable, complete font program to work with.
+
+        Returns:
+            EmbeddingResult describing which fonts were refreshed.
+        """
+        result = EmbeddingResult()
+        processed_font_ids: set[tuple[int, int]] = set()
+        refreshed_names: set[str] = set()
+
+        for page in self.pdf.pages:
+            for font_key, font_obj in iter_all_page_fonts(page):
+                try:
+                    obj_key = font_obj.objgen
+                    if obj_key != (0, 0):
+                        if obj_key in processed_font_ids:
+                            continue
+                        processed_font_ids.add(obj_key)
+
+                    if not is_font_embedded(font_obj):
+                        continue
+
+                    font_name = get_font_name(font_obj)
+                    if not _is_subset_font(font_name):
+                        continue
+
+                    base_name = get_base_font_name(font_name)
+                    if base_name not in FONT_REPLACEMENTS:
+                        continue
+
+                    font_type = get_font_type(font_obj)
+                    if font_type not in {"TrueType", "Type1", "MMType1"}:
+                        continue
+
+                    success = self._replace_font_in_page(
+                        page,
+                        font_key,
+                        font_obj,
+                        base_name,
+                    )
+                    if not success:
+                        if base_name not in result.fonts_failed:
+                            result.fonts_failed.append(base_name)
+                        continue
+
+                    font_obj[Name.BaseFont] = Name(f"/{base_name}")
+                    font_descriptor = font_obj.get("/FontDescriptor")
+                    if font_descriptor is not None:
+                        font_descriptor = _resolve_indirect(font_descriptor)
+                        font_descriptor[Name.FontName] = Name(f"/{base_name}")
+
+                    if base_name not in refreshed_names:
+                        refreshed_names.add(base_name)
+                        result.fonts_embedded.append(base_name)
+
+                    logger.info(
+                        "Replaced subsetted Standard-14 font '%s' with full '%s'",
+                        font_name,
+                        base_name,
+                    )
+
+                except Exception as e:
+                    logger.debug(
+                        "Error refreshing subsetted Standard-14 font %s: %s",
+                        font_key,
+                        e,
+                    )
+                    continue
+
+        return result
 
     def _build_encoding_dictionary(self, encoding: dict[int, str]) -> Dictionary:
         """Creates PDF Encoding with Differences array.
