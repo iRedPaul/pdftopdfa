@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.10] - 2026-03-24
+
+### Bug Fixes
+
+- Fix PDF/A validation failures for subsetted embedded Standard-14 fonts by refreshing them to full replacements
+- Fix generated XMP metadata to omit `pdf:Trapped` and avoid PDF/A validation failures
+
 ## [0.2.9] - 2026-03-24
 
 ### Changes
