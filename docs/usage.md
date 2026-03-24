@@ -206,6 +206,7 @@ def convert_files(
 | `processing_time` | `float` | Runtime in seconds |
 | `error` | `str \\| None` | Error message if failed |
 | `validation_failed` | `bool` | `True` if veraPDF reported non-compliance |
+| `skipped` | `bool` | `True` if the original PDF was copied unchanged |
 
 ## Exceptions
 
@@ -228,10 +229,13 @@ from pdftopdfa.exceptions import ConversionError, UnsupportedPDFError
 try:
     convert_to_pdfa(Path("input.pdf"), Path("output.pdf"))
 except UnsupportedPDFError:
-    print("Unsupported PDF (for example encrypted)")
+    print("Unsupported PDF")
 except ConversionError as exc:
     print(f"Conversion failed: {exc}")
 ```
+
+Encrypted PDFs are copied to the output path unchanged and returned with
+`success=True`, `skipped=True`, and a warning that conversion was skipped.
 
 ## PDF/A Levels
 

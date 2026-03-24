@@ -186,6 +186,7 @@ class ConversionResult:
         processing_time: Processing time in seconds.
         error: Error message if success=False.
         validation_failed: True if veraPDF validation failed.
+        skipped: True if the original PDF was copied through unchanged.
     """
 
     success: bool
@@ -196,6 +197,7 @@ class ConversionResult:
     processing_time: float = 0.0
     error: str | None = None
     validation_failed: bool = False
+    skipped: bool = False
 
 
 def generate_output_path(
@@ -215,6 +217,25 @@ def generate_output_path(
     if output_dir is not None:
         return output_dir / output_name
     return input_path.parent / output_name
+
+
+def _copy_input_to_output(input_path: Path, output_path: Path) -> None:
+    """Copy the input file to the requested output location.
+
+    Args:
+        input_path: Original file path.
+        output_path: Destination file path.
+
+    Raises:
+        ConversionError: If a different output file already exists.
+    """
+    if input_path.resolve() == output_path.resolve():
+        return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        raise ConversionError(f"Output file already exists: {output_path}")
+    shutil.copy2(str(input_path), str(output_path))
 
 
 def _truncate_trailing_data(output_path: Path) -> bool:
@@ -565,8 +586,18 @@ def convert_to_pdfa(
         # 0. Check if PDF is already PDF/A compliant (before OCR)
         with pikepdf.open(input_path) as check_pdf:
             if is_pdf_encrypted(check_pdf):
-                raise UnsupportedPDFError(
-                    f"PDF is encrypted and cannot be converted: {input_path}"
+                processing_time = time.perf_counter() - start_time
+                warning = "Conversion skipped: PDF is encrypted and cannot be converted"
+                logger.warning("%s: %s", warning, input_path)
+                _copy_input_to_output(input_path, output_path)
+                return ConversionResult(
+                    success=True,
+                    input_path=input_path,
+                    output_path=output_path,
+                    level=level,
+                    warnings=[warning],
+                    processing_time=processing_time,
+                    skipped=True,
                 )
             detected_level = detect_pdfa_level(check_pdf)
 
@@ -590,13 +621,7 @@ def convert_to_pdfa(
                         "Skipping conversion: PDF is already valid PDF/A-%s",
                         detected_level,
                     )
-                    if input_path.resolve() != output_path.resolve():
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        if output_path.exists():
-                            raise ConversionError(
-                                f"Output file already exists: {output_path}"
-                            )
-                        shutil.copy2(str(input_path), str(output_path))
+                    _copy_input_to_output(input_path, output_path)
                     return ConversionResult(
                         success=True,
                         input_path=input_path,
@@ -604,6 +629,7 @@ def convert_to_pdfa(
                         level=detected_level,
                         warnings=["Conversion skipped: PDF already valid PDF/A"],
                         processing_time=processing_time,
+                        skipped=True,
                     )
                 elif verapdf_result is not None:
                     logger.info(

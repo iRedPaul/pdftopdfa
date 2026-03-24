@@ -107,8 +107,9 @@ def _print_result(result: ConversionResult, quiet: bool) -> None:
     """
     if result.success:
         if not quiet:
+            action = "Skipped" if result.skipped else "Converted"
             print_success(
-                f"Converted: {result.input_path.name} -> "
+                f"{action}: {result.input_path.name} -> "
                 f"{result.output_path.name} (PDF/A-{result.level}, "
                 f"{result.processing_time:.2f}s)"
             )
@@ -490,7 +491,8 @@ def _convert_directory(
     )
 
     # Output summary
-    successful = [r for r in results if r.success]
+    successful = [r for r in results if r.success and not r.skipped]
+    skipped = [r for r in results if r.success and r.skipped]
     failed = [r for r in results if not r.success]
     validation_failures = [r for r in successful if r.validation_failed]
 
@@ -498,6 +500,11 @@ def _convert_directory(
         click.echo()
         click.echo("Summary:")
         print_success(f"{len(successful)} file(s) successfully converted")
+        if skipped:
+            print_warning(f"{len(skipped)} file(s) skipped and copied unchanged")
+            for result in skipped:
+                for warning in result.warnings:
+                    click.echo(f"  - {result.input_path.name}: {warning}")
         if failed:
             print_error(f"{len(failed)} file(s) failed")
             for result in failed:

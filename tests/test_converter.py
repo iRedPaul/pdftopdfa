@@ -24,7 +24,7 @@ from pdftopdfa.converter import (
     convert_to_pdfa,
     generate_output_path,
 )
-from pdftopdfa.exceptions import ConversionError, UnsupportedPDFError
+from pdftopdfa.exceptions import ConversionError
 from pdftopdfa.verapdf import VeraPDFResult
 
 
@@ -117,6 +117,7 @@ class TestConversionResult:
             level="2b",
         )
         assert result.validation_failed is False
+        assert result.skipped is False
 
     def test_validation_failed_set_to_true(self, tmp_dir: Path) -> None:
         """validation_failed can be explicitly set to True."""
@@ -182,11 +183,15 @@ class TestConvertToPdfa:
             convert_to_pdfa(input_path, output_path, level="invalid")
 
     def test_convert_encrypted_pdf(self, encrypted_pdf: Path, tmp_dir: Path) -> None:
-        """Encrypted PDF raises UnsupportedPDFError."""
+        """Encrypted PDF is copied unchanged and reported as skipped."""
         output_path = tmp_dir / "output.pdf"
+        result = convert_to_pdfa(encrypted_pdf, output_path)
 
-        with pytest.raises(UnsupportedPDFError, match="encrypted"):
-            convert_to_pdfa(encrypted_pdf, output_path)
+        assert result.success is True
+        assert result.skipped is True
+        assert any("encrypted" in w for w in result.warnings)
+        assert output_path.exists()
+        assert output_path.read_bytes() == encrypted_pdf.read_bytes()
 
     @pytest.mark.parametrize("level", ["2b", "2u", "3b", "3u"])
     def test_convert_all_levels(
@@ -489,6 +494,7 @@ class TestConvertToPdfa:
 
         assert result.success is True
         assert result.level == "2b"
+        assert result.skipped is True
         assert any("already valid" in w for w in result.warnings)
         assert output_path.exists()
         mock_verapdf.assert_called_once_with(
