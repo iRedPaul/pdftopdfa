@@ -25,7 +25,7 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..exceptions import UnsupportedPDFError
-from ..fonts.glyph_usage import _iter_content_streams_with_resources
+from ..fonts.glyph_usage import _iter_content_streams_with_resources, collect_font_usage
 from ..fonts.traversal import iter_all_page_fonts
 from ..utils import resolve_indirect as _resolve
 
@@ -46,6 +46,20 @@ _ASCII_NAME_RE = re.compile(r"[^A-Za-z0-9_.+-]+")
 _CIDS_INT_RE = re.compile(r"^<[^>]+>\s+<[^>]+>\s+(-?\d+)$")
 _CIDCHAR_INT_RE = re.compile(r"^<[^>]+>\s+(-?\d+)$")
 _CIDS_HEX_RE = re.compile(r"^<[^>]+>\s+<[^>]+>\s+<([0-9A-Fa-f]+)>$")
+_CIDS_INT_GROUP_RE = re.compile(
+    r"^(?P<src><(?P<src_hex>[^>]+)>)\s+"
+    r"(?P<end><(?P<end_hex>[^>]+)>)\s+"
+    r"(?P<cid>-?\d+)$"
+)
+_CIDS_HEX_GROUP_RE = re.compile(
+    r"^(?P<src><(?P<src_hex>[^>]+)>)\s+"
+    r"(?P<end><(?P<end_hex>[^>]+)>)\s+"
+    r"<(?P<cid_hex>[0-9A-Fa-f]+)>$"
+)
+_BLOCK_BEGIN_RE = re.compile(
+    r"^(?P<indent>\s*)(?P<count>\d+)"
+    r"(?P<suffix>\s+begincid(?:char|range)\s*)$"
+)
 
 
 def _indirect_objgen(obj: Any) -> tuple[int, int] | None:
@@ -582,11 +596,158 @@ def _cmap_has_cid_overflow(cmap_stream: Stream) -> bool:
     return False
 
 
-def _ensure_no_cid_overflow(pdf: Pdf) -> None:
-    """Raise UnsupportedPDFError for non-repairable CID overflows."""
+def _rewrite_cmap_block_begin(line: str, count: int) -> str:
+    """Update the mapping count on a begincidchar/begincidrange line."""
+    match = _BLOCK_BEGIN_RE.match(line)
+    if match is None:
+        return line
+    return f"{match.group('indent')}{count}{match.group('suffix')}"
+
+
+def _repair_unused_cid_overflow_entries(
+    cmap_stream: Stream,
+    used_codes: set[int],
+) -> tuple[int, bool]:
+    """Remove or clip unused overflowing entries from an embedded CMap.
+
+    Returns:
+        Tuple of (number of modified/removed CMap entries, has_remaining_overflow).
+    """
+    try:
+        data = cmap_stream.read_bytes().decode("latin-1")
+    except Exception:
+        return 0, False
+
+    lines = data.splitlines()
+    had_trailing_newline = data.endswith(("\n", "\r"))
+    changed_entries = 0
+    remaining_overflow = False
+    rewritten: list[str] = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        if stripped.endswith("begincidchar") or stripped.endswith("begincidrange"):
+            block_mode = "char" if stripped.endswith("begincidchar") else "range"
+            end_marker = "endcidchar" if block_mode == "char" else "endcidrange"
+            begin_line = line
+            i += 1
+
+            kept_entries: list[str] = []
+            while i < len(lines):
+                entry_line = lines[i]
+                entry_stripped = entry_line.strip()
+                if entry_stripped.endswith(end_marker):
+                    break
+
+                if block_mode == "char":
+                    match = _CIDCHAR_INT_RE.match(entry_stripped)
+                    if match is not None:
+                        try:
+                            src_code = int(
+                                entry_stripped.split(None, 1)[0].strip("<>"), 16
+                            )
+                            cid_value = int(match.group(1))
+                        except ValueError:
+                            kept_entries.append(entry_line)
+                            i += 1
+                            continue
+
+                        if cid_value > _MAX_CID_VALUE:
+                            if src_code in used_codes:
+                                remaining_overflow = True
+                                kept_entries.append(entry_line)
+                            else:
+                                changed_entries += 1
+                            i += 1
+                            continue
+
+                else:
+                    match_int = _CIDS_INT_GROUP_RE.match(entry_stripped)
+                    match_hex = _CIDS_HEX_GROUP_RE.match(entry_stripped)
+
+                    if match_int is not None or match_hex is not None:
+                        try:
+                            if match_int is not None:
+                                start_code = int(match_int.group("src_hex"), 16)
+                                end_code = int(match_int.group("end_hex"), 16)
+                                cid_start = int(match_int.group("cid"))
+                            else:
+                                assert match_hex is not None
+                                start_code = int(match_hex.group("src_hex"), 16)
+                                end_code = int(match_hex.group("end_hex"), 16)
+                                cid_start = int(match_hex.group("cid_hex"), 16)
+                        except ValueError:
+                            kept_entries.append(entry_line)
+                            i += 1
+                            continue
+
+                        safe_limit = start_code + (_MAX_CID_VALUE - cid_start)
+                        safe_end = min(end_code, safe_limit)
+                        if cid_start > _MAX_CID_VALUE or safe_end < end_code:
+                            overflow_start = max(start_code, safe_end + 1)
+                            used_in_overflow = any(
+                                overflow_start <= code <= end_code
+                                for code in used_codes
+                            )
+                            if used_in_overflow:
+                                remaining_overflow = True
+                                kept_entries.append(entry_line)
+                            elif safe_end < start_code:
+                                changed_entries += 1
+                            else:
+                                changed_entries += 1
+                                end_hex = (
+                                    match_int.group("end_hex")
+                                    if match_int is not None
+                                    else match_hex.group("end_hex")
+                                )
+                                end_hex_len = len(end_hex)
+                                new_end = f"<{safe_end:0{end_hex_len}X}>"
+                                if match_int is not None:
+                                    src = match_int.group("src")
+                                    cid = match_int.group("cid")
+                                    kept_entries.append(f"{src} {new_end} {cid}")
+                                else:
+                                    src = match_hex.group("src")
+                                    cid_hex = match_hex.group("cid_hex")
+                                    kept_entries.append(
+                                        f"{src} {new_end} <{cid_hex.upper()}>"
+                                    )
+                            i += 1
+                            continue
+
+                kept_entries.append(entry_line)
+                i += 1
+
+            rewritten.append(_rewrite_cmap_block_begin(begin_line, len(kept_entries)))
+            rewritten.extend(kept_entries)
+            if i < len(lines):
+                rewritten.append(lines[i])
+            i += 1
+            continue
+
+        rewritten.append(line)
+        i += 1
+
+    if changed_entries > 0:
+        new_data = "\n".join(rewritten)
+        if had_trailing_newline:
+            new_data += "\n"
+        cmap_stream.write(new_data.encode("latin-1"))
+
+    return changed_entries, remaining_overflow
+
+
+def _ensure_no_cid_overflow(pdf: Pdf) -> int:
+    """Repair unused CMap CID overflows and raise on remaining ones."""
+    font_usage = collect_font_usage(pdf)
     seen_fonts: set[tuple[int, int]] = set()
+    repaired = 0
     for page in pdf.pages:
-        for _font_name, font_obj in iter_all_page_fonts(page):
+        for font_name, font_obj in iter_all_page_fonts(page):
             font = _resolve(font_obj)
             if not isinstance(font, Dictionary):
                 continue
@@ -604,11 +765,24 @@ def _ensure_no_cid_overflow(pdf: Pdf) -> None:
             if not isinstance(encoding, Stream):
                 continue
 
-            if _cmap_has_cid_overflow(encoding):
+            repaired_here, remaining_overflow = _repair_unused_cid_overflow_entries(
+                encoding, font_usage.get(objgen, set())
+            )
+            repaired += repaired_here
+            if repaired_here > 0:
+                logger.warning(
+                    "Removed or clipped %d unused CID overflow entr(y/ies) from CMap "
+                    "for font %s",
+                    repaired_here,
+                    font_name,
+                )
+
+            if remaining_overflow or _cmap_has_cid_overflow(encoding):
                 raise UnsupportedPDFError(
                     "PDF contains CID values greater than 65535 in an embedded CMap. "
                     "This cannot be repaired safely."
                 )
+    return repaired
 
 
 def sanitize_structure_limits(pdf: Pdf) -> dict[str, int]:
@@ -623,9 +797,10 @@ def sanitize_structure_limits(pdf: Pdf) -> dict[str, int]:
         "hex_odd_fixed": 0,
         "hex_odd_obj_fixed": 0,
         "hex_invalid_fixed": 0,
+        "cid_overflow_entries_repaired": 0,
     }
 
-    _ensure_no_cid_overflow(pdf)
+    stats["cid_overflow_entries_repaired"] = _ensure_no_cid_overflow(pdf)
 
     visited: set[tuple[int, int]] = set()
     for obj in pdf.objects:

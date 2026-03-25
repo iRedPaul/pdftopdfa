@@ -320,19 +320,61 @@ class TestStructureLimitsSanitizer:
 12 dict begin
 begincmap
 1 begincidchar
-<0001> 65791
+<3F00> 65791
 endcidchar
 endcmap
 end
 end
 """
         encoding_stream = pdf.make_stream(cmap_data)
-        font = Dictionary(
-            Type=Name.Font,
-            Subtype=Name.Type0,
-            BaseFont=Name("/TestCID"),
-            Encoding=encoding_stream,
-            DescendantFonts=Array([]),
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type0,
+                BaseFont=Name("/TestCID"),
+                Encoding=encoding_stream,
+                DescendantFonts=Array([]),
+            )
+        )
+
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 200, 200]),
+                Resources=Dictionary(Font=Dictionary(F1=font)),
+                Contents=pdf.make_stream(b"BT /F1 12 Tf <3F00> Tj ET"),
+            )
+        )
+        pdf.pages.append(page)
+
+        with pytest.raises(UnsupportedPDFError, match="CID values greater than 65535"):
+            sanitize_structure_limits(pdf)
+
+    def test_removes_unused_cmap_cid_overflow_range(self) -> None:
+        pdf = new_pdf()
+        cmap_data = b"""
+/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+1 begincidchar
+<0001> 1
+endcidchar
+1 begincidrange
+<3F00> <3FFF> 65536
+endcidrange
+endcmap
+end
+end
+"""
+        encoding_stream = pdf.make_stream(cmap_data)
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type0,
+                BaseFont=Name("/TestCID"),
+                Encoding=encoding_stream,
+                DescendantFonts=Array([]),
+            )
         )
 
         page = pikepdf.Page(
@@ -345,8 +387,12 @@ end
         )
         pdf.pages.append(page)
 
-        with pytest.raises(UnsupportedPDFError, match="CID values greater than 65535"):
-            sanitize_structure_limits(pdf)
+        result = sanitize_structure_limits(pdf)
+        cmap_text = encoding_stream.read_bytes().decode("latin-1")
+
+        assert "65536" not in cmap_text
+        assert "<3F00> <3FFF> 65536" not in cmap_text
+        assert result["cid_overflow_entries_repaired"] == 1
 
     def test_pipeline_fixes_non_hex_text_stream(self) -> None:
         pdf = _make_page_pdf(b"BT <48G5> Tj ET")
