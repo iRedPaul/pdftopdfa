@@ -1435,9 +1435,9 @@ class TestExtensionSchemas:
             ext = desc.find(f"{{{ns_ext}}}schemas")
             if ext is not None:
                 ext_xml = etree.tostring(ext, encoding="unicode")
-                # Freshly regenerated pdfuaid extension present
+                # Existing pdfuaid extension is preserved
                 assert NAMESPACES["pdfuaid"] in ext_xml
-                assert "PDF/UA Universal Accessibility" in ext_xml
+                assert "PDF/UA ID" in ext_xml
                 # Missing pdfxid extension added
                 assert NAMESPACES["pdfxid"] in ext_xml
                 # Only one pdfaExtension:schemas element
@@ -3194,6 +3194,69 @@ class TestNonCatalogExtensionInCatalogXMP:
         xmp_str = xmp_bytes.decode("utf-8")
         assert "pdfaExtension:schemas" not in xmp_str
 
+    def test_catalog_only_original_block_preserved(self) -> None:
+        """Catalog properties reuse source extension blocks without extra needs."""
+        existing_xmp = (
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about=""'
+            b' xmlns:custom="http://example.com/custom/"'
+            b' xmlns:pdfaExtension="http://www.aiim.org/pdfa/ns/extension/"'
+            b' xmlns:pdfaSchema="http://www.aiim.org/pdfa/ns/schema#"'
+            b' xmlns:pdfaProperty="http://www.aiim.org/pdfa/ns/property#"'
+            b' xmlns:pdfaType="http://www.aiim.org/pdfa/ns/type#"'
+            b' xmlns:pdfaField="http://www.aiim.org/pdfa/ns/field#">'
+            b'<custom:Foo rdf:parseType="Resource">'
+            b"<custom:Value>bar</custom:Value>"
+            b"</custom:Foo>"
+            b"<pdfaExtension:schemas><rdf:Bag>"
+            b'<rdf:li rdf:parseType="Resource">'
+            b"<pdfaSchema:schema>Custom</pdfaSchema:schema>"
+            b"<pdfaSchema:namespaceURI>http://example.com/custom/</pdfaSchema:namespaceURI>"
+            b"<pdfaSchema:prefix>custom</pdfaSchema:prefix>"
+            b"<pdfaSchema:property><rdf:Seq>"
+            b'<rdf:li rdf:parseType="Resource">'
+            b"<pdfaProperty:name>Foo</pdfaProperty:name>"
+            b"<pdfaProperty:valueType>MyCustomType</pdfaProperty:valueType>"
+            b"<pdfaProperty:category>external</pdfaProperty:category>"
+            b"<pdfaProperty:description>Foo property</pdfaProperty:description>"
+            b"</rdf:li>"
+            b"</rdf:Seq></pdfaSchema:property>"
+            b"<pdfaSchema:valueType><rdf:Seq>"
+            b'<rdf:li rdf:parseType="Resource">'
+            b"<pdfaType:type>MyCustomType</pdfaType:type>"
+            b"<pdfaType:namespaceURI>http://example.com/types/</pdfaType:namespaceURI>"
+            b"<pdfaType:prefix>extype</pdfaType:prefix>"
+            b"<pdfaType:description>custom type</pdfaType:description>"
+            b"<pdfaType:field><rdf:Seq>"
+            b'<rdf:li rdf:parseType="Resource">'
+            b"<pdfaField:name>Value</pdfaField:name>"
+            b"<pdfaField:valueType>Text</pdfaField:valueType>"
+            b"<pdfaField:description>value</pdfaField:description>"
+            b"</rdf:li>"
+            b"</rdf:Seq></pdfaType:field>"
+            b"</rdf:li>"
+            b"</rdf:Seq></pdfaSchema:valueType>"
+            b"</rdf:li>"
+            b"</rdf:Bag></pdfaExtension:schemas>"
+            b"</rdf:Description>"
+            b"</rdf:RDF></x:xmpmeta>"
+        )
+        existing_tree = etree.fromstring(existing_xmp)
+
+        info = {"title": "Test"}
+        xmp_bytes = create_xmp_metadata(
+            info,
+            2,
+            "B",
+            existing_xmp_tree=existing_tree,
+        )
+        xmp_str = xmp_bytes.decode("utf-8")
+
+        assert "http://example.com/custom/" in xmp_str
+        assert "MyCustomType" in xmp_str
+        assert "http://example.com/types/" in xmp_str
+
     def test_malformed_original_block_regenerated(self) -> None:
         """Malformed original extension schema block is dropped and regenerated."""
         # Build source XMP with a pdfaExtension:schemas entry that is malformed
@@ -3664,6 +3727,79 @@ class TestSanitizeExtensionSchemaBlocks:
         ]
         assert "GoodField" in names
         assert "BadField" not in names
+
+    def test_field_namespace_is_serialized_with_canonical_prefix(self) -> None:
+        """pdfaField entries serialize with the canonical pdfaField prefix."""
+        uri = "http://example.com/ns/"
+        xmp = etree.fromstring(
+            f"""
+            <x:xmpmeta xmlns:x="adobe:ns:meta/">
+              <rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}">
+                <rdf:Description rdf:about=""
+                    xmlns:pdfaExtension="{_NS_PDFA_EXTENSION}"
+                    xmlns:pdfaSchema="{_NS_PDFA_SCHEMA}"
+                    xmlns:pdfaProperty="{_NS_PDFA_PROPERTY}"
+                    xmlns:pdfaType="{_NS_PDFA_TYPE}"
+                    xmlns:nonpdfaField="{_NS_PDFA_FIELD}">
+                  <pdfaExtension:schemas>
+                    <rdf:Bag>
+                      <rdf:li rdf:parseType="Resource">
+                        <pdfaSchema:schema>Custom</pdfaSchema:schema>
+                        <pdfaSchema:namespaceURI>{uri}</pdfaSchema:namespaceURI>
+                        <pdfaSchema:prefix>custom</pdfaSchema:prefix>
+                        <pdfaSchema:property>
+                          <rdf:Seq>
+                            <rdf:li rdf:parseType="Resource">
+                              <pdfaProperty:name>Foo</pdfaProperty:name>
+                              <pdfaProperty:valueType>ContainerType</pdfaProperty:valueType>
+                              <pdfaProperty:category>external</pdfaProperty:category>
+                              <pdfaProperty:description>
+                                Foo property
+                              </pdfaProperty:description>
+                            </rdf:li>
+                          </rdf:Seq>
+                        </pdfaSchema:property>
+                        <pdfaSchema:valueType>
+                          <rdf:Seq>
+                            <rdf:li rdf:parseType="Resource">
+                              <pdfaType:type>ContainerType</pdfaType:type>
+                              <pdfaType:namespaceURI>http://example.com/types/</pdfaType:namespaceURI>
+                              <pdfaType:prefix>ctype</pdfaType:prefix>
+                              <pdfaType:description>
+                                Container type
+                              </pdfaType:description>
+                              <pdfaType:field>
+                                <rdf:Seq>
+                                  <rdf:li rdf:parseType="Resource">
+                                    <nonpdfaField:name>FieldOne</nonpdfaField:name>
+                                    <nonpdfaField:valueType>Text</nonpdfaField:valueType>
+                                    <nonpdfaField:description>
+                                      Field one
+                                    </nonpdfaField:description>
+                                  </rdf:li>
+                                </rdf:Seq>
+                              </pdfaType:field>
+                            </rdf:li>
+                          </rdf:Seq>
+                        </pdfaSchema:valueType>
+                      </rdf:li>
+                    </rdf:Bag>
+                  </pdfaExtension:schemas>
+                </rdf:Description>
+              </rdf:RDF>
+            </x:xmpmeta>
+            """.encode()
+        )
+        li = _extract_extension_schema_blocks(xmp)[uri]
+
+        result = _sanitize_extension_schema_blocks({uri: li})
+
+        assert uri in result
+        xml = etree.tostring(result[uri], encoding="unicode")
+        assert "pdfaField:name" in xml
+        assert "pdfaField:valueType" in xml
+        assert "pdfaField:description" in xml
+        assert "nonpdfaField:" not in xml
 
     def test_missing_field_value_type_removes_field_entry(self) -> None:
         """Field entry without pdfaField:valueType is removed."""

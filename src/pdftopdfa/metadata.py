@@ -499,6 +499,22 @@ def _normalize_structural_properties(elem: etree._Element) -> None:
         _normalize_structural_properties(child)
 
 
+def _clone_with_registered_namespaces(elem: etree._Element) -> etree._Element:
+    """Clone an XML subtree so lxml re-serializes it with registered prefixes."""
+    clone = etree.Element(elem.tag)
+
+    for attr_name, attr_value in elem.attrib.items():
+        clone.set(attr_name, attr_value)
+
+    clone.text = elem.text
+    clone.tail = elem.tail
+
+    for child in elem:
+        clone.append(_clone_with_registered_namespaces(child))
+
+    return clone
+
+
 # Structural namespaces that never contain user properties (skip during scanning)
 _STRUCTURAL_NAMESPACES: frozenset[str] = frozenset(
     {
@@ -1147,7 +1163,7 @@ def _sanitize_extension_schema_blocks(
                     )
                     li_elem.remove(schema_value_type_elem)
 
-        result[uri] = li_elem
+        result[uri] = _clone_with_registered_namespaces(li_elem)
 
     return result
 
@@ -2379,7 +2395,7 @@ def create_xmp_metadata(
     # can reuse them for non-catalog properties (preserves custom
     # valueTypes that we cannot infer).
     original_blocks: dict[str, etree._Element] | None = None
-    if existing_xmp_tree is not None and non_catalog_extension_needs:
+    if existing_xmp_tree is not None:
         original_blocks = _extract_extension_schema_blocks(existing_xmp_tree)
         if original_blocks:
             original_blocks = _sanitize_extension_schema_blocks(original_blocks)
