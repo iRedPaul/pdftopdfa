@@ -84,6 +84,80 @@ def _make_minimal_ttfont(
     return font_data, tt_font
 
 
+def _make_symbolic_ttfont_with_conflicting_cmps() -> bytes:
+    """Creates a symbolic TrueType font whose symbolic cmap conflicts
+    with a Unicode cmap for the same low byte code.
+
+    Code 52 maps through the Microsoft Symbol cmap (3,0) to ``uni2834``
+    with width 700, while the Unicode cmap (3,1) maps 0x0034 to ``four``
+    with width 1102. This mirrors the real corpus regression where veraPDF
+    follows the symbolic cmap when /Encoding is absent.
+    """
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.ttLib.tables._c_m_a_p import cmap_format_4, table__c_m_a_p
+    from fontTools.ttLib.tables._g_l_y_f import Glyph
+
+    glyph_widths = {
+        ".notdef": 500,
+        "space": 250,
+        "uni2834": 700,
+        "four": 1102,
+        "heart": 740,
+    }
+    glyph_names = list(glyph_widths.keys())
+
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder(glyph_names)
+    fb.setupCharacterMap({0x20: "space", 0x34: "four", 0x2665: "heart"})
+    fb.setupGlyf({name: Glyph() for name in glyph_names})
+    fb.setupHorizontalMetrics(
+        {name: (width, 0) for name, width in glyph_widths.items()}
+    )
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({"familyName": "TestSymbol", "styleName": "Regular"})
+    fb.setupOS2(sTypoAscender=800, sTypoDescender=-200, sCapHeight=700)
+    fb.setupPost()
+    fb.setupHead(unitsPerEm=1000)
+
+    tt = fb.font
+
+    cmap_table = table__c_m_a_p()
+    cmap_table.tableVersion = 0
+
+    subtable30 = cmap_format_4(4)
+    subtable30.platformID = 3
+    subtable30.platEncID = 0
+    subtable30.format = 4
+    subtable30.reserved = 0
+    subtable30.length = 0
+    subtable30.language = 0
+    subtable30.cmap = {
+        0xF020: "space",
+        0xF034: "uni2834",
+    }
+
+    subtable31 = cmap_format_4(4)
+    subtable31.platformID = 3
+    subtable31.platEncID = 1
+    subtable31.format = 4
+    subtable31.reserved = 0
+    subtable31.length = 0
+    subtable31.language = 0
+    subtable31.cmap = {
+        0x0020: "space",
+        0x0034: "four",
+        0x2665: "heart",
+    }
+
+    cmap_table.tables = [subtable30, subtable31]
+    tt["cmap"] = cmap_table
+
+    buf = BytesIO()
+    tt.save(buf)
+    tt.close()
+    return buf.getvalue()
+
+
 def _make_simple_font_with_widths(
     pdf: Pdf,
     *,
@@ -1607,4 +1681,65 @@ class TestNameBasedWidthLookup:
         # Code 36 at index 4: should be 750 (.notdef fallback)
         assert corrected[4] == 750, (
             f"Code 36 width should be 750 (.notdef), got {corrected[4]}"
+        )
+
+
+class TestSymbolicTrueTypeWithoutEncoding:
+    """Tests for symbolic TrueType fonts that rely on their own cmap."""
+
+    def test_symbolic_truetype_without_encoding_uses_symbolic_cmap(self) -> None:
+        """Widths for symbolic TrueType fonts follow the (3,0) cmap.
+
+        The font intentionally has a conflicting Unicode cmap entry for
+        code 52. veraPDF resolves the used glyph through the symbolic cmap
+        when /Encoding is absent, so the sanitizer must correct /Widths[52]
+        to 700 rather than leave the mismatched value in place.
+        """
+        font_data = _make_symbolic_ttfont_with_conflicting_cmps()
+        pdf = new_pdf()
+
+        font_stream = pdf.make_stream(font_data)
+        font_stream[Name.Length1] = len(font_data)
+
+        font_descriptor = pdf.make_indirect(
+            Dictionary(
+                Type=Name.FontDescriptor,
+                FontName=Name("/TestSymbol"),
+                Flags=4,
+                FontBBox=Array([0, -200, 1200, 800]),
+                ItalicAngle=0,
+                Ascent=800,
+                Descent=-200,
+                CapHeight=700,
+                StemV=80,
+                FontFile2=pdf.make_indirect(font_stream),
+            )
+        )
+
+        widths = [0] * 256
+        widths[52] = 999
+
+        font_dict = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.TrueType,
+                BaseFont=Name("/TestSymbol"),
+                FontDescriptor=font_descriptor,
+                FirstChar=0,
+                LastChar=255,
+                Widths=Array(widths),
+            )
+        )
+
+        _build_pdf_with_font(pdf, font_dict)
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["simple_font_widths_fixed"] == 1
+
+        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
+        corrected = [int(w) for w in resolve(font_obj.Widths)]
+        assert corrected[52] == 700, (
+            f"Code 52 width should be 700 from the symbolic cmap, got {corrected[52]}"
         )

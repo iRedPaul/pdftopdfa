@@ -16,6 +16,7 @@ from collections.abc import Iterator
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
+from ..fonts.analysis import is_symbolic_font
 from ..fonts.metrics import FontMetricsExtractor
 from ..fonts.tounicode import (
     generate_tounicode_for_macroman,
@@ -477,9 +478,15 @@ def _get_encoding_mapping(font: pikepdf.Object) -> dict[int, int] | None:
     """
     encoding = font.get("/Encoding")
     if encoding is None:
-        # Default to WinAnsiEncoding for TrueType, StandardEncoding for Type1
+        # Default to WinAnsiEncoding for non-symbolic TrueType,
+        # StandardEncoding for Type1. Symbolic TrueType fonts without an
+        # explicit /Encoding resolve character codes through the font's own
+        # symbolic cmap, so returning a WinAnsi fallback would mask width
+        # mismatches that veraPDF still catches.
         subtype = font.get("/Subtype")
         if subtype is not None and _safe_str(subtype) == "/TrueType":
+            if is_symbolic_font(font):
+                return None
             return generate_tounicode_for_winansi()
         return generate_tounicode_for_standard_encoding()
 
@@ -519,10 +526,26 @@ def _compute_widths_by_name(font: pikepdf.Object, tt_font) -> dict[int, int]:
         Dictionary mapping char_code to width (scaled to 1000 units)
         for glyphs found by name but not through the cmap.
     """
-    from ..fonts.subsetter import _resolve_simple_font_encoding
+    from ..fonts.subsetter import (
+        _build_symbolic_truetype_encoding,
+        _resolve_simple_font_encoding,
+    )
 
     try:
         encoding = _resolve_simple_font_encoding(font)
+        if encoding is None and is_symbolic_font(font):
+            fd = _resolve(font.get("/FontDescriptor"))
+            if fd is not None:
+                font_file = None
+                for key in ("/FontFile2", "/FontFile3"):
+                    stream = fd.get(key)
+                    if stream is not None:
+                        font_file = _resolve(stream)
+                        break
+                if font_file is not None:
+                    encoding = _build_symbolic_truetype_encoding(
+                        font, bytes(font_file.read_bytes())
+                    )
     except Exception:
         return {}
     if not encoding:
@@ -824,11 +847,15 @@ def _fix_simple_font_widths(font: pikepdf.Object, font_name: str) -> bool:
 
         # Build encoding mapping
         code_to_unicode = _get_encoding_mapping(font)
-        if code_to_unicode is None:
-            return False
 
-        # Compute expected widths
-        expected = _metrics.compute_widths_for_encoding(tt_font, code_to_unicode)
+        # Compute expected widths from a Unicode-based encoding when one is
+        # available. Symbolic TrueType fonts without /Encoding intentionally
+        # skip this path and rely on the font's own symbolic cmap below.
+        expected = (
+            _metrics.compute_widths_for_encoding(tt_font, code_to_unicode)
+            if code_to_unicode is not None
+            else {}
+        )
 
         # Build a name-based width lookup for glyphs not reachable via
         # the cmap (e.g. glyphs added by glyph_coverage sanitizer).
@@ -839,7 +866,9 @@ def _fix_simple_font_widths(font: pikepdf.Object, font_name: str) -> bool:
         # Determine fallback width for codes not found in font at all.
         # veraPDF uses the .notdef glyph width from the font program
         # as widthFromFontProgram for completely missing glyphs.
-        fallback_width = _get_missing_width(font, tt_font)
+        fallback_width = (
+            _get_missing_width(font, tt_font) if code_to_unicode is not None else None
+        )
 
         # Compare declared vs expected
         mismatches = 0
