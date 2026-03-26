@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.14] - 2026-03-26
+
+### Features
+
+- Add deskew normalization for OCR-skipped text pages in `best` quality mode
+
+### Changes
+
+- Deduplicate identical embedded font programs to reduce output size
+
 ## [0.2.13] - 2026-03-26
 
 ### Bug Fixes
