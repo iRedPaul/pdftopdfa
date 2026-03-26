@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.11] - 2026-03-26
+
+### Bug Fixes
+
+- Preserve canonical XMP extension schemas during metadata sync
+- Fix reused XMP extension schema property declarations
+- Fix symbolic TrueType width matching when fonts omit Encoding
+- Repair unused CID overflow entries in embedded CMaps
+
 ## [0.2.10] - 2026-03-24
 
 ### Bug Fixes
