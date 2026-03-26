@@ -1163,6 +1163,41 @@ def _sanitize_extension_schema_blocks(
                     )
                     li_elem.remove(schema_value_type_elem)
 
+                invalid_property_value_types: list[etree._Element] = []
+                for prop_li in seq.findall(li_tag):
+                    name_elem = prop_li.find(name_tag)
+                    prop_name = (
+                        (name_elem.text or "").strip() if name_elem is not None else ""
+                    )
+                    vt_elem = prop_li.find(value_type_tag)
+                    prop_value_type = (
+                        (vt_elem.text or "").strip() if vt_elem is not None else ""
+                    )
+                    if _is_recognized_field_value_type(
+                        prop_value_type,
+                        declared_type_names,
+                    ):
+                        continue
+                    logger.warning(
+                        "Extension schema %s: removing property '%s'"
+                        " — invalid pdfaProperty:valueType '%s'",
+                        uri,
+                        prop_name,
+                        prop_value_type,
+                    )
+                    invalid_property_value_types.append(prop_li)
+
+                for prop_li in invalid_property_value_types:
+                    seq.remove(prop_li)
+
+                if not seq.findall(li_tag):
+                    logger.warning(
+                        "Extension schema block for %s dropped:"
+                        " no valid properties remain after valueType checks",
+                        uri,
+                    )
+                    continue
+
         result[uri] = _clone_with_registered_namespaces(li_elem)
 
     return result
@@ -1290,6 +1325,59 @@ def _build_extension_schemas_from_blocks(
         bag.append(copy.deepcopy(blocks[uri]))
 
     return schemas_elem
+
+
+def _augment_extension_schema_block(
+    block: etree._Element,
+    *,
+    uri: str,
+    props: set[str],
+    description: etree._Element,
+    known_prop_defs: dict[str, tuple[str, str, str]] | None = None,
+) -> etree._Element:
+    """Clone a schema block and add declarations for any missing properties."""
+    ns_rdf = NAMESPACES["rdf"]
+    property_tag = f"{{{_NS_PDFA_SCHEMA}}}property"
+    seq_tag = f"{{{ns_rdf}}}Seq"
+    li_tag = f"{{{ns_rdf}}}li"
+    name_tag = f"{{{_NS_PDFA_PROPERTY}}}name"
+    value_type_tag = f"{{{_NS_PDFA_PROPERTY}}}valueType"
+    category_tag = f"{{{_NS_PDFA_PROPERTY}}}category"
+    description_tag = f"{{{_NS_PDFA_PROPERTY}}}description"
+
+    block_copy = copy.deepcopy(block)
+    property_elem = block_copy.find(property_tag)
+    if property_elem is None:
+        property_elem = etree.SubElement(block_copy, property_tag)
+
+    seq = property_elem.find(seq_tag)
+    if seq is None:
+        seq = etree.SubElement(property_elem, seq_tag)
+
+    declared_props: set[str] = set()
+    for prop_li in seq.findall(li_tag):
+        name_elem = prop_li.find(name_tag)
+        prop_name = (name_elem.text or "").strip() if name_elem is not None else ""
+        if prop_name:
+            declared_props.add(prop_name)
+
+    missing_props = sorted(props - declared_props)
+    for prop_name in missing_props:
+        if known_prop_defs is not None and prop_name in known_prop_defs:
+            value_type, category, prop_description = known_prop_defs[prop_name]
+        else:
+            value_type = _infer_value_type(description, uri, prop_name)
+            category = "external"
+            prop_description = f"{prop_name} property"
+
+        prop_li = etree.SubElement(seq, li_tag)
+        prop_li.set(f"{{{ns_rdf}}}parseType", "Resource")
+        etree.SubElement(prop_li, name_tag).text = prop_name
+        etree.SubElement(prop_li, value_type_tag).text = value_type
+        etree.SubElement(prop_li, category_tag).text = category
+        etree.SubElement(prop_li, description_tag).text = prop_description
+
+    return block_copy
 
 
 def _detect_structure(elem: etree._Element, ns_rdf: str) -> str:
@@ -1699,13 +1787,22 @@ def _build_extension_schemas(
     bag = etree.SubElement(schemas_elem, f"{{{ns_rdf}}}Bag")
 
     for uri, props in sorted(missing.items()):
+        known = _KNOWN_EXTENSION_SCHEMAS.get(uri)
         # If the original catalog XMP had an extension schema block for
         # this namespace, reuse it (preserves custom valueTypes, etc.).
         if original_schema_blocks and uri in original_schema_blocks:
-            bag.append(original_schema_blocks[uri])
+            known_props = known[2] if known is not None else None
+            bag.append(
+                _augment_extension_schema_block(
+                    original_schema_blocks[uri],
+                    uri=uri,
+                    props=props,
+                    description=description,
+                    known_prop_defs=known_props,
+                )
+            )
             continue
 
-        known = _KNOWN_EXTENSION_SCHEMAS.get(uri)
         if known is not None:
             schema_name, prefix, known_props = known
             # Only declare properties that are actually used

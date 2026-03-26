@@ -3366,6 +3366,168 @@ class TestNonCatalogExtensionInCatalogXMP:
                 return
         pytest.fail("Foo property not found in output extension schema")
 
+    def test_original_block_augmented_with_missing_known_property(self) -> None:
+        """Reused schema block gains declarations for preserved known properties."""
+        ns_pdfuaid = NAMESPACES["pdfuaid"]
+        existing_xmp = f"""\
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}">
+    <rdf:Description rdf:about=""
+        xmlns:pdfuaid="{ns_pdfuaid}"
+        xmlns:pdfuaia="{ns_pdfuaid}"
+        xmlns:pdfaExtension="{_NS_PDFA_EXTENSION}"
+        xmlns:pdfaSchema="{_NS_PDFA_SCHEMA}"
+        xmlns:pdfaProperty="{_NS_PDFA_PROPERTY}">
+      <pdfuaid:part>1</pdfuaid:part>
+      <pdfuaia:amd>A</pdfuaia:amd>
+      <pdfaExtension:schemas>
+        <rdf:Bag>
+          <rdf:li rdf:parseType="Resource">
+            <pdfaSchema:schema>PDF/UA Universal Accessibility Schema</pdfaSchema:schema>
+            <pdfaSchema:namespaceURI>{ns_pdfuaid}</pdfaSchema:namespaceURI>
+            <pdfaSchema:prefix>pdfuaia</pdfaSchema:prefix>
+            <pdfaSchema:property>
+              <rdf:Seq>
+                <rdf:li rdf:parseType="Resource">
+                  <pdfaProperty:name>amd</pdfaProperty:name>
+                  <pdfaProperty:valueType>Text</pdfaProperty:valueType>
+                  <pdfaProperty:category>internal</pdfaProperty:category>
+                  <pdfaProperty:description
+                    >PDF/UA amendment identifier</pdfaProperty:description
+                  >
+                </rdf:li>
+              </rdf:Seq>
+            </pdfaSchema:property>
+          </rdf:li>
+        </rdf:Bag>
+      </pdfaExtension:schemas>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"""
+        existing_tree = etree.fromstring(existing_xmp.encode("utf-8"))
+
+        xmp_bytes = create_xmp_metadata(
+            {"title": "Test"},
+            2,
+            "B",
+            existing_xmp_tree=existing_tree,
+        )
+        xmp_str = xmp_bytes.decode("utf-8")
+
+        assert "<pdfaProperty:name>amd</pdfaProperty:name>" in xmp_str
+        assert "<pdfaProperty:name>part</pdfaProperty:name>" in xmp_str
+        assert "<pdfaProperty:valueType>Integer</pdfaProperty:valueType>" in xmp_str
+
+    def test_original_block_augmented_with_missing_custom_property(self) -> None:
+        """Reused custom schema block gains declarations for preserved properties."""
+        custom_ns = "http://www.acme.com/ns/email/1/"
+        existing_xmp = f"""\
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}">
+    <rdf:Description rdf:about=""
+        xmlns:acmeemail="{custom_ns}"
+        xmlns:pdfaExtension="{_NS_PDFA_EXTENSION}"
+        xmlns:pdfaSchema="{_NS_PDFA_SCHEMA}"
+        xmlns:pdfaProperty="{_NS_PDFA_PROPERTY}">
+      <acmeemail:Delivery-Date>2007-11-09T09:55:36+01:00</acmeemail:Delivery-Date>
+      <pdfaExtension:schemas>
+        <rdf:Bag>
+          <rdf:li rdf:parseType="Resource">
+            <pdfaSchema:schema>ACME E-Mail Schema</pdfaSchema:schema>
+            <pdfaSchema:namespaceURI>{custom_ns}</pdfaSchema:namespaceURI>
+            <pdfaSchema:prefix>acmeemail</pdfaSchema:prefix>
+            <pdfaSchema:property>
+              <rdf:Seq>
+                <rdf:li rdf:parseType="Resource">
+                  <pdfaProperty:name>Receive-Date</pdfaProperty:name>
+                  <pdfaProperty:valueType>Date</pdfaProperty:valueType>
+                  <pdfaProperty:category>internal</pdfaProperty:category>
+                  <pdfaProperty:description
+                    >date of email delivery</pdfaProperty:description
+                  >
+                </rdf:li>
+              </rdf:Seq>
+            </pdfaSchema:property>
+          </rdf:li>
+        </rdf:Bag>
+      </pdfaExtension:schemas>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"""
+        existing_tree = etree.fromstring(existing_xmp.encode("utf-8"))
+
+        xmp_bytes = create_xmp_metadata(
+            {"title": "Test"},
+            2,
+            "B",
+            existing_xmp_tree=existing_tree,
+        )
+        xmp_str = xmp_bytes.decode("utf-8")
+
+        assert "<pdfaProperty:name>Receive-Date</pdfaProperty:name>" in xmp_str
+        assert "<pdfaProperty:name>Delivery-Date</pdfaProperty:name>" in xmp_str
+
+    def test_invalid_custom_value_type_is_regenerated(self) -> None:
+        """Property using a stripped custom valueType is regenerated safely."""
+        custom_ns = "http://example.com/custom/"
+        existing_xmp = f"""\
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}">
+    <rdf:Description rdf:about=""
+        xmlns:custom="{custom_ns}"
+        xmlns:pdfaExtension="{_NS_PDFA_EXTENSION}"
+        xmlns:pdfaSchema="{_NS_PDFA_SCHEMA}"
+        xmlns:pdfaProperty="{_NS_PDFA_PROPERTY}"
+        xmlns:pdfaType="{_NS_PDFA_TYPE}">
+      <custom:From>alice@example.com</custom:From>
+      <pdfaExtension:schemas>
+        <rdf:Bag>
+          <rdf:li rdf:parseType="Resource">
+            <pdfaSchema:schema>Custom Schema</pdfaSchema:schema>
+            <pdfaSchema:namespaceURI>{custom_ns}</pdfaSchema:namespaceURI>
+            <pdfaSchema:prefix>custom</pdfaSchema:prefix>
+            <pdfaSchema:property>
+              <rdf:Seq>
+                <rdf:li rdf:parseType="Resource">
+                  <pdfaProperty:name>From</pdfaProperty:name>
+                  <pdfaProperty:valueType>mailaddress</pdfaProperty:valueType>
+                  <pdfaProperty:category>internal</pdfaProperty:category>
+                  <pdfaProperty:description
+                    >sender email address</pdfaProperty:description
+                  >
+                </rdf:li>
+              </rdf:Seq>
+            </pdfaSchema:property>
+            <pdfaSchema:valueType>
+              <rdf:Seq>
+                <rdf:li rdf:parseType="Resource">
+                  <pdfaType:type>mailaddress</pdfaType:type>
+                  <pdfaType:prefix>custom</pdfaType:prefix>
+                </rdf:li>
+              </rdf:Seq>
+            </pdfaSchema:valueType>
+          </rdf:li>
+        </rdf:Bag>
+      </pdfaExtension:schemas>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"""
+        existing_tree = etree.fromstring(existing_xmp.encode("utf-8"))
+
+        xmp_bytes = create_xmp_metadata(
+            {"title": "Test"},
+            2,
+            "B",
+            existing_xmp_tree=existing_tree,
+        )
+        xmp_str = xmp_bytes.decode("utf-8")
+
+        assert "<pdfaProperty:name>From</pdfaProperty:name>" in xmp_str
+        assert "<pdfaProperty:valueType>mailaddress</pdfaProperty:valueType>" not in (
+            xmp_str
+        )
+        assert "<pdfaProperty:valueType>Text</pdfaProperty:valueType>" in xmp_str
+
 
 def _make_valid_schema_li(
     uri: str = "http://example.com/ns/",
