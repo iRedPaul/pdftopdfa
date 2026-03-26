@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.15] - 2026-03-26
+
+### Bug Fixes
+
+- Fix text-page deskewing to preserve the original page size
+
 ## [0.2.14] - 2026-03-26
 
 ### Features
