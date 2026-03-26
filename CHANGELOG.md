@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.13] - 2026-03-26
+
+### Bug Fixes
+
+- Fix best-quality OCR rotation normalization for text pages skipped by OCR
+- Preserve font subsetting when refreshing embedded subsetted Standard 14 fonts
+
 ## [0.2.12] - 2026-03-26
 
 ### Bug Fixes
