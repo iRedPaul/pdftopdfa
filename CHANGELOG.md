@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.12] - 2026-03-26
+
+### Bug Fixes
+
+- Strip PDF/A-unsafe xmpMM metadata during metadata preservation
+- Fix Standard 14 font alias resolution for embedded replacements
+
 ## [0.2.11] - 2026-03-26
 
 ### Bug Fixes
