@@ -13,6 +13,7 @@ from .constants import (
     CJK_FONT_INDEX,
     FALLBACK_FONT,
     FONT_REPLACEMENTS,
+    resolve_standard14_alias,
 )
 
 if TYPE_CHECKING:
@@ -48,10 +49,11 @@ class FontLoader:
         """
         from fontTools.ttLib import TTFont
 
-        if font_name in self._font_cache:
-            return self._font_cache[font_name]
+        canonical_name = resolve_standard14_alias(font_name)
+        if canonical_name in self._font_cache:
+            return self._font_cache[canonical_name]
 
-        replacement_file = FONT_REPLACEMENTS.get(font_name)
+        replacement_file = FONT_REPLACEMENTS.get(canonical_name)
         if replacement_file is None:
             raise FontEmbeddingError(f"No replacement defined for font '{font_name}'")
 
@@ -70,7 +72,7 @@ class FontLoader:
         from io import BytesIO
 
         tt_font = TTFont(BytesIO(font_data))
-        self._font_cache[font_name] = (font_data, tt_font)
+        self._font_cache[canonical_name] = (font_data, tt_font)
         return font_data, tt_font
 
     def load_fallback_font(self) -> tuple[bytes, "TTFont"]:

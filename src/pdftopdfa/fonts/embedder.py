@@ -24,7 +24,7 @@ from .analysis import (
 )
 from .cid_unicode import get_cid_to_unicode
 from .cidfont import CIDFontBuilder
-from .constants import FONT_REPLACEMENTS, SYMBOL_FONTS
+from .constants import FONT_REPLACEMENTS, SYMBOL_FONTS, resolve_standard14_alias
 from .constants import UTF16_ENCODING_NAMES as _UTF16_ENCODING_NAMES
 from .encodings import SYMBOL_ENCODING, ZAPFDINGBATS_ENCODING
 from .glyph_mapping import SYMBOL_GLYPH_TO_UNICODE, ZAPFDINGBATS_GLYPH_TO_UNICODE
@@ -184,7 +184,9 @@ class FontEmbedder:
                         continue
 
                     # Replace font (use fallback for unknown fonts)
-                    use_fallback = base_name not in FONT_REPLACEMENTS
+                    use_fallback = (
+                        resolve_standard14_alias(base_name) not in FONT_REPLACEMENTS
+                    )
                     success = self._replace_font_in_page(
                         page,
                         font_key,
@@ -262,7 +264,10 @@ class FontEmbedder:
                                         encoding=encoding,
                                     )
                                 else:
-                                    use_fallback = base_name not in FONT_REPLACEMENTS
+                                    use_fallback = (
+                                        resolve_standard14_alias(base_name)
+                                        not in FONT_REPLACEMENTS
+                                    )
                                     success = self._replace_font_in_page(
                                         self.pdf.pages[0],
                                         str(font_key),
@@ -341,7 +346,7 @@ class FontEmbedder:
                         continue
 
                     base_name = get_base_font_name(font_name)
-                    if base_name not in FONT_REPLACEMENTS:
+                    if resolve_standard14_alias(base_name) not in FONT_REPLACEMENTS:
                         continue
 
                     font_type = get_font_type(font_obj)

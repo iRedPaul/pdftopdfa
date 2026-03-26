@@ -26,6 +26,50 @@ FONT_REPLACEMENTS = {
     "ZapfDingbats": "NotoSansSymbols2-Regular.ttf",
 }
 
+# Common aliases that should resolve to a Standard-14 replacement.
+STANDARD_14_ALIASES: dict[str, str] = {
+    # Common PDF form resource abbreviations
+    "Helv": "Helvetica",
+    "HeBo": "Helvetica-Bold",
+    "HeOb": "Helvetica-Oblique",
+    "HeBO": "Helvetica-BoldOblique",
+    "TiRo": "Times-Roman",
+    "TiBo": "Times-Bold",
+    "TiIt": "Times-Italic",
+    "TiBI": "Times-BoldItalic",
+    "Cour": "Courier",
+    "CoBo": "Courier-Bold",
+    "CoOb": "Courier-Oblique",
+    "CoBO": "Courier-BoldOblique",
+    "Symb": "Symbol",
+    "ZaDb": "ZapfDingbats",
+    # Common substitution fonts
+    "Arial": "Helvetica",
+    "ArialMT": "Helvetica",
+    "Arial,Bold": "Helvetica-Bold",
+    "Arial,Italic": "Helvetica-Oblique",
+    "Arial,BoldItalic": "Helvetica-BoldOblique",
+    "Arial-BoldMT": "Helvetica-Bold",
+    "Arial-ItalicMT": "Helvetica-Oblique",
+    "Arial-BoldItalicMT": "Helvetica-BoldOblique",
+    "TimesNewRoman": "Times-Roman",
+    "TimesNewRomanPSMT": "Times-Roman",
+    "TimesNewRomanPS-BoldMT": "Times-Bold",
+    "TimesNewRomanPS-ItalicMT": "Times-Italic",
+    "TimesNewRomanPS-BoldItalicMT": "Times-BoldItalic",
+    "CourierNew": "Courier",
+    "CourierNewPSMT": "Courier",
+    "CourierNew-Bold": "Courier-Bold",
+    "CourierNew-BoldItalic": "Courier-BoldOblique",
+}
+
+
+def resolve_standard14_alias(font_name: str) -> str:
+    """Return the canonical Standard-14 replacement name for *font_name*."""
+
+    return STANDARD_14_ALIASES.get(font_name, font_name)
+
+
 # Symbol fonts (require special encoding handling)
 SYMBOL_FONTS = frozenset({"Symbol", "ZapfDingbats"})
 

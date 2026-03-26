@@ -150,6 +150,43 @@ class TestFontEmbedder:
         assert is_compliant
         assert missing == []
 
+    def test_times_new_roman_alias_uses_standard_replacement(self):
+        """TimesNewRoman aliases should not fall back to LiberationSans."""
+        pdf = new_pdf()
+
+        font_dict = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/TimesNewRomanPSMT"),
+        )
+
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(
+                Font=Dictionary(F1=font_dict),
+            ),
+        )
+
+        content_stream = pdf.make_stream(b"BT /F1 12 Tf (Test) Tj ET")
+        page_dict[Name.Contents] = content_stream
+
+        page = pikepdf.Page(page_dict)
+        pdf.pages.append(page)
+
+        embedder = FontEmbedder(pdf)
+        with patch.object(
+            embedder,
+            "_replace_font_in_page",
+            return_value=True,
+        ) as mock_replace:
+            result = embedder.embed_missing_fonts()
+
+        assert "TimesNewRomanPSMT" in result.fonts_embedded
+        assert result.warnings == []
+        assert mock_replace.call_count == 1
+        assert mock_replace.call_args.kwargs["use_fallback"] is False
+
     def test_symbol_font_embedding(self):
         """Symbol font is successfully embedded."""
         pdf = new_pdf()

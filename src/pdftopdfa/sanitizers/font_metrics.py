@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from io import BytesIO
 
+from ..fonts.constants import STANDARD_14_ALIASES
 from ..utils import resolve_indirect as _resolve
 
 logger = logging.getLogger(__name__)
@@ -1710,40 +1711,7 @@ _STANDARD_14: dict[str, dict] = {
 }
 
 # Common aliases used in PDF form fields
-_FONT_ALIASES: dict[str, str] = {
-    "Helv": "Helvetica",
-    "HeBo": "Helvetica-Bold",
-    "HeOb": "Helvetica-Oblique",
-    "HeBO": "Helvetica-BoldOblique",
-    "TiRo": "Times-Roman",
-    "TiBo": "Times-Bold",
-    "TiIt": "Times-Italic",
-    "TiBI": "Times-BoldItalic",
-    "Cour": "Courier",
-    "CoBo": "Courier-Bold",
-    "CoOb": "Courier-Oblique",
-    "CoBO": "Courier-BoldOblique",
-    "Symb": "Symbol",
-    "ZaDb": "ZapfDingbats",
-    # Common substitution fonts
-    "Arial": "Helvetica",
-    "ArialMT": "Helvetica",
-    "Arial,Bold": "Helvetica-Bold",
-    "Arial,Italic": "Helvetica-Oblique",
-    "Arial,BoldItalic": "Helvetica-BoldOblique",
-    "Arial-BoldMT": "Helvetica-Bold",
-    "Arial-ItalicMT": "Helvetica-Oblique",
-    "Arial-BoldItalicMT": "Helvetica-BoldOblique",
-    "TimesNewRoman": "Times-Roman",
-    "TimesNewRomanPSMT": "Times-Roman",
-    "TimesNewRomanPS-BoldMT": "Times-Bold",
-    "TimesNewRomanPS-ItalicMT": "Times-Italic",
-    "TimesNewRomanPS-BoldItalicMT": "Times-BoldItalic",
-    "CourierNew": "Courier",
-    "CourierNewPSMT": "Courier",
-    "CourierNew-Bold": "Courier-Bold",
-    "CourierNew-BoldItalic": "Courier-BoldOblique",
-}
+_FONT_ALIASES = STANDARD_14_ALIASES
 
 
 # ---------------------------------------------------------------------------
