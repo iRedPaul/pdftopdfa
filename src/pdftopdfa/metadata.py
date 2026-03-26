@@ -127,6 +127,18 @@ _MANAGED_ELEMENTS = {
 # Attribute-form equivalents of managed elements (Clark notation)
 _MANAGED_ATTRS = _MANAGED_ELEMENTS
 
+# These xmpMM properties consistently fail veraPDF PDF/A-2/3 validation
+# (clause 6.6.2.3.1) even when copied verbatim from source files. Preserve
+# stable identifiers such as DocumentID/InstanceID, but strip the known
+# problematic fields from catalog and non-catalog XMP packets.
+_PDF_A_UNSAFE_PRESERVED_PROPERTIES = frozenset(
+    {
+        (NAMESPACES["xmpMM"], "OriginalDocumentID"),
+        (NAMESPACES["xmpMM"], "DerivedFrom"),
+        (NAMESPACES["xmpMM"], "History"),
+    }
+)
+
 
 # Predefined XMP properties that do NOT need extension schema declarations.
 # Map of namespace URI -> set of property local names.
@@ -1664,6 +1676,9 @@ def _is_valid_preserved_property(
     Returns True if valid or if no type info is available (unknown property).
     Returns False if structure/value violates the expected type.
     """
+    if (uri, local_name) in _PDF_A_UNSAFE_PRESERVED_PROPERTIES:
+        return False
+
     expected = _PREDEFINED_PROPERTY_TYPES.get((uri, local_name))
     if expected is None:
         # Check extension schema types (e.g. pdfaid:rev -> Integer)
@@ -1959,6 +1974,12 @@ def _collect_preserved_elements(
                 # Validate property structure/value against predefined schema
                 if isinstance(tag, str) and tag.startswith("{"):
                     uri, local = tag[1:].split("}", 1)
+                    if (uri, local) in _PDF_A_UNSAFE_PRESERVED_PROPERTIES:
+                        logger.debug(
+                            "Stripping PDF/A-unsafe preserved property: %s",
+                            tag,
+                        )
+                        continue
                     declared_value_type = declared_property_types.get(uri, {}).get(
                         local
                     )
@@ -2001,6 +2022,16 @@ def _collect_preserved_elements(
                 # Validate attribute value against known type constraints
                 if attr_name.startswith("{"):
                     a_uri, a_local = attr_name[1:].split("}", 1)
+                    if (
+                        a_uri,
+                        a_local,
+                    ) in _PDF_A_UNSAFE_PRESERVED_PROPERTIES:
+                        logger.debug(
+                            "Stripping PDF/A-unsafe preserved attribute: %s=%r",
+                            attr_name,
+                            attr_value,
+                        )
+                        continue
                     text = attr_value.strip()
                     declared_value_type = declared_property_types.get(a_uri, {}).get(
                         a_local
@@ -2691,6 +2722,9 @@ def _sanitize_non_catalog_xmp_tree(tree: etree._Element) -> None:
 
             uri, local = attr_name[1:].split("}", 1)
             if uri == ns_rdf:
+                del desc.attrib[attr_name]
+                continue
+            if (uri, local) in _PDF_A_UNSAFE_PRESERVED_PROPERTIES:
                 del desc.attrib[attr_name]
                 continue
 

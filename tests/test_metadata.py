@@ -889,6 +889,54 @@ class TestXmpPreservation:
         xmp_str = xmp.decode("utf-8")
         assert "pdfuaid" in xmp_str or NAMESPACES["pdfuaid"] in xmp_str
 
+    def test_problematic_xmpmm_properties_stripped(self) -> None:
+        """PDF/A-unsafe xmpMM properties are dropped during preservation."""
+        ns_rdf = NAMESPACES["rdf"]
+        ns_xmpmm = NAMESPACES["xmpMM"]
+        ns_stref = NAMESPACES["stRef"]
+        ns_stevt = NAMESPACES["stEvt"]
+        xmp_xml = f"""\
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{ns_rdf}"
+           xmlns:pdfaid="{NAMESPACES["pdfaid"]}"
+           xmlns:xmpMM="{ns_xmpmm}"
+           xmlns:stRef="{ns_stref}"
+           xmlns:stEvt="{ns_stevt}">
+    <rdf:Description rdf:about="">
+      <pdfaid:part>2</pdfaid:part>
+      <pdfaid:conformance>B</pdfaid:conformance>
+      <xmpMM:DocumentID>uuid:doc-1</xmpMM:DocumentID>
+      <xmpMM:InstanceID>uuid:inst-1</xmpMM:InstanceID>
+      <xmpMM:OriginalDocumentID>uuid:orig-1</xmpMM:OriginalDocumentID>
+      <xmpMM:DerivedFrom rdf:parseType="Resource">
+        <stRef:instanceID>uuid:src-inst</stRef:instanceID>
+      </xmpMM:DerivedFrom>
+      <xmpMM:History>
+        <rdf:Seq>
+          <rdf:li rdf:parseType="Resource">
+            <stEvt:action>saved</stEvt:action>
+            <stEvt:when>2024-01-01T00:00:00Z</stEvt:when>
+          </rdf:li>
+        </rdf:Seq>
+      </xmpMM:History>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"""
+        tree = etree.fromstring(xmp_xml.encode("utf-8"))
+        xmp = create_xmp_metadata(
+            {"title": "Test"},
+            pdfa_part=2,
+            pdfa_conformance="B",
+            existing_xmp_tree=tree,
+        )
+        xmp_str = xmp.decode("utf-8")
+
+        assert "xmpMM:DocumentID" in xmp_str
+        assert "xmpMM:InstanceID" in xmp_str
+        assert "xmpMM:OriginalDocumentID" not in xmp_str
+        assert "xmpMM:DerivedFrom" not in xmp_str
+        assert "xmpMM:History" not in xmp_str
+
     def test_managed_properties_not_duplicated(self) -> None:
         """Managed properties (dc:title etc.) appear only once (new value wins)."""
         tree = _build_xmp_with_extras(
@@ -2513,40 +2561,27 @@ class TestStructuralPropertyNormalization:
     """Tests for stEvt:When -> stEvt:when normalization."""
 
     def test_stevt_when_normalized_to_lowercase(self) -> None:
-        """stEvt:When is corrected to stEvt:when in preserved elements."""
+        """stEvt:When is corrected to stEvt:when recursively."""
         ns_rdf = NAMESPACES["rdf"]
         ns_xmpmm = NAMESPACES["xmpMM"]
         ns_stevt = NAMESPACES["stEvt"]
-        xmp_xml = f"""\
-<x:xmpmeta xmlns:x="adobe:ns:meta/">
-  <rdf:RDF xmlns:rdf="{ns_rdf}"
-           xmlns:pdfaid="{NAMESPACES["pdfaid"]}"
-           xmlns:xmpMM="{ns_xmpmm}"
-           xmlns:stEvt="{ns_stevt}">
-    <rdf:Description rdf:about="">
-      <pdfaid:part>2</pdfaid:part>
-      <pdfaid:conformance>B</pdfaid:conformance>
-      <xmpMM:History>
-        <rdf:Seq>
-          <rdf:li rdf:parseType="Resource">
-            <stEvt:action>created</stEvt:action>
-            <stEvt:When>2024-01-01T00:00:00Z</stEvt:When>
-          </rdf:li>
-        </rdf:Seq>
-      </xmpMM:History>
-    </rdf:Description>
-  </rdf:RDF>
-</x:xmpmeta>"""
-        tree = etree.fromstring(xmp_xml.encode("utf-8"))
-        xmp = create_xmp_metadata(
-            {"title": "Test"},
-            pdfa_part=2,
-            pdfa_conformance="B",
-            existing_xmp_tree=tree,
+        history = etree.fromstring(
+            f"""\
+<xmpMM:History xmlns:xmpMM="{ns_xmpmm}"
+               xmlns:rdf="{ns_rdf}"
+               xmlns:stEvt="{ns_stevt}">
+  <rdf:Seq>
+    <rdf:li rdf:parseType="Resource">
+      <stEvt:action>created</stEvt:action>
+      <stEvt:When>2024-01-01T00:00:00Z</stEvt:When>
+    </rdf:li>
+  </rdf:Seq>
+</xmpMM:History>""".encode()
         )
-        xmp_str = xmp.decode("utf-8")
-        assert "stEvt:when" in xmp_str
-        assert "stEvt:When" not in xmp_str
+        _normalize_structural_properties(history)
+        xml = etree.tostring(history, encoding="unicode")
+        assert "stEvt:when" in xml
+        assert "stEvt:When" not in xml
 
     def test_normalize_structural_properties_recursive(self) -> None:
         """_normalize_structural_properties fixes tags recursively."""
@@ -2712,6 +2747,55 @@ class TestSanitizeNonCatalogMetadata:
         assert sanitized == 1
         assert removed == 0
         assert "/Metadata" in pdf.pages[0].obj
+
+    def test_strips_problematic_xmpmm_properties(
+        self,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """PDF/A-unsafe xmpMM properties are removed from non-catalog XMP."""
+        from io import BytesIO
+
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
+        valid_xmp = f"""\
+<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}"
+           xmlns:xmpMM="{NAMESPACES["xmpMM"]}"
+           xmlns:stRef="{NAMESPACES["stRef"]}"
+           xmlns:stEvt="{NAMESPACES["stEvt"]}">
+    <rdf:Description rdf:about="">
+      <xmpMM:DocumentID>uuid:doc-1</xmpMM:DocumentID>
+      <xmpMM:OriginalDocumentID>uuid:orig-1</xmpMM:OriginalDocumentID>
+      <xmpMM:DerivedFrom rdf:parseType="Resource">
+        <stRef:instanceID>uuid:src-inst</stRef:instanceID>
+      </xmpMM:DerivedFrom>
+      <xmpMM:History>
+        <rdf:Seq>
+          <rdf:li rdf:parseType="Resource">
+            <stEvt:action>saved</stEvt:action>
+            <stEvt:when>2024-01-01T00:00:00Z</stEvt:when>
+          </rdf:li>
+        </rdf:Seq>
+      </xmpMM:History>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>""".encode()
+        meta = pikepdf.Stream(pdf, valid_xmp)
+        meta.Type = Name.Metadata
+        meta.Subtype = Name.XML
+        ref = pdf.make_indirect(meta)
+        pdf.pages[0].obj["/Metadata"] = ref
+
+        sanitized, removed = _sanitize_non_catalog_metadata(pdf)
+        assert sanitized == 1
+        assert removed == 0
+
+        content = bytes(pdf.get_object(ref.objgen).read_bytes())
+        assert b"xmpMM:DocumentID" in content
+        assert b"xmpMM:OriginalDocumentID" not in content
+        assert b"xmpMM:DerivedFrom" not in content
+        assert b"xmpMM:History" not in content
 
     def test_ensures_uncompressed_after_sanitize(
         self,
