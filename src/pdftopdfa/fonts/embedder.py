@@ -313,7 +313,49 @@ class FontEmbedder:
         subsetter = FontSubsetter(self.pdf)
         return subsetter.subset_all_fonts()
 
-    def replace_subsetted_standard14_fonts(self) -> EmbeddingResult:
+    def collect_subsetted_standard14_font_ids(self) -> set[tuple[int, int]]:
+        """Collect embedded subsetted Standard-14 font object IDs.
+
+        This is intended to run before our own subsetting step so later refreshes
+        only target problematic pre-existing subsets instead of undoing the size
+        savings from fonts we subset ourselves.
+        """
+        collected_ids: set[tuple[int, int]] = set()
+        processed_font_ids: set[tuple[int, int]] = set()
+
+        for page in self.pdf.pages:
+            for _font_key, font_obj in iter_all_page_fonts(page):
+                try:
+                    obj_key = font_obj.objgen
+                    if obj_key == (0, 0) or obj_key in processed_font_ids:
+                        continue
+                    processed_font_ids.add(obj_key)
+
+                    if not is_font_embedded(font_obj):
+                        continue
+
+                    font_name = get_font_name(font_obj)
+                    if not _is_subset_font(font_name):
+                        continue
+
+                    base_name = get_base_font_name(font_name)
+                    if resolve_standard14_alias(base_name) not in FONT_REPLACEMENTS:
+                        continue
+
+                    font_type = get_font_type(font_obj)
+                    if font_type not in {"TrueType", "Type1", "MMType1"}:
+                        continue
+
+                    collected_ids.add(obj_key)
+                except Exception:
+                    continue
+
+        return collected_ids
+
+    def replace_subsetted_standard14_fonts(
+        self,
+        target_font_ids: set[tuple[int, int]] | None = None,
+    ) -> EmbeddingResult:
         """Replace embedded subsetted Standard-14 fonts with full replacements.
 
         Some generators embed incomplete subsets of the Standard 14 fonts.
@@ -337,6 +379,11 @@ class FontEmbedder:
                         if obj_key in processed_font_ids:
                             continue
                         processed_font_ids.add(obj_key)
+                        if (
+                            target_font_ids is not None
+                            and obj_key not in target_font_ids
+                        ):
+                            continue
 
                     if not is_font_embedded(font_obj):
                         continue

@@ -21,8 +21,12 @@ from pdftopdfa.ocr import (
     _PREPROCESS_QUALITIES,
     OCR_SETTINGS,
     OcrQuality,
+    _normalize_best_quality_text_page_rotations,
+    _OrientationResult,
     _page_has_images,
     _page_has_text,
+    _parse_tesseract_osd,
+    _should_clear_page_rotate,
     apply_ocr,
     is_ocr_available,
     needs_ocr,
@@ -739,11 +743,17 @@ class TestOcrQuality:
     @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
+    @patch("pdftopdfa.ocr._normalize_best_quality_text_page_rotations")
     def test_apply_ocr_best_quality(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+        self,
+        mock_normalize_rotations: MagicMock,
+        mock_ocrmypdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
     ) -> None:
         """apply_ocr with BEST quality passes correct parameters."""
         output_path = tmp_dir / "output.pdf"
+        mock_ocrmypdf.ocr.side_effect = lambda *args, **kwargs: output_path.touch()
 
         apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
 
@@ -756,6 +766,7 @@ class TestOcrQuality:
             plugins=["pdftopdfa.ocr_rotation_fix"],
             **OCR_SETTINGS[OcrQuality.BEST],
         )
+        mock_normalize_rotations.assert_called_once_with(output_path)
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
@@ -1017,6 +1028,114 @@ class TestFilterOcrImage:
         pixels = np.array(result)
         unique_values = set(np.unique(pixels))
         assert unique_values <= {0, 255}
+
+
+class TestBestQualityTextRotationNormalization:
+    """Tests for post-OCR normalization of skipped text-page rotations."""
+
+    def test_parse_tesseract_osd(self) -> None:
+        """OSD output is parsed into rotation and confidence."""
+        result = _parse_tesseract_osd(
+            "Rotate: 180\nOrientation confidence: 12.5\nScript: Latin\n"
+        )
+
+        assert result == _OrientationResult(rotate=180, confidence=12.5)
+
+    def test_should_clear_page_rotate_when_cleared_preview_is_better(self) -> None:
+        """Clearing /Rotate is preferred when it removes the needed correction."""
+        current = _OrientationResult(rotate=180, confidence=8.0)
+        cleared = _OrientationResult(rotate=0, confidence=9.5)
+
+        assert _should_clear_page_rotate(180, current, cleared) is True
+
+    def test_should_not_clear_page_rotate_without_improvement(self) -> None:
+        """Pages stay untouched when the cleared preview is not better."""
+        current = _OrientationResult(rotate=0, confidence=9.0)
+        cleared = _OrientationResult(rotate=180, confidence=10.0)
+
+        assert _should_clear_page_rotate(180, current, cleared) is False
+
+    @patch("pdftopdfa.ocr._run_tesseract_orientation")
+    @patch("pdftopdfa.ocr._render_pdf_page_preview")
+    @patch("pdftopdfa.ocr._write_single_page_with_rotate")
+    def test_normalize_best_quality_text_page_rotations_clears_rotate(
+        self,
+        mock_write_single_page: MagicMock,
+        mock_render_preview: MagicMock,
+        mock_run_orientation: MagicMock,
+        tmp_dir: Path,
+    ) -> None:
+        """A text-only page with better orientation after clearing is normalized."""
+        pdf_path = tmp_dir / "rotated.pdf"
+
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(595.0, 842.0))
+            page.Rotate = 180
+            font = Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type1,
+                BaseFont=Name("/Helvetica"),
+            )
+            page.obj[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+            page.obj[Name.Contents] = pdf.make_stream(
+                b"BT /F1 12 Tf 100 700 Td (Rotated text) Tj ET"
+            )
+            pdf.save(pdf_path)
+
+        mock_write_single_page.side_effect = lambda *args, **kwargs: kwargs[
+            "output_path"
+        ]
+        mock_run_orientation.side_effect = [
+            _OrientationResult(rotate=180, confidence=8.0),
+            _OrientationResult(rotate=0, confidence=9.0),
+        ]
+
+        changed_pages = _normalize_best_quality_text_page_rotations(pdf_path)
+
+        assert changed_pages == [1]
+        with Pdf.open(pdf_path) as pdf:
+            assert int(pdf.pages[0].obj.get("/Rotate", 0)) == 0
+
+    @patch("pdftopdfa.ocr._run_tesseract_orientation")
+    @patch("pdftopdfa.ocr._render_pdf_page_preview")
+    @patch("pdftopdfa.ocr._write_single_page_with_rotate")
+    def test_normalize_best_quality_text_page_rotations_keeps_rotate_when_needed(
+        self,
+        mock_write_single_page: MagicMock,
+        mock_render_preview: MagicMock,
+        mock_run_orientation: MagicMock,
+        tmp_dir: Path,
+    ) -> None:
+        """Rotation is preserved when clearing it would not improve orientation."""
+        pdf_path = tmp_dir / "rotated_keep.pdf"
+
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(595.0, 842.0))
+            page.Rotate = 90
+            font = Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type1,
+                BaseFont=Name("/Helvetica"),
+            )
+            page.obj[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+            page.obj[Name.Contents] = pdf.make_stream(
+                b"BT /F1 12 Tf 100 700 Td (Keep rotate) Tj ET"
+            )
+            pdf.save(pdf_path)
+
+        mock_write_single_page.side_effect = lambda *args, **kwargs: kwargs[
+            "output_path"
+        ]
+        mock_run_orientation.side_effect = [
+            _OrientationResult(rotate=0, confidence=9.0),
+            _OrientationResult(rotate=90, confidence=9.5),
+        ]
+
+        changed_pages = _normalize_best_quality_text_page_rotations(pdf_path)
+
+        assert changed_pages == []
+        with Pdf.open(pdf_path) as pdf:
+            assert int(pdf.pages[0].obj.get("/Rotate", 0)) == 90
 
 
 class TestVisiblePageRotationFix:

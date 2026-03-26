@@ -785,6 +785,11 @@ def convert_to_pdfa(
 
         warnings.extend(tounicode_result.warnings)
 
+        with FontEmbedder(pdf) as embedder:
+            original_subsetted_standard14_font_ids = (
+                embedder.collect_subsetted_standard14_font_ids()
+            )
+
         # 3.7. Subset embedded fonts to reduce file size
         logger.debug("Subsetting embedded fonts")
         with FontEmbedder(pdf) as embedder:
@@ -819,7 +824,9 @@ def convert_to_pdfa(
         # carried forward into the final PDF/A output.
         logger.debug("Refreshing subsetted Standard-14 fonts")
         with FontEmbedder(pdf) as embedder:
-            refresh_result = embedder.replace_subsetted_standard14_fonts()
+            refresh_result = embedder.replace_subsetted_standard14_fonts(
+                original_subsetted_standard14_font_ids
+            )
 
         warnings.extend(refresh_result.warnings)
 

@@ -600,6 +600,51 @@ class TestConvertToPdfa:
             for record in caplog.records
         )
 
+    @patch("pdftopdfa.converter.check_font_compliance")
+    @patch("pdftopdfa.fonts.FontEmbedder")
+    def test_refreshes_only_original_subsetted_standard14_fonts(
+        self,
+        mock_font_embedder: MagicMock,
+        mock_check_font_compliance: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Only pre-existing subsetted Standard-14 fonts are refreshed."""
+        mock_check_font_compliance.return_value = (False, ["Unknown"])
+
+        embedder = MagicMock()
+        embedder.__enter__.return_value = embedder
+        embedder.__exit__.return_value = None
+        embedder.embed_missing_fonts.return_value = SimpleNamespace(
+            fonts_embedded=["Unknown"],
+            fonts_failed=[],
+            warnings=[],
+        )
+        embedder.add_tounicode_to_embedded_fonts.return_value = SimpleNamespace(
+            fonts_embedded=[],
+            fonts_failed=[],
+            warnings=[],
+        )
+        embedder.collect_subsetted_standard14_font_ids.return_value = {(99, 0)}
+        embedder.subset_embedded_fonts.return_value = SimpleNamespace(
+            fonts_subsetted=["Unknown"],
+            bytes_saved=1024,
+            warnings=[],
+        )
+        embedder.fix_font_encodings.return_value = 0
+        embedder.replace_subsetted_standard14_fonts.return_value = SimpleNamespace(
+            fonts_embedded=[],
+            fonts_failed=[],
+            warnings=[],
+        )
+        mock_font_embedder.return_value = embedder
+
+        output_path = tmp_dir / "refresh_subsetted.pdf"
+        result = convert_to_pdfa(sample_pdf, output_path, level="2b")
+
+        assert result.success is True
+        embedder.replace_subsetted_standard14_fonts.assert_called_once_with({(99, 0)})
+
     @patch("pdftopdfa.converter.detect_iso_standards")
     def test_iso_standard_logs_are_debug_only(
         self,
