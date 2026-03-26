@@ -332,69 +332,35 @@ def _detect_consistent_text_skew(page) -> float | None:
     return sum(consistent) / len(consistent)
 
 
-def _transform_point(
-    x: float,
-    y: float,
-    *,
-    a: float,
-    b: float,
-    c: float,
-    d: float,
-    e: float,
-    f: float,
-) -> tuple[float, float]:
-    """Apply a PDF transformation matrix to a point."""
-    return (a * x + c * y + e, b * x + d * y + f)
-
-
-def _transform_box(
-    box: list[float],
-    *,
-    a: float,
-    b: float,
-    c: float,
-    d: float,
-    e: float,
-    f: float,
-) -> list[float]:
-    """Transform a PDF page box and return its axis-aligned bounds."""
-    corners = (
-        _transform_point(box[0], box[1], a=a, b=b, c=c, d=d, e=e, f=f),
-        _transform_point(box[0], box[3], a=a, b=b, c=c, d=d, e=e, f=f),
-        _transform_point(box[2], box[1], a=a, b=b, c=c, d=d, e=e, f=f),
-        _transform_point(box[2], box[3], a=a, b=b, c=c, d=d, e=e, f=f),
-    )
-    xs = [point[0] for point in corners]
-    ys = [point[1] for point in corners]
-    return [min(xs), min(ys), max(xs), max(ys)]
-
-
 def _apply_page_content_transform(pdf, page, *, angle_degrees: float) -> None:
-    """Apply a global counter-rotation to a page and expand its boxes."""
+    """Apply a global counter-rotation while preserving the page format."""
     import pikepdf
 
     media_box = [float(value) for value in page.mediabox]
+    page_width = media_box[2] - media_box[0]
+    page_height = media_box[3] - media_box[1]
     radians = math.radians(angle_degrees)
     cos_theta = math.cos(radians)
     sin_theta = math.sin(radians)
 
-    rotated_media = _transform_box(
-        media_box,
-        a=cos_theta,
-        b=sin_theta,
-        c=-sin_theta,
-        d=cos_theta,
-        e=0.0,
-        f=0.0,
-    )
-    translate_x = -rotated_media[0]
-    translate_y = -rotated_media[1]
+    rotated_width = abs(page_width * cos_theta) + abs(page_height * sin_theta)
+    rotated_height = abs(page_width * sin_theta) + abs(page_height * cos_theta)
+    scale = min(page_width / rotated_width, page_height / rotated_height, 1.0)
+
+    a = scale * cos_theta
+    b = scale * sin_theta
+    c = -scale * sin_theta
+    d = scale * cos_theta
+    center_x = media_box[0] + page_width / 2.0
+    center_y = media_box[1] + page_height / 2.0
+    translate_x = center_x - (a * center_x + c * center_y)
+    translate_y = center_y - (b * center_x + d * center_y)
 
     prefix = pdf.make_stream(
         (
             "q\n"
-            f"{cos_theta:.12f} {sin_theta:.12f} "
-            f"{-sin_theta:.12f} {cos_theta:.12f} "
+            f"{a:.12f} {b:.12f} "
+            f"{c:.12f} {d:.12f} "
             f"{translate_x:.12f} {translate_y:.12f} cm\n"
         ).encode("ascii")
     )
@@ -406,30 +372,6 @@ def _apply_page_content_transform(pdf, page, *, angle_degrees: float) -> None:
     else:
         wrapped_contents = pikepdf.Array([prefix, contents, suffix])
     page.obj[pikepdf.Name.Contents] = wrapped_contents
-
-    page.MediaBox = pikepdf.Array(
-        [
-            0,
-            0,
-            rotated_media[2] - rotated_media[0],
-            rotated_media[3] - rotated_media[1],
-        ]
-    )
-
-    for box_name in ("CropBox", "TrimBox", "ArtBox", "BleedBox"):
-        source_box = page.obj.get(f"/{box_name}")
-        if source_box is None:
-            continue
-        transformed_box = _transform_box(
-            [float(value) for value in source_box],
-            a=cos_theta,
-            b=sin_theta,
-            c=-sin_theta,
-            d=cos_theta,
-            e=translate_x,
-            f=translate_y,
-        )
-        page.obj[pikepdf.Name(f"/{box_name}")] = pikepdf.Array(transformed_box)
 
 
 def _normalize_best_quality_text_page_skew(pdf_path: Path) -> list[tuple[int, float]]:

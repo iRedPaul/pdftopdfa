@@ -1097,7 +1097,65 @@ class TestBestQualityTextRotationNormalization:
 
         assert changed_pages == [1]
         with Pdf.open(pdf_path) as pdf:
-            assert int(pdf.pages[0].obj.get("/Rotate", 0)) == 0
+            page = pdf.pages[0]
+            assert int(page.obj.get("/Rotate", 0)) == 0
+            assert [float(value) for value in page.obj["/MediaBox"]] == pytest.approx(
+                [0.0, 0.0, 595.0, 842.0]
+            )
+
+    @patch("pdftopdfa.ocr._run_tesseract_orientation")
+    @patch("pdftopdfa.ocr._render_pdf_page_preview")
+    @patch("pdftopdfa.ocr._write_single_page_with_rotate")
+    def test_normalize_best_quality_text_page_rotations_preserves_visible_a4(
+        self,
+        mock_write_single_page: MagicMock,
+        mock_render_preview: MagicMock,
+        mock_run_orientation: MagicMock,
+        tmp_dir: Path,
+    ) -> None:
+        """Clearing /Rotate keeps the original page box geometry unchanged."""
+        pdf_path = tmp_dir / "rotated_visible_a4.pdf"
+        original_box = [0.0, 0.0, 842.0, 595.0]
+
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(842.0, 595.0))
+            page.Rotate = 270
+            font = Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type1,
+                BaseFont=Name("/Helvetica"),
+            )
+            page.obj[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+            page.obj[Name.CropBox] = Array(original_box)
+            page.obj[Name.TrimBox] = Array(original_box)
+            page.obj[Name.Contents] = pdf.make_stream(
+                b"BT /F1 12 Tf 100 450 Td (Portrait A4) Tj ET"
+            )
+            pdf.save(pdf_path)
+
+        mock_write_single_page.side_effect = lambda *args, **kwargs: kwargs[
+            "output_path"
+        ]
+        mock_run_orientation.side_effect = [
+            _OrientationResult(rotate=270, confidence=8.0),
+            _OrientationResult(rotate=0, confidence=9.0),
+        ]
+
+        changed_pages = _normalize_best_quality_text_page_rotations(pdf_path)
+
+        assert changed_pages == [1]
+        with Pdf.open(pdf_path) as pdf:
+            page = pdf.pages[0]
+            assert int(page.obj.get("/Rotate", 0)) == 0
+            assert [float(value) for value in page.obj["/MediaBox"]] == pytest.approx(
+                original_box
+            )
+            assert [float(value) for value in page.obj["/CropBox"]] == pytest.approx(
+                original_box
+            )
+            assert [float(value) for value in page.obj["/TrimBox"]] == pytest.approx(
+                original_box
+            )
 
     @patch("pdftopdfa.ocr._run_tesseract_orientation")
     @patch("pdftopdfa.ocr._render_pdf_page_preview")
@@ -1165,8 +1223,9 @@ class TestBestQualityTextRotationNormalization:
         assert angle == pytest.approx(4.77, abs=0.1)
 
     def test_normalize_best_quality_text_page_skew(self, tmp_dir: Path) -> None:
-        """Text-only pages with dominant skew are counter-rotated."""
+        """Text-only pages with dominant skew keep their original page size."""
         pdf_path = tmp_dir / "skew_page.pdf"
+        original_box = [0.0, 0.0, 595.0, 842.0]
 
         with Pdf.new() as pdf:
             page = pdf.add_blank_page(page_size=(595.0, 842.0))
@@ -1176,6 +1235,8 @@ class TestBestQualityTextRotationNormalization:
                 BaseFont=Name("/Helvetica"),
             )
             page.obj[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+            page.obj[Name.CropBox] = Array(original_box)
+            page.obj[Name.TrimBox] = Array(original_box)
             page.obj[Name.Contents] = pdf.make_stream(
                 b"BT /F1 12 Tf "
                 b"12.133 1.0125 -1.0125 12.133 100 700 Tm (A) Tj "
@@ -1187,10 +1248,20 @@ class TestBestQualityTextRotationNormalization:
 
         assert normalized
         with Pdf.open(pdf_path) as pdf:
-            contents = pdf.pages[0].obj["/Contents"]
+            page = pdf.pages[0]
+            contents = page.obj["/Contents"]
             assert isinstance(contents, Array)
             prefix = bytes(contents[0].read_bytes()).decode("ascii")
             assert " cm" in prefix
+            assert [float(value) for value in page.obj["/MediaBox"]] == pytest.approx(
+                original_box
+            )
+            assert [float(value) for value in page.obj["/CropBox"]] == pytest.approx(
+                original_box
+            )
+            assert [float(value) for value in page.obj["/TrimBox"]] == pytest.approx(
+                original_box
+            )
 
     @patch("pdftopdfa.ocr._normalize_best_quality_text_page_rotations")
     @patch("pdftopdfa.ocr._normalize_best_quality_text_page_skew")
