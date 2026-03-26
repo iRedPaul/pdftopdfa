@@ -4,6 +4,7 @@
 
 """Font embedding for PDF/A compliance."""
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -86,6 +87,14 @@ class EmbeddingResult:
     fonts_failed: list[str] = field(default_factory=list)
     fonts_preserved: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class FontProgramDeduplicationResult:
+    """Summary of embedded font-program deduplication."""
+
+    programs_deduplicated: int = 0
+    bytes_saved_estimate: int = 0
 
 
 class FontEmbedder:
@@ -313,6 +322,44 @@ class FontEmbedder:
         subsetter = FontSubsetter(self.pdf)
         return subsetter.subset_all_fonts()
 
+    def deduplicate_embedded_font_programs(self) -> FontProgramDeduplicationResult:
+        """Reuse identical embedded font program streams across font descriptors."""
+        result = FontProgramDeduplicationResult()
+        seen_streams: dict[
+            tuple[str, int, str],
+            pikepdf.Object,
+        ] = {}
+        processed_font_ids: set[tuple[int, int]] = set()
+
+        for font_obj in self._iter_unique_embedded_fonts(processed_font_ids):
+            try:
+                descriptor, _desc_font = self._get_font_descriptor_for_font(font_obj)
+                if descriptor is None:
+                    continue
+                font_file_info = self._find_any_font_file(descriptor)
+                if font_file_info is None:
+                    continue
+
+                font_stream = font_file_info[1]
+                font_bytes = bytes(font_stream.read_bytes())
+                signature = (
+                    hashlib.sha256(font_bytes).hexdigest(),
+                    len(font_bytes),
+                    str(font_stream.get("/Subtype", "")),
+                )
+                existing_stream = seen_streams.get(signature)
+                if existing_stream is None:
+                    seen_streams[signature] = font_stream
+                    continue
+
+                descriptor[font_file_info[0]] = existing_stream
+                result.programs_deduplicated += 1
+                result.bytes_saved_estimate += len(font_bytes)
+            except Exception:
+                continue
+
+        return result
+
     def collect_subsetted_standard14_font_ids(self) -> set[tuple[int, int]]:
         """Collect embedded subsetted Standard-14 font object IDs.
 
@@ -436,6 +483,70 @@ class FontEmbedder:
                     continue
 
         return result
+
+    def _iter_unique_embedded_fonts(
+        self,
+        processed_font_ids: set[tuple[int, int]],
+    ):
+        """Yield unique page and AcroForm fonts."""
+        for page in self.pdf.pages:
+            for _font_key, font_obj in iter_all_page_fonts(page):
+                obj_key = font_obj.objgen
+                if obj_key == (0, 0) or obj_key in processed_font_ids:
+                    continue
+                processed_font_ids.add(obj_key)
+                yield font_obj
+
+        try:
+            root = self.pdf.Root
+            if root is None or "/AcroForm" not in root:
+                return
+            acroform = _resolve_indirect(root.AcroForm)
+            dr = acroform.get("/DR")
+            if dr is None:
+                return
+            dr = _resolve_indirect(dr)
+            font_dict = dr.get("/Font")
+            if font_dict is None:
+                return
+            font_dict = _resolve_indirect(font_dict)
+            for font_key in list(font_dict.keys()):
+                font_obj = _resolve_indirect(font_dict[font_key])
+                obj_key = font_obj.objgen
+                if obj_key == (0, 0) or obj_key in processed_font_ids:
+                    continue
+                processed_font_ids.add(obj_key)
+                yield font_obj
+        except Exception:
+            return
+
+    def _get_font_descriptor_for_font(
+        self,
+        font_obj: pikepdf.Object,
+    ) -> tuple[pikepdf.Object | None, pikepdf.Object | None]:
+        """Resolve the FontDescriptor for a simple or CID font."""
+        font_descriptor = font_obj.get("/FontDescriptor")
+        descendant = None
+        if font_descriptor is None:
+            descendants = font_obj.get("/DescendantFonts")
+            if descendants is not None and len(descendants) > 0:
+                descendant = _resolve_indirect(descendants[0])
+                font_descriptor = descendant.get("/FontDescriptor")
+        if font_descriptor is None:
+            return (None, descendant)
+        return (_resolve_indirect(font_descriptor), descendant)
+
+    @staticmethod
+    def _find_any_font_file(
+        font_descriptor: pikepdf.Object,
+    ) -> tuple[Name, pikepdf.Object] | None:
+        """Find any embedded font program stream in a FontDescriptor."""
+        for key in (Name("/FontFile"), Name("/FontFile2"), Name("/FontFile3")):
+            stream = font_descriptor.get(str(key))
+            if stream is None:
+                continue
+            return (key, _resolve_indirect(stream))
+        return None
 
     def _build_encoding_dictionary(self, encoding: dict[int, str]) -> Dictionary:
         """Creates PDF Encoding with Differences array.

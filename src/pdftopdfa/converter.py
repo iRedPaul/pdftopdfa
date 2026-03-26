@@ -830,6 +830,15 @@ def convert_to_pdfa(
 
         warnings.extend(refresh_result.warnings)
 
+        with FontEmbedder(pdf) as embedder:
+            dedupe_result = embedder.deduplicate_embedded_font_programs()
+        if dedupe_result.programs_deduplicated:
+            logger.debug(
+                "Deduplicated %d embedded font program(s) (saved ~%d bytes)",
+                dedupe_result.programs_deduplicated,
+                dedupe_result.bytes_saved_estimate,
+            )
+
         # 4. Sanitize PDF for PDF/A
         logger.debug("Sanitizing PDF for PDF/A-%s", level)
         sanitize_result = sanitize_for_pdfa(pdf, level)

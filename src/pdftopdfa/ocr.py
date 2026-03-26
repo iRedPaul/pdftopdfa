@@ -12,6 +12,7 @@ in image-based PDFs (scanned documents).
 import contextlib
 import enum
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -286,6 +287,196 @@ def _should_clear_page_rotate(
     return cleared_orientation.confidence >= current_orientation.confidence
 
 
+def _extract_text_matrix_angles(page) -> list[float]:
+    """Collect text-matrix rotation angles from a page's content stream."""
+    angles: list[float] = []
+
+    try:
+        import pikepdf
+
+        for operands, operator in pikepdf.parse_content_stream(page):
+            if str(operator) != "Tm" or len(operands) != 6:
+                continue
+            a, b, c, d, _e, _f = [float(value) for value in operands]
+            if abs(a) < 1e-6 and abs(b) < 1e-6:
+                continue
+            angle = math.degrees(math.atan2(b, a))
+            if abs(d) > 1e-6 or abs(c) > 1e-6:
+                shear = math.degrees(math.atan2(c, d))
+            else:
+                shear = 0.0
+            if abs(angle - (-shear)) > 0.25:
+                continue
+            angles.append(angle)
+    except Exception as exc:
+        logger.debug("Failed to inspect text matrix skew: %s", exc)
+
+    return angles
+
+
+def _detect_consistent_text_skew(page) -> float | None:
+    """Detect a dominant small skew angle on a text-only page."""
+    angles = _extract_text_matrix_angles(page)
+    if len(angles) < 2:
+        return None
+
+    median_angle = sorted(angles)[len(angles) // 2]
+    abs_median = abs(median_angle)
+    if abs_median < 0.5 or abs_median > 10.0:
+        return None
+
+    consistent = [angle for angle in angles if abs(angle - median_angle) <= 0.5]
+    if len(consistent) / len(angles) < 0.8:
+        return None
+
+    return sum(consistent) / len(consistent)
+
+
+def _transform_point(
+    x: float,
+    y: float,
+    *,
+    a: float,
+    b: float,
+    c: float,
+    d: float,
+    e: float,
+    f: float,
+) -> tuple[float, float]:
+    """Apply a PDF transformation matrix to a point."""
+    return (a * x + c * y + e, b * x + d * y + f)
+
+
+def _transform_box(
+    box: list[float],
+    *,
+    a: float,
+    b: float,
+    c: float,
+    d: float,
+    e: float,
+    f: float,
+) -> list[float]:
+    """Transform a PDF page box and return its axis-aligned bounds."""
+    corners = (
+        _transform_point(box[0], box[1], a=a, b=b, c=c, d=d, e=e, f=f),
+        _transform_point(box[0], box[3], a=a, b=b, c=c, d=d, e=e, f=f),
+        _transform_point(box[2], box[1], a=a, b=b, c=c, d=d, e=e, f=f),
+        _transform_point(box[2], box[3], a=a, b=b, c=c, d=d, e=e, f=f),
+    )
+    xs = [point[0] for point in corners]
+    ys = [point[1] for point in corners]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _apply_page_content_transform(pdf, page, *, angle_degrees: float) -> None:
+    """Apply a global counter-rotation to a page and expand its boxes."""
+    import pikepdf
+
+    media_box = [float(value) for value in page.mediabox]
+    radians = math.radians(angle_degrees)
+    cos_theta = math.cos(radians)
+    sin_theta = math.sin(radians)
+
+    rotated_media = _transform_box(
+        media_box,
+        a=cos_theta,
+        b=sin_theta,
+        c=-sin_theta,
+        d=cos_theta,
+        e=0.0,
+        f=0.0,
+    )
+    translate_x = -rotated_media[0]
+    translate_y = -rotated_media[1]
+
+    prefix = pdf.make_stream(
+        (
+            "q\n"
+            f"{cos_theta:.12f} {sin_theta:.12f} "
+            f"{-sin_theta:.12f} {cos_theta:.12f} "
+            f"{translate_x:.12f} {translate_y:.12f} cm\n"
+        ).encode("ascii")
+    )
+    suffix = pdf.make_stream(b"\nQ\n")
+
+    contents = page.obj.get("/Contents")
+    if isinstance(contents, pikepdf.Array):
+        wrapped_contents = pikepdf.Array([prefix, *contents, suffix])
+    else:
+        wrapped_contents = pikepdf.Array([prefix, contents, suffix])
+    page.obj[pikepdf.Name.Contents] = wrapped_contents
+
+    page.MediaBox = pikepdf.Array(
+        [
+            0,
+            0,
+            rotated_media[2] - rotated_media[0],
+            rotated_media[3] - rotated_media[1],
+        ]
+    )
+
+    for box_name in ("CropBox", "TrimBox", "ArtBox", "BleedBox"):
+        source_box = page.obj.get(f"/{box_name}")
+        if source_box is None:
+            continue
+        transformed_box = _transform_box(
+            [float(value) for value in source_box],
+            a=cos_theta,
+            b=sin_theta,
+            c=-sin_theta,
+            d=cos_theta,
+            e=translate_x,
+            f=translate_y,
+        )
+        page.obj[pikepdf.Name(f"/{box_name}")] = pikepdf.Array(transformed_box)
+
+
+def _normalize_best_quality_text_page_skew(pdf_path: Path) -> list[tuple[int, float]]:
+    """Deskew text-only pages whose text matrices are consistently slanted."""
+    try:
+        import pikepdf
+    except ImportError:
+        return []
+
+    normalized: list[tuple[int, float]] = []
+    output_tmp = pdf_path.with_name(f"{pdf_path.stem}_deskew.pdf")
+
+    with pikepdf.open(pdf_path) as pdf:
+        changed = False
+        for page_index, page in enumerate(pdf.pages):
+            rotate = int(page.obj.get("/Rotate", 0) or 0) % 360
+            if rotate != 0:
+                continue
+            if not _page_has_text(page) or _page_has_images(page):
+                continue
+
+            skew_angle = _detect_consistent_text_skew(page)
+            if skew_angle is None:
+                continue
+
+            _apply_page_content_transform(
+                pdf,
+                page,
+                angle_degrees=-skew_angle,
+            )
+            normalized.append((page_index + 1, skew_angle))
+            changed = True
+
+        if not changed:
+            return []
+
+        pdf.save(output_tmp)
+
+    output_tmp.replace(pdf_path)
+
+    logger.info(
+        "Deskewed OCR-skipped text page(s): %s",
+        ", ".join(f"{page_no} ({angle:.2f}deg)" for page_no, angle in normalized),
+    )
+    return normalized
+
+
 def _normalize_best_quality_text_page_rotations(pdf_path: Path) -> list[int]:
     """Clear suspicious /Rotate flags on text-only pages skipped by OCR."""
     try:
@@ -368,6 +559,12 @@ def _normalize_best_quality_text_page_rotations(pdf_path: Path) -> list[int]:
         ", ".join(str(page_no) for page_no in normalized_pages),
     )
     return normalized_pages
+
+
+def _normalize_best_quality_skipped_text_pages(pdf_path: Path) -> None:
+    """Normalize skipped text pages for best-quality OCR output."""
+    _normalize_best_quality_text_page_rotations(pdf_path)
+    _normalize_best_quality_text_page_skew(pdf_path)
 
 
 def is_ocr_available() -> bool:
@@ -643,7 +840,7 @@ def apply_ocr(
                 **ocr_kwargs,
             )
         if quality == OcrQuality.BEST and output_path.exists():
-            _normalize_best_quality_text_page_rotations(output_path)
+            _normalize_best_quality_skipped_text_pages(output_path)
         logger.info("OCR completed successfully: %s", output_path)
         return output_path
 

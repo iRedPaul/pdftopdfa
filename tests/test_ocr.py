@@ -21,7 +21,10 @@ from pdftopdfa.ocr import (
     _PREPROCESS_QUALITIES,
     OCR_SETTINGS,
     OcrQuality,
+    _detect_consistent_text_skew,
+    _normalize_best_quality_skipped_text_pages,
     _normalize_best_quality_text_page_rotations,
+    _normalize_best_quality_text_page_skew,
     _OrientationResult,
     _page_has_images,
     _page_has_text,
@@ -743,10 +746,10 @@ class TestOcrQuality:
     @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
-    @patch("pdftopdfa.ocr._normalize_best_quality_text_page_rotations")
+    @patch("pdftopdfa.ocr._normalize_best_quality_skipped_text_pages")
     def test_apply_ocr_best_quality(
         self,
-        mock_normalize_rotations: MagicMock,
+        mock_normalize_pages: MagicMock,
         mock_ocrmypdf: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
@@ -766,7 +769,7 @@ class TestOcrQuality:
             plugins=["pdftopdfa.ocr_rotation_fix"],
             **OCR_SETTINGS[OcrQuality.BEST],
         )
-        mock_normalize_rotations.assert_called_once_with(output_path)
+        mock_normalize_pages.assert_called_once_with(output_path)
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
@@ -1136,6 +1139,75 @@ class TestBestQualityTextRotationNormalization:
         assert changed_pages == []
         with Pdf.open(pdf_path) as pdf:
             assert int(pdf.pages[0].obj.get("/Rotate", 0)) == 90
+
+    def test_detect_consistent_text_skew(self, tmp_dir: Path) -> None:
+        """Consistent small text-matrix skew is detected."""
+        pdf_path = tmp_dir / "skew_detect.pdf"
+
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(595.0, 842.0))
+            font = Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type1,
+                BaseFont=Name("/Helvetica"),
+            )
+            page.obj[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+            page.obj[Name.Contents] = pdf.make_stream(
+                b"BT /F1 12 Tf 12.133 1.0125 -1.0125 12.133 100 700 Tm (A) Tj "
+                b"12.133 1.0125 -1.0125 12.133 100 680 Tm (B) Tj ET"
+            )
+            pdf.save(pdf_path)
+
+        with Pdf.open(pdf_path) as pdf:
+            angle = _detect_consistent_text_skew(pdf.pages[0])
+
+        assert angle is not None
+        assert angle == pytest.approx(4.77, abs=0.1)
+
+    def test_normalize_best_quality_text_page_skew(self, tmp_dir: Path) -> None:
+        """Text-only pages with dominant skew are counter-rotated."""
+        pdf_path = tmp_dir / "skew_page.pdf"
+
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(595.0, 842.0))
+            font = Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type1,
+                BaseFont=Name("/Helvetica"),
+            )
+            page.obj[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+            page.obj[Name.Contents] = pdf.make_stream(
+                b"BT /F1 12 Tf "
+                b"12.133 1.0125 -1.0125 12.133 100 700 Tm (A) Tj "
+                b"12.133 1.0125 -1.0125 12.133 100 680 Tm (B) Tj ET"
+            )
+            pdf.save(pdf_path)
+
+        normalized = _normalize_best_quality_text_page_skew(pdf_path)
+
+        assert normalized
+        with Pdf.open(pdf_path) as pdf:
+            contents = pdf.pages[0].obj["/Contents"]
+            assert isinstance(contents, Array)
+            prefix = bytes(contents[0].read_bytes()).decode("ascii")
+            assert " cm" in prefix
+
+    @patch("pdftopdfa.ocr._normalize_best_quality_text_page_rotations")
+    @patch("pdftopdfa.ocr._normalize_best_quality_text_page_skew")
+    def test_normalize_best_quality_skipped_text_pages_runs_both_steps(
+        self,
+        mock_normalize_skew: MagicMock,
+        mock_normalize_rotations: MagicMock,
+        tmp_dir: Path,
+    ) -> None:
+        """Best-quality skipped text normalization runs rotation then skew."""
+        pdf_path = tmp_dir / "combined.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n")
+
+        _normalize_best_quality_skipped_text_pages(pdf_path)
+
+        mock_normalize_rotations.assert_called_once_with(pdf_path)
+        mock_normalize_skew.assert_called_once_with(pdf_path)
 
 
 class TestVisiblePageRotationFix:
