@@ -24,7 +24,7 @@ from pdftopdfa.converter import (
     convert_to_pdfa,
     generate_output_path,
 )
-from pdftopdfa.exceptions import ConversionError
+from pdftopdfa.exceptions import ConversionError, VeraPDFError
 from pdftopdfa.verapdf import VeraPDFResult
 
 
@@ -503,6 +503,148 @@ class TestConvertToPdfa:
             non_compliant_log_level=logging.WARNING,
         )
 
+    @pytest.mark.parametrize(
+        ("detected_level", "target_level"),
+        [("1b", "3b"), ("2b", "3u"), ("3u", "2b")],
+    )
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    @patch("pdftopdfa.converter.detect_pdfa_level")
+    def test_skip_any_pdfa_skips_any_verapdf_compliant_pdfa(
+        self,
+        mock_detect: MagicMock,
+        mock_verapdf: MagicMock,
+        detected_level: str,
+        target_level: str,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """skip_any_pdfa skips any veraPDF-compliant PDF/A claim."""
+        mock_detect.return_value = detected_level
+        mock_verapdf.return_value = VeraPDFResult(
+            compliant=True, flavour=detected_level
+        )
+
+        output_path = tmp_dir / "output.pdf"
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            level=target_level,
+            skip_any_pdfa=True,
+        )
+
+        assert result.success is True
+        assert result.level == detected_level
+        assert result.skipped is True
+        assert any("veraPDF compliant" in w for w in result.warnings)
+        assert output_path.exists()
+        mock_verapdf.assert_called_once_with(
+            sample_pdf,
+            flavour=detected_level,
+            non_compliant_log_level=logging.WARNING,
+        )
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    @patch("pdftopdfa.converter.detect_pdfa_level")
+    def test_skip_any_pdfa_disabled_keeps_existing_skip_rules(
+        self,
+        mock_detect: MagicMock,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Without skip_any_pdfa, cross-part PDFs are still converted."""
+        mock_detect.return_value = "1b"
+        mock_verapdf.return_value = VeraPDFResult(compliant=True, flavour="1b")
+
+        output_path = tmp_dir / "output.pdf"
+        result = convert_to_pdfa(sample_pdf, output_path, level="3b")
+
+        assert result.success is True
+        assert result.skipped is False
+        assert result.level == "3b"
+        assert output_path.exists()
+        mock_verapdf.assert_not_called()
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    @patch("pdftopdfa.converter.detect_pdfa_level")
+    def test_skip_any_pdfa_does_not_skip_non_compliant_pdfa(
+        self,
+        mock_detect: MagicMock,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """skip_any_pdfa converts files when veraPDF reports non-compliance."""
+        mock_detect.return_value = "1b"
+        mock_verapdf.return_value = VeraPDFResult(compliant=False, flavour="1b")
+
+        output_path = tmp_dir / "output.pdf"
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            level="3b",
+            skip_any_pdfa=True,
+        )
+
+        assert result.success is True
+        assert result.skipped is False
+        assert result.level == "3b"
+        assert output_path.exists()
+        mock_verapdf.assert_called_once()
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    @patch("pdftopdfa.converter.detect_pdfa_level")
+    def test_skip_any_pdfa_does_not_skip_when_verapdf_unavailable(
+        self,
+        mock_detect: MagicMock,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """skip_any_pdfa falls back to conversion when veraPDF is unavailable."""
+        mock_detect.return_value = "1b"
+        mock_verapdf.side_effect = VeraPDFError("veraPDF missing")
+
+        output_path = tmp_dir / "output.pdf"
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            level="3b",
+            skip_any_pdfa=True,
+        )
+
+        assert result.success is True
+        assert result.skipped is False
+        assert result.level == "3b"
+        assert output_path.exists()
+        mock_verapdf.assert_called_once()
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    @patch("pdftopdfa.converter.detect_pdfa_level")
+    def test_skip_any_pdfa_ignores_files_without_pdfa_claim(
+        self,
+        mock_detect: MagicMock,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """skip_any_pdfa does not validate files without a PDF/A claim."""
+        mock_detect.return_value = None
+
+        output_path = tmp_dir / "output.pdf"
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            level="3b",
+            skip_any_pdfa=True,
+        )
+
+        assert result.success is True
+        assert result.skipped is False
+        assert result.level == "3b"
+        assert output_path.exists()
+        mock_verapdf.assert_not_called()
+
     def test_corrupt_pdf_raises_conversion_error(self, tmp_dir: Path) -> None:
         """Corrupt PDF triggers PdfError which is wrapped as ConversionError."""
         corrupt_path = tmp_dir / "corrupt.pdf"
@@ -849,6 +991,20 @@ class TestConvertDirectory:
         has_ocr_warning = any("OCR not available" in w for w in results[0].warnings)
         assert has_ocr_warning
 
+    @patch("pdftopdfa.converter.convert_files")
+    def test_convert_directory_passes_skip_any_pdfa(
+        self, mock_convert_files: MagicMock, tmp_dir: Path, sample_pdf_bytes: bytes
+    ) -> None:
+        """convert_directory forwards skip_any_pdfa to convert_files."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        (input_dir / "test.pdf").write_bytes(sample_pdf_bytes)
+        mock_convert_files.return_value = []
+
+        convert_directory(input_dir, show_progress=False, skip_any_pdfa=True)
+
+        assert mock_convert_files.call_args.kwargs["skip_any_pdfa"] is True
+
 
 class TestConvertFiles:
     """Tests for convert_files."""
@@ -913,6 +1069,25 @@ class TestConvertFiles:
         assert results[0].success is True
         # Output should be a valid PDF now, not "existing content"
         assert out_path.stat().st_size > len(b"existing content")
+
+    @patch("pdftopdfa.converter.convert_to_pdfa")
+    def test_convert_files_passes_skip_any_pdfa(
+        self, mock_convert_to_pdfa: MagicMock, tmp_dir: Path
+    ) -> None:
+        """convert_files forwards skip_any_pdfa to convert_to_pdfa."""
+        in_path = tmp_dir / "test.pdf"
+        out_path = tmp_dir / "test_pdfa.pdf"
+        in_path.write_bytes(b"%PDF-1.4 dummy")
+        mock_convert_to_pdfa.return_value = ConversionResult(
+            success=True,
+            input_path=in_path,
+            output_path=out_path,
+            level="3b",
+        )
+
+        convert_files([(in_path, out_path)], skip_any_pdfa=True)
+
+        assert mock_convert_to_pdfa.call_args.kwargs["skip_any_pdfa"] is True
 
     def test_convert_files_cancellation(
         self, tmp_dir: Path, sample_pdf_bytes: bytes

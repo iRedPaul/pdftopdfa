@@ -73,6 +73,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `--ocr-lang LANG` | OCR language code (default: `eng`), for example `deu` or `deu+eng` |
 | `--ocr-quality [fast\|default\|best]` | OCR quality preset (default: `default`) |
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
+| `--skip-any-pdfa` | Skip inputs that veraPDF validates as any compliant PDF/A, regardless of target level |
 | `--version` | Show version and exit |
 | `--help` | Show help and exit |
 
@@ -117,6 +118,7 @@ def convert_to_pdfa(
     level: str = "3b",
     *,
     validate: bool = False,
+    skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_quality: OcrQuality | None = None,
     ocr_force: bool = False,
@@ -151,6 +153,7 @@ def convert_directory(
     *,
     recursive: bool = False,
     validate: bool = False,
+    skip_any_pdfa: bool = False,
     show_progress: bool = True,
     ocr_languages: list[str] | None = None,
     ocr_quality: OcrQuality | None = None,
@@ -182,6 +185,7 @@ def convert_files(
     level: str = "3b",
     *,
     validate: bool = False,
+    skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_quality: OcrQuality | None = None,
     ocr_force: bool = False,
@@ -253,18 +257,27 @@ Default level: `3b`.
 Before conversion, `pdftopdfa` checks whether a file already claims a PDF/A level.
 If veraPDF is available, it validates that claim before deciding to skip conversion.
 
+Default behavior:
+
 | Detected | Behavior |
 |---|---|
 | Same level (`2b` -> `2b`) | Skip conversion |
 | Higher conformance in same part (`2u` -> `2b`) | Skip conversion |
 | Lower conformance in same part (`2b` -> `2u`) | Convert |
-| Different part (`2x` <-> `3x`) | Convert |
+| Different part (`1b` -> `3b`, `3u` -> `2b`) | Convert |
+
+With `--skip-any-pdfa` or `skip_any_pdfa=True`, any input that veraPDF validates as
+compliant PDF/A is skipped, regardless of part or conformance level.
+
+- This broader skip only happens when veraPDF actually confirms compliance.
+- If veraPDF is not available, the file is converted normally.
+- If the document claims PDF/A but veraPDF reports non-compliance, the file is converted normally.
 
 Notes:
 
 - If the metadata claim fails veraPDF validation, conversion is not skipped.
 - If veraPDF is unavailable, conversion is not skipped based only on metadata.
-- Skipped files return warning: `Conversion skipped: PDF already valid PDF/A`.
+- Skipped files return warning: `Conversion skipped: PDF already valid PDF/A (veraPDF compliant)`.
 
 ## Validation
 

@@ -25,7 +25,7 @@ Instead of re-rendering via Ghostscript, it modifies the PDF structure directly 
 
 pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with the PDF/A standard:
 
-1. **Pre-check** -- detects if the PDF is already a valid PDF/A file (skips conversion if the existing level meets or exceeds the target; see [Usage Guide](docs/usage.md#already-compliant-pdfs) for details)
+1. **Pre-check** -- detects if the PDF is already a valid PDF/A file (skips conversion if the existing level meets or exceeds the target; optionally skips any veraPDF-compliant PDF/A via `--skip-any-pdfa`; see [Usage Guide](docs/usage.md#already-compliant-pdfs) for details)
 2. **OCR** (optional) -- runs Tesseract via ocrmypdf on scanned pages without a text layer
 3. **Font compliance** -- analyzes all fonts, embeds missing ones, adds ToUnicode mappings, subsets embedded fonts, and fixes encoding issues
 4. **Sanitization** -- removes or fixes non-compliant elements (JavaScript, non-standard actions, transparency groups, annotations, optional content, etc.)
@@ -63,6 +63,9 @@ pdftopdfa -l 2b document.pdf
 
 # With validation
 pdftopdfa -v document.pdf
+
+# Skip any existing veraPDF-compliant PDF/A
+pdftopdfa --skip-any-pdfa document.pdf
 
 # Convert an entire directory
 pdftopdfa -r ./documents/ ./output/

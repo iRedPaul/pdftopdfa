@@ -220,6 +220,14 @@ def _print_validation_result(
     default=True,
     help="Convert CalGray/CalRGB color spaces to ICCBased (default: enabled)",
 )
+@click.option(
+    "--skip-any-pdfa",
+    is_flag=True,
+    help=(
+        "Skip files that veraPDF validates as any compliant PDF/A, "
+        "regardless of target level"
+    ),
+)
 @click.version_option(version=__version__)
 def main(
     input_path: str | None,
@@ -235,6 +243,7 @@ def main(
     ocr_lang: str,
     ocr_quality: str,
     convert_calibrated: bool,
+    skip_any_pdfa: bool,
 ) -> None:
     """Converts PDF files to the archival PDF/A format.
 
@@ -294,6 +303,7 @@ def main(
                 ocr_quality=ocr_quality_enum,
                 ocr_force=ocr_force,
                 convert_calibrated=convert_calibrated,
+                skip_any_pdfa=skip_any_pdfa,
             )
         elif input_path_obj.is_dir():
             # Convert directory
@@ -309,6 +319,7 @@ def main(
                 ocr_quality=ocr_quality_enum,
                 ocr_force=ocr_force,
                 convert_calibrated=convert_calibrated,
+                skip_any_pdfa=skip_any_pdfa,
             )
         else:
             print_error(f"Invalid path: {input_path}")
@@ -352,6 +363,7 @@ def _convert_single_file(
     ocr_quality: "OcrQuality | None" = None,
     ocr_force: bool = False,
     convert_calibrated: bool = True,
+    skip_any_pdfa: bool = False,
 ) -> int:
     """Converts a single PDF file.
 
@@ -367,6 +379,8 @@ def _convert_single_file(
         ocr_quality: OCR quality preset.
         ocr_force: If True, force OCR even on pages with existing text.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
+        skip_any_pdfa: If True, skip files that veraPDF validates as
+            compliant PDF/A regardless of target level.
 
     Returns:
         Exit code.
@@ -393,6 +407,7 @@ def _convert_single_file(
         output_path=output_path,
         level=level,
         validate=False,  # Validate manually later
+        skip_any_pdfa=skip_any_pdfa,
         ocr_languages=ocr_languages,
         ocr_quality=ocr_quality,
         ocr_force=ocr_force,
@@ -450,6 +465,7 @@ def _convert_directory(
     ocr_quality: "OcrQuality | None" = None,
     ocr_force: bool = False,
     convert_calibrated: bool = True,
+    skip_any_pdfa: bool = False,
 ) -> int:
     """Converts all PDFs in a directory.
 
@@ -466,6 +482,8 @@ def _convert_directory(
         ocr_quality: OCR quality preset.
         ocr_force: If True, force OCR even on pages with existing text.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
+        skip_any_pdfa: If True, skip files that veraPDF validates as
+            compliant PDF/A regardless of target level.
 
     Returns:
         Exit code.
@@ -482,6 +500,7 @@ def _convert_directory(
         level=level,
         recursive=recursive,
         validate=do_validate,
+        skip_any_pdfa=skip_any_pdfa,
         show_progress=not quiet,
         ocr_languages=ocr_languages,
         ocr_quality=ocr_quality,

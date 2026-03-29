@@ -541,6 +541,7 @@ def convert_to_pdfa(
     level: str = "3b",
     *,
     validate: bool = False,
+    skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
     ocr_force: bool = False,
@@ -553,6 +554,8 @@ def convert_to_pdfa(
         output_path: Path for the output PDF/A.
         level: PDF/A conformance level ('2b' or '3b').
         validate: If True, the result is validated.
+        skip_any_pdfa: If True, skip conversion for any input that veraPDF
+            validates as compliant PDF/A, regardless of target level.
         ocr_languages: Optional list of Tesseract language codes
             (e.g., ``["deu", "eng"]``).  If specified, OCR is applied to
             image-based pages.
@@ -602,9 +605,12 @@ def convert_to_pdfa(
             detected_level = detect_pdfa_level(check_pdf)
 
         if detected_level is not None:
-            level_cmp = _compare_pdfa_levels(detected_level, level)
+            should_validate_for_skip = skip_any_pdfa
+            if not should_validate_for_skip:
+                level_cmp = _compare_pdfa_levels(detected_level, level)
+                should_validate_for_skip = level_cmp >= 0
 
-            if level_cmp >= 0:  # Same or higher level
+            if should_validate_for_skip:
                 try:
                     verapdf_result = validate_with_verapdf(
                         input_path,
@@ -612,7 +618,10 @@ def convert_to_pdfa(
                         non_compliant_log_level=logging.WARNING,
                     )
                 except VeraPDFError:
-                    logger.debug("veraPDF not available, skipping pre-check")
+                    logger.debug(
+                        "veraPDF not available, skipping PDF/A pre-check for %s",
+                        input_path,
+                    )
                     verapdf_result = None
 
                 if verapdf_result is not None and verapdf_result.compliant:
@@ -627,7 +636,10 @@ def convert_to_pdfa(
                         input_path=input_path,
                         output_path=output_path,
                         level=detected_level,
-                        warnings=["Conversion skipped: PDF already valid PDF/A"],
+                        warnings=[
+                            "Conversion skipped: PDF already valid PDF/A "
+                            "(veraPDF compliant)"
+                        ],
                         processing_time=processing_time,
                         skipped=True,
                     )
@@ -636,7 +648,7 @@ def convert_to_pdfa(
                         "PDF claims PDF/A-%s but validation failed, converting",
                         detected_level,
                     )
-            else:
+            elif not skip_any_pdfa:
                 logger.debug(
                     "PDF is PDF/A-%s, converting to PDF/A-%s",
                     detected_level,
@@ -1003,6 +1015,7 @@ def convert_files(
     level: str = "3b",
     *,
     validate: bool = False,
+    skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
     ocr_force: bool = False,
@@ -1019,6 +1032,8 @@ def convert_files(
         file_pairs: List of (input_path, output_path) tuples.
         level: PDF/A conformance level (e.g. '2b', '3b').
         validate: If True, results are validated.
+        skip_any_pdfa: If True, skip conversion for any input that veraPDF
+            validates as compliant PDF/A, regardless of target level.
         ocr_languages: Optional list of Tesseract language codes
             (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
@@ -1069,6 +1084,7 @@ def convert_files(
                 output_path=output_path,
                 level=level,
                 validate=validate,
+                skip_any_pdfa=skip_any_pdfa,
                 ocr_languages=ocr_languages,
                 ocr_quality=ocr_quality,
                 ocr_force=ocr_force,
@@ -1104,6 +1120,7 @@ def convert_directory(
     *,
     recursive: bool = False,
     validate: bool = False,
+    skip_any_pdfa: bool = False,
     show_progress: bool = True,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
@@ -1120,6 +1137,8 @@ def convert_directory(
         level: PDF/A conformance level ('2b' or '3b').
         recursive: If True, subdirectories are included.
         validate: If True, results are validated.
+        skip_any_pdfa: If True, skip conversion for any input that veraPDF
+            validates as compliant PDF/A, regardless of target level.
         show_progress: If True, a progress bar is shown.
         ocr_languages: Optional list of Tesseract language codes
             (e.g., ``["deu", "eng"]``).
@@ -1196,6 +1215,7 @@ def convert_directory(
         file_pairs=file_pairs,
         level=level,
         validate=validate,
+        skip_any_pdfa=skip_any_pdfa,
         ocr_languages=ocr_languages,
         ocr_quality=ocr_quality,
         ocr_force=ocr_force,

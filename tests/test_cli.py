@@ -60,6 +60,13 @@ class TestCliHelp:
         assert result.exit_code == 0
         assert "--ocr-force" in result.output
 
+    def test_cli_help_shows_skip_any_pdfa_option(self, runner: CliRunner) -> None:
+        """--skip-any-pdfa option appears in help."""
+        result = runner.invoke(main, ["--help"])
+
+        assert result.exit_code == 0
+        assert "--skip-any-pdfa" in result.output
+
 
 class TestCliVersion:
     """Tests for --version option."""
@@ -113,6 +120,26 @@ class TestCliConsoleOutput:
 
 class TestCliConvert:
     """Tests for file conversion."""
+
+    @patch("pdftopdfa.cli._convert_single_file")
+    def test_cli_convert_passes_skip_any_pdfa(
+        self,
+        mock_convert_single,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Single-file CLI forwards --skip-any-pdfa."""
+        output_path = tmp_dir / "output.pdf"
+        mock_convert_single.return_value = EXIT_SUCCESS
+
+        result = runner.invoke(
+            main,
+            [str(sample_pdf), str(output_path), "--skip-any-pdfa"],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert mock_convert_single.call_args.kwargs["skip_any_pdfa"] is True
 
     def test_cli_convert_simple(
         self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
@@ -225,6 +252,20 @@ class TestCliForceOverwrite:
 
 class TestCliDirectory:
     """Tests for directory conversion."""
+
+    @patch("pdftopdfa.cli._convert_directory")
+    def test_cli_convert_directory_passes_skip_any_pdfa(
+        self, mock_convert_directory, runner: CliRunner, tmp_dir: Path
+    ) -> None:
+        """Directory CLI forwards --skip-any-pdfa."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        mock_convert_directory.return_value = EXIT_SUCCESS
+
+        result = runner.invoke(main, [str(input_dir), "--skip-any-pdfa"])
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert mock_convert_directory.call_args.kwargs["skip_any_pdfa"] is True
 
     def test_cli_convert_directory(
         self, runner: CliRunner, tmp_dir: Path, sample_pdf_bytes: bytes
