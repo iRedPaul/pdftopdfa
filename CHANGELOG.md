@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.16] - 2026-03-29
+
+### Features
+
+- Add `--skip-any-pdfa` to skip inputs that veraPDF validates as compliant PDF/A regardless of target level
+
+### Documentation
+
+- Document the broader veraPDF-based PDF/A skip behavior in the README and usage guide
+
 ## [0.2.15] - 2026-03-26
 
 ### Bug Fixes
