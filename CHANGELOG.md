@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.20] - 2026-04-01
+
+### Bug Fixes
+
+- Fix interpolate cleanup for soft mask images
+
 ## [0.2.19] - 2026-04-01
 
 ### Bug Fixes
