@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.17] - 2026-04-01
+
+### Bug Fixes
+
+- Fix font width checks for AcroForm default resource fonts
+- Fix OCR error handling for PDFs with invalid metadata
+
 ## [0.2.16] - 2026-03-29
 
 ### Features
