@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.18] - 2026-04-01
+
+### Bug Fixes
+
+- Fix PDF/A validation after font subsetting
+
 ## [0.2.17] - 2026-04-01
 
 ### Bug Fixes
