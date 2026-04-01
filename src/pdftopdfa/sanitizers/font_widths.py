@@ -173,55 +173,90 @@ def _iter_all_embedded_fonts(
 
     for page in pdf.pages:
         for _font_key, font_obj in iter_all_page_fonts(pikepdf.Page(page)):
-            font = _resolve(font_obj)
-            if not isinstance(font, Dictionary):
+            yield from _iter_embedded_font(font_obj, seen_objgens)
+
+    # AcroForm /DR fonts may never appear in page resources directly, but they
+    # are still used for rendering widget field appearances and must satisfy
+    # the same width-consistency rules as page fonts.
+    try:
+        acroform = pdf.Root.get("/AcroForm")
+        if acroform is None:
+            return
+        acroform = _resolve(acroform)
+        dr = acroform.get("/DR")
+        if dr is None:
+            return
+        dr = _resolve(dr)
+        font_dict = dr.get("/Font")
+        if font_dict is None:
+            return
+        font_dict = _resolve(font_dict)
+        if not isinstance(font_dict, Dictionary):
+            return
+
+        for font_key in list(font_dict.keys()):
+            try:
+                yield from _iter_embedded_font(font_dict[font_key], seen_objgens)
+            except Exception:
                 continue
+    except Exception:
+        return
 
-            # Deduplicate by objgen
-            objgen = font.objgen
-            if objgen != (0, 0):
-                if objgen in seen_objgens:
-                    continue
-                seen_objgens.add(objgen)
 
-            subtype = font.get("/Subtype")
-            if subtype is None:
-                continue
-            subtype_str = _safe_str(subtype)
+def _iter_embedded_font(
+    font_obj: pikepdf.Object,
+    seen_objgens: set[tuple[int, int]],
+) -> Iterator[tuple[str, pikepdf.Object, str]]:
+    """Yield one embedded font, if eligible, while deduplicating by objgen."""
+    font = _resolve(font_obj)
+    if not isinstance(font, Dictionary):
+        return
 
-            # Type3: procedurally defined via CharProcs, no font program
-            if subtype_str == "/Type3":
-                char_procs = font.get("/CharProcs")
-                if char_procs is not None:
-                    font_name = _get_font_name(font)
-                    yield font_name, font, "Type3"
-                continue
+    objgen = font.objgen
+    if objgen != (0, 0):
+        if objgen in seen_objgens:
+            return
+        seen_objgens.add(objgen)
 
-            if subtype_str == "/Type0":
-                # CIDFont: check descendant
-                descendants = font.get("/DescendantFonts")
-                if descendants is None:
-                    continue
-                descendants = _resolve(descendants)
-                if not isinstance(descendants, Array) or len(descendants) == 0:
-                    continue
-                desc_font = _resolve(descendants[0])
-                if not isinstance(desc_font, Dictionary):
-                    continue
-                if not _has_embedded_data(desc_font):
-                    continue
-                font_name = _get_font_name(font)
-                yield font_name, font, "CIDFont"
-            elif subtype_str in ("/Type1", "/TrueType", "/MMType1"):
-                if not _has_embedded_data(font):
-                    continue
-                font_name = _get_font_name(font)
-                type_map = {
-                    "/Type1": "Type1",
-                    "/TrueType": "TrueType",
-                    "/MMType1": "MMType1",
-                }
-                yield font_name, font, type_map[subtype_str]
+    subtype = font.get("/Subtype")
+    if subtype is None:
+        return
+    subtype_str = _safe_str(subtype)
+
+    # Type3: procedurally defined via CharProcs, no font program
+    if subtype_str == "/Type3":
+        char_procs = font.get("/CharProcs")
+        if char_procs is not None:
+            font_name = _get_font_name(font)
+            yield font_name, font, "Type3"
+        return
+
+    if subtype_str == "/Type0":
+        descendants = font.get("/DescendantFonts")
+        if descendants is None:
+            return
+        descendants = _resolve(descendants)
+        if not isinstance(descendants, Array) or len(descendants) == 0:
+            return
+        desc_font = _resolve(descendants[0])
+        if not isinstance(desc_font, Dictionary):
+            return
+        if not _has_embedded_data(desc_font):
+            return
+        font_name = _get_font_name(font)
+        yield font_name, font, "CIDFont"
+        return
+
+    if subtype_str in ("/Type1", "/TrueType", "/MMType1"):
+        if not _has_embedded_data(font):
+            return
+        font_name = _get_font_name(font)
+        type_map = {
+            "/Type1": "Type1",
+            "/TrueType": "TrueType",
+            "/MMType1": "MMType1",
+        }
+        yield font_name, font, type_map[subtype_str]
 
 
 def _get_font_name(font: pikepdf.Object) -> str:

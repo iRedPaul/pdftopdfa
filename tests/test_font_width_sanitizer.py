@@ -1743,3 +1743,58 @@ class TestSymbolicTrueTypeWithoutEncoding:
         assert corrected[52] == 700, (
             f"Code 52 width should be 700 from the symbolic cmap, got {corrected[52]}"
         )
+
+
+class TestAcroFormDefaultResourceFonts:
+    """Regression tests for fonts referenced only from AcroForm /DR."""
+
+    def test_acroform_dr_font_widths_are_corrected(self) -> None:
+        """Widget default-appearance fonts in AcroForm /DR are sanitized.
+
+        veraPDF validates fonts used by form widgets even when the font only
+        lives in the document's AcroForm default resources. The width sanitizer
+        must not skip those embedded fonts just because they are absent from
+        page resource dictionaries.
+        """
+        pdf = new_pdf()
+        font = _make_simple_font_with_widths(pdf)
+
+        widget = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name.Widget,
+                FT=Name.Tx,
+                Rect=Array([100, 600, 240, 624]),
+                T="Field1",
+                DA="/F1 12 Tf 0 g",
+            )
+        )
+
+        acroform = Dictionary(
+            Fields=Array([widget]),
+            DR=Dictionary(Font=Dictionary(F1=font)),
+            DA="/F1 12 Tf 0 g",
+        )
+        pdf.Root[Name("/AcroForm")] = pdf.make_indirect(acroform)
+
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Annots=Array([widget]),
+            )
+        )
+        pdf.pages.append(page)
+
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["simple_font_widths_fixed"] == 1
+
+        acroform_obj = resolve(pdf.Root["/AcroForm"])
+        font_obj = resolve(acroform_obj["/DR"]["/Font"]["/F1"])
+        corrected = [int(w) for w in resolve(font_obj["/Widths"])]
+
+        # Code 65 ("A") is at index 33 in the 32..67 range.
+        assert corrected[33] == 600
