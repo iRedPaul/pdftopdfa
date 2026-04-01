@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 # Text-showing operators whose string operands may reference .notdef
 _TEXT_OPERATORS = frozenset({"Tj", "'", '"'})
+_SAVE_GRAPHICS_STATE = "q"
+_RESTORE_GRAPHICS_STATE = "Q"
 
 
 class _NotdefCodes:
@@ -530,6 +532,7 @@ def _fix_notdef_in_stream(
     fixed = 0
     new_instructions = []
     current_font_name: str | None = None
+    graphics_state_stack: list[str | None] = []
 
     for item in instructions:
         if isinstance(item, pikepdf.ContentStreamInlineImage):
@@ -538,6 +541,19 @@ def _fix_notdef_in_stream(
 
         operands, operator = item.operands, item.operator
         op_str = str(operator)
+
+        if op_str == _SAVE_GRAPHICS_STATE:
+            graphics_state_stack.append(current_font_name)
+            new_instructions.append(item)
+            continue
+
+        if op_str == _RESTORE_GRAPHICS_STATE:
+            if graphics_state_stack:
+                current_font_name = graphics_state_stack.pop()
+            else:
+                current_font_name = None
+            new_instructions.append(item)
+            continue
 
         # Track font changes via Tf operator
         if op_str == "Tf" and len(operands) >= 1:

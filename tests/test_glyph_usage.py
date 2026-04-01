@@ -265,6 +265,33 @@ class TestCollectFontUsage:
         assert usage[font1_obj.objgen] == {ord("A"), ord("B")}
         assert usage[font2_obj.objgen] == {ord("X"), ord("Y")}
 
+    def test_q_restore_restores_previous_font(self):
+        """Restoring graphics state also restores the active font."""
+        pdf = new_pdf()
+
+        font1 = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/Font1"),
+        )
+        font1_obj = pdf.make_indirect(font1)
+
+        font2 = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/Font2"),
+        )
+        font2_obj = pdf.make_indirect(font2)
+
+        font_dict = Dictionary(F1=font1_obj, F2=font2_obj)
+        content = b"BT /F1 12 Tf ET q BT /F2 10 Tf (B) Tj ET Q BT (A) Tj ET"
+        _make_page_with_content(pdf, content, font_dict)
+
+        usage = collect_font_usage(pdf)
+
+        assert usage[font1_obj.objgen] == {ord("A")}
+        assert usage[font2_obj.objgen] == {ord("B")}
+
     def test_form_xobject(self):
         """Collects usage from Form XObject content streams."""
         pdf = new_pdf()

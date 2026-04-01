@@ -161,6 +161,54 @@ class TestNoChanges:
         result = sanitize_notdef_usage(sample_pdf_obj)
         assert result["notdef_usage_fixed"] == 0
 
+    def test_q_restore_restores_previous_font(self):
+        """Restoring graphics state also restores the active font."""
+        pdf = new_pdf()
+
+        font1 = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/Font1"),
+            FirstChar=32,
+            LastChar=200,
+            Encoding=Name.WinAnsiEncoding,
+        )
+        font2 = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/Font2"),
+            FirstChar=32,
+            LastChar=114,
+            Encoding=Name.WinAnsiEncoding,
+        )
+
+        stream = pdf.make_stream(
+            b"BT /F1 12 Tf ET q BT /F2 12 Tf (A\x96B) Tj ET Q BT (A\x96B) Tj ET"
+        )
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Resources=Dictionary(Font=Dictionary(F1=font1, F2=font2)),
+                Contents=stream,
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result["notdef_usage_fixed"] == 1
+        instructions = list(pikepdf.parse_content_stream(stream))
+        tj_ops = [
+            i
+            for i in instructions
+            if isinstance(i, pikepdf.ContentStreamInstruction)
+            and str(i.operator) == "Tj"
+        ]
+        assert len(tj_ops) == 2
+        assert bytes(tj_ops[0].operands[0]) == b"AB"
+        assert bytes(tj_ops[1].operands[0]) == b"A\x96B"
+
 
 class TestCIDFont:
     """Tests for CIDFont (Type0) .notdef handling."""

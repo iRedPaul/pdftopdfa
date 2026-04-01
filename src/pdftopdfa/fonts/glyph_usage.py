@@ -31,6 +31,8 @@ _TEXT_OPERATORS = frozenset(
 )
 
 _TF_OPERATOR = pikepdf.Operator("Tf")
+_Q_OPERATOR = pikepdf.Operator("q")
+_RESTORE_OPERATOR = pikepdf.Operator("Q")
 
 
 def _is_cidfont(font_obj: pikepdf.Object) -> bool:
@@ -320,9 +322,18 @@ def _process_content_stream(
 
     current_font: pikepdf.Object | None = None
     current_font_is_cid = False
+    graphics_state_stack: list[tuple[pikepdf.Object | None, bool]] = []
 
     for operands, operator in instructions:
-        if operator == _TF_OPERATOR:
+        if operator == _Q_OPERATOR:
+            graphics_state_stack.append((current_font, current_font_is_cid))
+        elif operator == _RESTORE_OPERATOR:
+            if graphics_state_stack:
+                current_font, current_font_is_cid = graphics_state_stack.pop()
+            else:
+                current_font = None
+                current_font_is_cid = False
+        elif operator == _TF_OPERATOR:
             # Tf: set current font
             if operands:
                 font_name = str(operands[0])
