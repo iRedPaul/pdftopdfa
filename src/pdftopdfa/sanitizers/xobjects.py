@@ -304,11 +304,7 @@ def _fix_interpolate_in_xobjects(
             subtype_str = str(subtype)
 
             if subtype_str == "/Image":
-                interp = xobj.get("/Interpolate")
-                if interp is not None and bool(interp):
-                    xobj["/Interpolate"] = False
-                    fixed_count += 1
-                    logger.debug("Set /Interpolate to false on Image XObject: %s", key)
+                fixed_count += _fix_interpolate_in_image_stream(xobj, str(key), visited)
 
             elif subtype_str == "/Form":
                 fixed_count += _fix_inline_interpolate_in_stream_once(
@@ -328,6 +324,47 @@ def _fix_interpolate_in_xobjects(
             logger.debug("Error checking /Interpolate on XObject %s: %s", key, e)
 
     return fixed_count
+
+
+def _fix_interpolate_in_image_stream(
+    image: Stream,
+    image_name: str,
+    visited: set[tuple[int, int]],
+) -> int:
+    """Fix /Interpolate on an image stream and its image-mask descendants."""
+    fixed = 0
+
+    interp = image.get("/Interpolate")
+    if interp is not None and bool(interp):
+        image["/Interpolate"] = False
+        fixed += 1
+        logger.debug("Set /Interpolate to false on Image XObject: %s", image_name)
+
+    for mask_key in ("/SMask", "/Mask"):
+        mask = image.get(mask_key)
+        if mask is None:
+            continue
+
+        mask = _resolve_indirect(mask)
+        if not isinstance(mask, Stream):
+            continue
+
+        obj_key = mask.objgen
+        if obj_key != (0, 0):
+            if obj_key in visited:
+                continue
+            visited.add(obj_key)
+
+        if str(mask.get("/Subtype")) != "/Image":
+            continue
+
+        fixed += _fix_interpolate_in_image_stream(
+            mask,
+            f"{image_name}{mask_key}",
+            visited,
+        )
+
+    return fixed
 
 
 def _fix_interpolate_in_ap_stream(

@@ -277,6 +277,18 @@ class TestFixImageInterpolate:
         result = fix_image_interpolate(pdf)
         assert result == 1
 
+    def test_fixes_interpolate_in_soft_mask_image(self, make_pdf_with_page):
+        """Soft-mask image streams inherit the same Interpolate constraint."""
+        pdf = make_pdf_with_page()
+        soft_mask = _make_image_xobject(pdf, interpolate=True)
+        soft_mask[Name.ColorSpace] = Name.DeviceGray
+        image = _make_image_xobject(pdf)
+        image["/SMask"] = soft_mask
+        pdf.pages[0]["/Resources"] = Dictionary(XObject=Dictionary(Im0=image))
+        result = fix_image_interpolate(pdf)
+        assert result == 1
+        assert bool(soft_mask.get("/Interpolate")) is False
+
     def test_multiple_images(self, make_pdf_with_page):
         """All images with Interpolate=true are fixed."""
         pdf = make_pdf_with_page()
