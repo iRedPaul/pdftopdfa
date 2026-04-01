@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.19] - 2026-04-01
+
+### Bug Fixes
+
+- Fix font state restoration across q and Q operators
+
 ## [0.2.18] - 2026-04-01
 
 ### Bug Fixes
