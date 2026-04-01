@@ -851,6 +851,9 @@ def _subset_font_data(
 
         options = Options()
         options.retain_gids = True
+        # Preserve glyph names for simple fonts so PDF encodings can still
+        # resolve character codes via standard glyph names after subsetting.
+        options.glyph_names = True
         options.notdef_outline = True
         options.name_legacy = True
         options.name_IDs = ["*"]

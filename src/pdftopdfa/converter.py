@@ -32,7 +32,11 @@ from .exceptions import (
 from .extensions import add_extensions_if_needed
 from .fonts import check_font_compliance
 from .metadata import sync_metadata
-from .sanitizers import sanitize_for_pdfa, sanitize_structure_limits
+from .sanitizers import (
+    sanitize_for_pdfa,
+    sanitize_notdef_usage,
+    sanitize_structure_limits,
+)
 from .utils import get_required_pdf_version, is_pdf_encrypted, validate_pdfa_level
 from .validator import detect_iso_standards, detect_pdfa_level
 from .verapdf import validate_with_verapdf
@@ -915,6 +919,14 @@ def convert_to_pdfa(
             count = late_structure_result.get(key, 0)
             if count > 0:
                 warnings.append(f"{count} {message}")
+
+        # The late structure pass can rewrite malformed text strings and
+        # thereby reintroduce bytes that resolve to .notdef. Run the
+        # content-level .notdef cleanup once more on the final in-memory PDF.
+        late_notdef_result = sanitize_notdef_usage(pdf)
+        count = late_notdef_result.get("notdef_usage_fixed", 0)
+        if count > 0:
+            warnings.append(f"{count} .notdef usage operator(s) fixed")
 
         # 7. Create output directory if needed
         output_path.parent.mkdir(parents=True, exist_ok=True)
