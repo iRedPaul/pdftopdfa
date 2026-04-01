@@ -534,6 +534,18 @@ class TestApplyOcr:
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_blank_exception_uses_exception_type(
+        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """Exceptions without a message still produce a useful OCRError."""
+        output_path = tmp_dir / "output.pdf"
+        mock_ocrmypdf.ocr.side_effect = RuntimeError()
+
+        with pytest.raises(OCRError, match=r"OCR failed: RuntimeError"):
+            apply_ocr(sample_pdf, output_path, ["deu"])
+
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
     @patch("pdftopdfa.ocr.MissingDependencyError", Exception)
     def test_apply_ocr_handles_missing_dependency(
         self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path

@@ -180,6 +180,14 @@ def _remove_redo_ocr_incompatible_options(ocr_kwargs: dict[str, object]) -> list
     return removed_options
 
 
+def _format_ocr_exception(exc: BaseException) -> str:
+    """Return a stable, non-empty error description for OCR exceptions."""
+    message = str(exc).strip()
+    if message:
+        return message
+    return exc.__class__.__name__
+
+
 def _parse_tesseract_osd(output: str) -> _OrientationResult | None:
     """Parse Tesseract OSD output into a structured result."""
     rotate = None
@@ -796,7 +804,7 @@ def apply_ocr(
         return output_path
 
     except MissingDependencyError as e:
-        raise OCRError(f"OCR failed: {e}") from e
+        raise OCRError(f"OCR failed: {_format_ocr_exception(e)}") from e
 
     except Exception as e:
-        raise OCRError(f"OCR failed: {e}") from e
+        raise OCRError(f"OCR failed: {_format_ocr_exception(e)}") from e

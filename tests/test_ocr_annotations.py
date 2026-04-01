@@ -204,6 +204,34 @@ class TestStripAnnotationsForOcr:
             assert stream is not None
             assert b"Do" in bytes(stream.read_bytes())
 
+    def test_retries_without_metadata_when_save_fails(self) -> None:
+        """Invalid document metadata is dropped if it blocks the OCR temp save."""
+        page = Dictionary()
+        page[Name.Annots] = Array([Dictionary()])
+
+        root = Dictionary()
+        root[Name.Metadata] = Dictionary()
+
+        fake_pdf = MagicMock()
+        fake_pdf.pages = [page]
+        fake_pdf.Root = root
+        fake_pdf.save.side_effect = [
+            RuntimeError("While trying to update XMP metadata, an error occurred"),
+            None,
+        ]
+
+        context = MagicMock()
+        context.__enter__.return_value = fake_pdf
+        context.__exit__.return_value = False
+
+        with patch("pdftopdfa.converter.pikepdf.open", return_value=context):
+            result = _strip_annotations_for_ocr(Path("input.pdf"), Path("clean.pdf"))
+
+        assert result is True
+        assert page.get("/Annots") is None
+        assert "/Metadata" not in fake_pdf.Root
+        assert fake_pdf.save.call_count == 2
+
 
 # -- TestRestoreAnnotationsAfterOcr --
 

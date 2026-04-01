@@ -445,7 +445,26 @@ def _strip_annotations_for_ocr(input_path: Path, clean_path: Path) -> bool:
                 del pdf.Root["/AcroForm"]
                 removed = True
 
-            pdf.save(clean_path)
+            try:
+                pdf.save(clean_path)
+            except Exception as exc:
+                metadata_removed = False
+                if "/Metadata" in pdf.Root:
+                    try:
+                        del pdf.Root["/Metadata"]
+                        metadata_removed = True
+                    except Exception:
+                        metadata_removed = False
+
+                if not metadata_removed:
+                    raise
+
+                logger.warning(
+                    "Saving annotation-stripped PDF failed; retrying without "
+                    "document metadata: %s",
+                    exc,
+                )
+                pdf.save(clean_path)
         return removed
     except Exception as exc:
         logger.warning("Could not strip annotations for OCR: %s", exc)
