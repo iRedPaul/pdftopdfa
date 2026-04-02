@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.21] - 2026-04-02
+
+### Bug Fixes
+
+- Fix CID font subsetting for explicit CIDToGIDMap
+
 ## [0.2.20] - 2026-04-01
 
 ### Bug Fixes
