@@ -11,7 +11,7 @@ import pikepdf
 from conftest import new_pdf, open_pdf
 from fontTools.fontBuilder import FontBuilder
 from fontTools.ttLib import TTFont
-from fontTools.ttLib.tables._g_l_y_f import Glyph
+from fontTools.ttLib.tables._g_l_y_f import Glyph, GlyphComponent
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from pdftopdfa.sanitizers.font_notdef import sanitize_font_notdef
@@ -46,6 +46,54 @@ def _make_ttfont_data(*, include_notdef: bool = True) -> bytes:
     fb.setupHorizontalMetrics(metrics)
     fb.setupHorizontalHeader(ascent=800, descent=-200)
     fb.setupNameTable({"familyName": "TestFont", "styleName": "Regular"})
+    fb.setupOS2(sTypoAscender=800, sTypoDescender=-200, sCapHeight=700)
+    fb.setupPost()
+    fb.setupHead(unitsPerEm=1000)
+
+    tt = fb.font
+    buf = BytesIO()
+    tt.save(buf)
+    tt.close()
+    buf.seek(0)
+    return buf.read()
+
+
+def _make_ttfont_data_with_composite() -> bytes:
+    """Creates a minimal TrueType font with a composite glyph and no .notdef."""
+    glyph_names = ["glyph00000", "glyph00001", "glyph00002", "glyph00003"]
+
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder(glyph_names)
+    fb.setupCharacterMap({65: "glyph00003"})
+
+    composite = Glyph()
+    composite.numberOfContours = -1
+
+    base_component = GlyphComponent()
+    base_component.glyphName = "glyph00001"
+    base_component.x = 0
+    base_component.y = 0
+    base_component.flags = 0x4
+
+    accent_component = GlyphComponent()
+    accent_component.glyphName = "glyph00002"
+    accent_component.x = 0
+    accent_component.y = 0
+    accent_component.flags = 0x4
+
+    composite.components = [base_component, accent_component]
+
+    fb.setupGlyf(
+        {
+            "glyph00000": Glyph(),
+            "glyph00001": Glyph(),
+            "glyph00002": Glyph(),
+            "glyph00003": composite,
+        }
+    )
+    fb.setupHorizontalMetrics({name: (500, 0) for name in glyph_names})
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({"familyName": "TestComposite", "styleName": "Regular"})
     fb.setupOS2(sTypoAscender=800, sTypoDescender=-200, sCapHeight=700)
     fb.setupPost()
     fb.setupHead(unitsPerEm=1000)
@@ -405,8 +453,7 @@ class TestCIDFont:
         assert result["notdef_fixed"] == 0
 
     def test_explicit_cidtogidmap_updated_on_notdef_insert(self) -> None:
-        """When .notdef is inserted at GID 0, an explicit CIDToGIDMap
-        stream must have every GID incremented by 1."""
+        """Explicit CIDToGIDMap streams shift by +1 after .notdef repair."""
         font_data = _make_ttfont_data(include_notdef=False)
         pdf = new_pdf()
         _build_cidfont_pdf_with_explicit_gidmap(pdf, font_data)
@@ -422,12 +469,10 @@ class TestCIDFont:
         data = bytes(gidmap.read_bytes())
         n = len(data) // 2
         gids = struct.unpack(f">{n}H", data)
-        # Original was (0, 1, 2), should now be (1, 2, 3)
         assert gids == (1, 2, 3)
 
     def test_identity_cidtogidmap_replaced_with_shifted_stream(self) -> None:
-        """CIDToGIDMap=/Identity must be replaced with an explicit stream
-        that shifts every GID by +1 after .notdef insertion."""
+        """CIDToGIDMap=/Identity is replaced with a +1 shifted stream."""
         font_data = _make_ttfont_data(include_notdef=False)
         pdf = new_pdf()
         _build_cidfont_pdf(pdf, font_data)
@@ -438,14 +483,10 @@ class TestCIDFont:
 
         type0 = resolve_indirect(pdf.pages[0].Resources.Font["/F1"])
         cidfont = resolve_indirect(resolve_indirect(type0["/DescendantFonts"])[0])
-        # Should now be an explicit stream, not /Identity
         gidmap = resolve_indirect(cidfont["/CIDToGIDMap"])
         data = bytes(gidmap.read_bytes())
         n = len(data) // 2
         gids = struct.unpack(f">{n}H", data)
-        # Original font had 3 glyphs (glyph00000, space, A).
-        # Identity meant CID 0→GID 0, CID 1→GID 1, CID 2→GID 2.
-        # After .notdef insertion, all shift by +1.
         assert gids[:3] == (1, 2, 3)
 
 

@@ -13,6 +13,7 @@ glyph is missing, inserts a minimal empty .notdef.
 
 import io
 import logging
+import re
 import struct
 from collections.abc import Iterator
 
@@ -179,6 +180,7 @@ def _fix_notdef(
         # .notdef is missing — add a minimal empty one
         logger.info("Font %s: adding missing .notdef glyph", font_name)
         _add_notdef_glyph(tt_font)
+        _repair_placeholder_composite_refs(tt_font)
 
         # Serialize and write back
         buf = io.BytesIO()
@@ -198,8 +200,8 @@ def _fix_notdef(
                 new_stream[Name("/Subtype")] = original_subtype
         fd[Name(font_file_key)] = pdf.make_indirect(new_stream)
 
-        # Inserting .notdef at GID 0 shifts every existing GID by +1.
-        # Update CIDToGIDMap (both explicit streams and /Identity) to match.
+        # Inserting .notdef at GID 0 shifts rendered glyph IDs by +1. Update
+        # CIDToGIDMap to keep PDF content streams aligned with the new font.
         _update_cidtogidmap(pdf, font, len(glyph_order))
 
         return True
@@ -250,21 +252,45 @@ def _add_notdef_glyph(tt_font) -> None:
         tt_font["maxp"].numGlyphs = len(glyph_order)
 
 
+def _repair_placeholder_composite_refs(tt_font) -> None:
+    """Shift composite refs for placeholder-style glyph names after insert.
+
+    Some subset fonts use synthetic glyph names like ``glyph00058``. After we
+    insert ``.notdef`` at GID 0, fontTools preserves the underlying glyph data
+    at shifted GIDs, but composite component references continue to point to
+    the pre-shift placeholder names. Advancing these component names by one
+    keeps composite glyphs such as umlauts visually correct after serialization.
+    """
+    if "glyf" not in tt_font:
+        return
+
+    pattern = re.compile(r"glyph(\d{5})$")
+    glyf = tt_font["glyf"]
+
+    for glyph_name in tt_font.getGlyphOrder():
+        glyph = glyf[glyph_name]
+        if not glyph.isComposite():
+            continue
+        for component in glyph.components:
+            match = pattern.fullmatch(component.glyphName)
+            if match is None:
+                continue
+            component.glyphName = f"glyph{int(match.group(1)) + 1:05d}"
+
+
 def _update_cidtogidmap(
     pdf: Pdf, font: pikepdf.Object, original_glyph_count: int
 ) -> None:
     """Updates CIDToGIDMap after .notdef insertion at GID 0.
 
-    When .notdef is inserted at GID 0, all existing GIDs shift by +1.
-    Both explicit CIDToGIDMap streams and /Identity mappings must be
+    When .notdef is inserted at GID 0, all existing rendered glyph IDs move by
+    +1. Both explicit CIDToGIDMap streams and /Identity mappings must be
     updated to reflect this shift.
     """
     cidtogidmap = font.get("/CIDToGIDMap")
     if cidtogidmap is None:
         return
     resolved = _resolve(cidtogidmap)
-    # /Identity means CID == GID — must replace with an explicit stream
-    # where CID i → GID i+1 to account for the .notdef shift.
     if isinstance(resolved, Name):
         n = original_glyph_count
         shifted = [min(i + 1, 0xFFFF) for i in range(n)]
