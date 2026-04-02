@@ -21,6 +21,7 @@ from pdftopdfa.fonts.subsetter import (
     _generate_subset_prefix,
     _is_subset_font,
     _populate_from_encoding,
+    _resolve_cidfont_used_gids,
     _resolve_simple_font_encoding,
     _subset_font_data,
 )
@@ -111,6 +112,59 @@ def _make_embedded_cidfont(pdf, font_name, font_data):
             Subtype=Name("/CIDFontType2"),
             BaseFont=Name(f"/{font_name}"),
             CIDToGIDMap=Name.Identity,
+            FontDescriptor=font_descriptor,
+            CIDSystemInfo=Dictionary(
+                Registry=pikepdf.String("Adobe"),
+                Ordering=pikepdf.String("Identity"),
+                Supplement=0,
+            ),
+        )
+    )
+
+    font = Dictionary(
+        Type=Name.Font,
+        Subtype=Name.Type0,
+        BaseFont=Name(f"/{font_name}"),
+        Encoding=Name("/Identity-H"),
+        DescendantFonts=Array([desc_font]),
+    )
+
+    return pdf.make_indirect(font)
+
+
+def _make_embedded_cidfont_with_map(pdf, font_name, font_data, cid_to_gid):
+    """Helper: creates an embedded CIDFont with an explicit CIDToGIDMap."""
+    font_stream = Stream(pdf, font_data)
+    font_stream[Name.Length1] = len(font_data)
+
+    font_descriptor = pdf.make_indirect(
+        Dictionary(
+            Type=Name.FontDescriptor,
+            FontName=Name(f"/{font_name}"),
+            Flags=4,
+            FontBBox=Array([-500, -300, 1300, 1000]),
+            ItalicAngle=0,
+            Ascent=900,
+            Descent=-200,
+            CapHeight=700,
+            StemV=80,
+            FontFile2=pdf.make_indirect(font_stream),
+        )
+    )
+
+    max_cid = max(cid_to_gid, default=0)
+    gid_data = bytearray((max_cid + 1) * 2)
+    for cid, gid in cid_to_gid.items():
+        gid_data[cid * 2 : cid * 2 + 2] = gid.to_bytes(2, "big")
+
+    gid_map_stream = pdf.make_indirect(Stream(pdf, bytes(gid_data)))
+
+    desc_font = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Font,
+            Subtype=Name("/CIDFontType2"),
+            BaseFont=Name(f"/{font_name}"),
+            CIDToGIDMap=gid_map_stream,
             FontDescriptor=font_descriptor,
             CIDSystemInfo=Dictionary(
                 Registry=pikepdf.String("Adobe"),
@@ -282,6 +336,62 @@ class TestFontSubsetter:
 
         assert len(result.fonts_subsetted) == 1
         assert result.bytes_saved > 0
+
+    def test_subset_cidfont_with_explicit_cidtogidmap(self):
+        """CIDFont subsetting follows explicit CIDToGIDMap streams."""
+        from fontTools.ttLib import TTFont
+
+        pdf = new_pdf()
+        font_data = _load_liberation_sans()
+
+        font_obj = _make_embedded_cidfont_with_map(
+            pdf,
+            "MappedCID",
+            font_data,
+            {1: 36, 2: 37},
+        )
+        font_dict = Dictionary(F1=font_obj)
+
+        content = b"BT /F1 12 Tf <00010002> Tj ET"
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(Font=font_dict),
+            Contents=pdf.make_stream(content),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+
+        subsetter = FontSubsetter(pdf)
+        result = subsetter.subset_all_fonts()
+
+        assert len(result.fonts_subsetted) == 1
+        assert result.bytes_saved > 0
+
+        desc_font = font_obj["/DescendantFonts"][0]
+        font_descriptor = desc_font["/FontDescriptor"]
+        font_stream = font_descriptor["/FontFile2"]
+        subsetted_font = TTFont(BytesIO(bytes(font_stream.read_bytes())))
+        glyph_order = subsetted_font.getGlyphOrder()
+        subsetted_font.close()
+
+        assert len(glyph_order) > 37
+        assert glyph_order[36] == "A"
+        assert glyph_order[37] == "B"
+
+    def test_resolve_cidfont_used_gids_from_stream_map(self):
+        """Explicit CIDToGIDMap streams are translated to the mapped GIDs."""
+        pdf = new_pdf()
+        font_data = _load_liberation_sans()
+        font_obj = _make_embedded_cidfont_with_map(
+            pdf,
+            "MappedCID",
+            font_data,
+            {1: 36, 2: 37, 3: 190},
+        )
+
+        desc_font = font_obj["/DescendantFonts"][0]
+
+        assert _resolve_cidfont_used_gids(desc_font, {1, 3}) == {36, 190}
 
     def test_skip_type3_font(self):
         """Type3 fonts are skipped."""

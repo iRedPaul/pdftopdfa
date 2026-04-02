@@ -34,6 +34,7 @@ from .tounicode import (
     generate_tounicode_cmap_data,
     generate_tounicode_for_macroman,
     generate_tounicode_for_winansi,
+    parse_cidtogidmap_stream,
     parse_tounicode_cmap,
     resolve_glyph_to_unicode,
 )
@@ -69,6 +70,39 @@ class SubsettingResult:
     fonts_skipped: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     bytes_saved: int = 0
+
+
+def _resolve_cidfont_used_gids(
+    desc_font: pikepdf.Object,
+    used_codes: set[int],
+) -> set[int]:
+    """Resolves used CID character codes to glyph IDs for subsetting.
+
+    CIDFonts with ``/CIDToGIDMap /Identity`` can subset directly from the
+    character codes seen in content streams. When the descendant font carries
+    an explicit CIDToGIDMap stream, those CIDs must be translated to the
+    mapped GIDs first; otherwise the subsetter preserves the wrong glyph slots
+    and rendered text can become corrupted.
+
+    Args:
+        desc_font: The descendant CIDFont dictionary.
+        used_codes: CIDs extracted from the content streams.
+
+    Returns:
+        The set of GIDs that must be preserved in the embedded font program.
+    """
+    cidtogidmap = desc_font.get("/CIDToGIDMap")
+    if cidtogidmap is None or isinstance(cidtogidmap, pikepdf.Name):
+        return set(used_codes)
+
+    try:
+        cidtogidmap = _resolve_indirect(cidtogidmap)
+        cid_to_gid = parse_cidtogidmap_stream(bytes(cidtogidmap.read_bytes()))
+    except Exception as exc:
+        logger.debug("Error parsing CIDToGIDMap during subsetting: %s", exc)
+        return set(used_codes)
+
+    return {cid_to_gid[cid] for cid in used_codes if cid in cid_to_gid}
 
 
 class FontSubsetter:
@@ -198,8 +232,10 @@ class FontSubsetter:
             return
         font_file = font_file_info.stream
 
-        # Get used character codes (= GIDs for Identity-H/V)
+        # Get used CIDs from content streams and translate them to GIDs when
+        # the descendant font provides an explicit CIDToGIDMap stream.
         used_codes = font_usage.get(obj_key, set())
+        used_gids = _resolve_cidfont_used_gids(desc_font, used_codes)
 
         # Perform subsetting
         try:
@@ -210,7 +246,7 @@ class FontSubsetter:
             if not _check_subsetting_allowed(original_data, font_name, result):
                 return
 
-            subsetted_data = _subset_font_data(original_data, used_codes, is_cid=True)
+            subsetted_data = _subset_font_data(original_data, used_gids, is_cid=True)
 
             if subsetted_data is None:
                 result.fonts_skipped.append(f"{font_name} (subsetting failed)")
