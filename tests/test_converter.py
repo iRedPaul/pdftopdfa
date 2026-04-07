@@ -409,6 +409,79 @@ class TestConvertToPdfa:
         mock_apply_ocr.assert_called_once()
         assert mock_apply_ocr.call_args[1]["force"] is False
 
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_convert_with_ocr_sanitizes_signed_pdf_before_ocr(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Signed PDFs are neutralized before OCR and do not leak live signatures."""
+        mock_is_ocr_available.return_value = True
+
+        signed_input = tmp_dir / "signed_input.pdf"
+        with Pdf.open(sample_pdf) as pdf:
+            sig_dict = pdf.make_indirect(
+                Dictionary(
+                    Type=Name.Sig,
+                    Filter=Name("/Adobe.PPKLite"),
+                    SubFilter=Name("/adbe.pkcs7.detached"),
+                    ByteRange=Array([0, 100, 200, 300]),
+                    Contents=pdf.make_stream(b"\x00" * 64),
+                )
+            )
+            sig_field = pdf.make_indirect(
+                Dictionary(
+                    Type=Name.Annot,
+                    Subtype=Name.Widget,
+                    FT=Name.Sig,
+                    T="Signature1",
+                    Rect=Array([0, 0, 200, 50]),
+                    V=sig_dict,
+                )
+            )
+            pdf.pages[0].obj["/Annots"] = Array([sig_field])
+            pdf.Root["/AcroForm"] = pdf.make_indirect(
+                Dictionary(Fields=Array([sig_field]), SigFlags=1)
+            )
+            pdf.save(signed_input)
+
+        def create_ocr_output(
+            input_path: Path, output_path: Path, langs: list[str], **kwargs: object
+        ) -> Path:
+            import shutil
+
+            with Pdf.open(input_path) as prepared_pdf:
+                assert "/AcroForm" not in prepared_pdf.Root
+                for obj in prepared_pdf.objects:
+                    if isinstance(obj, Dictionary):
+                        assert obj.get("/ByteRange") is None
+
+            shutil.copy(input_path, output_path)
+            return output_path
+
+        mock_apply_ocr.side_effect = create_ocr_output
+
+        output_path = tmp_dir / "output.pdf"
+        result = convert_to_pdfa(signed_input, output_path, ocr_languages=["eng"])
+
+        assert result.success is True
+        assert any(
+            "digital signature(s) removed before OCR" in warning
+            for warning in result.warnings
+        )
+
+        with Pdf.open(output_path) as output_pdf:
+            if "/AcroForm" in output_pdf.Root:
+                assert output_pdf.Root.AcroForm.Fields[0].get("/V") is None
+            for obj in output_pdf.objects:
+                if isinstance(obj, Dictionary):
+                    assert obj.get("/ByteRange") is None
+
+        mock_apply_ocr.assert_called_once()
+
     def test_upgrades_pdf_version_and_adds_warning(
         self, sample_pdf: Path, tmp_dir: Path
     ) -> None:

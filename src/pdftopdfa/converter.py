@@ -35,6 +35,7 @@ from .metadata import sync_metadata
 from .sanitizers import (
     sanitize_for_pdfa,
     sanitize_notdef_usage,
+    sanitize_signatures,
     sanitize_structure_limits,
 )
 from .utils import get_required_pdf_version, is_pdf_encrypted, validate_pdfa_level
@@ -475,6 +476,50 @@ def _strip_annotations_for_ocr(input_path: Path, clean_path: Path) -> bool:
         return False
 
 
+def _prepare_signed_pdf_for_ocr(input_path: Path, prepared_path: Path) -> dict:
+    """Create a temporary OCR source with live signatures neutralized.
+
+    OCR rewrites the PDF and therefore invalidates digital signatures.
+    When a signed PDF is converted to PDF/A with OCR enabled, we first
+    neutralize live signature values in a temporary copy so ocrmypdf can
+    process it instead of aborting early.
+
+    Args:
+        input_path: Path to the original PDF.
+        prepared_path: Path where the prepared PDF should be saved.
+
+    Returns:
+        The ``sanitize_signatures()`` statistics dictionary.
+    """
+    with pikepdf.open(input_path) as pdf:
+        sig_result = sanitize_signatures(pdf)
+        if sig_result["signatures_found"] == 0:
+            return sig_result
+
+        try:
+            pdf.save(prepared_path)
+        except Exception as exc:
+            metadata_removed = False
+            if "/Metadata" in pdf.Root:
+                try:
+                    del pdf.Root["/Metadata"]
+                    metadata_removed = True
+                except Exception:
+                    metadata_removed = False
+
+            if not metadata_removed:
+                raise
+
+            logger.warning(
+                "Saving signature-sanitized OCR source failed; retrying without "
+                "document metadata: %s",
+                exc,
+            )
+            pdf.save(prepared_path)
+
+    return sig_result
+
+
 def _restore_annotations_after_ocr(
     original_path: Path, ocr_path: Path, output_path: Path
 ) -> int:
@@ -599,6 +644,7 @@ def convert_to_pdfa(
     start_time = time.perf_counter()
     warnings: list[str] = []
     ocr_temp_file: Path | None = None
+    ocr_signature_temp_file: Path | None = None
     pdf: pikepdf.Pdf | None = None
 
     logger.info(
@@ -694,12 +740,35 @@ def convert_to_pdfa(
                 effective_quality = (
                     ocr_quality if ocr_quality is not None else OcrQuality.DEFAULT
                 )
+                ocr_source_base = input_path
+
+                fd_sig, sig_tmp = tempfile.mkstemp(
+                    suffix=".pdf",
+                    prefix=f".{input_path.stem}_sig_",
+                )
+                os.close(fd_sig)
+                ocr_signature_temp_file = Path(sig_tmp)
+                sig_result = _prepare_signed_pdf_for_ocr(
+                    input_path, ocr_signature_temp_file
+                )
+                if sig_result["signatures_found"] > 0:
+                    ocr_source_base = ocr_signature_temp_file
+                    warnings.append(
+                        f"{sig_result['signatures_found']} digital signature(s) "
+                        "removed before OCR for PDF/A compliance"
+                    )
+                else:
+                    try:
+                        ocr_signature_temp_file.unlink()
+                    except Exception:
+                        pass
+                    ocr_signature_temp_file = None
 
                 # Strip annotations before OCR so they are not
                 # rasterized into page images.
-                preserve_annots = _has_annotations(input_path)
+                preserve_annots = _has_annotations(ocr_source_base)
                 clean_temp_file: Path | None = None
-                ocr_source = input_path
+                ocr_source = ocr_source_base
                 if preserve_annots:
                     fd2, clean_tmp = tempfile.mkstemp(
                         suffix=".pdf",
@@ -707,7 +776,7 @@ def convert_to_pdfa(
                     )
                     os.close(fd2)
                     clean_temp_file = Path(clean_tmp)
-                    if _strip_annotations_for_ocr(input_path, clean_temp_file):
+                    if _strip_annotations_for_ocr(ocr_source_base, clean_temp_file):
                         ocr_source = clean_temp_file
                     else:
                         preserve_annots = False
@@ -729,7 +798,7 @@ def convert_to_pdfa(
                     os.close(fd3)
                     merged_temp_file = Path(merged_tmp)
                     count = _restore_annotations_after_ocr(
-                        input_path, ocr_temp_file, merged_temp_file
+                        ocr_source_base, ocr_temp_file, merged_temp_file
                     )
                     if count > 0:
                         os.replace(str(merged_temp_file), str(ocr_temp_file))
@@ -1037,6 +1106,20 @@ def convert_to_pdfa(
                 logger.warning(
                     "Could not delete OCR temporary file: %s (%s)",
                     ocr_temp_file,
+                    cleanup_error,
+                )
+
+        if ocr_signature_temp_file is not None and ocr_signature_temp_file.exists():
+            try:
+                ocr_signature_temp_file.unlink()
+                logger.debug(
+                    "OCR signature temporary file deleted: %s",
+                    ocr_signature_temp_file,
+                )
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Could not delete OCR signature temporary file: %s (%s)",
+                    ocr_signature_temp_file,
                     cleanup_error,
                 )
 
