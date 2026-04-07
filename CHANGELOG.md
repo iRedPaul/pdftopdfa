@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.23] - 2026-04-07
+
+### Bug Fixes
+
+- Fix CIDFont width repair when `W` entries are missing
+- Handle signed PDFs before OCR conversion
+
 ## [0.2.22] - 2026-04-02
 
 ### Bug Fixes
