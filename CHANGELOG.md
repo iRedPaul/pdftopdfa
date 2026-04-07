@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.24] - 2026-04-07
+
+### Bug Fixes
+
+- Fix Type3 font width scaling for nonstandard `FontMatrix`
+
 ## [0.2.23] - 2026-04-07
 
 ### Bug Fixes
