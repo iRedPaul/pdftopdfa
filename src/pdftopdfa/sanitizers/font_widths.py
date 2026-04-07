@@ -777,18 +777,6 @@ def _fix_type3_font_widths(font: pikepdf.Object, font_name: str) -> bool:
                         code_to_glyph[current_code] = glyph_name
                         current_code += 1
 
-    # Determine FontMatrix scale for width comparison.
-    # Type3 FontMatrix is typically [0.001, 0, 0, 0.001, 0, 0]
-    # meaning glyph space is 1/1000 of text space. The /Widths
-    # array is in text space (like other font types), but d0/d1
-    # widths are in glyph space and must be scaled by FontMatrix[0]*1000.
-    font_matrix = font.get("/FontMatrix")
-    if font_matrix is not None:
-        fm = _resolve(font_matrix)
-        fm_scale = float(fm[0]) * 1000.0
-    else:
-        fm_scale = 1.0
-
     # Extract widths from CharProc streams (d0/d1 operators)
     glyph_widths: dict[str, int] = {}
     for glyph_name_key in dict(char_procs):
@@ -801,8 +789,11 @@ def _fix_type3_font_widths(font: pikepdf.Object, font_name: str) -> bool:
                 if op_str in ("d0", "d1"):
                     # d0: wx wy d0 — width is first operand
                     # d1: wx wy llx lly urx ury d1 — width is first operand
-                    raw_width = float(operands[0])
-                    glyph_widths[glyph_name] = round(raw_width * fm_scale)
+                    # Type3 /Widths and d0/d1 glyph widths are both expressed
+                    # in glyph space. Applying FontMatrix scaling here would
+                    # halve widths for fonts using non-standard matrices
+                    # such as 1/2048, which is exactly what veraPDF flags.
+                    glyph_widths[glyph_name] = round(float(operands[0]))
                     break
         except Exception:
             continue

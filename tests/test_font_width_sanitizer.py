@@ -1406,9 +1406,8 @@ class TestType3FontWidthFix:
     def test_type3_d1_wrong_widths_corrected(self) -> None:
         """Type3 font with d1 operator: wrong widths are corrected."""
         pdf = new_pdf()
-        # d_widths=[1000, 750] in glyph space, fm_scale=1.0
-        # Expected text-space widths: [1000, 750]
-        # Declared widths: [500, 500] — wrong
+        # d_widths=[1000, 750] in glyph space.
+        # Declared widths: [500, 500] — wrong.
         font = _make_type3_font(pdf, widths=[500, 500], d_widths=[1000, 750])
         _build_pdf_with_font(pdf, font)
         pdf = _roundtrip(pdf)
@@ -1418,6 +1417,26 @@ class TestType3FontWidthFix:
         assert result["type3_font_widths_fixed"] == 1
 
         # Verify corrected widths
+        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
+        corrected = [int(w) for w in resolve(font_obj.Widths)]
+        assert corrected == [1000, 750]
+
+    def test_type3_nonstandard_fontmatrix_keeps_glyph_space_widths(self) -> None:
+        """Type3 widths stay in glyph space even with FontMatrix 1/2048."""
+        pdf = new_pdf()
+        font = _make_type3_font(
+            pdf,
+            widths=[488, 366],
+            d_widths=[1000, 750],
+            font_matrix=[1.0 / 2048, 0, 0, 1.0 / 2048, 0, 0],
+        )
+        _build_pdf_with_font(pdf, font)
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["type3_font_widths_fixed"] == 1
+
         font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
         corrected = [int(w) for w in resolve(font_obj.Widths)]
         assert corrected == [1000, 750]
