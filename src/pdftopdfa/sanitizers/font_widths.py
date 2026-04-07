@@ -1055,6 +1055,99 @@ def _parse_w_array(w_array: pikepdf.Object) -> dict[int, int]:
     return result
 
 
+def _get_cidfont_default_width(desc_font: pikepdf.Object) -> int:
+    """Returns the effective default width for a CIDFont.
+
+    PDF uses ``/DW`` as the fallback width for any CID not listed in ``/W``.
+    If ``/DW`` is absent, the spec default is 1000.
+    """
+    dw = desc_font.get("/DW")
+    if dw is None:
+        return 1000
+    try:
+        return int(dw)
+    except (TypeError, ValueError):
+        return 1000
+
+
+def _get_cidfont_program_default_width(tt_font) -> int | None:
+    """Returns the CIDFont default width from the embedded font program."""
+    try:
+        glyph_order = tt_font.getGlyphOrder()
+        if not glyph_order:
+            return None
+        notdef_name = glyph_order[0]
+        hmtx = tt_font["hmtx"]
+        if notdef_name not in hmtx.metrics:
+            return None
+        units_per_em = tt_font["head"].unitsPerEm
+        scale = 1000.0 / units_per_em
+        return round(hmtx.metrics[notdef_name][0] * scale)
+    except Exception:
+        return None
+
+
+def _build_sparse_cidfont_w_array(
+    cid_to_width: dict[int, int],
+    default_width: int,
+) -> list:
+    """Builds a sparse CIDFont ``/W`` array from explicit CID widths.
+
+    Only widths differing from ``default_width`` are emitted; omitted CIDs are
+    implicitly covered by ``/DW``.
+    """
+    explicit_widths = sorted(
+        (cid, width) for cid, width in cid_to_width.items() if width != default_width
+    )
+    if not explicit_widths:
+        return []
+
+    w_array: list = []
+    i = 0
+    while i < len(explicit_widths):
+        j = i + 1
+        while (
+            j < len(explicit_widths)
+            and explicit_widths[j][0] == explicit_widths[j - 1][0] + 1
+        ):
+            j += 1
+        run = explicit_widths[i:j]
+
+        k = 0
+        while k < len(run):
+            width = run[k][1]
+            m = k + 1
+            while m < len(run) and run[m][1] == width:
+                m += 1
+            same_count = m - k
+
+            if same_count >= 4:
+                w_array.append(run[k][0])
+                w_array.append(run[m - 1][0])
+                w_array.append(width)
+                k = m
+                continue
+
+            end = m
+            while end < len(run):
+                next_width = run[end][1]
+                lookahead = end + 1
+                while lookahead < len(run) and run[lookahead][1] == next_width:
+                    lookahead += 1
+                if lookahead - end >= 4:
+                    break
+                end = lookahead
+
+            seq_widths = [run[n][1] for n in range(k, end)]
+            w_array.append(run[k][0])
+            w_array.append(seq_widths)
+            k = end
+
+        i = j
+
+    return w_array
+
+
 def _fix_cidfont_widths(font: pikepdf.Object, font_name: str) -> bool:
     """Validates and fixes widths for a CIDFont (Type0).
 
@@ -1068,15 +1161,9 @@ def _fix_cidfont_widths(font: pikepdf.Object, font_name: str) -> bool:
     descendants = _resolve(font.get("/DescendantFonts"))
     desc_font = _resolve(descendants[0])
 
-    # Get /W array
     w_array = desc_font.get("/W")
-
-    if w_array is None:
-        return False
-
-    declared_widths = _parse_w_array(w_array)
-    if not declared_widths:
-        return False
+    declared_widths = _parse_w_array(w_array) if w_array is not None else {}
+    declared_default_width = _get_cidfont_default_width(desc_font)
 
     # Extract and parse font program from the descendant font
     tt_font = _extract_font_program(desc_font)
@@ -1092,6 +1179,7 @@ def _fix_cidfont_widths(font: pikepdf.Object, font_name: str) -> bool:
                 font_name,
                 tt_font,
                 declared_widths,
+                declared_default_width,
             )
 
         if not _validate_font_program(tt_font, font_name):
@@ -1114,10 +1202,19 @@ def _fix_cidfont_widths(font: pikepdf.Object, font_name: str) -> bool:
             else:
                 return False
 
+        glyph_order = tt_font.getGlyphOrder()
+        if cid_to_gid is None:
+            candidate_cids = set(range(len(glyph_order)))
+        else:
+            candidate_cids = set(cid_to_gid)
+        candidate_cids.update(declared_widths)
+        if not candidate_cids:
+            return False
+
         # Build set of GIDs we need widths for
         gids_needed: set[int] = set()
         cid_to_gid_map: dict[int, int] = {}
-        for cid in declared_widths:
+        for cid in candidate_cids:
             if cid_to_gid is not None:
                 gid = cid_to_gid.get(cid)
                 if gid is None:
@@ -1129,17 +1226,19 @@ def _fix_cidfont_widths(font: pikepdf.Object, font_name: str) -> bool:
 
         # Compute expected widths for those GIDs
         expected_gid_widths = _metrics.compute_widths_for_gids(tt_font, gids_needed)
+        expected_cid_widths = {
+            cid: expected_gid_widths[gid]
+            for cid, gid in cid_to_gid_map.items()
+            if gid in expected_gid_widths
+        }
+        if not expected_cid_widths:
+            return False
 
         # Compare
         mismatches = 0
         comparable = 0
-        for cid, declared in declared_widths.items():
-            gid = cid_to_gid_map.get(cid)
-            if gid is None:
-                continue
-            expected = expected_gid_widths.get(gid)
-            if expected is None:
-                continue
+        for cid, expected in expected_cid_widths.items():
+            declared = declared_widths.get(cid, declared_default_width)
             comparable += 1
             if abs(declared - expected) > _WIDTH_TOLERANCE:
                 mismatches += 1
@@ -1156,20 +1255,20 @@ def _fix_cidfont_widths(font: pikepdf.Object, font_name: str) -> bool:
                 100 * mismatches / comparable,
             )
 
-        # Rebuild /W array from the font program
-        new_w_array = _metrics.build_cidfont_w_array(tt_font)
-        desc_font[Name.W] = Array(_convert_w_array_to_pikepdf(new_w_array))
+        # Rebuild /DW + /W from the font program.
+        program_default_width = _get_cidfont_program_default_width(tt_font)
+        if program_default_width is None:
+            return False
 
-        # Set /DW to .notdef (GID 0) width from the font program
-        glyph_order = tt_font.getGlyphOrder()
-        if glyph_order:
-            notdef_name = glyph_order[0]
-            hmtx = tt_font["hmtx"]
-            if notdef_name in hmtx.metrics:
-                units_per_em = tt_font["head"].unitsPerEm
-                scale = 1000.0 / units_per_em
-                dw = round(hmtx.metrics[notdef_name][0] * scale)
-                desc_font[Name.DW] = dw
+        new_w_array = _build_sparse_cidfont_w_array(
+            expected_cid_widths,
+            program_default_width,
+        )
+        if new_w_array:
+            desc_font[Name.W] = Array(_convert_w_array_to_pikepdf(new_w_array))
+        elif desc_font.get("/W") is not None:
+            del desc_font[Name.W]
+        desc_font[Name.DW] = program_default_width
 
         logger.info(
             "Fixed %d width mismatches in CIDFont %s",
@@ -1189,6 +1288,7 @@ def _fix_cidfont_widths_cff(
     font_name: str,
     tt_font,
     declared_widths: dict[int, int],
+    declared_default_width: int,
 ) -> bool:
     """Fixes widths for a CIDFontType0 with bare CFF font program.
 
@@ -1214,10 +1314,13 @@ def _fix_cidfont_widths_cff(
     # Compare declared vs CFF
     mismatches = 0
     comparable = 0
-    for cid, declared in declared_widths.items():
+    candidate_cids = set(cid_to_width)
+    candidate_cids.update(declared_widths)
+    for cid in candidate_cids:
         actual = cid_to_width.get(cid)
         if actual is None:
             continue
+        declared = declared_widths.get(cid, declared_default_width)
         comparable += 1
         if abs(declared - actual) > _WIDTH_TOLERANCE:
             mismatches += 1
@@ -1225,29 +1328,17 @@ def _fix_cidfont_widths_cff(
     if mismatches == 0:
         return False
 
-    # Rebuild /W array from CFF widths
-    # Build sorted list of (cid, width) for all known CIDs
-    all_widths: list[tuple[int, int]] = sorted(cid_to_width.items())
-    w_array: list = []
-    i = 0
-    while i < len(all_widths):
-        start_cid, start_w = all_widths[i]
-        # Collect consecutive CIDs
-        seq = [start_w]
-        j = i + 1
-        while j < len(all_widths) and all_widths[j][0] == start_cid + (j - i):
-            seq.append(all_widths[j][1])
-            j += 1
-        w_array.append(start_cid)
-        w_array.append(seq)
-        i = j
-
-    desc_font[Name.W] = Array(_convert_w_array_to_pikepdf(w_array))
-
-    # Set /DW to .notdef width
+    # Rebuild /DW + /W from the CFF widths
     notdef_w = cid_to_width.get(0)
     if notdef_w is not None:
         desc_font[Name.DW] = notdef_w
+
+    default_width = _get_cidfont_default_width(desc_font)
+    w_array = _build_sparse_cidfont_w_array(cid_to_width, default_width)
+    if w_array:
+        desc_font[Name.W] = Array(_convert_w_array_to_pikepdf(w_array))
+    elif desc_font.get("/W") is not None:
+        del desc_font[Name.W]
 
     logger.info(
         "Fixed %d width mismatches in CFF CIDFont %s",

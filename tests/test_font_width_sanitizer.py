@@ -493,7 +493,65 @@ class TestCIDFontWidthFix:
         assert result["cidfont_widths_fixed"] == 0
 
     def test_cidfont_without_w_array_not_modified(self) -> None:
-        """CIDFont without /W array is not touched."""
+        """CIDFont without /W array stays unchanged when /DW already matches."""
+        font_data, tt_font = _make_minimal_ttfont(
+            glyph_widths={
+                ".notdef": 1000,
+                "space": 1000,
+                "A": 1000,
+                "B": 1000,
+                "C": 1000,
+            }
+        )
+        tt_font.close()
+
+        pdf = new_pdf()
+
+        font_stream = pdf.make_stream(font_data)
+        font_stream[Name.Length1] = len(font_data)
+
+        font_descriptor = pdf.make_indirect(
+            Dictionary(
+                Type=Name.FontDescriptor,
+                FontName=Name("/TestCIDFont"),
+                Flags=32,
+                FontFile2=pdf.make_indirect(font_stream),
+            )
+        )
+
+        cidfont = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name("/CIDFontType2"),
+                BaseFont=Name("/TestCIDFont"),
+                CIDSystemInfo=Dictionary(
+                    Registry="Adobe", Ordering="Identity", Supplement=0
+                ),
+                FontDescriptor=font_descriptor,
+                DW=1000,
+                CIDToGIDMap=Name.Identity,
+            )
+        )
+
+        type0_font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type0,
+                BaseFont=Name("/TestCIDFont"),
+                Encoding=Name("/Identity-H"),
+                DescendantFonts=Array([cidfont]),
+            )
+        )
+
+        _build_pdf_with_font(pdf, type0_font)
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["cidfont_widths_fixed"] == 0
+
+    def test_cidfont_without_w_array_but_wrong_dw_is_corrected(self) -> None:
+        """CIDFont without /W is corrected when /DW mismatches used glyph widths."""
         font_data, tt_font = _make_minimal_ttfont()
         tt_font.close()
 
@@ -520,6 +578,7 @@ class TestCIDFontWidthFix:
                     Registry="Adobe", Ordering="Identity", Supplement=0
                 ),
                 FontDescriptor=font_descriptor,
+                DW=999,
                 CIDToGIDMap=Name.Identity,
             )
         )
@@ -539,7 +598,111 @@ class TestCIDFontWidthFix:
 
         result = sanitize_font_widths(pdf)
 
-        assert result["cidfont_widths_fixed"] == 0
+        assert result["cidfont_widths_fixed"] == 1
+
+        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
+        descendants = resolve(font_obj["/DescendantFonts"])
+        desc_font = resolve(descendants[0])
+        assert int(desc_font["/DW"]) == 500
+        corrected_w = list(resolve(desc_font["/W"]))
+        assert corrected_w[0] == 1
+        assert [int(w) for w in resolve(corrected_w[1])] == [250, 600, 650, 700]
+
+    def test_cidfont_without_w_array_with_cidtogidmap_stream_is_corrected(
+        self,
+    ) -> None:
+        """CIDFont without /W is corrected for explicit CIDToGIDMap streams."""
+        font_data, tt_font = _make_minimal_ttfont()
+        tt_font.close()
+
+        pdf = new_pdf()
+
+        font_stream = pdf.make_stream(font_data)
+        font_stream[Name.Length1] = len(font_data)
+
+        font_descriptor = pdf.make_indirect(
+            Dictionary(
+                Type=Name.FontDescriptor,
+                FontName=Name("/TestCIDFont"),
+                Flags=32,
+                FontFile2=pdf.make_indirect(font_stream),
+            )
+        )
+
+        cidtogidmap_data = bytearray(26)
+        cidtogidmap_data[20:22] = b"\x00\x01"  # CID 10 -> GID 1 ("space")
+        cidtogidmap_data[24:26] = b"\x00\x03"  # CID 12 -> GID 3 ("B")
+        cidtogidmap_stream = pdf.make_indirect(pdf.make_stream(bytes(cidtogidmap_data)))
+
+        cidfont = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name("/CIDFontType2"),
+                BaseFont=Name("/TestCIDFont"),
+                CIDSystemInfo=Dictionary(
+                    Registry="Adobe", Ordering="Identity", Supplement=0
+                ),
+                FontDescriptor=font_descriptor,
+                DW=999,
+                CIDToGIDMap=cidtogidmap_stream,
+            )
+        )
+
+        type0_font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type0,
+                BaseFont=Name("/TestCIDFont"),
+                Encoding=Name("/Identity-H"),
+                DescendantFonts=Array([cidfont]),
+            )
+        )
+
+        _build_pdf_with_font(pdf, type0_font)
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["cidfont_widths_fixed"] == 1
+
+        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
+        descendants = resolve(font_obj["/DescendantFonts"])
+        desc_font = resolve(descendants[0])
+        assert int(desc_font["/DW"]) == 500
+        corrected_w = list(resolve(desc_font["/W"]))
+        assert corrected_w[0] == 10
+        assert [int(w) for w in resolve(corrected_w[1])] == [250]
+        assert corrected_w[2] == 12
+        assert [int(w) for w in resolve(corrected_w[3])] == [650]
+
+    def test_cidfont_partial_w_array_missing_nondefault_widths_is_corrected(
+        self,
+    ) -> None:
+        """CIDFont widths omitted from /W fall back to /DW and must be fixed."""
+        font_data, tt_font = _make_minimal_ttfont()
+        tt_font.close()
+
+        pdf = new_pdf()
+        font = _make_cidfont_with_widths(
+            pdf,
+            w_array=[0, Array([500])],
+            default_width=500,
+            font_data=font_data,
+        )
+        _build_pdf_with_font(pdf, font)
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["cidfont_widths_fixed"] == 1
+
+        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
+        descendants = resolve(font_obj["/DescendantFonts"])
+        desc_font = resolve(descendants[0])
+        assert int(desc_font["/DW"]) == 500
+        corrected_w = list(resolve(desc_font["/W"]))
+        assert corrected_w[0] == 1
+        assert [int(w) for w in resolve(corrected_w[1])] == [250, 600, 650, 700]
 
 
 class TestSkipConditions:
