@@ -116,11 +116,12 @@ class TestCheckFstypeRestrictions:
         assert "Preview & Print" in warnings[0]
 
     def test_editable_no_restrictions(self):
-        """fsType 0x0008 allows embedding and subsetting."""
+        """fsType 0x0008 allows embedding but should still warn."""
         allowed, can_subset, warnings = check_fstype_restrictions(FSTYPE_EDITABLE)
         assert allowed is True
         assert can_subset is True
-        assert warnings == []
+        assert len(warnings) == 1
+        assert "Editable" in warnings[0]
 
     def test_no_subsetting(self):
         """fsType 0x0100 disallows subsetting."""
@@ -131,9 +132,9 @@ class TestCheckFstypeRestrictions:
         assert "No subsetting" in warnings[0]
 
     def test_bitmap_only(self):
-        """fsType 0x0200 warns about bitmap-only embedding."""
+        """fsType 0x0200 disallows outline embedding."""
         allowed, can_subset, warnings = check_fstype_restrictions(FSTYPE_BITMAP_ONLY)
-        assert allowed is True
+        assert allowed is False
         assert can_subset is True
         assert len(warnings) == 1
         assert "Bitmap" in warnings[0]
@@ -145,3 +146,13 @@ class TestCheckFstypeRestrictions:
         assert allowed is False
         assert can_subset is False
         assert len(warnings) == 2
+
+    def test_preview_and_print_plus_editable_warns_twice(self):
+        """Both permitted embedding flags should still be reported."""
+        combined = FSTYPE_PREVIEW_AND_PRINT | FSTYPE_EDITABLE
+        allowed, can_subset, warnings = check_fstype_restrictions(combined)
+        assert allowed is True
+        assert can_subset is True
+        assert len(warnings) == 2
+        assert any("Preview & Print" in warning for warning in warnings)
+        assert any("Editable" in warning for warning in warnings)

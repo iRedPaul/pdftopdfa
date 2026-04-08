@@ -12,7 +12,7 @@ Instead of re-rendering via Ghostscript, it modifies the PDF structure directly 
 
 - **No Ghostscript required** -- direct PDF manipulation via pikepdf/QPDF
 - **PDF/A-2b, 2u, 3b, 3u** -- supports modern PDF/A levels (ISO 19005-2 and 19005-3)
-- **Automatic font embedding** -- embeds missing fonts with metrically compatible replacements
+- **Automatic font embedding** -- uses policy-approved Windows system fonts or bundled replacements
 - **Font subsetting** -- reduces file size by removing unused glyphs
 - **CJK support** -- embeds Noto Sans CJK for Chinese, Japanese, and Korean text
 - **ICC color profiles** -- automatically embeds sRGB, CMYK, and grayscale profiles
@@ -92,6 +92,14 @@ See [docs/usage.md](docs/usage.md) for the full CLI reference, Python API docume
 - **No PDF/A-1 support** -- only PDF/A-2 and PDF/A-3 levels are supported
 - **Encrypted PDFs** -- password-protected PDFs cannot be converted
 - **Font replacement** -- fonts without a suitable metrically compatible replacement produce a warning; the resulting file may not be fully compliant
+
+## Font Sourcing
+
+- On Windows, `pdftopdfa` may automatically embed a conservative fixed allowlist of local fonts from `%WINDIR%\Fonts`.
+- A Windows system font is only used when the installed file lives under `%WINDIR%\Fonts`, its actual PostScript name is allowlisted, and its OpenType `fsType` permits outline embedding.
+- On macOS and Linux, system fonts are never auto-embedded; bundled replacement fonts are used instead.
+- `fsType` checks are a technical safeguard only and do not replace the font vendor's EULA or other license terms.
+- For auditable deployments, keep the allowlist tied to reviewed target systems or golden images.
 
 ## Development
 

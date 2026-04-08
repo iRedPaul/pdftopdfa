@@ -147,7 +147,8 @@ def check_fstype_restrictions(
 
     Returns:
         Tuple of (embedding_allowed, subsetting_allowed, warnings).
-        embedding_allowed is False only for Restricted License (0x0002).
+        embedding_allowed is False for Restricted License (0x0002) and
+        Bitmap-only embedding (0x0200).
         subsetting_allowed is False if the No Subsetting bit (0x0100) is set.
         warnings contains human-readable descriptions of restrictions found.
     """
@@ -162,11 +163,24 @@ def check_fstype_restrictions(
     if fstype & FSTYPE_PREVIEW_AND_PRINT:
         warnings.append("Preview & Print embedding only (fsType bit 2)")
 
+    if fstype & FSTYPE_EDITABLE:
+        warnings.append("Editable embedding allowed (fsType bit 3)")
+
     if fstype & FSTYPE_NO_SUBSETTING:
         subsetting_allowed = False
         warnings.append("No subsetting allowed (fsType bit 8)")
 
     if fstype & FSTYPE_BITMAP_ONLY:
+        embedding_allowed = False
         warnings.append("Bitmap embedding only (fsType bit 9)")
 
     return embedding_allowed, subsetting_allowed, warnings
+
+
+def is_permitted_fstype_notice(message: str) -> bool:
+    """Return whether an fsType message is informational only.
+
+    ``Preview & Print`` and ``Editable`` permit outline embedding, so they
+    should be logged for traceability without surfacing as conversion warnings.
+    """
+    return "Preview & Print" in message or "Editable" in message

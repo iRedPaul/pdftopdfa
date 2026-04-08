@@ -4,12 +4,16 @@
 
 """Tests for fonts/embedder.py — font embedding and FontEmbedder class."""
 
+from io import BytesIO
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pikepdf
 import pytest
 from conftest import new_pdf
 from font_helpers import _liberation_fonts_available, _noto_cjk_font_available
+from fontTools.fontBuilder import FontBuilder
+from fontTools.ttLib.tables._g_l_y_f import Glyph
 from pikepdf import Array, Dictionary, Name
 
 from pdftopdfa.exceptions import FontEmbeddingError
@@ -21,7 +25,40 @@ from pdftopdfa.fonts import (
 )
 from pdftopdfa.fonts.analysis import is_font_embedded
 from pdftopdfa.fonts.embedder import _UTF16_ENCODING_NAMES, _is_utf16_encoding
+from pdftopdfa.fonts.loader import FontLoader
 from pdftopdfa.utils import resolve_indirect as _resolve_indirect
+
+
+def _build_test_font_file(
+    path: Path,
+    *,
+    family_name: str,
+    style_name: str,
+    postscript_name: str,
+    fstype: int = 0,
+) -> None:
+    """Create a tiny TrueType font file for loader tests."""
+    fb = FontBuilder(1000, isTTF=True)
+    glyphs = [".notdef", "A"]
+    fb.setupGlyphOrder(glyphs)
+    fb.setupCharacterMap({65: "A"})
+    fb.setupGlyf({gname: Glyph() for gname in glyphs})
+    fb.setupHorizontalMetrics({".notdef": (500, 0), "A": (600, 0)})
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable(
+        {
+            "familyName": family_name,
+            "styleName": style_name,
+            "psName": postscript_name,
+            "fullName": f"{family_name} {style_name}",
+        }
+    )
+    fb.setupOS2(fsType=fstype)
+    fb.setupPost()
+
+    buffer = BytesIO()
+    fb.font.save(buffer)
+    path.write_bytes(buffer.getvalue())
 
 
 class TestFontReplacements:
@@ -105,8 +142,8 @@ class TestFontEmbedder:
         """embed_missing_fonts returns EmbeddingResult."""
         embedder = FontEmbedder(pdf_with_text_obj)
 
-        # Mock _loader.load_standard14_font to avoid file system access
-        with patch.object(embedder._loader, "load_standard14_font") as mock_load:
+        # Mock loader to avoid file system access
+        with patch.object(embedder._loader, "load_replacement_font") as mock_load:
             # Simulate error when loading
             mock_load.side_effect = FontEmbeddingError("Font not found")
 
@@ -186,6 +223,237 @@ class TestFontEmbedder:
         assert result.warnings == []
         assert mock_replace.call_count == 1
         assert mock_replace.call_args.kwargs["use_fallback"] is False
+
+
+class TestFontLoader:
+    """Tests for Windows allowlisted system-font loading."""
+
+    @staticmethod
+    def _make_windows_font_path(tmp_path: Path, filename: str) -> tuple[Path, Path]:
+        """Return a fake ``%WINDIR%`` and a font path under ``Fonts``."""
+        windir = tmp_path / "Windows"
+        font_path = windir / "Fonts" / filename
+        font_path.parent.mkdir(parents=True)
+        return windir, font_path
+
+    @staticmethod
+    def _load_policy_font(
+        tmp_path: Path,
+        *,
+        requested_name: str,
+        postscript_name: str,
+        family_name: str,
+        style_name: str,
+        use_fallback: bool,
+        fstype: int = 0,
+    ) -> tuple[bytes, object]:
+        """Create a fake Windows font and load it through the policy path."""
+        windir, font_path = TestFontLoader._make_windows_font_path(
+            tmp_path, f"{postscript_name}.ttf"
+        )
+        _build_test_font_file(
+            font_path,
+            family_name=family_name,
+            style_name=style_name,
+            postscript_name=postscript_name,
+            fstype=fstype,
+        )
+
+        loader = FontLoader({})
+        with (
+            patch.object(FontLoader, "_is_windows_platform", return_value=True),
+            patch.dict("os.environ", {"WINDIR": str(windir)}, clear=False),
+        ):
+            return loader.load_replacement_font(
+                requested_name,
+                use_fallback=use_fallback,
+            )
+
+    @pytest.mark.parametrize(
+        (
+            "requested_name",
+            "postscript_name",
+            "family_name",
+            "style_name",
+            "use_fallback",
+        ),
+        [
+            (
+                "TimesNewRomanPS-BoldMT",
+                "TimesNewRomanPS-BoldMT",
+                "Times New Roman",
+                "Bold",
+                False,
+            ),
+            ("Arial-BoldMT", "Arial-BoldMT", "Arial", "Bold", False),
+            ("Calibri", "Calibri", "Calibri", "Regular", True),
+            ("Consolas", "Consolas", "Consolas", "Regular", True),
+            ("LucidaConsole", "LucidaConsole", "Lucida Console", "Regular", True),
+        ],
+    )
+    def test_windows_allowlisted_font_is_used(
+        self,
+        tmp_path,
+        requested_name,
+        postscript_name,
+        family_name,
+        style_name,
+        use_fallback,
+    ):
+        """Allowlisted Windows fonts under ``%WINDIR%\\Fonts`` are embedded."""
+        font_data, tt_font = self._load_policy_font(
+            tmp_path,
+            requested_name=requested_name,
+            postscript_name=postscript_name,
+            family_name=family_name,
+            style_name=style_name,
+            use_fallback=use_fallback,
+        )
+        try:
+            assert len(font_data) > 0
+            assert tt_font["name"].getDebugName(6) == postscript_name
+        finally:
+            tt_font.close()
+
+    def test_non_allowlisted_windows_font_is_ignored(self, tmp_path):
+        """Non-allowlisted Windows fonts fall back to bundled replacements."""
+        font_data, tt_font = self._load_policy_font(
+            tmp_path,
+            requested_name="Helvetica",
+            postscript_name="Helvetica",
+            family_name="Helvetica",
+            style_name="Regular",
+            use_fallback=False,
+        )
+        try:
+            assert len(font_data) > 0
+            assert tt_font["name"].getDebugName(1).startswith("Liberation Sans")
+        finally:
+            tt_font.close()
+
+    def test_allowlisted_font_outside_windows_fonts_is_ignored(self, tmp_path):
+        """Allowlisted fonts outside ``%WINDIR%\\Fonts`` are never used."""
+        outside_font = tmp_path / "external" / "Calibri.ttf"
+        outside_font.parent.mkdir(parents=True)
+        _build_test_font_file(
+            outside_font,
+            family_name="Calibri",
+            style_name="Regular",
+            postscript_name="Calibri",
+        )
+
+        windir = tmp_path / "Windows"
+        (windir / "Fonts").mkdir(parents=True)
+
+        loader = FontLoader({})
+        with (
+            patch.object(FontLoader, "_is_windows_platform", return_value=True),
+            patch.dict("os.environ", {"WINDIR": str(windir)}, clear=False),
+            patch.object(
+                loader, "_iter_system_font_files", return_value=[outside_font]
+            ),
+        ):
+            _font_data, tt_font = loader.load_replacement_font(
+                "Calibri",
+                use_fallback=True,
+            )
+
+        try:
+            assert tt_font["name"].getDebugName(1).startswith("Liberation Sans")
+        finally:
+            tt_font.close()
+
+    def test_resolved_postscript_name_must_still_be_allowlisted(self, tmp_path):
+        """The matched file's actual PostScript name is rechecked after lookup."""
+        windir, font_path = self._make_windows_font_path(tmp_path, "spoofed.ttf")
+        _build_test_font_file(
+            font_path,
+            family_name="Helvetica",
+            style_name="Regular",
+            postscript_name="Helvetica",
+        )
+
+        loader = FontLoader({})
+        with (
+            patch.object(FontLoader, "_is_windows_platform", return_value=True),
+            patch.dict("os.environ", {"WINDIR": str(windir)}, clear=False),
+            patch.object(
+                loader,
+                "_build_system_font_index",
+                return_value={
+                    loader._normalize_font_lookup_name("Calibri"): (font_path, None)
+                },
+            ),
+        ):
+            _font_data, tt_font = loader.load_replacement_font(
+                "Calibri",
+                use_fallback=True,
+            )
+
+        try:
+            assert tt_font["name"].getDebugName(1).startswith("Liberation Sans")
+        finally:
+            tt_font.close()
+
+    def test_non_windows_platform_never_uses_system_fonts(self, tmp_path):
+        """macOS/Linux policy always skips local system fonts."""
+        windir, font_path = self._make_windows_font_path(tmp_path, "Calibri.ttf")
+        _build_test_font_file(
+            font_path,
+            family_name="Calibri",
+            style_name="Regular",
+            postscript_name="Calibri",
+        )
+
+        loader = FontLoader({})
+        with (
+            patch.object(FontLoader, "_is_windows_platform", return_value=False),
+            patch.dict("os.environ", {"WINDIR": str(windir)}, clear=False),
+        ):
+            _font_data, tt_font = loader.load_replacement_font(
+                "Calibri",
+                use_fallback=True,
+            )
+
+        try:
+            assert tt_font["name"].getDebugName(1).startswith("Liberation Sans")
+        finally:
+            tt_font.close()
+
+    def test_bitmap_only_system_font_falls_back_to_bundled_replacement(self, tmp_path):
+        """Bitmap-only fonts are blocked even when allowlisted."""
+        _font_data, tt_font = self._load_policy_font(
+            tmp_path,
+            requested_name="TimesNewRomanPS-BoldMT",
+            postscript_name="TimesNewRomanPS-BoldMT",
+            family_name="Times New Roman",
+            style_name="Bold",
+            use_fallback=False,
+            fstype=0x0200,
+        )
+        try:
+            assert tt_font["name"].getDebugName(1).startswith("Liberation Serif")
+        finally:
+            tt_font.close()
+
+    def test_preview_and_print_system_font_logs_info(self, tmp_path, caplog):
+        """Preview & Print fonts stay usable and are logged as info only."""
+        caplog.set_level("INFO")
+        _font_data, tt_font = self._load_policy_font(
+            tmp_path,
+            requested_name="Calibri",
+            postscript_name="Calibri",
+            family_name="Calibri",
+            style_name="Regular",
+            use_fallback=True,
+            fstype=0x0004,
+        )
+        try:
+            assert tt_font["name"].getDebugName(6) == "Calibri"
+            assert any("Preview & Print" in record.message for record in caplog.records)
+            assert all(record.levelname != "WARNING" for record in caplog.records)
+        finally:
+            tt_font.close()
 
     def test_symbol_font_embedding(self):
         """Symbol font is successfully embedded."""

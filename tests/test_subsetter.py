@@ -1650,6 +1650,14 @@ class TestCheckSubsettingAllowed:
         assert _check_subsetting_allowed(b"not a font", "Test", result) is True
         assert result.warnings == []
 
+    def test_bitmap_only_blocks_subsetting(self):
+        """Bitmap-only embedding flags block outline subsetting too."""
+        font_data = _make_font_with_fstype(0x0200)
+        result = SubsettingResult()
+        assert _check_subsetting_allowed(font_data, "Test", result) is False
+        assert any("Bitmap embedding only" in w for w in result.warnings)
+        assert any("embedding not allowed" in s for s in result.fonts_skipped)
+
 
 class TestFontSubsetterFsType:
     """Integration tests for fsType checking in FontSubsetter."""
@@ -1728,6 +1736,33 @@ class TestFontSubsetterFsType:
         assert len(result.fonts_subsetted) == 0
         assert any("Restricted License" in w for w in result.warnings)
         assert any("embedding not allowed" in s for s in result.fonts_skipped)
+
+    def test_editable_embedding_is_info_only(self, caplog):
+        """Editable embedding should not surface as a subsetting warning."""
+        pdf = new_pdf()
+        font_data = _make_font_with_fstype(0x0008)
+
+        font_obj = _make_embedded_truetype_font(pdf, "EditableFont", font_data)
+        font_dict = Dictionary(F1=font_obj)
+
+        content = b"BT /F1 12 Tf (AB) Tj ET"
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(Font=font_dict),
+            Contents=pdf.make_stream(content),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+
+        caplog.set_level("INFO")
+        subsetter = FontSubsetter(pdf)
+        result = subsetter.subset_all_fonts()
+
+        assert len(result.fonts_subsetted) == 1
+        assert not any("Editable embedding allowed" in w for w in result.warnings)
+        assert any(
+            "Editable embedding allowed" in record.message for record in caplog.records
+        )
 
     def test_no_subsetting_cidfont_skipped(self):
         """CIDFont with no-subsetting fsType is skipped."""

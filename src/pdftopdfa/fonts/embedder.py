@@ -100,7 +100,7 @@ class FontProgramDeduplicationResult:
 class FontEmbedder:
     """Embeds missing fonts in a PDF.
 
-    Replaces Standard-14 fonts with metrically compatible Liberation fonts.
+    Replaces missing fonts with policy-approved system fonts or bundled replacements.
     """
 
     def __init__(self, pdf: pikepdf.Pdf) -> None:
@@ -766,10 +766,10 @@ class FontEmbedder:
         """
         try:
             # Load replacement font
-            if use_fallback:
-                font_data, tt_font = self._loader.load_fallback_font()
-            else:
-                font_data, tt_font = self._loader.load_standard14_font(font_name)
+            font_data, tt_font = self._loader.load_replacement_font(
+                font_name,
+                use_fallback=use_fallback,
+            )
 
             # Check if symbol font
             is_symbol = font_name in SYMBOL_FONTS

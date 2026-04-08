@@ -39,7 +39,7 @@ from .tounicode import (
     resolve_glyph_to_unicode,
 )
 from .traversal import iter_all_page_fonts
-from .utils import check_fstype_restrictions, get_fstype
+from .utils import check_fstype_restrictions, get_fstype, is_permitted_fstype_notice
 from .utils import safe_str as _safe_str
 
 logger = logging.getLogger(__name__)
@@ -473,8 +473,11 @@ def _check_subsetting_allowed(
 
     for warning in warnings:
         msg = f"Font '{font_name}': {warning}"
-        result.warnings.append(msg)
-        logger.warning(msg)
+        if is_permitted_fstype_notice(warning):
+            logger.info(msg)
+        else:
+            result.warnings.append(msg)
+            logger.warning(msg)
 
     if not embedding_allowed:
         result.fonts_skipped.append(f"{font_name} (fsType: embedding not allowed)")
