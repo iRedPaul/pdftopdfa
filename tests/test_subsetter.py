@@ -1772,6 +1772,7 @@ class TestResolveSimpleFontEncoding:
         assert result is not None
         assert result[65] == "A"
         assert result[32] == "space"
+        assert result[178] == "twosuperior"
 
     def test_standard_encoding(self):
         """StandardEncoding produces correct glyph name mapping."""

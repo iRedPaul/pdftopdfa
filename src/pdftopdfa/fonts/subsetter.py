@@ -44,6 +44,29 @@ from .utils import safe_str as _safe_str
 
 logger = logging.getLogger(__name__)
 
+_UNICODE_GLYPH_NAME_FALLBACKS: dict[int, str] = {
+    0x00A0: "nbspace",
+    0x00AD: "sfthyphen",
+    0x00A6: "brokenbar",
+    0x00AC: "logicalnot",
+    0x00AE: "registered",
+    0x00AF: "macron",
+    0x00B0: "degree",
+    0x00B1: "plusminus",
+    0x00B2: "twosuperior",
+    0x00B3: "threesuperior",
+    0x00B4: "acute",
+    0x00B5: "mu",
+    0x00B6: "paragraph",
+    0x00B7: "periodcentered",
+    0x00B8: "cedilla",
+    0x00B9: "onesuperior",
+    0x00BA: "ordmasculine",
+    0x00BC: "onequarter",
+    0x00BD: "onehalf",
+    0x00BE: "threequarters",
+}
+
 
 def _generate_subset_prefix() -> str:
     """Generates a random 6-letter uppercase subset prefix.
@@ -598,6 +621,13 @@ def _get_uv2agl() -> dict[int, str]:
     for name, uv in AGL2UV.items():
         if uv not in uv2agl:
             uv2agl[uv] = name
+
+    # fontTools' reverse AGL table omits some WinAnsi glyph names
+    # (for example twosuperior / onesuperior / nbsp variants). Fill only the
+    # missing Unicode values with explicit Adobe glyph-name fallbacks.
+    for uv, glyph_name in _UNICODE_GLYPH_NAME_FALLBACKS.items():
+        if uv not in uv2agl:
+            uv2agl[uv] = glyph_name
     return uv2agl
 
 
