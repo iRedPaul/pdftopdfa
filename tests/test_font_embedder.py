@@ -26,6 +26,7 @@ from pdftopdfa.fonts import (
 from pdftopdfa.fonts.analysis import is_font_embedded
 from pdftopdfa.fonts.embedder import _UTF16_ENCODING_NAMES, _is_utf16_encoding
 from pdftopdfa.fonts.loader import FontLoader
+from pdftopdfa.fonts.tounicode import generate_tounicode_cmap_data, parse_tounicode_cmap
 from pdftopdfa.utils import resolve_indirect as _resolve_indirect
 
 
@@ -730,6 +731,92 @@ class TestFontEmbedderIntegration:
         assert font.get("/BaseFont") == Name("/Helvetica")
         assert font_descriptor.get("/FontName") == Name("/Helvetica")
         assert is_font_embedded(font)
+
+    @pytest.mark.skipif(
+        not _liberation_fonts_available(),
+        reason="Liberation fonts not installed",
+    )
+    def test_replace_subsetted_standard14_font_preserves_custom_code_mapping(
+        self,
+        pdf_with_helvetica,
+    ):
+        """Refresh keeps existing visible text mapping for subset fonts."""
+        embedder = FontEmbedder(pdf_with_helvetica)
+        result = embedder.embed_missing_fonts()
+        assert "Helvetica" in result.fonts_embedded
+
+        font = _resolve_indirect(pdf_with_helvetica.pages[0].Resources["/Font"]["/F1"])
+        font[Name.BaseFont] = Name("/ABCDEF+Helvetica")
+        font_descriptor = _resolve_indirect(font["/FontDescriptor"])
+        font_descriptor[Name.FontName] = Name("/ABCDEF+Helvetica")
+        if font.get("/Encoding") is not None:
+            del font[Name.Encoding]
+
+        custom_mapping = {
+            32: ord("5"),
+            33: ord("8"),
+            34: ord("4"),
+            42: ord("T"),
+            43: ord("e"),
+            44: ord("c"),
+            45: ord("h"),
+        }
+        font[Name.ToUnicode] = pdf_with_helvetica.make_indirect(
+            pikepdf.Stream(
+                pdf_with_helvetica,
+                generate_tounicode_cmap_data(custom_mapping),
+            )
+        )
+
+        refreshed = FontEmbedder(
+            pdf_with_helvetica
+        ).replace_subsetted_standard14_fonts()
+        font_descriptor = _resolve_indirect(font["/FontDescriptor"])
+
+        assert "Helvetica" in refreshed.fonts_embedded
+        assert font.get("/BaseFont") == Name("/Helvetica")
+        assert font_descriptor.get("/FontName") == Name("/Helvetica")
+        encoding = _resolve_indirect(font["/Encoding"])
+        assert isinstance(encoding, Dictionary)
+        assert encoding.get("/BaseEncoding") == Name.WinAnsiEncoding
+        differences = list(encoding["/Differences"])
+        assert differences[:8] == [
+            32,
+            Name("/five"),
+            Name("/eight"),
+            Name("/four"),
+            42,
+            Name("/T"),
+            Name("/e"),
+            Name("/c"),
+        ]
+        parsed_mapping = parse_tounicode_cmap(bytes(font["/ToUnicode"].read_bytes()))
+        assert parsed_mapping == custom_mapping
+
+    @pytest.mark.skipif(
+        not _liberation_fonts_available(),
+        reason="Liberation fonts not installed",
+    )
+    def test_collect_subsetted_standard14_font_ids_skips_symbolic_subset_fonts(
+        self,
+        pdf_with_helvetica,
+    ):
+        """Symbolic subsetted Standard-14 fonts are excluded from refresh."""
+        embedder = FontEmbedder(pdf_with_helvetica)
+        result = embedder.embed_missing_fonts()
+        assert "Helvetica" in result.fonts_embedded
+
+        font = _resolve_indirect(pdf_with_helvetica.pages[0].Resources["/Font"]["/F1"])
+        font[Name.BaseFont] = Name("/ABCDEF+Helvetica")
+        font_descriptor = _resolve_indirect(font["/FontDescriptor"])
+        font_descriptor[Name.FontName] = Name("/ABCDEF+Helvetica")
+        font_descriptor[Name.Flags] = 4
+
+        collected = FontEmbedder(
+            pdf_with_helvetica
+        ).collect_subsetted_standard14_font_ids()
+
+        assert font.objgen not in collected
 
 
 class TestCIDFontEmbedding:

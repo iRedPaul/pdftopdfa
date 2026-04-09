@@ -366,6 +366,28 @@ def _strip_invalid_hex_chars(stream_data: bytes) -> tuple[bytes, int]:
     return re.sub(rb"(?<!<)<([^<>]*)>(?!>)", _fix, stream_data), count
 
 
+def _operands_contain_parse_placeholders(operand: Any) -> bool:
+    """Return True when qpdf left placeholder values in parsed operands."""
+    if operand is None:
+        return True
+    if isinstance(operand, Array):
+        return any(_operands_contain_parse_placeholders(item) for item in operand)
+    return False
+
+
+def _instructions_need_hex_repair(instructions: list[Any]) -> bool:
+    """Detect when parsed content still contains invalid hex placeholders."""
+    for instruction in instructions:
+        if isinstance(instruction, pikepdf.ContentStreamInlineImage):
+            continue
+        if any(
+            _operands_contain_parse_placeholders(operand)
+            for operand in instruction.operands
+        ):
+            return True
+    return False
+
+
 def _sanitize_content_stream(stream_obj: Stream, stats: dict[str, int]) -> None:
     """Sanitize one parsed content stream."""
     try:
@@ -374,16 +396,6 @@ def _sanitize_content_stream(stream_obj: Stream, stats: dict[str, int]) -> None:
         logger.debug("Skipping unreadable content stream %s: %s", stream_obj.objgen, e)
         return
 
-    # Strip non-hex chars before counting or parsing (rule 6.1.6-2).
-    raw, invalid_hex = _strip_invalid_hex_chars(raw)
-    if invalid_hex > 0:
-        stats["hex_invalid_fixed"] += invalid_hex
-        stream_obj.write(raw)  # update stream so pikepdf parser sees clean bytes
-
-    odd_hex = _count_odd_hex_string_tokens(raw)
-    if odd_hex > 0:
-        stats["hex_odd_fixed"] += odd_hex
-
     try:
         with warnings.catch_warnings():
             warnings.filterwarnings(
@@ -391,7 +403,27 @@ def _sanitize_content_stream(stream_obj: Stream, stats: dict[str, int]) -> None:
             )
             instructions = list(pikepdf.parse_content_stream(stream_obj))
     except Exception:
-        return
+        instructions = []
+
+    invalid_hex = 0
+    if not instructions or _instructions_need_hex_repair(instructions):
+        repaired_raw, invalid_hex = _strip_invalid_hex_chars(raw)
+        if invalid_hex > 0:
+            stats["hex_invalid_fixed"] += invalid_hex
+            stream_obj.write(repaired_raw)
+            raw = repaired_raw
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", message="Unexpected end of stream", category=UserWarning
+                )
+                instructions = list(pikepdf.parse_content_stream(stream_obj))
+        except Exception:
+            return
+
+    odd_hex = _count_odd_hex_string_tokens(raw)
+    if odd_hex > 0:
+        stats["hex_odd_fixed"] += odd_hex
 
     depth = 0
     suppressed_q = 0

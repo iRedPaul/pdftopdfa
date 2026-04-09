@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import pikepdf
+from fontTools.agl import UV2AGL
 from pikepdf import Array, Dictionary, Name, Stream
 
 from ..exceptions import FontEmbeddingError
@@ -44,6 +45,7 @@ from .tounicode import (
     generate_tounicode_for_winansi,
     generate_tounicode_from_encoding_dict,
     parse_cidtogidmap_stream,
+    parse_tounicode_cmap,
     resolve_glyph_to_unicode,
     resolve_symbol_glyph_to_unicode,
 )
@@ -389,6 +391,9 @@ class FontEmbedder:
                     if resolve_standard14_alias(base_name) not in FONT_REPLACEMENTS:
                         continue
 
+                    if is_symbolic_font(font_obj):
+                        continue
+
                     font_type = get_font_type(font_obj)
                     if font_type not in {"TrueType", "Type1", "MMType1"}:
                         continue
@@ -443,6 +448,14 @@ class FontEmbedder:
                     if resolve_standard14_alias(base_name) not in FONT_REPLACEMENTS:
                         continue
 
+                    if is_symbolic_font(font_obj):
+                        logger.info(
+                            "Skipping refresh for symbolic subsetted "
+                            "Standard-14 font '%s'",
+                            font_name,
+                        )
+                        continue
+
                     font_type = get_font_type(font_obj)
                     if font_type not in {"TrueType", "Type1", "MMType1"}:
                         continue
@@ -452,6 +465,7 @@ class FontEmbedder:
                         font_key,
                         font_obj,
                         base_name,
+                        preserve_existing_encoding=True,
                     )
                     if not success:
                         if base_name not in result.fonts_failed:
@@ -548,13 +562,19 @@ class FontEmbedder:
             return (key, _resolve_indirect(stream))
         return None
 
-    def _build_encoding_dictionary(self, encoding: dict[int, str]) -> Dictionary:
+    def _build_encoding_dictionary(
+        self,
+        encoding: dict[int, str],
+        *,
+        base_encoding: Name | None = None,
+    ) -> Dictionary:
         """Creates PDF Encoding with Differences array.
 
         For Symbol/ZapfDingbats fonts that don't use WinAnsiEncoding.
 
         Args:
             encoding: Dictionary with code -> glyph name mapping.
+            base_encoding: Optional BaseEncoding name to include.
 
         Returns:
             pikepdf Dictionary with Type=Encoding and Differences array.
@@ -569,7 +589,10 @@ class FontEmbedder:
             differences.append(Name(f"/{encoding[code]}"))
             prev = code
 
-        return Dictionary(Type=Name.Encoding, Differences=Array(differences))
+        encoding_dict = Dictionary(Type=Name.Encoding, Differences=Array(differences))
+        if differences and base_encoding is not None:
+            encoding_dict[Name("/BaseEncoding")] = base_encoding
+        return encoding_dict
 
     def _create_font_stream(self, font_data: bytes) -> Stream:
         """Creates a FontFile2 stream for TrueType fonts.
@@ -750,6 +773,7 @@ class FontEmbedder:
         font_name: str,
         *,
         use_fallback: bool = False,
+        preserve_existing_encoding: bool = False,
     ) -> bool:
         """Replaces a non-embedded font with an embedded one.
 
@@ -780,20 +804,35 @@ class FontEmbedder:
                 logger.error("Font '%s' missing head/OS2 tables", font_name)
                 return False
 
+            encoding_name: Name | None = None
+            encoding_dict: Dictionary | None = None
+
+            preserved_encoding = None
+            if preserve_existing_encoding and not is_symbol:
+                preserved_encoding = self._build_preserved_simple_font_encoding(
+                    font_obj,
+                    tt_font,
+                )
+
             # Encoding-specific width extraction and encoding object
-            if font_name == "Symbol":
+            if preserved_encoding is not None:
+                widths, encoding_dict, to_unicode_data = preserved_encoding
+            elif font_name == "Symbol":
                 widths = self._metrics.extract_widths_for_encoding(
                     tt_font, SYMBOL_ENCODING, SYMBOL_GLYPH_TO_UNICODE
                 )
-                encoding = self._build_encoding_dictionary(SYMBOL_ENCODING)
+                encoding_dict = self._build_encoding_dictionary(SYMBOL_ENCODING)
+                to_unicode_data = self._generate_to_unicode_for_simple_font(font_name)
             elif font_name == "ZapfDingbats":
                 widths = self._metrics.extract_widths_for_encoding(
                     tt_font, ZAPFDINGBATS_ENCODING, ZAPFDINGBATS_GLYPH_TO_UNICODE
                 )
-                encoding = self._build_encoding_dictionary(ZAPFDINGBATS_ENCODING)
+                encoding_dict = self._build_encoding_dictionary(ZAPFDINGBATS_ENCODING)
+                to_unicode_data = self._generate_to_unicode_for_simple_font(font_name)
             else:
                 widths = self._metrics.extract_widths(tt_font)
-                encoding = None  # WinAnsiEncoding as Name
+                encoding_name = Name.WinAnsiEncoding
+                to_unicode_data = self._generate_to_unicode_for_simple_font(font_name)
 
             # Create font stream and descriptor
             font_stream = self._create_font_stream(font_data)
@@ -809,15 +848,14 @@ class FontEmbedder:
             font_obj[Name.Widths] = Array(widths)
 
             # Set encoding
-            if encoding is not None:
-                # Symbol font: Encoding dictionary with Differences
-                font_obj[Name.Encoding] = self.pdf.make_indirect(encoding)
+            if encoding_dict is not None:
+                font_obj[Name.Encoding] = self.pdf.make_indirect(encoding_dict)
+            elif encoding_name is not None:
+                font_obj[Name.Encoding] = encoding_name
             else:
-                # Standard font: WinAnsiEncoding
-                font_obj[Name.Encoding] = Name.WinAnsiEncoding
+                font_obj.pop(Name.Encoding, None)
 
             # Generate and attach ToUnicode CMap for text extraction
-            to_unicode_data = self._generate_to_unicode_for_simple_font(font_name)
             to_unicode_stream = Stream(self.pdf, to_unicode_data)
             font_obj[Name.ToUnicode] = self.pdf.make_indirect(to_unicode_stream)
 
@@ -833,6 +871,113 @@ class FontEmbedder:
                 e,
             )
             return False
+
+    def _build_preserved_simple_font_encoding(
+        self,
+        font_obj: pikepdf.Object,
+        tt_font: "TTFont",
+    ) -> tuple[list[int], Dictionary, bytes] | None:
+        """Preserve a simple font's visible code mapping during refresh.
+
+        Embedded subset fonts sometimes use a custom byte-to-glyph layout
+        together with a ToUnicode CMap. Refreshing the font program must keep
+        those byte codes mapped to the same Unicode text, otherwise rendered
+        output changes even if the replacement font is metrically compatible.
+        """
+        code_to_unicode = self._get_existing_simple_font_mapping(font_obj)
+        if not code_to_unicode:
+            return None
+
+        code_to_glyph_name = self._build_glyph_names_from_unicode_map(code_to_unicode)
+        if not code_to_glyph_name:
+            return None
+
+        widths = self._build_widths_from_unicode_map(tt_font, code_to_unicode)
+        if widths is None:
+            return None
+
+        encoding = self._build_encoding_dictionary(
+            code_to_glyph_name,
+            base_encoding=Name.WinAnsiEncoding,
+        )
+        to_unicode_data = generate_tounicode_cmap_data(code_to_unicode)
+        return widths, encoding, to_unicode_data
+
+    def _get_existing_simple_font_mapping(
+        self,
+        font_obj: pikepdf.Object,
+    ) -> dict[int, int]:
+        """Return the current simple font's code-to-Unicode mapping."""
+        tounicode = font_obj.get("/ToUnicode")
+        if tounicode is not None:
+            try:
+                tounicode = _resolve_indirect(tounicode)
+                mapping = parse_tounicode_cmap(bytes(tounicode.read_bytes()))
+                if mapping:
+                    return {
+                        code: unicode_val
+                        for code, unicode_val in mapping.items()
+                        if 0 <= code <= 255
+                    }
+            except Exception:
+                logger.debug("Could not parse existing ToUnicode for font refresh")
+
+        encoding = font_obj.get("/Encoding")
+        if encoding is None:
+            return {}
+
+        if isinstance(encoding, pikepdf.Name):
+            enc_name = _safe_str(encoding)
+            if enc_name == "/WinAnsiEncoding":
+                return generate_tounicode_for_winansi()
+            if enc_name == "/MacRomanEncoding":
+                return generate_tounicode_for_macroman()
+            if enc_name == "/StandardEncoding":
+                return generate_tounicode_for_standard_encoding()
+            return {}
+
+        try:
+            return generate_tounicode_from_encoding_dict(encoding)
+        except Exception:
+            logger.debug("Could not derive encoding mapping for font refresh")
+            return {}
+
+    @staticmethod
+    def _build_glyph_names_from_unicode_map(
+        code_to_unicode: dict[int, int],
+    ) -> dict[int, str]:
+        """Build a Differences map from Unicode values using AGL names."""
+        code_to_glyph_name: dict[int, str] = {}
+        for code, unicode_val in code_to_unicode.items():
+            glyph_name = UV2AGL.get(unicode_val)
+            if glyph_name is None:
+                if 0 <= unicode_val <= 0xFFFF:
+                    glyph_name = f"uni{unicode_val:04X}"
+                elif unicode_val <= 0x10FFFF:
+                    glyph_name = f"u{unicode_val:05X}"
+                else:
+                    continue
+            code_to_glyph_name[code] = glyph_name
+        return code_to_glyph_name
+
+    def _build_widths_from_unicode_map(
+        self,
+        tt_font: "TTFont",
+        code_to_unicode: dict[int, int],
+    ) -> list[int] | None:
+        """Build a 256-entry width array for a preserved code mapping."""
+        width_map = self._metrics.compute_widths_for_encoding(tt_font, code_to_unicode)
+        if not width_map:
+            return None
+
+        head = tt_font["head"]
+        hmtx = tt_font["hmtx"]
+        units_per_em = head.unitsPerEm
+        scale = 1000.0 / units_per_em
+        notdef_width = hmtx.metrics.get(".notdef", (500, 0))[0]
+        fallback_width = round(notdef_width * scale)
+
+        return [width_map.get(code, fallback_width) for code in range(256)]
 
     def fix_font_encodings(self) -> int:
         """Fixes encoding issues on embedded simple fonts for PDF/A rule 6.2.11.6.
