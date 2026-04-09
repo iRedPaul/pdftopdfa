@@ -1,10 +1,19 @@
 # Changelog
 
-## [0.2.24] - 2026-04-07
+## [0.3.0] - 2026-04-09
+
+### Changes
+
+- Enforce a Windows system font allowlist and `fsType` embedding policy
 
 ### Bug Fixes
 
 - Fix Type3 font width scaling for nonstandard `FontMatrix`
+- Preserve WinAnsi superscript glyphs during `.notdef` handling
+
+### Documentation
+
+- Document the Windows font sourcing and embedding policy in the README and usage guide
 
 ## [0.2.23] - 2026-04-07
 
