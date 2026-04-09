@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.4] - 2026-04-09
+
+### Bug Fixes
+
+- Preserve original document metadata after OCR conversion
+
 ## [0.3.3] - 2026-04-09
 
 ### Bug Fixes
