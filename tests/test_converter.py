@@ -314,6 +314,47 @@ class TestConvertToPdfa:
         )
         assert has_ocr_done_warning
 
+    @patch("pdftopdfa.converter.sync_metadata")
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_convert_passes_original_metadata_snapshot_to_sync_after_ocr(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        mock_sync_metadata: MagicMock,
+        pdf_with_metadata: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """OCR runs still hand original metadata to sync_metadata."""
+        mock_is_ocr_available.return_value = True
+
+        def create_ocr_output(
+            input_path: Path, output_path: Path, langs: list[str], **kwargs: object
+        ) -> Path:
+            import shutil
+
+            shutil.copy(input_path, output_path)
+            return output_path
+
+        mock_apply_ocr.side_effect = create_ocr_output
+
+        output_path = tmp_dir / "output.pdf"
+
+        result = convert_to_pdfa(
+            pdf_with_metadata,
+            output_path,
+            level="2b",
+            ocr_languages=["eng"],
+        )
+
+        assert result.success is True
+        mock_sync_metadata.assert_called_once()
+
+        call_kwargs = mock_sync_metadata.call_args.kwargs
+        assert call_kwargs["source_info"]["creator"] == "Test Creator"
+        assert call_kwargs["source_info"]["producer"] == "Test Producer"
+        assert call_kwargs["source_xmp_tree"] is not None
+
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_runs_ocr_even_for_text_pdf(

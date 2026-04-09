@@ -4,6 +4,7 @@
 
 """Unit tests for metadata.py."""
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -526,6 +527,76 @@ class TestSyncMetadata:
 
             # Check if title was transferred
             assert b"Test Title" in xmp_bytes
+
+    def test_sync_prefers_original_creator_and_producer_snapshot(
+        self, pdf_with_metadata: Path
+    ) -> None:
+        """Original Creator/Producer win over OCR-rewritten DocInfo values."""
+        with Pdf.open(pdf_with_metadata) as original_pdf:
+            source_info = extract_pdf_info(original_pdf)
+            source_xmp_tree = _extract_existing_xmp(original_pdf)
+
+        with Pdf.open(pdf_with_metadata) as pdf:
+            pdf.docinfo["/Creator"] = (
+                "OCRmyPDF 17.3.0 / OCRmyPDF fpdf2 + Tesseract OCR 5.5.0.20241111"
+            )
+            pdf.docinfo["/Producer"] = "pikepdf 10.3.0"
+
+            sync_metadata(
+                pdf,
+                "2b",
+                source_info=source_info,
+                source_xmp_tree=source_xmp_tree,
+            )
+
+            assert str(pdf.docinfo["/Creator"]) == "Test Creator"
+            assert str(pdf.docinfo["/Producer"]) == "Test Producer"
+
+            xmp_bytes = bytes(pdf.Root.Metadata.read_bytes())
+            assert b"Test Creator" in xmp_bytes
+            assert b"Test Producer" in xmp_bytes
+            assert b"OCRmyPDF" not in xmp_bytes
+            assert b"pikepdf 10.3.0" not in xmp_bytes
+
+    def test_sync_logs_effective_snapshot_instead_of_ocr_values(
+        self, pdf_with_metadata: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Debug logs should describe restored source metadata, not OCR rewrites."""
+        with Pdf.open(pdf_with_metadata) as original_pdf:
+            source_info = extract_pdf_info(original_pdf)
+            source_xmp_tree = _extract_existing_xmp(original_pdf)
+
+        caplog.clear()
+
+        with Pdf.open(pdf_with_metadata) as pdf:
+            pdf.docinfo["/Creator"] = (
+                "OCRmyPDF 17.3.0 / OCRmyPDF fpdf2 + Tesseract OCR 5.5.0.20241111"
+            )
+            pdf.docinfo["/Producer"] = "pikepdf 10.3.0"
+
+            with caplog.at_level(logging.DEBUG, logger="pdftopdfa.metadata"):
+                sync_metadata(
+                    pdf,
+                    "2b",
+                    source_info=source_info,
+                    source_xmp_tree=source_xmp_tree,
+                )
+
+        assert any(
+            "Restoring original metadata snapshot for: creator, producer"
+            in record.message
+            for record in caplog.records
+        )
+        assert any(
+            "Effective metadata after applying source snapshot:" in record.message
+            and "Test Creator" in record.message
+            and "Test Producer" in record.message
+            for record in caplog.records
+        )
+        assert not any(
+            "Extracted metadata:" in record.message and "OCRmyPDF" in record.message
+            for record in caplog.records
+        )
 
     def test_sync_normalizes_trapped_in_docinfo(self, sample_pdf_bytes: bytes) -> None:
         """Normalizes /Trapped in DocInfo without writing pdf:Trapped to XMP."""

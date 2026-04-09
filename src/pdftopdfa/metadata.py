@@ -7,6 +7,7 @@
 import copy
 import logging
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
@@ -2289,12 +2290,13 @@ def _format_iso_date(dt: datetime | None) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 
-def extract_pdf_info(pdf: pikepdf.Pdf) -> dict[str, Any]:
+def extract_pdf_info(pdf: pikepdf.Pdf, *, log_result: bool = True) -> dict[str, Any]:
     """
     Extract metadata from PDF Info dictionary.
 
     Args:
         pdf: pikepdf Pdf object.
+        log_result: Whether to emit a debug log with the extracted metadata.
 
     Returns:
         Dictionary with normalized metadata keys:
@@ -2351,7 +2353,8 @@ def extract_pdf_info(pdf: pikepdf.Pdf) -> dict[str, Any]:
         except Exception as e:
             logger.debug("Error reading %s: %s", pdf_key, e)
 
-    logger.debug("Extracted metadata: %s", info)
+    if log_result:
+        logger.debug("Extracted metadata: %s", info)
     return info
 
 
@@ -2901,7 +2904,13 @@ def _sanitize_non_catalog_metadata(pdf: pikepdf.Pdf) -> tuple[int, int]:
     return sanitized, removed
 
 
-def sync_metadata(pdf: pikepdf.Pdf, pdfa_level: str) -> None:
+def sync_metadata(
+    pdf: pikepdf.Pdf,
+    pdfa_level: str,
+    *,
+    source_info: Mapping[str, Any] | None = None,
+    source_xmp_tree: etree._Element | None = None,
+) -> None:
     """
     Synchronize PDF metadata and embed XMP for PDF/A compliance.
 
@@ -2911,6 +2920,12 @@ def sync_metadata(pdf: pikepdf.Pdf, pdfa_level: str) -> None:
     Args:
         pdf: pikepdf Pdf object to modify.
         pdfa_level: PDF/A level string (e.g., '2b', '3b').
+        source_info: Optional metadata snapshot captured from the original
+            input PDF before intermediate processing (for example OCR) may
+            rewrite DocInfo values like /Creator or /Producer.
+        source_xmp_tree: Optional parsed XMP tree captured from the original
+            input PDF. When provided, preserved non-managed XMP properties are
+            taken from this tree instead of the current in-memory PDF.
 
     Raises:
         ConversionError: If level is invalid or metadata sync fails.
@@ -2926,11 +2941,29 @@ def sync_metadata(pdf: pikepdf.Pdf, pdfa_level: str) -> None:
     # Capture current time once for consistency between XMP and DocInfo
     now = datetime.now(UTC)
 
-    # Extract existing metadata
-    info = extract_pdf_info(pdf)
+    # Extract existing metadata. Prefer a caller-provided snapshot from the
+    # original input so OCR/temp saves do not overwrite user-authored values.
+    info = extract_pdf_info(pdf, log_result=source_info is None)
+    if source_info is not None:
+        restored_fields: list[str] = []
+        for key, value in source_info.items():
+            if value is not None:
+                if info.get(key) != value:
+                    restored_fields.append(key)
+                info[key] = value
+        if restored_fields:
+            logger.debug(
+                "Restoring original metadata snapshot for: %s",
+                ", ".join(sorted(restored_fields)),
+            )
+        logger.debug("Effective metadata after applying source snapshot: %s", info)
 
     # Extract existing XMP tree for preservation of non-managed properties
-    existing_xmp_tree = _extract_existing_xmp(pdf)
+    existing_xmp_tree = (
+        copy.deepcopy(source_xmp_tree)
+        if source_xmp_tree is not None
+        else _extract_existing_xmp(pdf)
+    )
 
     # Scan non-catalog XMP streams for properties that need extension
     # schema declarations in the catalog XMP (veraPDF rule 6.6.2.3.1).
@@ -2978,12 +3011,21 @@ def sync_metadata(pdf: pikepdf.Pdf, pdfa_level: str) -> None:
         except Exception as e:
             logger.warning("Error removing non-standard DocInfo keys: %s", e)
 
-        # Keep Producer and Creator in DocInfo (synchronized with XMP)
-        # Only log if present for debugging
-        if "/Producer" in docinfo:
-            logger.debug("Keeping DocInfo Producer: %s", docinfo.get("/Producer"))
-        if "/Creator" in docinfo:
-            logger.debug("Keeping DocInfo Creator: %s", docinfo.get("/Creator"))
+        # Synchronize Producer/Creator with the metadata we decided to keep.
+        try:
+            if info.get("producer") is not None:
+                docinfo["/Producer"] = info["producer"]
+                logger.debug("Synchronized DocInfo Producer: %s", info["producer"])
+            elif "/Producer" in docinfo:
+                logger.debug("Using DocInfo Producer: %s", docinfo.get("/Producer"))
+
+            if info.get("creator") is not None:
+                docinfo["/Creator"] = info["creator"]
+                logger.debug("Synchronized DocInfo Creator: %s", info["creator"])
+            elif "/Creator" in docinfo:
+                logger.debug("Using DocInfo Creator: %s", docinfo.get("/Creator"))
+        except Exception as e:
+            logger.warning("Error synchronizing Creator/Producer in DocInfo: %s", e)
 
         # Synchronize /Trapped with XMP pdf:Trapped
         try:

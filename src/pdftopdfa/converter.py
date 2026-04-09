@@ -31,7 +31,7 @@ from .exceptions import (
 )
 from .extensions import add_extensions_if_needed
 from .fonts import check_font_compliance
-from .metadata import sync_metadata
+from .metadata import _extract_existing_xmp, extract_pdf_info, sync_metadata
 from .sanitizers import (
     sanitize_for_pdfa,
     sanitize_notdef_usage,
@@ -646,6 +646,8 @@ def convert_to_pdfa(
     ocr_temp_file: Path | None = None
     ocr_signature_temp_file: Path | None = None
     pdf: pikepdf.Pdf | None = None
+    source_info: dict | None = None
+    source_xmp_tree = None
 
     logger.info(
         "Starting conversion: %s -> %s (PDF/A-%s)",
@@ -671,6 +673,8 @@ def convert_to_pdfa(
                     processing_time=processing_time,
                     skipped=True,
                 )
+            source_info = extract_pdf_info(check_pdf)
+            source_xmp_tree = _extract_existing_xmp(check_pdf)
             detected_level = detect_pdfa_level(check_pdf)
 
         if detected_level is not None:
@@ -965,7 +969,12 @@ def convert_to_pdfa(
 
         # 5. Synchronize metadata
         logger.debug("Synchronizing XMP metadata")
-        sync_metadata(pdf, level)
+        sync_metadata(
+            pdf,
+            level,
+            source_info=source_info,
+            source_xmp_tree=source_xmp_tree,
+        )
 
         # 5.5. Add Extensions dictionary for PDF/A-3
         add_extensions_if_needed(pdf, level)
