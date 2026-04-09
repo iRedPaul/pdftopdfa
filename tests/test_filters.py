@@ -823,3 +823,37 @@ class TestMalformedUtf8Names:
         assert remove_crypt_streams(pdf) == 0
         assert sanitize_nonstandard_inline_filters(pdf) == 0
         assert "Error processing object" not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("func_name", "patch_target"),
+        [
+            ("convert_lzw_streams", "_normalize_stream_filter_names"),
+            ("remove_crypt_streams", "_normalize_stream_filter_names"),
+            ("remove_external_stream_keys", "_has_external_stream_keys"),
+            ("sanitize_nonstandard_inline_filters", "_may_contain_inline_images"),
+        ],
+    )
+    def test_filter_sanitizers_suppress_unicode_decode_logs(
+        self,
+        pdf: Pdf,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+        func_name: str,
+        patch_target: str,
+    ) -> None:
+        stream = pdf.make_indirect(Stream(pdf, b"hello"))
+        page = pdf.pages[0]
+        page[Name("/Contents")] = stream
+
+        def _raise_unicode_error(*_args, **_kwargs):
+            raise UnicodeDecodeError("utf-8", b"\xba", 0, 1, "invalid start byte")
+
+        monkeypatch.setattr(
+            f"pdftopdfa.sanitizers.filters.{patch_target}",
+            _raise_unicode_error,
+        )
+        caplog.set_level("DEBUG", logger="pdftopdfa.sanitizers.filters")
+
+        func = globals()[func_name]
+        assert func(pdf) == 0
+        assert "Error processing object" not in caplog.text

@@ -556,6 +556,12 @@ def convert_lzw_streams(pdf: Pdf) -> int:
                         obj.objgen,
                     )
 
+        except UnicodeDecodeError:
+            # Malformed PDF names can trigger UTF-8 decoding failures inside
+            # pikepdf while inspecting stream dictionaries. Skip the object
+            # here; later structural sanitizers handle name repair where
+            # possible, and this should not surface as a generic error log.
+            continue
         except Exception as e:
             logger.debug("Error processing object: %s", e)
 
@@ -685,6 +691,8 @@ def remove_crypt_streams(pdf: Pdf) -> int:
                         obj.objgen,
                     )
 
+        except UnicodeDecodeError:
+            continue
         except Exception as e:
             logger.debug("Error processing object: %s", e)
 
@@ -771,6 +779,8 @@ def remove_external_stream_keys(pdf: Pdf) -> int:
                 obj.objgen,
             )
 
+        except UnicodeDecodeError:
+            continue
         except Exception as e:
             logger.debug("Error processing object: %s", e)
 
@@ -813,6 +823,8 @@ def sanitize_nonstandard_inline_filters(pdf: Pdf) -> int:
                     "Re-encoded non-standard inline-image filter(s) in stream: %s",
                     obj.objgen,
                 )
+        except UnicodeDecodeError:
+            continue
         except Exception as e:
             logger.debug("Error processing object: %s", e)
 
