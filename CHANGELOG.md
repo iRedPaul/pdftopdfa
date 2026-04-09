@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.3] - 2026-04-09
+
+### Bug Fixes
+
+- Suppress malformed UTF-8 name decode logs during filter sanitization
+
 ## [0.3.2] - 2026-04-09
 
 ### Bug Fixes
