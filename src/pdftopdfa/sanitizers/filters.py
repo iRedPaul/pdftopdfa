@@ -57,6 +57,17 @@ _INLINE_IMAGE_ALLOWED_FILTER_NAMES: frozenset[str] = frozenset(
 )
 
 
+def _safe_name_to_string(value) -> str | None:
+    """Return a PDF Name as text, or None if it contains invalid UTF-8."""
+    if not isinstance(value, Name):
+        return None
+
+    try:
+        return str(value)
+    except UnicodeDecodeError:
+        return None
+
+
 def _normalize_inline_filter_name(filter_name: str) -> str:
     """Normalize filter names to canonical PDF names."""
     return _CANONICAL_FILTER_NAMES_BY_LOWER.get(
@@ -72,8 +83,10 @@ def _normalize_inline_filter_object(
     filter_obj = _resolve_indirect(filter_obj)
 
     if isinstance(filter_obj, Name):
-        original_name = str(filter_obj)
-        normalized_name = _normalize_inline_filter_name(str(filter_obj))
+        original_name = _safe_name_to_string(filter_obj)
+        if original_name is None:
+            return None
+        normalized_name = _normalize_inline_filter_name(original_name)
         return (
             [normalized_name],
             Name(normalized_name),
@@ -87,7 +100,9 @@ def _normalize_inline_filter_object(
             entry = _resolve_indirect(entry)
             if not isinstance(entry, Name):
                 return None
-            original_name = str(entry)
+            original_name = _safe_name_to_string(entry)
+            if original_name is None:
+                return None
             original_names.append(original_name)
             normalized_names.append(_normalize_inline_filter_name(original_name))
         return (
@@ -149,7 +164,7 @@ def _replace_inline_filter_tokens(
         value = tokens[i + 1]
         i += 2
 
-        key_name = str(key) if isinstance(key, Name) else None
+        key_name = _safe_name_to_string(key)
         if key_name in _INLINE_FILTER_KEYS or key_name in _INLINE_DECODE_PARMS_KEYS:
             continue
 
@@ -411,7 +426,7 @@ def _may_contain_inline_images(stream: Stream) -> bool:
     """
     subtype = stream.get("/Subtype")
     if subtype is not None:
-        return str(subtype) == "/Form"
+        return _safe_name_to_string(subtype) == "/Form"
     # No /Subtype — could be a page content stream.
     # Skip if /Type is present (e.g. /Metadata, /XRef).
     if stream.get("/Type") is not None:
@@ -442,15 +457,21 @@ def _has_lzw_filter(stream: Stream) -> bool:
 
         # Single filter case
         if isinstance(filter_obj, Name):
-            return _normalize_inline_filter_name(str(filter_obj)) == "/LZWDecode"
+            filter_name = _safe_name_to_string(filter_obj)
+            if filter_name is None:
+                return False
+            return _normalize_inline_filter_name(filter_name) == "/LZWDecode"
 
         # Filter array case
         if isinstance(filter_obj, Array):
             for f in filter_obj:
                 f = _resolve_indirect(f)
+                if not isinstance(f, Name):
+                    continue
+                filter_name = _safe_name_to_string(f)
                 if (
-                    isinstance(f, Name)
-                    and _normalize_inline_filter_name(str(f)) == "/LZWDecode"
+                    filter_name is not None
+                    and _normalize_inline_filter_name(filter_name) == "/LZWDecode"
                 ):
                     return True
 
@@ -564,15 +585,21 @@ def _has_crypt_filter(stream: Stream) -> bool:
 
         # Single filter case
         if isinstance(filter_obj, Name):
-            return _normalize_inline_filter_name(str(filter_obj)) == "/Crypt"
+            filter_name = _safe_name_to_string(filter_obj)
+            if filter_name is None:
+                return False
+            return _normalize_inline_filter_name(filter_name) == "/Crypt"
 
         # Filter array case
         if isinstance(filter_obj, Array):
             for f in filter_obj:
                 f = _resolve_indirect(f)
+                if not isinstance(f, Name):
+                    continue
+                filter_name = _safe_name_to_string(f)
                 if (
-                    isinstance(f, Name)
-                    and _normalize_inline_filter_name(str(f)) == "/Crypt"
+                    filter_name is not None
+                    and _normalize_inline_filter_name(filter_name) == "/Crypt"
                 ):
                     return True
 
@@ -829,14 +856,20 @@ def _has_image_filter(stream: Stream) -> bool:
         filter_obj = _resolve_indirect(filter_obj)
 
         if isinstance(filter_obj, Name):
-            return _normalize_inline_filter_name(str(filter_obj)) in _IMAGE_FILTERS
+            filter_name = _safe_name_to_string(filter_obj)
+            if filter_name is None:
+                return False
+            return _normalize_inline_filter_name(filter_name) in _IMAGE_FILTERS
 
         if isinstance(filter_obj, Array):
             for f in filter_obj:
                 f = _resolve_indirect(f)
+                if not isinstance(f, Name):
+                    continue
+                filter_name = _safe_name_to_string(f)
                 if (
-                    isinstance(f, Name)
-                    and _normalize_inline_filter_name(str(f)) in _IMAGE_FILTERS
+                    filter_name is not None
+                    and _normalize_inline_filter_name(filter_name) in _IMAGE_FILTERS
                 ):
                     return True
 

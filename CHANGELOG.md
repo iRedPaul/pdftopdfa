@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.2] - 2026-04-09
+
+### Bug Fixes
+
+- Skip malformed UTF-8 PDF names during filter sanitization to avoid noisy decode errors
+
 ## [0.3.1] - 2026-04-09
 
 ### Bug Fixes

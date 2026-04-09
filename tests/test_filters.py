@@ -6,10 +6,12 @@
 
 import zlib
 from collections.abc import Generator
+from io import BytesIO
+from pathlib import Path
 
 import pikepdf
 import pytest
-from conftest import new_pdf
+from conftest import new_pdf, open_pdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from pdftopdfa.sanitizers.filters import (
@@ -66,6 +68,52 @@ def _normalized_inline_filters(inline_image: pikepdf.PdfInlineImage) -> list[str
             if isinstance(entry, Name)
         ]
     return []
+
+
+def _save_pdf(pdf: Pdf, path: Path) -> bytes:
+    """Save PDF to disk and return its bytes."""
+    buffer = BytesIO()
+    pdf.save(buffer)
+    data = buffer.getvalue()
+    path.write_bytes(data)
+    return data
+
+
+def _open_pdf_with_invalid_filter_name(tmp_path: Path) -> Pdf:
+    """Open a PDF whose stream /Filter name contains invalid UTF-8."""
+    pdf = new_pdf()
+    page = pikepdf.Page(Dictionary(Type=Name.Page, MediaBox=Array([0, 0, 612, 792])))
+    pdf.pages.append(page)
+    page[Name("/Contents")] = pdf.make_stream(b"BT ET")
+
+    path = tmp_path / "invalid-filter-name.pdf"
+    data = _save_pdf(pdf, path)
+    needle = b"/Filter /FlateDecode"
+    replacement = b"/Filter /Fl\xe8teDecode"
+    assert needle in data
+    path.write_bytes(data.replace(needle, replacement, 1))
+    return open_pdf(path)
+
+
+def _open_pdf_with_invalid_subtype_name(tmp_path: Path) -> Pdf:
+    """Open a PDF whose Form XObject /Subtype name contains invalid UTF-8."""
+    pdf = new_pdf()
+    page = pikepdf.Page(Dictionary(Type=Name.Page, MediaBox=Array([0, 0, 612, 792])))
+    pdf.pages.append(page)
+    form = pdf.make_stream(b"q Q")
+    form[Name.Type] = Name.XObject
+    form[Name.Subtype] = Name.Form
+    form[Name.BBox] = Array([0, 0, 10, 10])
+    page.Resources = Dictionary(XObject=Dictionary(Fm0=form))
+    page[Name("/Contents")] = pdf.make_stream(b"/Fm0 Do")
+
+    path = tmp_path / "invalid-subtype-name.pdf"
+    data = _save_pdf(pdf, path)
+    needle = b"/Subtype /Form"
+    replacement = b"/Subtype /Fo\xbar"
+    assert needle in data
+    path.write_bytes(data.replace(needle, replacement, 1))
+    return open_pdf(path)
 
 
 # --- _has_crypt_filter tests ---
@@ -750,3 +798,28 @@ class TestNonstandardInlineImageFilters:
         )
 
         assert sanitize_nonstandard_inline_filters(pdf) == 0
+
+
+class TestMalformedUtf8Names:
+    """Regression tests for malformed UTF-8 in PDF Name objects."""
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            _open_pdf_with_invalid_filter_name,
+            _open_pdf_with_invalid_subtype_name,
+        ],
+    )
+    def test_filter_sanitizers_ignore_invalid_utf8_names(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        factory,
+    ) -> None:
+        pdf = factory(tmp_path)
+        caplog.set_level("DEBUG", logger="pdftopdfa.sanitizers.filters")
+
+        assert convert_lzw_streams(pdf) == 0
+        assert remove_crypt_streams(pdf) == 0
+        assert sanitize_nonstandard_inline_filters(pdf) == 0
+        assert "Error processing object" not in caplog.text
