@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1] - 2026-04-09
+
+### Bug Fixes
+
+- Preserve subsetted Standard 14 font code mappings during embedded font refresh
+- Avoid unsafe content stream hex repairs unless parsed operands contain placeholders
+
 ## [0.3.0] - 2026-04-09
 
 ### Changes
