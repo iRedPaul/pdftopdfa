@@ -32,7 +32,9 @@ def remove_actions(pdf: Pdf) -> int:
     try:
         if "/OpenAction" in pdf.Root:
             open_action = _resolve_indirect(pdf.Root.OpenAction)
-            if _is_non_compliant_action(open_action):
+            if isinstance(open_action, Array):
+                pass
+            elif _is_non_compliant_action(open_action):
                 del pdf.Root["/OpenAction"]
                 removed_count += 1
                 logger.debug("Non-compliant OpenAction removed")

@@ -96,6 +96,9 @@ def _is_javascript_action(action: pikepdf.Object) -> bool:
         except (AttributeError, ValueError, TypeError):
             pass
 
+        if not isinstance(action, pikepdf.Dictionary):
+            return False
+
         action_type = action.get("/S")
         if action_type is not None:
             return str(action_type) == "/JavaScript"
@@ -118,6 +121,9 @@ def _is_non_compliant_action(action: pikepdf.Object) -> bool:
             action = action.get_object()
         except (AttributeError, ValueError, TypeError):
             pass
+
+        if not isinstance(action, pikepdf.Dictionary):
+            return True
 
         action_type = action.get("/S")
         if action_type is not None:

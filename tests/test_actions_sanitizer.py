@@ -42,6 +42,14 @@ class TestRemoveActions:
         remove_actions(pdf)
         assert "/OpenAction" in pdf.Root
 
+    def test_keeps_open_action_destination_array(self, make_pdf_with_page):
+        """OpenAction destination arrays are not removed during action cleanup."""
+        pdf = make_pdf_with_page()
+        pdf.Root["/OpenAction"] = Array([pdf.pages[0].obj, Name.Fit])
+        result = remove_actions(pdf)
+        assert result == 0
+        assert "/OpenAction" in pdf.Root
+
     def test_removes_document_aa(self, make_pdf_with_page):
         """Non-compliant Document Additional Actions are removed."""
         pdf = make_pdf_with_page()

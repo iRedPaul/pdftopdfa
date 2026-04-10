@@ -249,6 +249,11 @@ class TestIsNonCompliantAction:
         action = Dictionary()
         assert _is_non_compliant_action(action) is True
 
+    def test_array_is_non_compliant_without_raising(self) -> None:
+        """Array values are treated as malformed actions."""
+        action = Array([Name.GoTo])
+        assert _is_non_compliant_action(action) is True
+
 
 class TestResolveIndirect:
     """Tests for resolve_indirect."""
