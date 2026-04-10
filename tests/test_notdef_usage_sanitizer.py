@@ -11,6 +11,7 @@ import pikepdf
 from conftest import new_pdf
 from pikepdf import Array, Dictionary, Name, Pdf, String
 
+from pdftopdfa.sanitizers import notdef_usage as notdef_usage_mod
 from pdftopdfa.sanitizers.notdef_usage import (
     _NotdefCodes,
     sanitize_notdef_usage,
@@ -265,6 +266,62 @@ class TestCIDFont:
         assert len(tj_ops) == 1
         # Only CID 65 (\x00\x41) should remain
         assert bytes(tj_ops[0].operands[0]) == b"\x00\x41"
+
+    def test_cidfont_type0_keeps_valid_nonsequential_cids(self, monkeypatch):
+        """CIDFontType0 keeps valid charset CIDs even when they are high values."""
+        pdf = new_pdf()
+
+        cidfont = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.CIDFontType0,
+            BaseFont=Name("/TestCIDFontType0"),
+            CIDSystemInfo=Dictionary(
+                Registry=String(b"Adobe"),
+                Ordering=String(b"Identity"),
+                Supplement=0,
+            ),
+            FontDescriptor=Dictionary(),
+        )
+        type0_font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCIDFontType0"),
+            Encoding=Name("/Identity-H"),
+            DescendantFonts=Array([cidfont]),
+        )
+
+        monkeypatch.setattr(
+            notdef_usage_mod,
+            "_get_cidfonttype0_valid_cids",
+            lambda _cidfont: frozenset({0, 3, 5, 107, 124, 172, 316}),
+        )
+
+        content = b"BT /F1 12 Tf <000000AC006B0003007C013C0005> Tj ET"
+        stream = pdf.make_stream(content)
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Resources=Dictionary(Font=Dictionary(F1=type0_font)),
+                Contents=stream,
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result["notdef_usage_fixed"] == 1
+        instructions = list(pikepdf.parse_content_stream(stream))
+        tj_ops = [
+            i
+            for i in instructions
+            if isinstance(i, pikepdf.ContentStreamInstruction)
+            and str(i.operator) == "Tj"
+        ]
+        assert len(tj_ops) == 1
+        assert (
+            bytes(tj_ops[0].operands[0]) == b"\x00\xac\x00k\x00\x03\x00|\x01<\x00\x05"
+        )
 
     def test_cidfont_stream_gid_zero_removed(self):
         """CIDs mapping to GID 0 via stream CIDToGIDMap are removed."""

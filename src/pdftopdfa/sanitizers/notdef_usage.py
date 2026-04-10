@@ -41,23 +41,31 @@ class _NotdefCodes:
     without building a 65k-entry frozenset.
     """
 
-    __slots__ = ("_explicit", "_max_valid_code")
+    __slots__ = ("_explicit", "_max_valid_code", "_valid_codes")
 
     def __init__(
         self,
         explicit: frozenset[int] = frozenset(),
         max_valid_code: int | None = None,
+        valid_codes: frozenset[int] | None = None,
     ) -> None:
         self._explicit = explicit
         self._max_valid_code = max_valid_code
+        self._valid_codes = valid_codes
 
     def __contains__(self, code: int) -> bool:
-        return code in self._explicit or (
-            self._max_valid_code is not None and code > self._max_valid_code
-        )
+        if code in self._explicit:
+            return True
+        if self._valid_codes is not None:
+            return code not in self._valid_codes
+        return self._max_valid_code is not None and code > self._max_valid_code
 
     def __bool__(self) -> bool:
-        return bool(self._explicit) or self._max_valid_code is not None
+        return (
+            bool(self._explicit)
+            or self._max_valid_code is not None
+            or self._valid_codes is not None
+        )
 
 
 def sanitize_notdef_usage(pdf: Pdf) -> dict[str, int]:
@@ -385,6 +393,63 @@ def _get_cidfont_num_glyphs(cidfont: pikepdf.Object) -> int | None:
         return None
 
 
+def _get_cidfonttype0_valid_cids(cidfont: pikepdf.Object) -> frozenset[int] | None:
+    """Return valid CIDs for CIDFontType0 fonts from the CFF charset."""
+    try:
+        fd = cidfont.get("/FontDescriptor")
+        if fd is None:
+            return None
+        fd = _resolve(fd)
+
+        font_data = None
+        font_file_key = None
+        for key in ("/FontFile3", "/FontFile2", "/FontFile"):
+            stream = fd.get(key)
+            if stream is not None:
+                stream = _resolve(stream)
+                font_data = bytes(stream.read_bytes())
+                font_file_key = key
+                break
+
+        if font_data is None:
+            return None
+
+        from fontTools.ttLib import TTFont
+
+        tt_font = None
+        try:
+            try:
+                tt_font = TTFont(io.BytesIO(font_data))
+            except Exception:
+                if font_file_key == "/FontFile3":
+                    from .glyph_coverage import _wrap_cff_in_otf
+
+                    tt_font = TTFont(io.BytesIO(_wrap_cff_in_otf(font_data)))
+                else:
+                    return None
+
+            if "CFF " not in tt_font:
+                return None
+
+            valid_cids: set[int] = set()
+            char_strings = tt_font["CFF "].cff.topDictIndex[0].CharStrings
+            for name in char_strings.keys():
+                if name == ".notdef":
+                    valid_cids.add(0)
+                elif name.startswith("cid"):
+                    try:
+                        valid_cids.add(int(name[3:]))
+                    except ValueError:
+                        continue
+
+            return frozenset(valid_cids) if valid_cids else None
+        finally:
+            if tt_font is not None:
+                tt_font.close()
+    except Exception:
+        return None
+
+
 def _get_cidfont_notdef_codes(font_obj: pikepdf.Object) -> _NotdefCodes:
     """Computes CIDs that resolve to .notdef for CIDFonts (Type0).
 
@@ -410,6 +475,13 @@ def _get_cidfont_notdef_codes(font_obj: pikepdf.Object) -> _NotdefCodes:
     cidfont = _resolve(descendants[0])
     if not isinstance(cidfont, Dictionary):
         return _NotdefCodes()
+
+    cidfont_subtype = _safe_str(cidfont.get("/Subtype") or "")
+    if cidfont_subtype == "/CIDFontType0":
+        valid_cids = _get_cidfonttype0_valid_cids(cidfont)
+        if valid_cids is not None:
+            return _NotdefCodes(frozenset({0}), valid_codes=valid_cids)
+        return _NotdefCodes(frozenset({0}))
 
     num_glyphs = _get_cidfont_num_glyphs(cidfont)
 
