@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.6] - 2026-04-10
+
+### Bug Fixes
+
+- Fix AGL validation for TrueType encoding differences
+- Fix `.notdef` filtering for CIDFontType0 charsets
+
 ## [0.3.5] - 2026-04-10
 
 ### Bug Fixes
