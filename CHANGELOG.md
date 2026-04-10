@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.5] - 2026-04-10
+
+### Bug Fixes
+
+- Handle array-valued `OpenAction` objects safely
+
 ## [0.3.4] - 2026-04-09
 
 ### Bug Fixes
