@@ -16,12 +16,12 @@ import logging
 from io import BytesIO
 
 import pikepdf
+from fontTools.agl import AGL2UV
 from fontTools.ttLib import TTFont
 from fontTools.ttLib.tables._c_m_a_p import cmap_format_4
 from pikepdf import Dictionary, Name, Pdf, Stream
 
 from ..fonts.analysis import is_symbolic_font
-from ..fonts.tounicode import resolve_glyph_to_unicode
 from ..fonts.traversal import iter_all_page_fonts
 from ..fonts.utils import safe_str as _safe_str
 from ..utils import resolve_indirect as _resolve
@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 
 # Encoding names considered compliant for non-symbolic TrueType fonts (6.2.11.6-2)
 _VALID_ENCODINGS = frozenset({"/WinAnsiEncoding", "/MacRomanEncoding"})
+
+
+def _is_agl_glyph_name(glyph_name: str) -> bool:
+    """Return True when a glyph name is explicitly listed in Adobe Glyph List."""
+    return glyph_name == ".notdef" or glyph_name in AGL2UV
 
 
 def sanitize_truetype_encoding(pdf: Pdf) -> dict[str, int]:
@@ -489,8 +494,6 @@ def _has_non_agl_differences(differences: pikepdf.Object) -> bool:
     for item in differences:
         if isinstance(item, pikepdf.Name):
             glyph_name = _safe_str(item).lstrip("/")
-            if glyph_name == ".notdef":
-                continue
-            if resolve_glyph_to_unicode(glyph_name) is None:
+            if not _is_agl_glyph_name(glyph_name):
                 return True
     return False

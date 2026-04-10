@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import pikepdf
-from fontTools.agl import UV2AGL
+from fontTools.agl import AGL2UV, UV2AGL
 from pikepdf import Array, Dictionary, Name, Stream
 
 from ..exceptions import FontEmbeddingError
@@ -46,7 +46,6 @@ from .tounicode import (
     generate_tounicode_from_encoding_dict,
     parse_cidtogidmap_stream,
     parse_tounicode_cmap,
-    resolve_glyph_to_unicode,
     resolve_symbol_glyph_to_unicode,
 )
 from .traversal import iter_all_page_fonts
@@ -57,6 +56,11 @@ if TYPE_CHECKING:
     from fontTools.ttLib import TTFont
 
 logger = logging.getLogger(__name__)
+
+
+def _is_agl_glyph_name(glyph_name: str) -> bool:
+    """Return True when a glyph name is explicitly listed in Adobe Glyph List."""
+    return glyph_name == ".notdef" or glyph_name in AGL2UV
 
 
 def _is_utf16_encoding(encoding_name: str) -> bool:
@@ -580,19 +584,48 @@ class FontEmbedder:
             pikepdf Dictionary with Type=Encoding and Differences array.
         """
         differences = []
+        base_glyphs = self._get_base_encoding_glyph_names(base_encoding)
         prev = -2
 
         for code in sorted(encoding.keys()):
+            glyph_name = encoding[code]
+            if base_encoding is not None and not _is_agl_glyph_name(glyph_name):
+                continue
+            if base_glyphs is not None and base_glyphs.get(code) == glyph_name:
+                continue
             if code != prev + 1:
                 # Start new sequence
                 differences.append(code)
-            differences.append(Name(f"/{encoding[code]}"))
+            differences.append(Name(f"/{glyph_name}"))
             prev = code
 
         encoding_dict = Dictionary(Type=Name.Encoding, Differences=Array(differences))
         if differences and base_encoding is not None:
             encoding_dict[Name("/BaseEncoding")] = base_encoding
         return encoding_dict
+
+    @staticmethod
+    def _get_base_encoding_glyph_names(
+        base_encoding: Name | None,
+    ) -> dict[int, str] | None:
+        """Return Adobe glyph names for a supported base encoding."""
+        if base_encoding is None:
+            return None
+
+        if base_encoding == Name.WinAnsiEncoding:
+            code_to_unicode = generate_tounicode_for_winansi()
+        elif base_encoding == Name.MacRomanEncoding:
+            code_to_unicode = generate_tounicode_for_macroman()
+        elif str(base_encoding) == "/StandardEncoding":
+            code_to_unicode = generate_tounicode_for_standard_encoding()
+        else:
+            return None
+
+        return {
+            code: glyph_name
+            for code, unicode_val in code_to_unicode.items()
+            if (glyph_name := UV2AGL.get(unicode_val)) is not None
+        }
 
     def _create_font_stream(self, font_data: bytes) -> Stream:
         """Creates a FontFile2 stream for TrueType fonts.
@@ -950,14 +983,8 @@ class FontEmbedder:
         code_to_glyph_name: dict[int, str] = {}
         for code, unicode_val in code_to_unicode.items():
             glyph_name = UV2AGL.get(unicode_val)
-            if glyph_name is None:
-                if 0 <= unicode_val <= 0xFFFF:
-                    glyph_name = f"uni{unicode_val:04X}"
-                elif unicode_val <= 0x10FFFF:
-                    glyph_name = f"u{unicode_val:05X}"
-                else:
-                    continue
-            code_to_glyph_name[code] = glyph_name
+            if glyph_name is not None:
+                code_to_glyph_name[code] = glyph_name
         return code_to_glyph_name
 
     def _build_widths_from_unicode_map(
@@ -1384,9 +1411,7 @@ class FontEmbedder:
         for item in differences:
             if isinstance(item, pikepdf.Name):
                 glyph_name = _safe_str(item).lstrip("/")
-                if glyph_name == ".notdef":
-                    continue
-                if resolve_glyph_to_unicode(glyph_name) is None:
+                if not _is_agl_glyph_name(glyph_name):
                     return True
         return False
 

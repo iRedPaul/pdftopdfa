@@ -653,6 +653,30 @@ class TestEnsureEncoding:
         enc = _resolve_indirect(font_dict.get("/Encoding"))
         assert enc.get("/Differences") is None
 
+    def test_truetype_encoding_dict_uni_names_removed(self):
+        """TrueType with synthesized uniXXXX names in Differences gets them removed."""
+        pdf = new_pdf()
+        enc_dict = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Encoding,
+                BaseEncoding=Name.WinAnsiEncoding,
+                Differences=Array([0, Name("/uniE000"), Name("/uni0001")]),
+            )
+        )
+        font_dict = self._make_embedded_font(
+            pdf,
+            subtype="/TrueType",
+            flags=32,
+            encoding=enc_dict,
+        )
+        self._build_pdf_with_font(pdf, font_dict)
+
+        embedder = FontEmbedder(pdf)
+        embedder.fix_font_encodings()
+
+        enc = _resolve_indirect(font_dict.get("/Encoding"))
+        assert enc.get("/Differences") is None
+
     def test_truetype_macroman_not_modified(self):
         """TrueType with MacRomanEncoding is not modified."""
         pdf = new_pdf()
@@ -668,6 +692,25 @@ class TestEnsureEncoding:
         embedder.fix_font_encodings()
 
         assert font_dict.get("/Encoding") == Name.MacRomanEncoding
+
+    def test_build_encoding_dictionary_with_base_encoding_is_minimal(self):
+        """Preserved encodings keep only AGL overrides that differ from the base."""
+        pdf = new_pdf()
+        embedder = FontEmbedder(pdf)
+
+        encoding = embedder._build_encoding_dictionary(
+            {
+                0: "uniE000",
+                1: "uni0001",
+                65: "A",
+                66: "B",
+                128: "Adieresis",
+            },
+            base_encoding=Name.WinAnsiEncoding,
+        )
+
+        assert encoding.get("/BaseEncoding") == Name.WinAnsiEncoding
+        assert list(encoding.get("/Differences")) == [128, Name("/Adieresis")]
 
     # --- FM2: Symbolic TrueType encoding removal ---
 
