@@ -36,10 +36,10 @@ def _read_page_rotate(input_file: Path, pageno: int) -> int:
 
 
 def _compose_page_rotation(existing_rotate: int, requested_rotate: int | None) -> int:
-    """Compose OCRmyPDF's requested rotation with the page's existing /Rotate."""
+    """Combine OCR correction with an existing page /Rotate for rasterization."""
     if not requested_rotate:
         return existing_rotate % 360
-    return (existing_rotate + requested_rotate) % 360
+    return (existing_rotate - requested_rotate) % 360
 
 
 def _write_rotated_temp_pdf(
