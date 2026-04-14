@@ -649,6 +649,8 @@ def convert_to_pdfa(
     source_info: dict | None = None
     source_xmp_tree = None
 
+    force_ocr_requested = ocr_force and ocr_languages is not None
+
     logger.info(
         "Starting conversion: %s -> %s (PDF/A-%s)",
         input_path,
@@ -677,7 +679,12 @@ def convert_to_pdfa(
             source_xmp_tree = _extract_existing_xmp(check_pdf)
             detected_level = detect_pdfa_level(check_pdf)
 
-        if detected_level is not None:
+        if detected_level is not None and force_ocr_requested:
+            logger.debug(
+                "Bypassing PDF/A pre-check skip because forced OCR was requested"
+            )
+
+        if detected_level is not None and not force_ocr_requested:
             should_validate_for_skip = skip_any_pdfa
             if not should_validate_for_skip:
                 level_cmp = _compare_pdfa_levels(detected_level, level)

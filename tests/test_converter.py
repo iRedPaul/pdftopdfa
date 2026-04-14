@@ -418,6 +418,83 @@ class TestConvertToPdfa:
         call_kwargs = mock_apply_ocr.call_args[1]
         assert call_kwargs["force"] is True
 
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    @patch("pdftopdfa.converter.detect_pdfa_level")
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_convert_ocr_force_bypasses_same_level_skip(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        mock_detect: MagicMock,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Forced OCR runs even when the input is already compliant."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_detect.return_value = "2b"
+        mock_verapdf.return_value = VeraPDFResult(compliant=True, flavour="2b")
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
+
+        output_path = tmp_dir / "output.pdf"
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            level="2b",
+            ocr_languages=["eng"],
+            ocr_force=True,
+        )
+
+        assert result.success is True
+        assert result.skipped is False
+        assert output_path.exists()
+        mock_apply_ocr.assert_called_once()
+        mock_verapdf.assert_not_called()
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    @patch("pdftopdfa.converter.detect_pdfa_level")
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_convert_ocr_force_bypasses_skip_any_pdfa(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        mock_detect: MagicMock,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Forced OCR also overrides skip_any_pdfa pre-check skipping."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_detect.return_value = "3a"
+        mock_verapdf.return_value = VeraPDFResult(compliant=True, flavour="3a")
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
+
+        output_path = tmp_dir / "output.pdf"
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            level="2b",
+            skip_any_pdfa=True,
+            ocr_languages=["eng"],
+            ocr_force=True,
+        )
+
+        assert result.success is True
+        assert result.skipped is False
+        assert output_path.exists()
+        mock_apply_ocr.assert_called_once()
+        mock_verapdf.assert_not_called()
+
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_ocr_force_false_still_calls_apply_ocr(

@@ -204,7 +204,8 @@ def _print_validation_result(
     is_flag=True,
     default=False,
     help="Force OCR even on pages that already contain text "
-    "(removes existing OCR layer and re-applies). Implies --ocr.",
+    "(removes existing OCR layer and re-applies). Implies --ocr and "
+    "bypasses compliant-PDF/A skip checks.",
 )
 @click.option(
     "--ocr-quality",

@@ -78,7 +78,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `-q, --quiet` | Show only errors |
 | `--verbose` | Enable detailed logs |
 | `--ocr` | Enable OCR for scanned/image-based PDFs |
-| `--ocr-force` | Force OCR even if text is present (implies `--ocr`) |
+| `--ocr-force` | Force OCR even if text is present (implies `--ocr` and disables compliant-PDF/A skip optimization) |
 | `--ocr-lang LANG` | OCR language code (default: `eng`), for example `deu` or `deu+eng` |
 | `--ocr-quality [fast\|default\|best]` | OCR quality preset (default: `default`) |
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
@@ -287,6 +287,7 @@ Notes:
 - If the metadata claim fails veraPDF validation, conversion is not skipped.
 - If veraPDF is unavailable, conversion is not skipped based only on metadata.
 - Skipped files return warning: `Conversion skipped: PDF already valid PDF/A (veraPDF compliant)`.
+- Forced OCR (`--ocr-force` or `ocr_force=True` with OCR languages configured) always runs and bypasses this skip logic.
 
 ## Validation
 

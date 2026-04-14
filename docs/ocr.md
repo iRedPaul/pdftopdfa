@@ -91,6 +91,7 @@ Behavior notes:
 
 - `--ocr-force` implies `--ocr`.
 - Existing OCR text layers are replaced.
+- Forced OCR bypasses the "already compliant PDF/A" skip path so OCR still runs.
 - With forced OCR, options incompatible with ocrmypdf's `redo_ocr`
   mode are disabled automatically.
 - Original annotations are preserved when possible.
