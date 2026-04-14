@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.7] - 2026-04-14
+
+### Bug Fixes
+
+- Fix OCR rotation composition for pre-rotated pages
+- Make `--ocr-force` bypass compliant PDF/A skip checks
+
+### Documentation
+
+- Clarify `--ocr-force` skip-check behavior in the OCR and usage guides
+
 ## [0.3.6] - 2026-04-10
 
 ### Bug Fixes
