@@ -3038,6 +3038,62 @@ class TestSanitizeNonCatalogMetadata:
         assert b"xmp:CreatorTool" in content
         assert b"custom:Foo" not in content
 
+    def test_strips_problematic_photoshop_properties_from_stream_holder(
+        self,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """Image/Form stream metadata drops known veraPDF-failing photoshop props."""
+        from io import BytesIO
+
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
+        xmp_data = (
+            b'<?xpacket begin="\xef\xbb\xbf"'
+            b' id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b"<rdf:RDF xmlns:rdf="
+            b'"http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about=""'
+            b' xmlns:xmp="http://ns.adobe.com/xap/1.0/"'
+            b' xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/">'
+            b"<xmp:CreatorTool>scanner</xmp:CreatorTool>"
+            b"<photoshop:ColorMode>1</photoshop:ColorMode>"
+            b"<photoshop:ICCProfile>sRGB IEC61966-2.1</photoshop:ICCProfile>"
+            b"<photoshop:LegacyIPTCDigest>digest</photoshop:LegacyIPTCDigest>"
+            b"<photoshop:DocumentAncestors><rdf:Bag><rdf:li>ancestor</rdf:li></rdf:Bag></photoshop:DocumentAncestors>"
+            b"</rdf:Description>"
+            b"</rdf:RDF>"
+            b"</x:xmpmeta>\n"
+            b'<?xpacket end="w"?>'
+        )
+        meta = pikepdf.Stream(pdf, xmp_data)
+        meta.Type = Name.Metadata
+        meta.Subtype = Name.XML
+        meta_ref = pdf.make_indirect(meta)
+
+        image = pikepdf.Stream(pdf, b"\x00")
+        image.Type = Name("/XObject")
+        image.Subtype = Name("/Image")
+        image["/Width"] = 1
+        image["/Height"] = 1
+        image["/ColorSpace"] = Name("/DeviceGray")
+        image["/BitsPerComponent"] = 8
+        image["/Metadata"] = meta_ref
+        image_ref = pdf.make_indirect(image)
+
+        sanitized, removed = _sanitize_non_catalog_metadata(pdf)
+        assert sanitized >= 1
+        assert removed == 0
+
+        image_obj = pdf.get_object(image_ref.objgen)
+        assert "/Metadata" in image_obj
+
+        content = bytes(pdf.get_object(meta_ref.objgen).read_bytes())
+        assert b"xmp:CreatorTool" in content
+        assert b"photoshop:ColorMode" not in content
+        assert b"photoshop:ICCProfile" not in content
+        assert b"photoshop:LegacyIPTCDigest" not in content
+        assert b"photoshop:DocumentAncestors" not in content
+
     def test_preserves_locally_declared_custom_properties(
         self,
         sample_pdf_bytes: bytes,
@@ -3268,6 +3324,44 @@ class TestCollectNonCatalogExtensionNeeds:
         result = _collect_non_catalog_extension_needs(pdf)
         assert "http://example.com/ns/" in result
         assert "Prop" in result["http://example.com/ns/"]
+
+    def test_collects_stream_holder_custom_namespace(
+        self,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """Image/Form stream metadata is scanned for extension needs too."""
+        from io import BytesIO
+
+        pdf = pikepdf.open(BytesIO(sample_pdf_bytes))
+        xmp_data = (
+            b'<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about=""'
+            b' xmlns:custom="http://example.com/custom/">'
+            b"<custom:Foo>bar</custom:Foo>"
+            b"</rdf:Description>"
+            b"</rdf:RDF></x:xmpmeta>"
+            b'<?xpacket end="w"?>'
+        )
+        meta_stream = pikepdf.Stream(pdf, xmp_data)
+        meta_stream.Type = Name.Metadata
+        meta_stream.Subtype = Name.XML
+        meta_ref = pdf.make_indirect(meta_stream)
+
+        image = pikepdf.Stream(pdf, b"\x00")
+        image.Type = Name("/XObject")
+        image.Subtype = Name("/Image")
+        image["/Width"] = 1
+        image["/Height"] = 1
+        image["/ColorSpace"] = Name("/DeviceGray")
+        image["/BitsPerComponent"] = 8
+        image["/Metadata"] = meta_ref
+        pdf.make_indirect(image)
+
+        result = _collect_non_catalog_extension_needs(pdf)
+        assert "http://example.com/custom/" in result
+        assert "Foo" in result["http://example.com/custom/"]
 
 
 class TestNonCatalogExtensionInCatalogXMP:

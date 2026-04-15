@@ -7,7 +7,7 @@
 import copy
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
@@ -137,6 +137,19 @@ _PDF_A_UNSAFE_PRESERVED_PROPERTIES = frozenset(
         (NAMESPACES["xmpMM"], "OriginalDocumentID"),
         (NAMESPACES["xmpMM"], "DerivedFrom"),
         (NAMESPACES["xmpMM"], "History"),
+    }
+)
+
+# OCR/image pipelines frequently attach object-level XMP packets to image or
+# form XObject streams. veraPDF reports these particular properties as
+# non-compliant in non-catalog metadata packets under PDF/A-2/3 clause 6.6.2.3.1,
+# so drop them during non-catalog sanitization instead of re-emitting invalid XMP.
+_PDF_A_UNSAFE_NON_CATALOG_PROPERTIES = frozenset(
+    {
+        (NAMESPACES["photoshop"], "ColorMode"),
+        (NAMESPACES["photoshop"], "ICCProfile"),
+        (NAMESPACES["photoshop"], "DocumentAncestors"),
+        (NAMESPACES["photoshop"], "LegacyIPTCDigest"),
     }
 )
 
@@ -2695,6 +2708,9 @@ def _sanitize_non_catalog_xmp_tree(tree: etree._Element) -> None:
                 continue
 
             uri, local = tag[1:].split("}", 1)
+            if (uri, local) in _PDF_A_UNSAFE_NON_CATALOG_PROPERTIES:
+                desc.remove(child)
+                continue
             predefined = _PREDEFINED_PROPERTIES.get(uri)
             declared_value_type = declared_property_types.get(uri, {}).get(local)
 
@@ -2725,6 +2741,9 @@ def _sanitize_non_catalog_xmp_tree(tree: etree._Element) -> None:
 
             uri, local = attr_name[1:].split("}", 1)
             if uri == ns_rdf:
+                del desc.attrib[attr_name]
+                continue
+            if (uri, local) in _PDF_A_UNSAFE_NON_CATALOG_PROPERTIES:
                 del desc.attrib[attr_name]
                 continue
             if (uri, local) in _PDF_A_UNSAFE_PRESERVED_PROPERTIES:
@@ -2771,16 +2790,10 @@ def _collect_non_catalog_extension_needs(
     Returns a dict of namespace_uri -> {property_local_names}.
     """
     result: dict[str, set[str]] = {}
-    root_objgen = pdf.Root.objgen
     ns_rdf = NAMESPACES["rdf"]
 
-    for obj in pdf.objects:
-        if not isinstance(obj, pikepdf.Dictionary):
-            continue
+    for obj in _iter_non_catalog_metadata_holders(pdf):
         try:
-            if "/Metadata" not in obj or obj.objgen == root_objgen:
-                continue
-
             meta_ref = obj["/Metadata"]
             try:
                 meta_stream = meta_ref.get_object()
@@ -2811,7 +2824,13 @@ def _collect_non_catalog_extension_needs(
                 for desc in rdf_root.findall(f"{{{ns_rdf}}}Description"):
                     needed = _collect_non_predefined_properties(desc)
                     for uri, props in needed.items():
-                        result.setdefault(uri, set()).update(props)
+                        safe_props = {
+                            prop
+                            for prop in props
+                            if (uri, prop) not in _PDF_A_UNSAFE_NON_CATALOG_PROPERTIES
+                        }
+                        if safe_props:
+                            result.setdefault(uri, set()).update(safe_props)
 
         except Exception as e:
             logger.debug(
@@ -2842,19 +2861,9 @@ def _sanitize_non_catalog_metadata(pdf: pikepdf.Pdf) -> tuple[int, int]:
     """
     sanitized = 0
     removed = 0
-    root_objgen = pdf.Root.objgen
 
-    for obj in pdf.objects:
+    for obj in _iter_non_catalog_metadata_holders(pdf):
         try:
-            obj = obj.get_object()
-        except Exception:
-            pass
-        if not isinstance(obj, pikepdf.Dictionary):
-            continue
-        try:
-            if "/Metadata" not in obj or obj.objgen == root_objgen:
-                continue
-
             meta_ref = obj["/Metadata"]
             try:
                 meta_stream = meta_ref.get_object()
@@ -2902,6 +2911,41 @@ def _sanitize_non_catalog_metadata(pdf: pikepdf.Pdf) -> tuple[int, int]:
     if removed > 0:
         logger.info("Removed %d malformed non-catalog /Metadata stream(s)", removed)
     return sanitized, removed
+
+
+def _iter_non_catalog_metadata_holders(
+    pdf: pikepdf.Pdf,
+) -> Iterator[pikepdf.Object]:
+    """Yield non-catalog objects that carry a /Metadata reference.
+
+    OCR pipelines may attach XMP to image/Form XObject streams directly, not
+    only to dictionaries such as pages or auxiliary resource containers. Those
+    stream objects must be sanitized as well because veraPDF validates every
+    XMP packet in the document.
+    """
+    root_objgen = pdf.Root.objgen
+
+    for obj in pdf.objects:
+        try:
+            obj = obj.get_object()
+        except Exception:
+            pass
+
+        try:
+            has_metadata = "/Metadata" in obj
+        except Exception:
+            continue
+
+        if not has_metadata:
+            continue
+
+        try:
+            if obj.objgen == root_objgen:
+                continue
+        except Exception:
+            pass
+
+        yield obj
 
 
 def sync_metadata(
