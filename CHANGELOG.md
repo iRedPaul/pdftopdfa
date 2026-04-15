@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.9] - 2026-04-15
+
+### Bug Fixes
+
+- Fix OCR metadata validation for non-catalog XMP streams
+
 ## [0.3.8] - 2026-04-15
 
 ### Bug Fixes
