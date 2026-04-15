@@ -18,6 +18,7 @@ import struct
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
 
+from ..fonts.glyph_mapping import resolve_glyph_name
 from ..fonts.subsetter import (
     _resolve_simple_font_encoding,
 )
@@ -292,13 +293,18 @@ def _find_missing_glyphs_in_simple_font(
                     return set()
 
             glyph_set = set(tt_font.getGlyphOrder())
+            hmtx_metrics = tt_font["hmtx"].metrics if "hmtx" in tt_font else {}
+            cmap = _get_any_cmap(tt_font)
             missing = set()
             for code in range(first_char, last_char + 1):
                 name = encoding.get(code)
                 if name is None or name == ".notdef":
                     # No encoding entry or explicit .notdef → maps to .notdef
                     missing.add(code)
-                elif name not in glyph_set:
+                elif (
+                    name not in glyph_set
+                    and resolve_glyph_name(name, cmap, hmtx_metrics) is None
+                ):
                     missing.add(code)
 
             return missing
@@ -308,6 +314,30 @@ def _find_missing_glyphs_in_simple_font(
     except Exception:
         logger.debug("Error analyzing simple font glyphs", exc_info=True)
         return set()
+
+
+def _get_any_cmap(tt_font) -> dict[int, str]:
+    """Return the most useful cmap available for glyph-name resolution."""
+    try:
+        cmap = tt_font.getBestCmap()
+    except KeyError:
+        cmap = None
+    if cmap:
+        return cmap
+    if "cmap" not in tt_font:
+        return {}
+
+    cmap_table = tt_font["cmap"]
+    for subtable in cmap_table.tables:
+        if subtable.platformID == 3 and subtable.platEncID == 0 and subtable.cmap:
+            return subtable.cmap
+    for subtable in cmap_table.tables:
+        if subtable.platformID == 1 and subtable.platEncID == 0 and subtable.cmap:
+            return subtable.cmap
+    for subtable in cmap_table.tables:
+        if subtable.cmap:
+            return subtable.cmap
+    return {}
 
 
 def _get_simple_font_notdef_codes(font_obj: pikepdf.Object) -> _NotdefCodes:

@@ -628,7 +628,7 @@ class TestNotdefCodesClass:
         assert _NotdefCodes(frozenset(), max_valid_code=10)
 
 
-def _make_ttfont_bytes(glyph_names):
+def _make_ttfont_bytes(glyph_names, cmap=None):
     """Creates minimal TrueType font data containing given glyph names.
 
     Uses fontTools to build a minimal font with .notdef + the given names.
@@ -639,7 +639,7 @@ def _make_ttfont_bytes(glyph_names):
     all_names = [".notdef"] + list(glyph_names)
     fb = FontBuilder(1000, isTTF=True)
     fb.setupGlyphOrder(all_names)
-    fb.setupCharacterMap({})
+    fb.setupCharacterMap(cmap or {})
     # Use empty Glyph objects (zero-contour) instead of dicts
     fb.setupGlyf({name: Glyph() for name in all_names})
     fb.setupHorizontalMetrics({name: (500, 0) for name in all_names})
@@ -767,6 +767,48 @@ class TestSimpleFontGlyphMissing:
         ]
         assert len(tj_ops) == 1
         assert bytes(tj_ops[0].operands[0]) == b"A\xb2"
+
+    def test_space_kept_when_subset_glyph_is_renamed_but_mapped_in_cmap(self):
+        """Subset glyph renames must not make valid spaces look like .notdef."""
+        pdf = new_pdf()
+
+        font_data = _make_ttfont_bytes(
+            ["glyph00001", "A"],
+            cmap={0x0020: "glyph00001", 0x0041: "A"},
+        )
+        font_stream = pdf.make_stream(font_data)
+
+        fd = Dictionary(
+            Type=Name.FontDescriptor,
+            FontName=Name("/TestFont"),
+            FontFile2=font_stream,
+        )
+
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/TestFont"),
+            FirstChar=32,
+            LastChar=65,
+            Encoding=Name.WinAnsiEncoding,
+            FontDescriptor=fd,
+        )
+
+        content = b"BT /F1 12 Tf (A A) Tj ET"
+        stream = _make_page_with_font_and_content(pdf, font, content)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result["notdef_usage_fixed"] == 0
+        instructions = list(pikepdf.parse_content_stream(stream))
+        tj_ops = [
+            i
+            for i in instructions
+            if isinstance(i, pikepdf.ContentStreamInstruction)
+            and str(i.operator) == "Tj"
+        ]
+        assert len(tj_ops) == 1
+        assert bytes(tj_ops[0].operands[0]) == b"A A"
 
     def test_no_font_descriptor_falls_back(self):
         """Font without FontDescriptor falls back to range-only check."""
