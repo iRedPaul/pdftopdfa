@@ -18,7 +18,7 @@ from PIL import Image
 
 from pdftopdfa.exceptions import OCRError
 from pdftopdfa.ocr import (
-    _PREPROCESS_QUALITIES,
+    _ROTATION_FIX_QUALITIES,
     OCR_SETTINGS,
     OcrQuality,
     _detect_consistent_text_skew,
@@ -429,7 +429,6 @@ class TestApplyOcr:
             with pytest.raises(OCRError, match="OCR not available"):
                 apply_ocr(sample_pdf, output_path, ["deu"])
 
-    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     def test_apply_ocr_calls_ocrmypdf(
@@ -698,7 +697,9 @@ class TestOcrQuality:
         assert settings["skip_text"] is True
         assert settings["deskew"] is False
         assert settings["rotate_pages"] is False
-        assert settings["oversample"] == 300
+        assert settings["oversample"] == 600
+        assert settings["tesseract_pagesegmode"] == 11
+        assert settings["tesseract_thresholding"] == 1
         assert settings["optimize"] == 0
         assert settings["progress_bar"] is False
         assert "clean" not in settings
@@ -710,7 +711,9 @@ class TestOcrQuality:
         assert settings["deskew"] is True
         assert settings["rotate_pages"] is True
         assert settings["rotate_pages_threshold"] == 5.0
-        assert settings["oversample"] == 200
+        assert settings["oversample"] == 600
+        assert settings["tesseract_pagesegmode"] == 11
+        assert settings["tesseract_thresholding"] == 1
         assert settings["optimize"] == 0
         assert settings["progress_bar"] is False
         assert "clean" not in settings
@@ -734,7 +737,6 @@ class TestOcrQuality:
             **OCR_SETTINGS[OcrQuality.FAST],
         )
 
-    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     def test_apply_ocr_default_quality(
@@ -755,7 +757,6 @@ class TestOcrQuality:
             **OCR_SETTINGS[OcrQuality.DEFAULT],
         )
 
-    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     @patch("pdftopdfa.ocr._normalize_best_quality_skipped_text_pages")
@@ -802,7 +803,6 @@ class TestOcrQuality:
 class TestApplyOcrForce:
     """Tests for apply_ocr(force=True) behaviour."""
 
-    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     def test_apply_ocr_force_sets_redo_ocr(
@@ -816,7 +816,6 @@ class TestApplyOcrForce:
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
         assert call_kwargs["redo_ocr"] is True
 
-    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     def test_apply_ocr_force_removes_skip_text(
@@ -830,7 +829,6 @@ class TestApplyOcrForce:
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
         assert "skip_text" not in call_kwargs
 
-    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     def test_apply_ocr_no_force_uses_skip_text(
@@ -845,7 +843,6 @@ class TestApplyOcrForce:
         assert call_kwargs["skip_text"] is True
         assert "redo_ocr" not in call_kwargs
 
-    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     def test_apply_ocr_force_with_best_quality(
@@ -862,7 +859,6 @@ class TestApplyOcrForce:
         assert "deskew" not in call_kwargs
         assert call_kwargs["rotate_pages"] is True
 
-    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     def test_apply_ocr_force_removes_all_redo_ocr_incompatible_options(
@@ -891,7 +887,6 @@ class TestApplyOcrForce:
         assert "remove_background" not in call_kwargs
         assert call_kwargs["rotate_pages"] is True
 
-    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     def test_apply_ocr_force_logs_removed_incompatible_options(
@@ -915,56 +910,21 @@ class TestApplyOcrForce:
         )
 
 
-class TestOpenCVPlugin:
-    """Tests for OpenCV preprocessing plugin integration."""
+class TestOcrPlugins:
+    """Tests for active OCR plugin integration."""
 
-    def test_preprocess_qualities_contains_default_and_best(self) -> None:
-        """_PREPROCESS_QUALITIES includes DEFAULT and BEST."""
-        assert OcrQuality.DEFAULT in _PREPROCESS_QUALITIES
-        assert OcrQuality.BEST in _PREPROCESS_QUALITIES
-        assert OcrQuality.FAST not in _PREPROCESS_QUALITIES
+    def test_rotation_fix_qualities_contains_default_and_best(self) -> None:
+        """Rotation fix stays enabled for the non-fast OCR presets."""
+        assert OcrQuality.DEFAULT in _ROTATION_FIX_QUALITIES
+        assert OcrQuality.BEST in _ROTATION_FIX_QUALITIES
+        assert OcrQuality.FAST not in _ROTATION_FIX_QUALITIES
 
-    @patch("pdftopdfa.ocr.HAS_OPENCV", True)
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_uses_opencv_plugin(
+    def test_apply_ocr_default_uses_rotation_plugin(
         self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
     ) -> None:
-        """Plugins kwarg is set when OpenCV is available and quality supports it."""
-        output_path = tmp_dir / "output.pdf"
-
-        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.DEFAULT)
-
-        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert call_kwargs["plugins"] == [
-            "pdftopdfa.ocr_rotation_fix",
-            "pdftopdfa.ocr_preprocess",
-        ]
-
-    @patch("pdftopdfa.ocr.HAS_OPENCV", True)
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_best_uses_opencv_plugin(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """BEST quality also uses the OpenCV plugin."""
-        output_path = tmp_dir / "output.pdf"
-
-        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
-
-        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert call_kwargs["plugins"] == [
-            "pdftopdfa.ocr_rotation_fix",
-            "pdftopdfa.ocr_preprocess",
-        ]
-
-    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_no_opencv_no_plugin(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """Rotation fix stays enabled even when OpenCV preprocessing is unavailable."""
+        """DEFAULT quality keeps the rotation plugin only."""
         output_path = tmp_dir / "output.pdf"
 
         apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.DEFAULT)
@@ -972,77 +932,44 @@ class TestOpenCVPlugin:
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
         assert call_kwargs["plugins"] == ["pdftopdfa.ocr_rotation_fix"]
 
-    @patch("pdftopdfa.ocr.HAS_OPENCV", True)
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_best_uses_rotation_plugin(
+        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """BEST quality also keeps only the rotation plugin."""
+        output_path = tmp_dir / "output.pdf"
+
+        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
+
+        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
+        assert call_kwargs["plugins"] == ["pdftopdfa.ocr_rotation_fix"]
+
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_default_uses_rotation_plugin_without_extra_dependencies(
+        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """Rotation fix stays enabled without optional preprocessing packages."""
+        output_path = tmp_dir / "output.pdf"
+
+        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.DEFAULT)
+
+        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
+        assert call_kwargs["plugins"] == ["pdftopdfa.ocr_rotation_fix"]
+
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     def test_apply_ocr_fast_no_plugin(
         self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
     ) -> None:
-        """FAST quality never uses the OpenCV plugin."""
+        """FAST quality never uses OCR plugins."""
         output_path = tmp_dir / "output.pdf"
 
         apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.FAST)
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
         assert "plugins" not in call_kwargs
-
-    @patch("pdftopdfa.ocr.HAS_OPENCV", False)
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_no_opencv_logs_warning(
-        self,
-        mock_ocrmypdf: MagicMock,
-        sample_pdf: Path,
-        tmp_dir: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """Warning is logged when OpenCV is not available."""
-        output_path = tmp_dir / "output.pdf"
-
-        with caplog.at_level(logging.WARNING, logger="pdftopdfa.ocr"):
-            apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.DEFAULT)
-
-        assert "OpenCV not available" in caplog.text
-
-
-class TestFilterOcrImage:
-    """Tests for the filter_ocr_image plugin hook."""
-
-    def test_filter_ocr_image_color_input(self) -> None:
-        """Color image is converted to grayscale and binarized."""
-        from pdftopdfa.ocr_preprocess import filter_ocr_image
-
-        # Create a color image (RGB)
-        img = Image.new("RGB", (100, 100), color=(128, 128, 128))
-        result = filter_ocr_image(page=None, image=img)
-
-        assert isinstance(result, Image.Image)
-        assert result.mode == "L"  # Grayscale output
-        assert result.size == (100, 100)
-
-    def test_filter_ocr_image_grayscale_input(self) -> None:
-        """Grayscale image is processed without color conversion."""
-        from pdftopdfa.ocr_preprocess import filter_ocr_image
-
-        img = Image.new("L", (100, 100), color=128)
-        result = filter_ocr_image(page=None, image=img)
-
-        assert isinstance(result, Image.Image)
-        assert result.mode == "L"
-        assert result.size == (100, 100)
-
-    def test_filter_ocr_image_binarizes_output(self) -> None:
-        """Output image contains only black and white pixels."""
-        import numpy as np
-
-        from pdftopdfa.ocr_preprocess import filter_ocr_image
-
-        img = Image.new("L", (100, 100), color=128)
-        result = filter_ocr_image(page=None, image=img)
-
-        pixels = np.array(result)
-        unique_values = set(np.unique(pixels))
-        assert unique_values <= {0, 255}
 
 
 class TestBestQualityTextRotationNormalization:

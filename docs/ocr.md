@@ -111,11 +111,14 @@ Internal OCR settings:
 | `deskew` | False | False | True |
 | `rotate_pages` | False | False | True |
 | `rotate_pages_threshold` | - | - | 5.0 |
-| `oversample` | - | 300 | 200 |
-| OpenCV preprocessing | No | Yes | Yes |
+| `oversample` | - | 600 | 600 |
+| `tesseract_pagesegmode` | - | 11 (`sparse_text`) | 11 (`sparse_text`) |
+| `tesseract_thresholding` | - | `adaptive-otsu` | `adaptive-otsu` |
 
-`default` and `best` use OpenCV preprocessing when available.
-If OpenCV is unavailable, OCR still runs and preprocessing is skipped.
+`default` and `best` rely on Tesseract's built-in adaptive thresholding.
+This is generally more robust for mixed scans with small text regions on large pages.
+`best` now includes the same OCR detection baseline as `default` and adds
+deskew/rotation on top.
 When OCR is forced, redo-ocr-incompatible options such as `deskew`
 are disabled automatically.
 

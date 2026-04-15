@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 # Optional import of ocrmypdf
 try:
     import ocrmypdf
+    from ocrmypdf._exec.tesseract import ThresholdingMethod
     from ocrmypdf.exceptions import (
         EncryptedPdfError,
         MissingDependencyError,
@@ -36,6 +37,12 @@ except ImportError:
     HAS_OCR = False
     ocrmypdf = None  # type: ignore[assignment]
 
+    class ThresholdingMethod(enum.IntEnum):  # type: ignore[no-redef]
+        AUTO = 0
+        OTSU = 0
+        ADAPTIVE_OTSU = 1
+        SAUVOLA = 2
+
     class EncryptedPdfError(Exception):  # type: ignore[no-redef]
         pass
 
@@ -45,14 +52,6 @@ except ImportError:
     class PriorOcrFoundError(Exception):  # type: ignore[no-redef]
         pass
 
-
-# Optional import of OpenCV (used for OCR image preprocessing)
-try:
-    import cv2  # noqa: F401
-
-    HAS_OPENCV = True
-except ImportError:
-    HAS_OPENCV = False
 
 if TYPE_CHECKING:
     import pikepdf
@@ -64,7 +63,6 @@ logger = logging.getLogger(__name__)
 
 _path_lock = threading.Lock()
 _ROTATION_FIX_PLUGIN = "pdftopdfa.ocr_rotation_fix"
-_PREPROCESS_PLUGIN = "pdftopdfa.ocr_preprocess"
 
 
 @contextlib.contextmanager
@@ -117,7 +115,12 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
         "skip_text": True,
         "deskew": False,
         "rotate_pages": False,
-        "oversample": 300,
+        # Higher oversampling helps small text blocks on large pages.
+        "oversample": 600,
+        # Sparse-text mode is more robust when text covers only part of a page.
+        "tesseract_pagesegmode": 11,
+        # Let modern Tesseract handle local thresholding directly.
+        "tesseract_thresholding": int(ThresholdingMethod.ADAPTIVE_OTSU),
         "optimize": 0,
         "tesseract_timeout": 120,
         "progress_bar": False,
@@ -128,9 +131,10 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
         "rotate_pages": True,
         # Lower threshold so sideways scanned pages are rotated more reliably.
         "rotate_pages_threshold": 5.0,
-        # Keep a moderate upsampling target to avoid excessive output growth
-        # when deskew/rotation trigger image transcoding.
-        "oversample": 200,
+        # Match DEFAULT's OCR-friendly sampling so BEST truly builds on it.
+        "oversample": 600,
+        "tesseract_pagesegmode": 11,
+        "tesseract_thresholding": int(ThresholdingMethod.ADAPTIVE_OTSU),
         "optimize": 0,
         "tesseract_timeout": 120,
         "progress_bar": False,
@@ -142,8 +146,7 @@ _REDO_OCR_INCOMPATIBLE_OPTIONS = frozenset(
     {"deskew", "clean_final", "remove_background"}
 )
 
-# Quality levels that benefit from OpenCV preprocessing
-_PREPROCESS_QUALITIES = frozenset({OcrQuality.DEFAULT, OcrQuality.BEST})
+_ROTATION_FIX_QUALITIES = frozenset({OcrQuality.DEFAULT, OcrQuality.BEST})
 
 
 @dataclass(frozen=True)
@@ -156,12 +159,9 @@ class _OrientationResult:
 
 def _get_ocr_plugins(quality: OcrQuality) -> list[str]:
     """Build the plugin list for the current OCR run."""
-    if quality not in _PREPROCESS_QUALITIES:
-        return []
-
-    plugins = [_ROTATION_FIX_PLUGIN]
-    if HAS_OPENCV:
-        plugins.append(_PREPROCESS_PLUGIN)
+    plugins: list[str] = []
+    if quality in _ROTATION_FIX_QUALITIES:
+        plugins.append(_ROTATION_FIX_PLUGIN)
     return plugins
 
 
@@ -772,13 +772,6 @@ def apply_ocr(
 
         if plugins:
             ocr_kwargs["plugins"] = plugins
-            if quality in _PREPROCESS_QUALITIES and HAS_OPENCV:
-                logger.debug("OpenCV preprocessing plugin enabled")
-            elif quality in _PREPROCESS_QUALITIES:
-                logger.warning(
-                    "OpenCV not available; skipping image preprocessing. "
-                    "Install opencv-python-headless for better OCR quality."
-                )
 
         with _temporary_tesseract_path():
             ocrmypdf.ocr(
