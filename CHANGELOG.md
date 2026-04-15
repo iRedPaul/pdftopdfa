@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.8] - 2026-04-15
+
+### Bug Fixes
+
+- Preserve mapped subset glyphs in `.notdef` usage sanitization
+
 ## [0.3.7] - 2026-04-14
 
 ### Bug Fixes
