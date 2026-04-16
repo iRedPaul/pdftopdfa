@@ -3094,6 +3094,48 @@ class TestSanitizeNonCatalogMetadata:
         assert b"photoshop:LegacyIPTCDigest" not in content
         assert b"photoshop:DocumentAncestors" not in content
 
+    def test_strips_problematic_native_digest_properties(
+        self,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """Non-catalog XMP drops NativeDigest fields that fail veraPDF."""
+        from io import BytesIO
+
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
+        xmp_data = (
+            b'<?xpacket begin="\xef\xbb\xbf"'
+            b' id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b"<rdf:RDF xmlns:rdf="
+            b'"http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about=""'
+            b' xmlns:xmp="http://ns.adobe.com/xap/1.0/"'
+            b' xmlns:exif="http://ns.adobe.com/exif/1.0/"'
+            b' xmlns:tiff="http://ns.adobe.com/tiff/1.0/">'
+            b"<xmp:CreatorTool>scanner</xmp:CreatorTool>"
+            b"<exif:NativeDigest>digest-a</exif:NativeDigest>"
+            b"<tiff:NativeDigest>digest-b</tiff:NativeDigest>"
+            b"</rdf:Description>"
+            b"</rdf:RDF>"
+            b"</x:xmpmeta>\n"
+            b'<?xpacket end="w"?>'
+        )
+        meta = pikepdf.Stream(pdf, xmp_data)
+        meta.Type = Name.Metadata
+        meta.Subtype = Name.XML
+        ref = pdf.make_indirect(meta)
+        pdf.pages[0].obj["/Metadata"] = ref
+
+        sanitized, removed = _sanitize_non_catalog_metadata(pdf)
+        assert sanitized == 1
+        assert removed == 0
+
+        page_meta = pdf.get_object(ref.objgen)
+        content = bytes(page_meta.read_bytes())
+        assert b"xmp:CreatorTool" in content
+        assert b"exif:NativeDigest" not in content
+        assert b"tiff:NativeDigest" not in content
+
     def test_preserves_locally_declared_custom_properties(
         self,
         sample_pdf_bytes: bytes,

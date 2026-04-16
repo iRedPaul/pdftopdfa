@@ -137,6 +137,8 @@ _PDF_A_UNSAFE_PRESERVED_PROPERTIES = frozenset(
         (NAMESPACES["xmpMM"], "OriginalDocumentID"),
         (NAMESPACES["xmpMM"], "DerivedFrom"),
         (NAMESPACES["xmpMM"], "History"),
+        (NAMESPACES["exif"], "NativeDigest"),
+        (NAMESPACES["tiff"], "NativeDigest"),
     }
 )
 
@@ -150,6 +152,8 @@ _PDF_A_UNSAFE_NON_CATALOG_PROPERTIES = frozenset(
         (NAMESPACES["photoshop"], "ICCProfile"),
         (NAMESPACES["photoshop"], "DocumentAncestors"),
         (NAMESPACES["photoshop"], "LegacyIPTCDigest"),
+        (NAMESPACES["exif"], "NativeDigest"),
+        (NAMESPACES["tiff"], "NativeDigest"),
     }
 )
 
