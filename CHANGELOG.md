@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.11] - 2026-04-16
+
+### Bug Fixes
+
+- Strip EXIF and TIFF `NativeDigest` metadata that fails veraPDF
+
 ## [0.3.10] - 2026-04-16
 
 ### Changes
