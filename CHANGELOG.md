@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.12] - 2026-04-16
+
+### Bug Fixes
+
+- Preserve non-compliant annotations by flattening appearance streams
+
 ## [0.3.11] - 2026-04-16
 
 ### Bug Fixes
