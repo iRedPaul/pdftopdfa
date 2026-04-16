@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.10] - 2026-04-16
+
+### Changes
+
+- Remove OpenCV preprocessing from the OCR pipeline
+- Increase Tesseract timeout for the default and best OCR presets
+
 ## [0.3.9] - 2026-04-15
 
 ### Bug Fixes
