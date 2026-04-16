@@ -21,6 +21,7 @@ from .annotations import (
     fix_annotation_flags,
     fix_annotation_opacity,
     fix_button_appearance_subdicts,
+    flatten_non_compliant_annotations,
     remove_annotation_colors,
     remove_forbidden_annotations,
     remove_needs_appearances,
@@ -139,6 +140,7 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "invalid_destinations_removed": 0,
         "xfa_removed": 0,
         "forbidden_annotations_removed": 0,
+        "non_compliant_annotations_flattened": 0,
         "forbidden_xobjects_removed": 0,
         "appearance_streams_added": 0,
         "annotation_flags_fixed": 0,
@@ -320,6 +322,11 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
     result["signatures_removed"] = sig_result["signatures_removed"]
     result["sigflags_fixed"] = sig_result["sigflags_fixed"]
     result["signatures_type_fixed"] = sig_result["signatures_type_fixed"]
+
+    # Flatten visible non-standard annotations before removing them outright
+    result["non_compliant_annotations_flattened"] = flatten_non_compliant_annotations(
+        pdf, level
+    )
 
     # Remove forbidden annotation subtypes (all levels)
     result["forbidden_annotations_removed"] = remove_forbidden_annotations(pdf, level)
@@ -527,7 +534,8 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "%d XFA, %d forbidden catalog entries, "
         "%d viewer prefs entries removed, "
         "catalog /Lang set: %s, "
-        "%d forbidden annots, %d forbidden XObjects removed, "
+        "%d forbidden annots, %d non-compliant annots flattened, "
+        "%d forbidden XObjects removed, "
         "%d AP streams added, %d annot flags fixed, %d annot /CA fixed, "
         "%d annot colors removed, %d annot AP keys removed, "
         "%d Btn AP subdicts fixed, "
@@ -585,6 +593,7 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         result["viewer_prefs_entries_removed"],
         result["catalog_lang_set"],
         result["forbidden_annotations_removed"],
+        result["non_compliant_annotations_flattened"],
         result["forbidden_xobjects_removed"],
         result["appearance_streams_added"],
         result["annotation_flags_fixed"],
@@ -674,6 +683,7 @@ __all__ = [
     "ensure_filespec_desc",
     "ensure_filespec_uf_entries",
     "ensure_appearance_streams",
+    "flatten_non_compliant_annotations",
     "fix_button_appearance_subdicts",
     "remove_needs_appearances",
     "remove_javascript",

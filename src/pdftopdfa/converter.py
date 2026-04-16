@@ -52,6 +52,10 @@ _CONFORMANCE_RANK = {"b": 0, "u": 1, "a": 2}
 
 # Sanitization result key -> warning message mappings for convert_to_pdfa().
 _SANITIZE_WARNINGS: list[tuple[str, str]] = [
+    (
+        "non_compliant_annotations_flattened",
+        "non-compliant annotation(s) flattened into page content",
+    ),
     ("javascript_removed", "JavaScript element(s) removed"),
     ("actions_removed", "non-compliant action(s) removed"),
     ("files_removed", "embedded file(s) removed"),

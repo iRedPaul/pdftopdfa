@@ -14,6 +14,7 @@ from pdftopdfa.sanitizers.annotations import (
     fix_annotation_flags,
     fix_annotation_opacity,
     fix_button_appearance_subdicts,
+    flatten_non_compliant_annotations,
     remove_annotation_colors,
     remove_forbidden_annotations,
     remove_needs_appearances,
@@ -209,6 +210,113 @@ class TestRemoveForbiddenAnnotations:
         page_xobjects = resolve(page_resources.get("/XObject"))
         form_obj = resolve(page_xobjects.get("/Fm0"))
         assert form_obj.get("/Annots") is None
+
+
+class TestFlattenNonCompliantAnnotations:
+    """Tests for flatten_non_compliant_annotations()."""
+
+    def test_flattens_unknown_annotation_with_ap_stream(self, make_pdf_with_page):
+        """Visible non-standard annotation is painted into page contents."""
+        pdf = make_pdf_with_page()
+        ap_stream = pdf.make_stream(b"0 0 1 rg 0 0 20 20 re f")
+        ap_stream[Name.Type] = Name.XObject
+        ap_stream[Name.Subtype] = Name.Form
+        ap_stream[Name.BBox] = Array([0, 0, 20, 20])
+
+        annot = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name("/VendorStamp"),
+                Rect=Array([100, 700, 120, 720]),
+                AP=Dictionary(N=ap_stream),
+            )
+        )
+        pdf.pages[0][Name.Contents] = pdf.make_stream(b"q 1 0 0 1 0 0 cm Q")
+        pdf.pages[0]["/Annots"] = Array([annot])
+
+        pdf = save_and_reopen(pdf)
+        result = flatten_non_compliant_annotations(pdf)
+
+        assert result == 1
+        assert "/Annots" not in pdf.pages[0]
+
+        contents = resolve(pdf.pages[0].obj.get("/Contents"))
+        assert isinstance(contents, Array)
+        flattened_stream = resolve(contents[-1])
+        assert b"Do" in flattened_stream.read_bytes()
+        assert b"/FmFlattenAnnot0" in flattened_stream.read_bytes()
+
+        resources = resolve(pdf.pages[0].obj.get("/Resources"))
+        xobjects = resolve(resources.get("/XObject"))
+        flattened_ap = resolve(xobjects.get("/FmFlattenAnnot0"))
+        assert flattened_ap.read_bytes() == b"0 0 1 rg 0 0 20 20 re f"
+
+    def test_uses_as_state_from_ap_n_dictionary(self, make_pdf_with_page):
+        """State dictionaries are flattened using the selected /AS stream."""
+        pdf = make_pdf_with_page()
+        on_stream = pdf.make_stream(b"1 0 0 rg")
+        on_stream[Name.Type] = Name.XObject
+        on_stream[Name.Subtype] = Name.Form
+        on_stream[Name.BBox] = Array([0, 0, 10, 10])
+
+        off_stream = pdf.make_stream(b"0 1 0 rg")
+        off_stream[Name.Type] = Name.XObject
+        off_stream[Name.Subtype] = Name.Form
+        off_stream[Name.BBox] = Array([0, 0, 10, 10])
+
+        state_dict = Dictionary()
+        state_dict[Name("/On")] = on_stream
+        state_dict[Name("/Off")] = off_stream
+
+        annot = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name("/VendorStamp"),
+                Rect=Array([10, 10, 20, 20]),
+                AP=Dictionary(N=state_dict),
+                AS=Name("/On"),
+            )
+        )
+        pdf.pages[0]["/Annots"] = Array([annot])
+
+        pdf = save_and_reopen(pdf)
+        result = flatten_non_compliant_annotations(pdf)
+
+        assert result == 1
+        xobjects = resolve(resolve(pdf.pages[0].obj.get("/Resources")).get("/XObject"))
+        flattened_ap = resolve(xobjects.get("/FmFlattenAnnot0"))
+        assert flattened_ap.read_bytes() == b"1 0 0 rg"
+
+    def test_sanitize_for_pdfa_flattens_before_removal(self, make_pdf_with_page):
+        """Integration: sanitize_for_pdfa preserves visible appearance."""
+        from pdftopdfa.sanitizers import sanitize_for_pdfa
+
+        pdf = make_pdf_with_page()
+        ap_stream = pdf.make_stream(b"0 0 1 rg 0 0 20 20 re f")
+        ap_stream[Name.Type] = Name.XObject
+        ap_stream[Name.Subtype] = Name.Form
+        ap_stream[Name.BBox] = Array([0, 0, 20, 20])
+        annot = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name("/VendorStamp"),
+                Rect=Array([100, 700, 120, 720]),
+                AP=Dictionary(N=ap_stream),
+            )
+        )
+        pdf.pages[0]["/Annots"] = Array([annot])
+
+        pdf = save_and_reopen(pdf)
+        result = sanitize_for_pdfa(pdf, "2b")
+
+        assert result["non_compliant_annotations_flattened"] == 1
+        assert result["forbidden_annotations_removed"] == 0
+        assert "/Annots" not in pdf.pages[0]
+        contents = resolve(pdf.pages[0].obj.get("/Contents"))
+        flattened_stream = resolve(
+            contents[-1] if isinstance(contents, Array) else contents
+        )
+        assert b"/FmFlattenAnnot0 Do" in flattened_stream.read_bytes()
 
 
 class TestFixAnnotationFlags:

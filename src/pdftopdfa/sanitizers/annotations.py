@@ -129,6 +129,208 @@ def _is_non_compliant_annotation_subtype(subtype: str) -> bool:
     return subtype not in DEFINED_ANNOTATION_SUBTYPES
 
 
+def _annotation_is_hidden(resolved: Dictionary) -> bool:
+    """Return ``True`` when an annotation is explicitly non-visible."""
+    raw_flags = resolved.get("/F")
+    flags = int(raw_flags) if raw_flags is not None else 0
+    return bool(flags & (ANNOT_FLAG_INVISIBLE | ANNOT_FLAG_HIDDEN | ANNOT_FLAG_NOVIEW))
+
+
+def _extract_normal_appearance_stream(annot: Dictionary) -> Stream | None:
+    """Return a usable normal appearance stream for an annotation."""
+    ap = annot.get("/AP")
+    if ap is None:
+        return None
+
+    ap = _resolve_indirect(ap)
+    if not isinstance(ap, Dictionary) or isinstance(ap, Stream):
+        return None
+
+    normal = ap.get("/N")
+    if normal is None:
+        return None
+
+    normal = _resolve_indirect(normal)
+    if isinstance(normal, Stream):
+        return normal
+
+    if isinstance(normal, Dictionary):
+        return _extract_stream_from_state_dict(normal, annot)
+
+    return None
+
+
+def _ensure_page_xobject_resources(page) -> Dictionary:
+    """Return the page ``/Resources/XObject`` dictionary, creating it if needed."""
+    resources = page.obj.get("/Resources")
+    resources = _resolve_indirect(resources) if resources is not None else None
+    if not isinstance(resources, Dictionary):
+        resources = Dictionary()
+        page.obj[Name.Resources] = resources
+
+    xobjects = resources.get("/XObject")
+    xobjects = _resolve_indirect(xobjects) if xobjects is not None else None
+    if not isinstance(xobjects, Dictionary):
+        xobjects = Dictionary()
+        resources[Name.XObject] = xobjects
+
+    return xobjects
+
+
+def _append_page_content_stream(page, stream: Stream) -> None:
+    """Append a content stream so flattened appearances render on top."""
+    contents = page.obj.get("/Contents")
+    if contents is None:
+        page.obj[Name.Contents] = stream
+        return
+
+    resolved = _resolve_indirect(contents)
+    if isinstance(resolved, Array):
+        resolved.append(stream)
+        return
+
+    page.obj[Name.Contents] = Array([contents, stream])
+
+
+def _format_pdf_number(value: float) -> str:
+    """Format a float as a compact PDF numeric literal."""
+    text = f"{value:.12f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _appearance_invocation_stream(
+    pdf: Pdf, resource_name: Name, annot, ap_stream
+) -> Stream:
+    """Build a page content stream that paints an annotation appearance."""
+    rect = annot.get("/Rect")
+    bbox = ap_stream.get("/BBox")
+    if rect is None or bbox is None or len(rect) != 4 or len(bbox) != 4:
+        command = f"q {str(resource_name)} Do Q\n".encode("ascii")
+        return pdf.make_stream(command)
+
+    try:
+        rect_coords = [float(value) for value in rect]
+        bbox_coords = [float(value) for value in bbox]
+    except Exception:
+        command = f"q {str(resource_name)} Do Q\n".encode("ascii")
+        return pdf.make_stream(command)
+
+    bbox_width = bbox_coords[2] - bbox_coords[0]
+    bbox_height = bbox_coords[3] - bbox_coords[1]
+
+    if bbox_width == 0 or bbox_height == 0:
+        command = f"q {str(resource_name)} Do Q\n".encode("ascii")
+        return pdf.make_stream(command)
+
+    scale_x = (rect_coords[2] - rect_coords[0]) / bbox_width
+    scale_y = (rect_coords[3] - rect_coords[1]) / bbox_height
+    translate_x = rect_coords[0] - (bbox_coords[0] * scale_x)
+    translate_y = rect_coords[1] - (bbox_coords[1] * scale_y)
+
+    command = (
+        "q "
+        f"{_format_pdf_number(scale_x)} 0 0 {_format_pdf_number(scale_y)} "
+        f"{_format_pdf_number(translate_x)} {_format_pdf_number(translate_y)} cm "
+        f"{str(resource_name)} Do Q\n"
+    ).encode("ascii")
+    return pdf.make_stream(command)
+
+
+def flatten_non_compliant_annotations(pdf: Pdf, level: str = "3b") -> int:
+    """Flatten visible non-compliant page annotations into page content.
+
+    Proprietary or otherwise non-standard annotations cannot remain in a
+    PDF/A file.  When such an annotation has a usable normal appearance
+    stream, this function paints that appearance into the owning page's
+    content stream and removes the annotation entry afterwards so the
+    visual result is preserved.
+
+    Args:
+        pdf: Opened pikepdf PDF object (modified in place).
+        level: PDF/A conformance level (reserved for future use).
+
+    Returns:
+        Number of annotations flattened into page content.
+    """
+    del level  # reserved for future use
+
+    flattened_count = 0
+
+    for page in pdf.pages:
+        annots = page.obj.get("/Annots")
+        if annots is None:
+            continue
+
+        annots = _resolve_indirect(annots)
+        if not isinstance(annots, Array):
+            continue
+
+        indices_to_remove: list[int] = []
+        page_xobjects: Dictionary | None = None
+
+        for index, annot in enumerate(annots):
+            try:
+                resolved = _resolve_indirect(annot)
+                if not isinstance(resolved, Dictionary):
+                    continue
+
+                subtype = resolved.get("/Subtype")
+                if subtype is None:
+                    continue
+
+                subtype_str = str(subtype)
+                if not _is_non_compliant_annotation_subtype(subtype_str):
+                    continue
+
+                if _annotation_is_hidden(resolved):
+                    continue
+
+                appearance = _extract_normal_appearance_stream(resolved)
+                if appearance is None:
+                    continue
+
+                page_xobjects = (
+                    page_xobjects
+                    if page_xobjects is not None
+                    else _ensure_page_xobject_resources(page)
+                )
+                resource_index = len(page_xobjects)
+                resource_name = Name(f"/FmFlattenAnnot{resource_index}")
+                while page_xobjects.get(resource_name) is not None:
+                    resource_index += 1
+                    resource_name = Name(f"/FmFlattenAnnot{resource_index}")
+
+                page_xobjects[resource_name] = appearance
+                content_stream = _appearance_invocation_stream(
+                    pdf, resource_name, resolved, appearance
+                )
+                _append_page_content_stream(page, content_stream)
+
+                indices_to_remove.append(index)
+                flattened_count += 1
+                logger.debug(
+                    "Flattened non-compliant annotation subtype %s into page content",
+                    subtype_str,
+                )
+            except Exception as e:
+                logger.debug("Error flattening non-compliant annotation: %s", e)
+
+        for index in reversed(indices_to_remove):
+            del annots[index]
+
+        if len(annots) == 0 and indices_to_remove:
+            del page.obj["/Annots"]
+
+    if flattened_count > 0:
+        _invalidate_annotation_arrays_cache(pdf)
+        logger.info(
+            "%d non-compliant annotation(s) flattened into page content",
+            flattened_count,
+        )
+
+    return flattened_count
+
+
 def remove_forbidden_annotations(pdf: Pdf, level: str = "3b") -> int:
     """Removes forbidden and undefined annotation subtypes from the PDF.
 
