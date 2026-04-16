@@ -700,6 +700,7 @@ class TestOcrQuality:
         assert settings["oversample"] == 600
         assert settings["tesseract_pagesegmode"] == 11
         assert settings["tesseract_thresholding"] == 1
+        assert settings["tesseract_timeout"] == 300
         assert settings["optimize"] == 0
         assert settings["progress_bar"] is False
         assert "clean" not in settings
@@ -714,6 +715,7 @@ class TestOcrQuality:
         assert settings["oversample"] == 600
         assert settings["tesseract_pagesegmode"] == 11
         assert settings["tesseract_thresholding"] == 1
+        assert settings["tesseract_timeout"] == 300
         assert settings["optimize"] == 0
         assert settings["progress_bar"] is False
         assert "clean" not in settings

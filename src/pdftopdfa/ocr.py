@@ -122,7 +122,7 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
         # Let modern Tesseract handle local thresholding directly.
         "tesseract_thresholding": int(ThresholdingMethod.ADAPTIVE_OTSU),
         "optimize": 0,
-        "tesseract_timeout": 120,
+        "tesseract_timeout": 300,
         "progress_bar": False,
     },
     OcrQuality.BEST: {
@@ -136,7 +136,7 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
         "tesseract_pagesegmode": 11,
         "tesseract_thresholding": int(ThresholdingMethod.ADAPTIVE_OTSU),
         "optimize": 0,
-        "tesseract_timeout": 120,
+        "tesseract_timeout": 300,
         "progress_bar": False,
     },
 }
