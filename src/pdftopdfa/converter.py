@@ -32,6 +32,7 @@ from .exceptions import (
 from .extensions import add_extensions_if_needed
 from .fonts import check_font_compliance
 from .metadata import _extract_existing_xmp, extract_pdf_info, sync_metadata
+from .ocr import DEFAULT_OCR_FALLBACK_AFTER_SECONDS, DEFAULT_OCR_FALLBACK_QUALITY
 from .sanitizers import (
     sanitize_for_pdfa,
     sanitize_notdef_usage,
@@ -620,6 +621,8 @@ def convert_to_pdfa(
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
+    ocr_fallback_quality: "OcrQuality | None" = DEFAULT_OCR_FALLBACK_QUALITY,
+    ocr_fallback_after_seconds: float | None = DEFAULT_OCR_FALLBACK_AFTER_SECONDS,
     ocr_force: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
@@ -637,6 +640,10 @@ def convert_to_pdfa(
             (e.g., ``["deu", "eng"]``).  If specified, OCR is applied to
             image-based pages.
         ocr_quality: OCR quality preset. If None, uses OcrQuality.DEFAULT.
+        ocr_fallback_quality: Faster OCR quality to retry with if OCR leaves
+            the selected preset takes too long. Use None to disable.
+        ocr_fallback_after_seconds: Runtime threshold for OCR fallback.
+            Use None to disable time-based retry.
         ocr_force: If True, force OCR even on pages that already contain
             text by using ocrmypdf's ``redo_ocr`` mode. Options
             incompatible with ``redo_ocr`` are disabled automatically.
@@ -810,6 +817,8 @@ def convert_to_pdfa(
                     ocr_temp_file,
                     ocr_languages,
                     quality=effective_quality,
+                    fallback_quality=ocr_fallback_quality,
+                    fallback_after_seconds=ocr_fallback_after_seconds,
                     force=ocr_force,
                 )
 
@@ -1161,6 +1170,8 @@ def convert_files(
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
+    ocr_fallback_quality: "OcrQuality | None" = DEFAULT_OCR_FALLBACK_QUALITY,
+    ocr_fallback_after_seconds: float | None = DEFAULT_OCR_FALLBACK_AFTER_SECONDS,
     ocr_force: bool = False,
     force_overwrite: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
@@ -1181,6 +1192,9 @@ def convert_files(
         ocr_languages: Optional list of Tesseract language codes
             (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
+        ocr_fallback_quality: Faster OCR quality to retry with if OCR leaves
+            the selected preset takes too long.
+        ocr_fallback_after_seconds: Runtime threshold for OCR fallback.
         ocr_force: If True, force OCR even on pages that already contain
             text. Options incompatible with ocrmypdf's ``redo_ocr``
             mode are disabled automatically.
@@ -1234,6 +1248,8 @@ def convert_files(
                 skip_any_pdfa=skip_any_pdfa,
                 ocr_languages=ocr_languages,
                 ocr_quality=ocr_quality,
+                ocr_fallback_quality=ocr_fallback_quality,
+                ocr_fallback_after_seconds=ocr_fallback_after_seconds,
                 ocr_force=ocr_force,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
@@ -1272,6 +1288,8 @@ def convert_directory(
     show_progress: bool = True,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
+    ocr_fallback_quality: "OcrQuality | None" = DEFAULT_OCR_FALLBACK_QUALITY,
+    ocr_fallback_after_seconds: float | None = DEFAULT_OCR_FALLBACK_AFTER_SECONDS,
     ocr_force: bool = False,
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
@@ -1293,6 +1311,9 @@ def convert_directory(
             (e.g., ``["deu", "eng"]``).
             If specified, OCR is applied to image-based pages.
         ocr_quality: OCR quality preset.
+        ocr_fallback_quality: Faster OCR quality to retry with if OCR leaves
+            the selected preset takes too long.
+        ocr_fallback_after_seconds: Runtime threshold for OCR fallback.
         ocr_force: If True, force OCR even on pages that already contain
             text. Options incompatible with ocrmypdf's ``redo_ocr``
             mode are disabled automatically.
@@ -1370,6 +1391,8 @@ def convert_directory(
         skip_any_pdfa=skip_any_pdfa,
         ocr_languages=ocr_languages,
         ocr_quality=ocr_quality,
+        ocr_fallback_quality=ocr_fallback_quality,
+        ocr_fallback_after_seconds=ocr_fallback_after_seconds,
         ocr_force=ocr_force,
         force_overwrite=force_overwrite,
         on_progress=_on_progress if show_progress else None,

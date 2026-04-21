@@ -494,6 +494,8 @@ class TestCliOcr:
 
         assert result.exit_code == 0
         assert "--ocr-quality" in result.output
+        assert "--ocr-fallback-quality" in result.output
+        assert "--ocr-fallback-after" in result.output
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
@@ -582,6 +584,80 @@ class TestCliOcr:
         )
 
         assert result.exit_code == 2  # Click rejects invalid choice
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_cli_ocr_fallback_quality_none(
+        self,
+        mock_is_ocr_available,
+        mock_apply_ocr,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """--ocr-fallback-quality none disables automatic OCR fallback."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--ocr",
+                "--ocr-fallback-quality",
+                "none",
+            ],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert mock_apply_ocr.call_args[1]["fallback_quality"] is None
+        assert mock_apply_ocr.call_args[1]["fallback_after_seconds"] == 60.0
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_cli_ocr_fallback_quality_default_with_custom_threshold(
+        self,
+        mock_is_ocr_available,
+        mock_apply_ocr,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """--ocr-fallback-quality default is passed through."""
+        import shutil
+
+        from pdftopdfa.ocr import OcrQuality
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--ocr",
+                "--ocr-quality",
+                "best",
+                "--ocr-fallback-quality",
+                "default",
+                "--ocr-fallback-after",
+                "120",
+            ],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert mock_apply_ocr.call_args[1]["fallback_quality"] == OcrQuality.DEFAULT
+        assert mock_apply_ocr.call_args[1]["fallback_after_seconds"] == 120.0
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")

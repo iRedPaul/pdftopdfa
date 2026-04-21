@@ -439,6 +439,10 @@ class TestApplyOcr:
 
         apply_ocr(sample_pdf, output_path, ["eng"])
 
+        expected_settings = {
+            **OCR_SETTINGS[OcrQuality.DEFAULT],
+            "tesseract_timeout": 60,
+        }
         mock_ocrmypdf.ocr.assert_called_once_with(
             sample_pdf,
             output_path,
@@ -446,7 +450,7 @@ class TestApplyOcr:
             output_type="pdf",
             rasterizer="pypdfium",
             plugins=["pdftopdfa.ocr_rotation_fix"],
-            **OCR_SETTINGS[OcrQuality.DEFAULT],
+            **expected_settings,
         )
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
@@ -504,6 +508,71 @@ class TestApplyOcr:
         result = apply_ocr(sample_pdf, output_path, ["deu"])
 
         assert result == output_path
+
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    @patch("pdftopdfa.ocr.time.perf_counter")
+    def test_apply_ocr_retries_with_fallback_when_runtime_exceeds_limit(
+        self,
+        mock_perf_counter: MagicMock,
+        mock_ocrmypdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """A faster fallback runs when OCR exceeds the time threshold."""
+        output_path = tmp_dir / "output.pdf"
+        mock_perf_counter.side_effect = [0.0, 61.0, 61.0, 62.0]
+
+        def create_output(input_path: Path, output: Path, **kwargs: object) -> None:
+            import shutil
+
+            shutil.copy(input_path, output)
+
+        mock_ocrmypdf.ocr.side_effect = create_output
+
+        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
+
+        assert mock_ocrmypdf.ocr.call_count == 2
+        first_kwargs = mock_ocrmypdf.ocr.call_args_list[0].kwargs
+        assert first_kwargs["tesseract_timeout"] == 60
+        retry_kwargs = mock_ocrmypdf.ocr.call_args_list[1].kwargs
+        assert (
+            retry_kwargs["tesseract_timeout"]
+            == OCR_SETTINGS[OcrQuality.FAST]["tesseract_timeout"]
+        )
+        assert "oversample" not in retry_kwargs
+        assert "plugins" not in retry_kwargs
+
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    @patch("pdftopdfa.ocr.time.perf_counter")
+    def test_apply_ocr_fallback_can_be_disabled(
+        self,
+        mock_perf_counter: MagicMock,
+        mock_ocrmypdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """fallback_quality=None disables automatic retry."""
+        output_path = tmp_dir / "output.pdf"
+        mock_perf_counter.side_effect = [0.0, 61.0]
+
+        def create_output(input_path: Path, output: Path, **kwargs: object) -> None:
+            import shutil
+
+            shutil.copy(input_path, output)
+
+        mock_ocrmypdf.ocr.side_effect = create_output
+
+        apply_ocr(
+            sample_pdf,
+            output_path,
+            ["eng"],
+            quality=OcrQuality.BEST,
+            fallback_quality=None,
+        )
+
+        mock_ocrmypdf.ocr.assert_called_once()
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
@@ -749,6 +818,10 @@ class TestOcrQuality:
 
         apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.DEFAULT)
 
+        expected_settings = {
+            **OCR_SETTINGS[OcrQuality.DEFAULT],
+            "tesseract_timeout": 60,
+        }
         mock_ocrmypdf.ocr.assert_called_once_with(
             sample_pdf,
             output_path,
@@ -756,7 +829,7 @@ class TestOcrQuality:
             output_type="pdf",
             rasterizer="pypdfium",
             plugins=["pdftopdfa.ocr_rotation_fix"],
-            **OCR_SETTINGS[OcrQuality.DEFAULT],
+            **expected_settings,
         )
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
@@ -775,6 +848,10 @@ class TestOcrQuality:
 
         apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
 
+        expected_settings = {
+            **OCR_SETTINGS[OcrQuality.BEST],
+            "tesseract_timeout": 60,
+        }
         mock_ocrmypdf.ocr.assert_called_once_with(
             sample_pdf,
             output_path,
@@ -782,7 +859,7 @@ class TestOcrQuality:
             output_type="pdf",
             rasterizer="pypdfium",
             plugins=["pdftopdfa.ocr_rotation_fix"],
-            **OCR_SETTINGS[OcrQuality.BEST],
+            **expected_settings,
         )
         mock_normalize_pages.assert_called_once_with(output_path)
 
@@ -799,7 +876,10 @@ class TestOcrQuality:
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
         expected = OCR_SETTINGS[OcrQuality.DEFAULT]
         for key, value in expected.items():
-            assert call_kwargs[key] == value
+            if key == "tesseract_timeout":
+                assert call_kwargs[key] == 60
+            else:
+                assert call_kwargs[key] == value
 
 
 class TestApplyOcrForce:

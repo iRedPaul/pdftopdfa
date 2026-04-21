@@ -81,6 +81,8 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `--ocr-force` | Force OCR even if text is present (implies `--ocr` and disables compliant-PDF/A skip optimization) |
 | `--ocr-lang LANG` | OCR language code (default: `eng`), for example `deu` or `deu+eng` |
 | `--ocr-quality [fast\|default\|best]` | OCR quality preset (default: `default`) |
+| `--ocr-fallback-quality [none\|fast\|default\|best]` | Faster OCR preset to retry with if OCR takes too long (default: `fast`) |
+| `--ocr-fallback-after SECONDS` | Retry threshold for OCR fallback (default: `60`) |
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
 | `--preserve-stamps` | Convert known proprietary stamp annotations to standard PDF Stamp annotations instead of flattening them |
 | `--skip-any-pdfa` | Skip inputs that veraPDF validates as any compliant PDF/A, regardless of target level |
@@ -131,6 +133,8 @@ def convert_to_pdfa(
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_quality: OcrQuality | None = None,
+    ocr_fallback_quality: OcrQuality | None = OcrQuality.FAST,
+    ocr_fallback_after_seconds: float | None = 60.0,
     ocr_force: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
@@ -173,6 +177,8 @@ def convert_directory(
     show_progress: bool = True,
     ocr_languages: list[str] | None = None,
     ocr_quality: OcrQuality | None = None,
+    ocr_fallback_quality: OcrQuality | None = OcrQuality.FAST,
+    ocr_fallback_after_seconds: float | None = 60.0,
     ocr_force: bool = False,
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
@@ -204,6 +210,8 @@ def convert_files(
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_quality: OcrQuality | None = None,
+    ocr_fallback_quality: OcrQuality | None = OcrQuality.FAST,
+    ocr_fallback_after_seconds: float | None = 60.0,
     ocr_force: bool = False,
     force_overwrite: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,

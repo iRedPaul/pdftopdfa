@@ -284,6 +284,40 @@ class TestConvertToPdfa:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_convert_with_ocr_fallback_quality_parameter(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """ocr_fallback_quality is passed through to apply_ocr."""
+        import shutil
+
+        from pdftopdfa.ocr import OcrQuality
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
+
+        output_path = tmp_dir / "output.pdf"
+
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            ocr_languages=["eng"],
+            ocr_fallback_quality=OcrQuality.FAST,
+            ocr_fallback_after_seconds=45.0,
+        )
+
+        assert result.success is True
+        mock_apply_ocr.assert_called_once()
+        assert mock_apply_ocr.call_args[1]["fallback_quality"] == OcrQuality.FAST
+        assert mock_apply_ocr.call_args[1]["fallback_after_seconds"] == 45.0
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_with_ocr_adds_warning_message(
         self,
         mock_is_ocr_available: MagicMock,

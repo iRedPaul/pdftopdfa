@@ -217,6 +217,23 @@ def _print_validation_result(
     "best=best quality (may alter document visually and increase file size).",
 )
 @click.option(
+    "--ocr-fallback-quality",
+    "ocr_fallback_quality",
+    type=click.Choice(["none", "fast", "default", "best"]),
+    default="fast",
+    help="Faster OCR preset to retry with when OCR takes too long "
+    "(default: fast; use none to disable).",
+)
+@click.option(
+    "--ocr-fallback-after",
+    "ocr_fallback_after_seconds",
+    type=click.FloatRange(min=1.0),
+    default=60.0,
+    show_default=True,
+    help="Retry with --ocr-fallback-quality if the selected OCR preset takes "
+    "longer than this many seconds.",
+)
+@click.option(
     "--convert-calibrated/--no-convert-calibrated",
     default=True,
     help="Convert CalGray/CalRGB color spaces to ICCBased (default: enabled)",
@@ -251,6 +268,8 @@ def main(
     ocr_force: bool,
     ocr_lang: str,
     ocr_quality: str,
+    ocr_fallback_quality: str,
+    ocr_fallback_after_seconds: float,
     convert_calibrated: bool,
     preserve_stamps: bool,
     skip_any_pdfa: bool,
@@ -295,10 +314,13 @@ def main(
         # Convert OCR quality string to enum (lazy import to avoid requiring
         # ocrmypdf when OCR is not used)
         ocr_quality_enum = None
+        ocr_fallback_quality_enum = None
         if ocr_enabled:
             from .ocr import OcrQuality
 
             ocr_quality_enum = OcrQuality(ocr_quality)
+            if ocr_fallback_quality != "none":
+                ocr_fallback_quality_enum = OcrQuality(ocr_fallback_quality)
 
         if input_path_obj.is_file():
             # Convert single file
@@ -311,6 +333,8 @@ def main(
                 quiet,
                 ocr_languages=ocr_languages,
                 ocr_quality=ocr_quality_enum,
+                ocr_fallback_quality=ocr_fallback_quality_enum,
+                ocr_fallback_after_seconds=ocr_fallback_after_seconds,
                 ocr_force=ocr_force,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
@@ -328,6 +352,8 @@ def main(
                 quiet,
                 ocr_languages=ocr_languages,
                 ocr_quality=ocr_quality_enum,
+                ocr_fallback_quality=ocr_fallback_quality_enum,
+                ocr_fallback_after_seconds=ocr_fallback_after_seconds,
                 ocr_force=ocr_force,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
@@ -373,6 +399,8 @@ def _convert_single_file(
     *,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
+    ocr_fallback_quality: "OcrQuality | None" = None,
+    ocr_fallback_after_seconds: float | None = None,
     ocr_force: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
@@ -390,6 +418,8 @@ def _convert_single_file(
         ocr_languages: Optional list of Tesseract language codes
             (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
+        ocr_fallback_quality: Faster OCR quality used if OCR takes too long.
+        ocr_fallback_after_seconds: Runtime threshold for OCR fallback.
         ocr_force: If True, force OCR even on pages with existing text.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations
@@ -425,6 +455,8 @@ def _convert_single_file(
         skip_any_pdfa=skip_any_pdfa,
         ocr_languages=ocr_languages,
         ocr_quality=ocr_quality,
+        ocr_fallback_quality=ocr_fallback_quality,
+        ocr_fallback_after_seconds=ocr_fallback_after_seconds,
         ocr_force=ocr_force,
         convert_calibrated=convert_calibrated,
         preserve_stamps=preserve_stamps,
@@ -479,6 +511,8 @@ def _convert_directory(
     *,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
+    ocr_fallback_quality: "OcrQuality | None" = None,
+    ocr_fallback_after_seconds: float | None = None,
     ocr_force: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
@@ -497,6 +531,8 @@ def _convert_directory(
         ocr_languages: Optional list of Tesseract language codes
             (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
+        ocr_fallback_quality: Faster OCR quality used if OCR takes too long.
+        ocr_fallback_after_seconds: Runtime threshold for OCR fallback.
         ocr_force: If True, force OCR even on pages with existing text.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations
@@ -523,6 +559,8 @@ def _convert_directory(
         show_progress=not quiet,
         ocr_languages=ocr_languages,
         ocr_quality=ocr_quality,
+        ocr_fallback_quality=ocr_fallback_quality,
+        ocr_fallback_after_seconds=ocr_fallback_after_seconds,
         ocr_force=ocr_force,
         force_overwrite=force,
         convert_calibrated=convert_calibrated,

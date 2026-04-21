@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -141,6 +142,14 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
     },
 }
 
+DEFAULT_OCR_FALLBACK_QUALITY = OcrQuality.FAST
+DEFAULT_OCR_FALLBACK_AFTER_SECONDS = 60.0
+_OCR_QUALITY_RANK = {
+    OcrQuality.FAST: 0,
+    OcrQuality.DEFAULT: 1,
+    OcrQuality.BEST: 2,
+}
+
 # ocrmypdf rejects these options when redo_ocr is enabled.
 _REDO_OCR_INCOMPATIBLE_OPTIONS = frozenset(
     {"deskew", "clean_final", "remove_background"}
@@ -165,6 +174,23 @@ def _get_ocr_plugins(quality: OcrQuality) -> list[str]:
     return plugins
 
 
+def _is_faster_ocr_quality(candidate: OcrQuality, quality: OcrQuality) -> bool:
+    """Return True if candidate is a faster OCR quality than quality."""
+    return _OCR_QUALITY_RANK[candidate] < _OCR_QUALITY_RANK[quality]
+
+
+def _effective_fallback_quality(
+    quality: OcrQuality,
+    fallback_quality: OcrQuality | None,
+) -> OcrQuality | None:
+    """Return the fallback quality to use for quality, if any."""
+    if fallback_quality is None:
+        return None
+    if not _is_faster_ocr_quality(fallback_quality, quality):
+        return None
+    return fallback_quality
+
+
 def _remove_redo_ocr_incompatible_options(ocr_kwargs: dict[str, object]) -> list[str]:
     """Remove options that ocrmypdf rejects together with redo_ocr."""
     removed_options: list[str] = []
@@ -186,6 +212,19 @@ def _format_ocr_exception(exc: BaseException) -> str:
     if message:
         return message
     return exc.__class__.__name__
+
+
+def _cap_tesseract_timeout(
+    ocr_kwargs: dict[str, object],
+    fallback_after_seconds: float | None,
+) -> None:
+    """Cap Tesseract OCR timeout so fallback can happen promptly."""
+    if fallback_after_seconds is None:
+        return
+    timeout = max(1, math.ceil(fallback_after_seconds))
+    existing_timeout = ocr_kwargs.get("tesseract_timeout")
+    if existing_timeout is None or float(existing_timeout) > timeout:
+        ocr_kwargs["tesseract_timeout"] = timeout
 
 
 def _parse_tesseract_osd(output: str) -> _OrientationResult | None:
@@ -718,6 +757,8 @@ def apply_ocr(
     languages: list[str] | None = None,
     *,
     quality: OcrQuality = OcrQuality.DEFAULT,
+    fallback_quality: OcrQuality | None = DEFAULT_OCR_FALLBACK_QUALITY,
+    fallback_after_seconds: float | None = DEFAULT_OCR_FALLBACK_AFTER_SECONDS,
     force: bool = False,
 ) -> Path:
     """Performs OCR on a PDF.
@@ -731,6 +772,11 @@ def apply_ocr(
         languages: List of Tesseract language codes (default: ``["eng"]``).
             Example: ``["deu", "eng"]`` for German + English.
         quality: OCR quality preset (default: OcrQuality.DEFAULT).
+        fallback_quality: Faster OCR quality to retry with if the initial OCR
+            run exceeds ``fallback_after_seconds``. Use ``None`` to disable.
+        fallback_after_seconds: Runtime threshold for OCR fallback. The initial
+            Tesseract timeout is capped to this value so fallback can happen
+            promptly. Use ``None`` to disable time-based retry.
         force: If True, use ocrmypdf's ``redo_ocr`` mode to remove the
             existing OCR layer and re-apply OCR. Options incompatible with
             ``redo_ocr`` are disabled automatically (default: False).
@@ -756,9 +802,17 @@ def apply_ocr(
         force,
     )
 
-    try:
-        ocr_kwargs = dict(OCR_SETTINGS[quality])
-        plugins = _get_ocr_plugins(quality)
+    fallback = _effective_fallback_quality(quality, fallback_quality)
+    fallback_limit = fallback_after_seconds if fallback is not None else None
+
+    def run_ocr_with_quality(
+        run_quality: OcrQuality,
+        *,
+        timeout_limit: float | None = None,
+    ) -> float:
+        ocr_kwargs = dict(OCR_SETTINGS[run_quality])
+        _cap_tesseract_timeout(ocr_kwargs, timeout_limit)
+        plugins = _get_ocr_plugins(run_quality)
 
         if force:
             ocr_kwargs.pop("skip_text", None)
@@ -773,6 +827,7 @@ def apply_ocr(
         if plugins:
             ocr_kwargs["plugins"] = plugins
 
+        started = time.perf_counter()
         with _temporary_tesseract_path():
             ocrmypdf.ocr(
                 input_path,
@@ -782,6 +837,30 @@ def apply_ocr(
                 rasterizer="pypdfium",
                 **ocr_kwargs,
             )
+        return time.perf_counter() - started
+
+    try:
+        elapsed = run_ocr_with_quality(quality, timeout_limit=fallback_limit)
+
+        if (
+            fallback is not None
+            and fallback_after_seconds is not None
+            and elapsed > fallback_after_seconds
+        ):
+            logger.warning(
+                "Retrying OCR with fallback quality '%s' after '%s' took %.2fs "
+                "(limit: %.2fs)",
+                fallback.value,
+                quality.value,
+                elapsed,
+                fallback_after_seconds,
+            )
+            try:
+                output_path.unlink()
+            except FileNotFoundError:
+                pass
+            run_ocr_with_quality(fallback)
+
         if quality == OcrQuality.BEST and output_path.exists():
             _normalize_best_quality_skipped_text_pages(output_path)
         logger.info("OCR completed successfully: %s", output_path)

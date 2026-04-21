@@ -36,6 +36,9 @@ pdftopdfa --ocr --ocr-lang deu+eng scan.pdf
 
 # Highest OCR quality
 pdftopdfa --ocr --ocr-quality best scan.pdf
+
+# Highest OCR quality, but retry with fast OCR if it takes over 60 seconds
+pdftopdfa --ocr --ocr-quality best --ocr-fallback-quality fast scan.pdf
 ```
 
 ### Python API
@@ -50,6 +53,8 @@ result = convert_to_pdfa(
     output_path=Path("scan_pdfa.pdf"),
     ocr_languages=["eng"],
     ocr_quality=OcrQuality.DEFAULT,
+    ocr_fallback_quality=OcrQuality.FAST,
+    ocr_fallback_after_seconds=60.0,
 )
 ```
 
@@ -121,6 +126,31 @@ This is generally more robust for mixed scans with small text regions on large p
 deskew/rotation on top.
 When OCR is forced, redo-ocr-incompatible options such as `deskew`
 are disabled automatically.
+
+## Automatic Fallback
+
+By default, OCR retries with the `fast` preset when the selected preset takes
+longer than 60 seconds. The initial Tesseract OCR timeout is capped to this
+threshold so fallback can happen promptly instead of waiting for the longer
+quality-preset timeout.
+
+```bash
+# Default behavior: best first, fast fallback after 60 seconds
+pdftopdfa --ocr --ocr-quality best scan.pdf
+
+# Use default as fallback from best
+pdftopdfa --ocr --ocr-quality best --ocr-fallback-quality default scan.pdf
+
+# Change the fallback threshold
+pdftopdfa --ocr --ocr-quality best --ocr-fallback-after 120 scan.pdf
+
+# Disable automatic retry
+pdftopdfa --ocr --ocr-quality best --ocr-fallback-quality none scan.pdf
+```
+
+Fallback presets only run when they are faster than the selected preset. For
+example, `--ocr-quality fast --ocr-fallback-quality default` is ignored because
+`default` is not a faster fallback.
 
 ## Troubleshooting
 
