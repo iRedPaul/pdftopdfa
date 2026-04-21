@@ -222,6 +222,14 @@ def _print_validation_result(
     help="Convert CalGray/CalRGB color spaces to ICCBased (default: enabled)",
 )
 @click.option(
+    "--preserve-stamps",
+    is_flag=True,
+    help=(
+        "Convert known proprietary stamp annotations to standard PDF Stamp "
+        "annotations instead of flattening them"
+    ),
+)
+@click.option(
     "--skip-any-pdfa",
     is_flag=True,
     help=(
@@ -244,6 +252,7 @@ def main(
     ocr_lang: str,
     ocr_quality: str,
     convert_calibrated: bool,
+    preserve_stamps: bool,
     skip_any_pdfa: bool,
 ) -> None:
     """Converts PDF files to the archival PDF/A format.
@@ -304,6 +313,7 @@ def main(
                 ocr_quality=ocr_quality_enum,
                 ocr_force=ocr_force,
                 convert_calibrated=convert_calibrated,
+                preserve_stamps=preserve_stamps,
                 skip_any_pdfa=skip_any_pdfa,
             )
         elif input_path_obj.is_dir():
@@ -320,6 +330,7 @@ def main(
                 ocr_quality=ocr_quality_enum,
                 ocr_force=ocr_force,
                 convert_calibrated=convert_calibrated,
+                preserve_stamps=preserve_stamps,
                 skip_any_pdfa=skip_any_pdfa,
             )
         else:
@@ -364,6 +375,7 @@ def _convert_single_file(
     ocr_quality: "OcrQuality | None" = None,
     ocr_force: bool = False,
     convert_calibrated: bool = True,
+    preserve_stamps: bool = False,
     skip_any_pdfa: bool = False,
 ) -> int:
     """Converts a single PDF file.
@@ -380,6 +392,8 @@ def _convert_single_file(
         ocr_quality: OCR quality preset.
         ocr_force: If True, force OCR even on pages with existing text.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
+        preserve_stamps: If True, convert known proprietary stamp annotations
+            to standard PDF Stamp annotations instead of flattening them.
         skip_any_pdfa: If True, skip files that veraPDF validates as
             compliant PDF/A regardless of target level.
 
@@ -413,6 +427,7 @@ def _convert_single_file(
         ocr_quality=ocr_quality,
         ocr_force=ocr_force,
         convert_calibrated=convert_calibrated,
+        preserve_stamps=preserve_stamps,
     )
 
     _print_result(result, quiet)
@@ -466,6 +481,7 @@ def _convert_directory(
     ocr_quality: "OcrQuality | None" = None,
     ocr_force: bool = False,
     convert_calibrated: bool = True,
+    preserve_stamps: bool = False,
     skip_any_pdfa: bool = False,
 ) -> int:
     """Converts all PDFs in a directory.
@@ -483,6 +499,8 @@ def _convert_directory(
         ocr_quality: OCR quality preset.
         ocr_force: If True, force OCR even on pages with existing text.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
+        preserve_stamps: If True, convert known proprietary stamp annotations
+            to standard PDF Stamp annotations instead of flattening them.
         skip_any_pdfa: If True, skip files that veraPDF validates as
             compliant PDF/A regardless of target level.
 
@@ -508,6 +526,7 @@ def _convert_directory(
         ocr_force=ocr_force,
         force_overwrite=force,
         convert_calibrated=convert_calibrated,
+        preserve_stamps=preserve_stamps,
     )
 
     # Output summary

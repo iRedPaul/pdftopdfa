@@ -22,6 +22,7 @@ from .annotations import (
     fix_annotation_opacity,
     fix_button_appearance_subdicts,
     flatten_non_compliant_annotations,
+    normalize_proprietary_stamp_annotations,
     remove_annotation_colors,
     remove_forbidden_annotations,
     remove_needs_appearances,
@@ -98,7 +99,9 @@ from .xobjects import (
 logger = logging.getLogger(__name__)
 
 
-def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
+def sanitize_for_pdfa(
+    pdf: Pdf, level: str = "3b", *, preserve_stamps: bool = False
+) -> dict[str, Any]:
     """Sanitizes a PDF for PDF/A conformance.
 
     Performs all necessary sanitization based on the
@@ -111,6 +114,9 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
         level: PDF/A conformance level ('2b', '2u', '3b', or '3u').
+        preserve_stamps: If True, known proprietary stamp annotations are
+            normalized to standard ``/Stamp`` annotations instead of being
+            flattened into page content.
 
     Returns:
         Dictionary with statistics about performed sanitizations:
@@ -141,6 +147,7 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "xfa_removed": 0,
         "forbidden_annotations_removed": 0,
         "non_compliant_annotations_flattened": 0,
+        "proprietary_stamps_normalized": 0,
         "forbidden_xobjects_removed": 0,
         "appearance_streams_added": 0,
         "annotation_flags_fixed": 0,
@@ -323,7 +330,13 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
     result["sigflags_fixed"] = sig_result["sigflags_fixed"]
     result["signatures_type_fixed"] = sig_result["signatures_type_fixed"]
 
-    # Flatten visible non-standard annotations before removing them outright
+    # Optionally preserve known proprietary stamps as standard Stamp annotations.
+    if preserve_stamps:
+        result["proprietary_stamps_normalized"] = (
+            normalize_proprietary_stamp_annotations(pdf, level)
+        )
+
+    # Flatten visible remaining non-standard annotations before removing them outright
     result["non_compliant_annotations_flattened"] = flatten_non_compliant_annotations(
         pdf, level
     )
@@ -535,6 +548,7 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         "%d viewer prefs entries removed, "
         "catalog /Lang set: %s, "
         "%d forbidden annots, %d non-compliant annots flattened, "
+        "%d proprietary stamps normalized, "
         "%d forbidden XObjects removed, "
         "%d AP streams added, %d annot flags fixed, %d annot /CA fixed, "
         "%d annot colors removed, %d annot AP keys removed, "
@@ -594,6 +608,7 @@ def sanitize_for_pdfa(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
         result["catalog_lang_set"],
         result["forbidden_annotations_removed"],
         result["non_compliant_annotations_flattened"],
+        result["proprietary_stamps_normalized"],
         result["forbidden_xobjects_removed"],
         result["appearance_streams_added"],
         result["annotation_flags_fixed"],
@@ -684,6 +699,7 @@ __all__ = [
     "ensure_filespec_uf_entries",
     "ensure_appearance_streams",
     "flatten_non_compliant_annotations",
+    "normalize_proprietary_stamp_annotations",
     "fix_button_appearance_subdicts",
     "remove_needs_appearances",
     "remove_javascript",

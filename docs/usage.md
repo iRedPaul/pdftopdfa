@@ -82,6 +82,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `--ocr-lang LANG` | OCR language code (default: `eng`), for example `deu` or `deu+eng` |
 | `--ocr-quality [fast\|default\|best]` | OCR quality preset (default: `default`) |
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
+| `--preserve-stamps` | Convert known proprietary stamp annotations to standard PDF Stamp annotations instead of flattening them |
 | `--skip-any-pdfa` | Skip inputs that veraPDF validates as any compliant PDF/A, regardless of target level |
 | `--version` | Show version and exit |
 | `--help` | Show help and exit |
@@ -132,8 +133,14 @@ def convert_to_pdfa(
     ocr_quality: OcrQuality | None = None,
     ocr_force: bool = False,
     convert_calibrated: bool = True,
+    preserve_stamps: bool = False,
 ) -> ConversionResult
 ```
+
+By default, non-standard visible annotations are flattened into page content for
+maximum archival robustness. Set `preserve_stamps=True` or pass
+`--preserve-stamps` to convert known proprietary stamp annotations to standard
+`/Stamp` annotations instead.
 
 ### `convert_directory()`
 

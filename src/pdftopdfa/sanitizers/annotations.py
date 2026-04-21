@@ -59,6 +59,12 @@ DEFINED_ANNOTATION_SUBTYPES = frozenset(
     }
 )
 
+PROPRIETARY_STAMP_SUBTYPES = frozenset(
+    {
+        "/GdPicture-AnnotationTypeEmbeddedImage",
+    }
+)
+
 
 def _iter_annotation_arrays(
     pdf: Pdf,
@@ -127,6 +133,11 @@ def _is_non_compliant_annotation_subtype(subtype: str) -> bool:
     if subtype in FORBIDDEN_ANNOTATION_SUBTYPES:
         return True
     return subtype not in DEFINED_ANNOTATION_SUBTYPES
+
+
+def _is_proprietary_stamp_subtype(subtype: str) -> bool:
+    """Return ``True`` for known proprietary stamp-like annotations."""
+    return subtype in PROPRIETARY_STAMP_SUBTYPES
 
 
 def _annotation_is_hidden(resolved: Dictionary) -> bool:
@@ -329,6 +340,64 @@ def flatten_non_compliant_annotations(pdf: Pdf, level: str = "3b") -> int:
         )
 
     return flattened_count
+
+
+def normalize_proprietary_stamp_annotations(pdf: Pdf, level: str = "3b") -> int:
+    """Convert known proprietary stamp annotations to standard ``/Stamp``.
+
+    This is intentionally narrower than flattening: only known stamp-like
+    vendor annotations with a usable normal appearance stream are normalized.
+    Other non-standard annotations still fall through to the robust flattening
+    path or, if they cannot be flattened, removal.
+
+    Args:
+        pdf: Opened pikepdf PDF object (modified in place).
+        level: PDF/A conformance level (reserved for future use).
+
+    Returns:
+        Number of proprietary stamp annotations normalized.
+    """
+    del level  # reserved for future use
+
+    normalized_count = 0
+
+    for _, annots in _get_annotation_arrays(pdf):
+        for annot in annots:
+            try:
+                resolved = _resolve_indirect(annot)
+                if not isinstance(resolved, Dictionary):
+                    continue
+
+                subtype = resolved.get("/Subtype")
+                if subtype is None:
+                    continue
+
+                subtype_str = str(subtype)
+                if not _is_proprietary_stamp_subtype(subtype_str):
+                    continue
+
+                if _annotation_is_hidden(resolved):
+                    continue
+
+                if _extract_normal_appearance_stream(resolved) is None:
+                    continue
+
+                resolved[Name.Subtype] = Name.Stamp
+                normalized_count += 1
+                logger.debug(
+                    "Normalized proprietary annotation subtype %s to /Stamp",
+                    subtype_str,
+                )
+            except Exception as e:
+                logger.debug("Error normalizing proprietary stamp annotation: %s", e)
+
+    if normalized_count > 0:
+        logger.info(
+            "%d proprietary stamp annotation(s) normalized to /Stamp",
+            normalized_count,
+        )
+
+    return normalized_count
 
 
 def remove_forbidden_annotations(pdf: Pdf, level: str = "3b") -> int:

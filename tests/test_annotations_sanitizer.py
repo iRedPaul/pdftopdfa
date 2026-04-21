@@ -15,6 +15,7 @@ from pdftopdfa.sanitizers.annotations import (
     fix_annotation_opacity,
     fix_button_appearance_subdicts,
     flatten_non_compliant_annotations,
+    normalize_proprietary_stamp_annotations,
     remove_annotation_colors,
     remove_forbidden_annotations,
     remove_needs_appearances,
@@ -317,6 +318,121 @@ class TestFlattenNonCompliantAnnotations:
             contents[-1] if isinstance(contents, Array) else contents
         )
         assert b"/FmFlattenAnnot0 Do" in flattened_stream.read_bytes()
+
+
+class TestNormalizeProprietaryStampAnnotations:
+    """Tests for normalize_proprietary_stamp_annotations()."""
+
+    def test_normalizes_gdpicture_embedded_image_to_stamp(self, make_pdf_with_page):
+        """Known GdPicture stamp-like annotations become standard /Stamp."""
+        pdf = make_pdf_with_page()
+        ap_stream = pdf.make_stream(b"0 0 1 rg 0 0 20 20 re f")
+        ap_stream[Name.Type] = Name.XObject
+        ap_stream[Name.Subtype] = Name.Form
+        ap_stream[Name.BBox] = Array([0, 0, 20, 20])
+
+        annot = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name("/GdPicture-AnnotationTypeEmbeddedImage"),
+                Rect=Array([100, 700, 120, 720]),
+                AP=Dictionary(N=ap_stream),
+            )
+        )
+        pdf.pages[0]["/Annots"] = Array([annot])
+
+        pdf = save_and_reopen(pdf)
+        result = normalize_proprietary_stamp_annotations(pdf)
+
+        assert result == 1
+        normalized = resolve(pdf.pages[0]["/Annots"][0])
+        assert str(normalized.get("/Subtype")) == "/Stamp"
+        assert resolve(resolve(normalized.get("/AP")).get("/N")).read_bytes() == (
+            b"0 0 1 rg 0 0 20 20 re f"
+        )
+
+    def test_does_not_normalize_unknown_vendor_annotation(self, make_pdf_with_page):
+        """Unknown proprietary annotation types are not treated as stamps."""
+        pdf = make_pdf_with_page()
+        ap_stream = pdf.make_stream(b"0 0 1 rg")
+        ap_stream[Name.Type] = Name.XObject
+        ap_stream[Name.Subtype] = Name.Form
+        ap_stream[Name.BBox] = Array([0, 0, 20, 20])
+        annot = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name("/VendorNote"),
+                Rect=Array([100, 700, 120, 720]),
+                AP=Dictionary(N=ap_stream),
+            )
+        )
+        pdf.pages[0]["/Annots"] = Array([annot])
+
+        pdf = save_and_reopen(pdf)
+        result = normalize_proprietary_stamp_annotations(pdf)
+
+        assert result == 0
+        resolved = resolve(pdf.pages[0]["/Annots"][0])
+        assert str(resolved.get("/Subtype")) == "/VendorNote"
+
+    def test_sanitize_for_pdfa_preserve_stamps_keeps_stamp_annotation(
+        self, make_pdf_with_page
+    ):
+        """Integration: preserve_stamps converts instead of flattening."""
+        from pdftopdfa.sanitizers import sanitize_for_pdfa
+
+        pdf = make_pdf_with_page()
+        ap_stream = pdf.make_stream(b"0 0 1 rg 0 0 20 20 re f")
+        ap_stream[Name.Type] = Name.XObject
+        ap_stream[Name.Subtype] = Name.Form
+        ap_stream[Name.BBox] = Array([0, 0, 20, 20])
+        annot = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name("/GdPicture-AnnotationTypeEmbeddedImage"),
+                Rect=Array([100, 700, 120, 720]),
+                AP=Dictionary(N=ap_stream),
+            )
+        )
+        pdf.pages[0]["/Annots"] = Array([annot])
+
+        pdf = save_and_reopen(pdf)
+        result = sanitize_for_pdfa(pdf, "2b", preserve_stamps=True)
+
+        assert result["proprietary_stamps_normalized"] == 1
+        assert result["non_compliant_annotations_flattened"] == 0
+        assert result["forbidden_annotations_removed"] == 0
+        assert len(pdf.pages[0]["/Annots"]) == 1
+        resolved = resolve(pdf.pages[0]["/Annots"][0])
+        assert str(resolved.get("/Subtype")) == "/Stamp"
+
+    def test_sanitize_for_pdfa_default_still_flattens_gdpicture_stamp(
+        self, make_pdf_with_page
+    ):
+        """Integration: default behavior remains robust flattening."""
+        from pdftopdfa.sanitizers import sanitize_for_pdfa
+
+        pdf = make_pdf_with_page()
+        ap_stream = pdf.make_stream(b"0 0 1 rg 0 0 20 20 re f")
+        ap_stream[Name.Type] = Name.XObject
+        ap_stream[Name.Subtype] = Name.Form
+        ap_stream[Name.BBox] = Array([0, 0, 20, 20])
+        annot = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name("/GdPicture-AnnotationTypeEmbeddedImage"),
+                Rect=Array([100, 700, 120, 720]),
+                AP=Dictionary(N=ap_stream),
+            )
+        )
+        pdf.pages[0]["/Annots"] = Array([annot])
+
+        pdf = save_and_reopen(pdf)
+        result = sanitize_for_pdfa(pdf, "2b")
+
+        assert result["proprietary_stamps_normalized"] == 0
+        assert result["non_compliant_annotations_flattened"] == 1
+        assert "/Annots" not in pdf.pages[0]
 
 
 class TestFixAnnotationFlags:

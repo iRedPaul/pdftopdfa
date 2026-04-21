@@ -72,6 +72,9 @@ pdftopdfa -r ./documents/ ./output/
 
 # OCR for scanned PDFs
 pdftopdfa --ocr document.pdf
+
+# Preserve known proprietary stamps as PDF Stamp annotations
+pdftopdfa --preserve-stamps document.pdf
 ```
 
 ```python

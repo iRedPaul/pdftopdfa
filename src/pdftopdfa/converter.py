@@ -56,6 +56,10 @@ _SANITIZE_WARNINGS: list[tuple[str, str]] = [
         "non_compliant_annotations_flattened",
         "non-compliant annotation(s) flattened into page content",
     ),
+    (
+        "proprietary_stamps_normalized",
+        "proprietary stamp annotation(s) converted to standard PDF Stamp annotation(s)",
+    ),
     ("javascript_removed", "JavaScript element(s) removed"),
     ("actions_removed", "non-compliant action(s) removed"),
     ("files_removed", "embedded file(s) removed"),
@@ -618,6 +622,7 @@ def convert_to_pdfa(
     ocr_quality: "OcrQuality | None" = None,
     ocr_force: bool = False,
     convert_calibrated: bool = True,
+    preserve_stamps: bool = False,
 ) -> ConversionResult:
     """Converts a PDF file to the PDF/A format.
 
@@ -635,6 +640,10 @@ def convert_to_pdfa(
         ocr_force: If True, force OCR even on pages that already contain
             text by using ocrmypdf's ``redo_ocr`` mode. Options
             incompatible with ``redo_ocr`` are disabled automatically.
+        convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
+        preserve_stamps: If True, known proprietary stamp annotations are
+            normalized to standard ``/Stamp`` annotations instead of being
+            flattened into page content.
 
     Returns:
         ConversionResult with status and details.
@@ -960,7 +969,7 @@ def convert_to_pdfa(
 
         # 4. Sanitize PDF for PDF/A
         logger.debug("Sanitizing PDF for PDF/A-%s", level)
-        sanitize_result = sanitize_for_pdfa(pdf, level)
+        sanitize_result = sanitize_for_pdfa(pdf, level, preserve_stamps=preserve_stamps)
 
         # Collect warnings from sanitization
         for key, message in _SANITIZE_WARNINGS:
@@ -1157,6 +1166,7 @@ def convert_files(
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,
     convert_calibrated: bool = True,
+    preserve_stamps: bool = False,
 ) -> list[ConversionResult]:
     """Converts a list of PDF files to PDF/A.
 
@@ -1176,6 +1186,9 @@ def convert_files(
             mode are disabled automatically.
         force_overwrite: If True, existing output files are overwritten.
             If False, existing outputs are skipped with an error result.
+        preserve_stamps: If True, known proprietary stamp annotations are
+            normalized to standard ``/Stamp`` annotations instead of being
+            flattened into page content.
         on_progress: Optional callback(current_idx, total, filename) called
             before each file.
         cancel_event: Optional threading.Event; when set, iteration stops.
@@ -1223,6 +1236,7 @@ def convert_files(
                 ocr_quality=ocr_quality,
                 ocr_force=ocr_force,
                 convert_calibrated=convert_calibrated,
+                preserve_stamps=preserve_stamps,
             )
             results.append(result)
 
@@ -1261,6 +1275,7 @@ def convert_directory(
     ocr_force: bool = False,
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
+    preserve_stamps: bool = False,
 ) -> list[ConversionResult]:
     """Converts all PDFs in a directory to PDF/A.
 
@@ -1281,6 +1296,9 @@ def convert_directory(
         ocr_force: If True, force OCR even on pages that already contain
             text. Options incompatible with ocrmypdf's ``redo_ocr``
             mode are disabled automatically.
+        preserve_stamps: If True, known proprietary stamp annotations are
+            normalized to standard ``/Stamp`` annotations instead of being
+            flattened into page content.
         force_overwrite: If True, existing output files are overwritten.
 
     Returns:
@@ -1356,6 +1374,7 @@ def convert_directory(
         force_overwrite=force_overwrite,
         on_progress=_on_progress if show_progress else None,
         convert_calibrated=convert_calibrated,
+        preserve_stamps=preserve_stamps,
     )
 
     if progress_bar is not None:
