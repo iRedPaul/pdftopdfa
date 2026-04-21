@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.14] - 2026-04-21
+
+### Features
+
+- Add OCR time-based fallback options
+
+### Changes
+
+- Add mailmap for contributor attribution
+
+### Documentation
+
+- Document OCR time-based fallback options
+
 ## [0.3.13] - 2026-04-21
 
 ### Features
