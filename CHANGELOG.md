@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.13] - 2026-04-21
+
+### Features
+
+- Add stamp preservation flag for proprietary annotations
+
 ## [0.3.12] - 2026-04-16
 
 ### Bug Fixes
