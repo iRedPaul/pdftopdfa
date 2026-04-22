@@ -62,6 +62,10 @@ DEFINED_ANNOTATION_SUBTYPES = frozenset(
 PROPRIETARY_STAMP_SUBTYPES = frozenset(
     {
         "/GdPicture-AnnotationTypeEmbeddedImage",
+        "/GdPicture-AnnotationTypeFreeHandHighlighter",
+        "/GdPicture-AnnotationTypeLine",
+        "/GdPicture-AnnotationTypeStickyNote",
+        "/GdPicture-AnnotationTypeText",
     }
 )
 

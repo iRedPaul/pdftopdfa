@@ -323,7 +323,19 @@ class TestFlattenNonCompliantAnnotations:
 class TestNormalizeProprietaryStampAnnotations:
     """Tests for normalize_proprietary_stamp_annotations()."""
 
-    def test_normalizes_gdpicture_embedded_image_to_stamp(self, make_pdf_with_page):
+    @pytest.mark.parametrize(
+        "subtype",
+        [
+            "/GdPicture-AnnotationTypeEmbeddedImage",
+            "/GdPicture-AnnotationTypeFreeHandHighlighter",
+            "/GdPicture-AnnotationTypeLine",
+            "/GdPicture-AnnotationTypeStickyNote",
+            "/GdPicture-AnnotationTypeText",
+        ],
+    )
+    def test_normalizes_gdpicture_stamp_like_subtype_to_stamp(
+        self, make_pdf_with_page, subtype
+    ):
         """Known GdPicture stamp-like annotations become standard /Stamp."""
         pdf = make_pdf_with_page()
         ap_stream = pdf.make_stream(b"0 0 1 rg 0 0 20 20 re f")
@@ -334,7 +346,7 @@ class TestNormalizeProprietaryStampAnnotations:
         annot = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name("/GdPicture-AnnotationTypeEmbeddedImage"),
+                Subtype=Name(subtype),
                 Rect=Array([100, 700, 120, 720]),
                 AP=Dictionary(N=ap_stream),
             )
@@ -375,8 +387,18 @@ class TestNormalizeProprietaryStampAnnotations:
         resolved = resolve(pdf.pages[0]["/Annots"][0])
         assert str(resolved.get("/Subtype")) == "/VendorNote"
 
+    @pytest.mark.parametrize(
+        ("subtype", "level"),
+        [
+            ("/GdPicture-AnnotationTypeEmbeddedImage", "2b"),
+            ("/GdPicture-AnnotationTypeFreeHandHighlighter", "3u"),
+            ("/GdPicture-AnnotationTypeLine", "3u"),
+            ("/GdPicture-AnnotationTypeStickyNote", "3u"),
+            ("/GdPicture-AnnotationTypeText", "3u"),
+        ],
+    )
     def test_sanitize_for_pdfa_preserve_stamps_keeps_stamp_annotation(
-        self, make_pdf_with_page
+        self, make_pdf_with_page, subtype, level
     ):
         """Integration: preserve_stamps converts instead of flattening."""
         from pdftopdfa.sanitizers import sanitize_for_pdfa
@@ -389,7 +411,7 @@ class TestNormalizeProprietaryStampAnnotations:
         annot = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name("/GdPicture-AnnotationTypeEmbeddedImage"),
+                Subtype=Name(subtype),
                 Rect=Array([100, 700, 120, 720]),
                 AP=Dictionary(N=ap_stream),
             )
@@ -397,7 +419,7 @@ class TestNormalizeProprietaryStampAnnotations:
         pdf.pages[0]["/Annots"] = Array([annot])
 
         pdf = save_and_reopen(pdf)
-        result = sanitize_for_pdfa(pdf, "2b", preserve_stamps=True)
+        result = sanitize_for_pdfa(pdf, level, preserve_stamps=True)
 
         assert result["proprietary_stamps_normalized"] == 1
         assert result["non_compliant_annotations_flattened"] == 0
