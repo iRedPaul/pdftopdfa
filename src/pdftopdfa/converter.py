@@ -252,6 +252,22 @@ def _copy_input_to_output(input_path: Path, output_path: Path) -> None:
     shutil.copy2(str(input_path), str(output_path))
 
 
+def _get_pdfa_save_settings_for_version(required_version: str) -> dict[str, object]:
+    """Return pikepdf save settings for final PDF/A output."""
+    return {
+        "linearize": False,
+        "force_version": required_version,
+        "deterministic_id": True,
+        "preserve_pdfa": True,
+        "object_stream_mode": pikepdf.ObjectStreamMode.preserve,
+    }
+
+
+def get_pdfa_save_settings(level: str) -> dict[str, object]:
+    """Return pikepdf save settings for a PDF/A target level."""
+    return _get_pdfa_save_settings_for_version(get_required_pdf_version(level))
+
+
 def _truncate_trailing_data(output_path: Path) -> bool:
     """Remove data after the last ``%%EOF`` marker (ISO 19005-2, 6.1.3).
 
@@ -346,12 +362,7 @@ def _ensure_binary_comment(output_path: Path, required_version: str) -> bool:
     tmp = Path(tmp_path)
     try:
         with pikepdf.open(output_path) as pdf:
-            pdf.save(
-                tmp,
-                linearize=False,
-                force_version=required_version,
-                deterministic_id=True,
-            )
+            pdf.save(tmp, **_get_pdfa_save_settings_for_version(required_version))
         os.replace(str(tmp), str(output_path))
     except Exception as e:
         logger.warning("Could not add binary comment: %s", e)
@@ -404,6 +415,25 @@ def _verify_file_structure(output_path: Path, required_version: str) -> None:
                 )
     except Exception as e:
         logger.warning("Post-save verification: could not reopen file: %s", e)
+
+
+def save_pdfa(
+    pdf: pikepdf.Pdf,
+    output_path: Path,
+    level: str,
+    *,
+    verify: bool = True,
+) -> None:
+    """Save final PDF/A output with consistent pikepdf settings and hardening."""
+    required_version = get_required_pdf_version(level)
+    pdf.save(output_path, **_get_pdfa_save_settings_for_version(required_version))
+
+    # Post-save file structure hardening (ISO 19005-2, 6.1.2/6.1.3).
+    _ensure_binary_comment(output_path, required_version)
+    _truncate_trailing_data(output_path)
+
+    if verify:
+        _verify_file_structure(output_path, required_version)
 
 
 def _has_annotations(pdf_path: Path) -> bool:
@@ -1057,23 +1087,9 @@ def convert_to_pdfa(
                 f"PDF version {direction} from {current_version} to {required_version}"
             )
 
-        pdf.save(
-            output_path,
-            linearize=False,
-            force_version=required_version,
-            deterministic_id=True,
-        )
+        save_pdfa(pdf, output_path, level, verify=not validate)
         pdf.close()
         pdf = None
-
-        # 8.2. Post-save file structure hardening (ISO 19005-2, 6.1.2/6.1.3)
-        _ensure_binary_comment(output_path, required_version)
-        _truncate_trailing_data(output_path)
-
-        # 8.5. Post-save file structure verification (only when veraPDF
-        # is NOT enabled — veraPDF would catch these issues anyway).
-        if not validate:
-            _verify_file_structure(output_path, required_version)
 
         processing_time = time.perf_counter() - start_time
 

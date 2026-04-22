@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pikepdf
 import pytest
 from pikepdf import Array, Dictionary, Name, Pdf
 
@@ -23,6 +24,8 @@ from pdftopdfa.converter import (
     convert_files,
     convert_to_pdfa,
     generate_output_path,
+    get_pdfa_save_settings,
+    save_pdfa,
 )
 from pdftopdfa.exceptions import ConversionError, VeraPDFError
 from pdftopdfa.verapdf import VeraPDFResult
@@ -152,6 +155,50 @@ class TestGenerateOutputPath:
         assert output_path.name == "document_pdfa.pdf"
 
 
+class TestPdfaSaveSettings:
+    """Tests for centralized PDF/A save settings."""
+
+    @pytest.mark.parametrize(
+        ("level", "expected_version"),
+        [("2b", "1.7"), ("2u", "1.7"), ("3b", "1.7"), ("3u", "1.7")],
+    )
+    def test_get_pdfa_save_settings(self, level: str, expected_version: str) -> None:
+        """PDF/A save settings keep the existing final output behavior."""
+        settings = get_pdfa_save_settings(level)
+
+        assert settings["force_version"] == expected_version
+        assert settings["linearize"] is False
+        assert settings["deterministic_id"] is True
+        assert settings["preserve_pdfa"] is True
+        assert settings["object_stream_mode"] is pikepdf.ObjectStreamMode.preserve
+
+    def test_save_pdfa_runs_hardening_without_optional_verify(
+        self, tmp_dir: Path
+    ) -> None:
+        """save_pdfa runs required hardening and can skip lightweight verify."""
+        pdf = Pdf.new()
+        page = pikepdf.Page(
+            Dictionary(Type=Name.Page, MediaBox=Array([0, 0, 612, 792]))
+        )
+        pdf.pages.append(page)
+        output_path = tmp_dir / "output.pdf"
+
+        try:
+            with (
+                patch("pdftopdfa.converter._ensure_binary_comment") as mock_ensure,
+                patch("pdftopdfa.converter._truncate_trailing_data") as mock_truncate,
+                patch("pdftopdfa.converter._verify_file_structure") as mock_verify,
+            ):
+                save_pdfa(pdf, output_path, "2b", verify=False)
+        finally:
+            pdf.close()
+
+        assert output_path.exists()
+        mock_ensure.assert_called_once_with(output_path, "1.7")
+        mock_truncate.assert_called_once_with(output_path)
+        mock_verify.assert_not_called()
+
+
 class TestConvertToPdfa:
     """Tests for convert_to_pdfa."""
 
@@ -165,6 +212,22 @@ class TestConvertToPdfa:
         assert result.output_path == output_path
         assert result.level == "2b"
         assert output_path.exists()
+
+    def test_convert_uses_central_pdfa_save(
+        self, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """Final PDF/A output is written through save_pdfa."""
+        output_path = tmp_dir / "output_pdfa.pdf"
+
+        with patch("pdftopdfa.converter.save_pdfa", wraps=save_pdfa) as mock_save:
+            result = convert_to_pdfa(sample_pdf, output_path, level="2b")
+
+        assert result.success is True
+        mock_save.assert_called_once()
+        call_args = mock_save.call_args
+        assert call_args.args[1] == output_path
+        assert call_args.args[2] == "2b"
+        assert call_args.kwargs["verify"] is True
 
     def test_convert_nonexistent_file(self, tmp_dir: Path) -> None:
         """Non-existent file raises ConversionError."""
