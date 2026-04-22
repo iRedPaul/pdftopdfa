@@ -396,6 +396,58 @@ class TestSimpleFontWidthFix:
 
         assert result["simple_font_widths_fixed"] == 0
 
+    def test_fractional_width_outside_verapdf_tolerance_is_corrected(self) -> None:
+        """A declared integer can be invalid against the exact font width."""
+        font_data, tt_font = _make_minimal_ttfont(
+            units_per_em=2048,
+            glyph_widths={".notdef": 500, "space": 463},
+        )
+        tt_font.close()
+
+        pdf = new_pdf()
+        font = _make_simple_font_with_widths(
+            pdf,
+            widths=[225],
+            first_char=32,
+            last_char=32,
+            font_data=font_data,
+        )
+        _build_pdf_with_font(pdf, font)
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["simple_font_widths_fixed"] == 1
+        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
+        corrected = [int(w) for w in resolve(font_obj.Widths)]
+        assert corrected == [226]
+
+    def test_fractional_width_inside_verapdf_tolerance_is_not_corrected(self) -> None:
+        """Widths valid against the exact font width are left untouched."""
+        font_data, tt_font = _make_minimal_ttfont(
+            units_per_em=10000,
+            glyph_widths={".notdef": 500, "space": 2259},
+        )
+        tt_font.close()
+
+        pdf = new_pdf()
+        font = _make_simple_font_with_widths(
+            pdf,
+            widths=[225],
+            first_char=32,
+            last_char=32,
+            font_data=font_data,
+        )
+        _build_pdf_with_font(pdf, font)
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["simple_font_widths_fixed"] == 0
+        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
+        corrected = [int(w) for w in resolve(font_obj.Widths)]
+        assert corrected == [225]
+
     def test_macroman_encoding(self) -> None:
         """Widths are validated against MacRomanEncoding."""
         pdf = new_pdf()

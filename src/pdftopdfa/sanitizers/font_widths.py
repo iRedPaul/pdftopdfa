@@ -17,7 +17,6 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from ..fonts.analysis import is_symbolic_font
-from ..fonts.metrics import FontMetricsExtractor
 from ..fonts.tounicode import (
     generate_tounicode_for_macroman,
     generate_tounicode_for_standard_encoding,
@@ -38,7 +37,99 @@ _WIDTH_TOLERANCE = 1
 _MIN_UNITS_PER_EM = 16
 _MAX_UNITS_PER_EM = 16384
 
-_metrics = FontMetricsExtractor()
+
+def _pdf_width_from_exact(width: float) -> int:
+    """Return an integer PDF width close enough to the exact font width."""
+    return int(round(width))
+
+
+def _width_outside_tolerance(declared: int, exact: float) -> bool:
+    """Return whether veraPDF would reject the declared width."""
+    return abs(float(declared) - exact) > _WIDTH_TOLERANCE
+
+
+def _scaled_width(advance_width: int | float, units_per_em: int) -> float:
+    """Scale a font-program advance width into 1000-unit PDF width space."""
+    return float(advance_width) * 1000.0 / units_per_em
+
+
+def _get_any_cmap(tt_font) -> dict[int, str] | None:
+    """Gets a cmap dict from any available subtable."""
+    if "cmap" not in tt_font:
+        return None
+    cmap_table = tt_font["cmap"]
+    for subtable in cmap_table.tables:
+        if subtable.platformID == 3 and subtable.platEncID == 0:
+            return subtable.cmap
+    for subtable in cmap_table.tables:
+        if subtable.platformID == 1 and subtable.platEncID == 0:
+            return subtable.cmap
+    for subtable in cmap_table.tables:
+        if subtable.cmap:
+            return subtable.cmap
+    return None
+
+
+def _compute_exact_widths_for_encoding(
+    tt_font,
+    code_to_unicode: dict[int, int],
+) -> dict[int, float]:
+    """Computes exact scaled glyph widths for a code-to-Unicode mapping."""
+    head = tt_font["head"]
+    hmtx = tt_font["hmtx"]
+    try:
+        cmap = tt_font.getBestCmap()
+    except KeyError:
+        cmap = None
+    if cmap is None:
+        cmap = _get_any_cmap(tt_font)
+    if cmap is None:
+        return {}
+
+    result: dict[int, float] = {}
+    for code, unicode_val in code_to_unicode.items():
+        glyph_name = cmap.get(unicode_val)
+        if glyph_name and glyph_name in hmtx.metrics:
+            result[code] = _scaled_width(hmtx.metrics[glyph_name][0], head.unitsPerEm)
+
+    if not result:
+        for code, unicode_val in code_to_unicode.items():
+            sym_val = 0xF000 + unicode_val
+            glyph_name = cmap.get(sym_val)
+            if glyph_name and glyph_name in hmtx.metrics:
+                result[code] = _scaled_width(
+                    hmtx.metrics[glyph_name][0],
+                    head.unitsPerEm,
+                )
+        if not result:
+            for code in code_to_unicode:
+                glyph_name = cmap.get(code)
+                if glyph_name and glyph_name in hmtx.metrics:
+                    result[code] = _scaled_width(
+                        hmtx.metrics[glyph_name][0],
+                        head.unitsPerEm,
+                    )
+
+    return result
+
+
+def _compute_exact_widths_for_gids(tt_font, gids: set[int]) -> dict[int, float]:
+    """Computes exact scaled glyph widths for a set of glyph IDs."""
+    head = tt_font["head"]
+    hmtx = tt_font["hmtx"]
+    glyph_order = tt_font.getGlyphOrder()
+
+    result: dict[int, float] = {}
+    for gid in gids:
+        if gid < len(glyph_order):
+            glyph_name = glyph_order[gid]
+            if glyph_name in hmtx.metrics:
+                result[gid] = _scaled_width(
+                    hmtx.metrics[glyph_name][0],
+                    head.unitsPerEm,
+                )
+
+    return result
 
 
 def _validate_font_program(tt_font, font_name: str = "") -> bool:
@@ -460,7 +551,7 @@ def _extract_font_program(font: pikepdf.Object):
         return None
 
 
-def _get_missing_width(font: pikepdf.Object, tt_font) -> int | None:
+def _get_missing_width(font: pikepdf.Object, tt_font) -> float | None:
     """Gets the fallback width for glyphs not found in the font program.
 
     veraPDF checks rule 6.3.6 by comparing the /Widths entry against the
@@ -484,7 +575,7 @@ def _get_missing_width(font: pikepdf.Object, tt_font) -> int | None:
             head = tt_font["head"]
             notdef = hmtx.metrics.get(".notdef")
             if notdef is not None:
-                return round(notdef[0] * 1000.0 / head.unitsPerEm)
+                return _scaled_width(notdef[0], head.unitsPerEm)
     except Exception:
         pass
 
@@ -495,7 +586,7 @@ def _get_missing_width(font: pikepdf.Object, tt_font) -> int | None:
             fd = _resolve(fd)
             mw = fd.get("/MissingWidth")
             if mw is not None:
-                return int(mw)
+                return float(mw)
     except Exception:
         pass
 
@@ -544,7 +635,7 @@ def _get_encoding_mapping(font: pikepdf.Object) -> dict[int, int] | None:
     return None
 
 
-def _compute_widths_by_name(font: pikepdf.Object, tt_font) -> dict[int, int]:
+def _compute_widths_by_name(font: pikepdf.Object, tt_font) -> dict[int, float]:
     """Computes glyph widths by looking up glyphs by name in the font.
 
     veraPDF resolves glyphs for simple fonts by mapping character codes
@@ -558,7 +649,7 @@ def _compute_widths_by_name(font: pikepdf.Object, tt_font) -> dict[int, int]:
         tt_font: fontTools TTFont object.
 
     Returns:
-        Dictionary mapping char_code to width (scaled to 1000 units)
+        Dictionary mapping char_code to exact width (scaled to 1000 units)
         for glyphs found by name but not through the cmap.
     """
     from ..fonts.subsetter import (
@@ -591,12 +682,11 @@ def _compute_widths_by_name(font: pikepdf.Object, tt_font) -> dict[int, int]:
 
     hmtx = tt_font["hmtx"]
     units_per_em = tt_font["head"].unitsPerEm
-    scale = 1000.0 / units_per_em
 
-    result: dict[int, int] = {}
+    result: dict[int, float] = {}
     for code, glyph_name in encoding.items():
         if glyph_name in hmtx.metrics:
-            result[code] = round(hmtx.metrics[glyph_name][0] * scale)
+            result[code] = _scaled_width(hmtx.metrics[glyph_name][0], units_per_em)
 
     return result
 
@@ -874,11 +964,11 @@ def _fix_simple_font_widths(font: pikepdf.Object, font_name: str) -> bool:
         # Build encoding mapping
         code_to_unicode = _get_encoding_mapping(font)
 
-        # Compute expected widths from a Unicode-based encoding when one is
-        # available. Symbolic TrueType fonts without /Encoding intentionally
-        # skip this path and rely on the font's own symbolic cmap below.
+        # Compute exact expected widths from a Unicode-based encoding when one
+        # is available.  veraPDF compares /Widths against the exact scaled
+        # font-program width, not against our rounded replacement value.
         expected = (
-            _metrics.compute_widths_for_encoding(tt_font, code_to_unicode)
+            _compute_exact_widths_for_encoding(tt_font, code_to_unicode)
             if code_to_unicode is not None
             else {}
         )
@@ -905,8 +995,8 @@ def _fix_simple_font_widths(font: pikepdf.Object, font_name: str) -> bool:
                 comparable += 1
                 declared = declared_widths[i]
                 actual = expected[code]
-                if abs(declared - actual) > _WIDTH_TOLERANCE:
-                    corrected_widths[i] = actual
+                if _width_outside_tolerance(declared, actual):
+                    corrected_widths[i] = _pdf_width_from_exact(actual)
                     mismatches += 1
             elif code in name_widths:
                 # Glyph found by name (e.g. added by glyph_coverage)
@@ -914,16 +1004,16 @@ def _fix_simple_font_widths(font: pikepdf.Object, font_name: str) -> bool:
                 comparable += 1
                 declared = declared_widths[i]
                 actual = name_widths[code]
-                if abs(declared - actual) > _WIDTH_TOLERANCE:
-                    corrected_widths[i] = actual
+                if _width_outside_tolerance(declared, actual):
+                    corrected_widths[i] = _pdf_width_from_exact(actual)
                     mismatches += 1
             elif fallback_width is not None and code in code_to_unicode:
                 # Code has an encoding entry but no glyph was found in
                 # the font program — use .notdef width as the expected
                 # width (matches veraPDF behaviour).
                 declared = declared_widths[i]
-                if abs(declared - fallback_width) > _WIDTH_TOLERANCE:
-                    corrected_widths[i] = fallback_width
+                if _width_outside_tolerance(declared, fallback_width):
+                    corrected_widths[i] = _pdf_width_from_exact(fallback_width)
                     mismatches += 1
 
         if mismatches == 0:
@@ -1061,7 +1151,7 @@ def _get_cidfont_default_width(desc_font: pikepdf.Object) -> int:
         return 1000
 
 
-def _get_cidfont_program_default_width(tt_font) -> int | None:
+def _get_cidfont_program_default_width(tt_font) -> float | None:
     """Returns the CIDFont default width from the embedded font program."""
     try:
         glyph_order = tt_font.getGlyphOrder()
@@ -1072,8 +1162,7 @@ def _get_cidfont_program_default_width(tt_font) -> int | None:
         if notdef_name not in hmtx.metrics:
             return None
         units_per_em = tt_font["head"].unitsPerEm
-        scale = 1000.0 / units_per_em
-        return round(hmtx.metrics[notdef_name][0] * scale)
+        return _scaled_width(hmtx.metrics[notdef_name][0], units_per_em)
     except Exception:
         return None
 
@@ -1215,8 +1304,9 @@ def _fix_cidfont_widths(font: pikepdf.Object, font_name: str) -> bool:
             gids_needed.add(gid)
             cid_to_gid_map[cid] = gid
 
-        # Compute expected widths for those GIDs
-        expected_gid_widths = _metrics.compute_widths_for_gids(tt_font, gids_needed)
+        # Compute exact expected widths for those GIDs. veraPDF compares the
+        # dictionary width against the exact scaled font-program width.
+        expected_gid_widths = _compute_exact_widths_for_gids(tt_font, gids_needed)
         expected_cid_widths = {
             cid: expected_gid_widths[gid]
             for cid, gid in cid_to_gid_map.items()
@@ -1231,7 +1321,7 @@ def _fix_cidfont_widths(font: pikepdf.Object, font_name: str) -> bool:
         for cid, expected in expected_cid_widths.items():
             declared = declared_widths.get(cid, declared_default_width)
             comparable += 1
-            if abs(declared - expected) > _WIDTH_TOLERANCE:
+            if _width_outside_tolerance(declared, expected):
                 mismatches += 1
 
         if mismatches == 0:
@@ -1250,16 +1340,21 @@ def _fix_cidfont_widths(font: pikepdf.Object, font_name: str) -> bool:
         program_default_width = _get_cidfont_program_default_width(tt_font)
         if program_default_width is None:
             return False
+        program_default_pdf_width = _pdf_width_from_exact(program_default_width)
 
+        corrected_cid_widths = {
+            cid: _pdf_width_from_exact(width)
+            for cid, width in expected_cid_widths.items()
+        }
         new_w_array = _build_sparse_cidfont_w_array(
-            expected_cid_widths,
-            program_default_width,
+            corrected_cid_widths,
+            program_default_pdf_width,
         )
         if new_w_array:
             desc_font[Name.W] = Array(_convert_w_array_to_pikepdf(new_w_array))
         elif desc_font.get("/W") is not None:
             del desc_font[Name.W]
-        desc_font[Name.DW] = program_default_width
+        desc_font[Name.DW] = program_default_pdf_width
 
         logger.info(
             "Fixed %d width mismatches in CIDFont %s",
