@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.15] - 2026-04-22
+
+### Changes
+
+- Normalize additional GdPicture stamp annotations
+
+### Bug Fixes
+
+- Fix font width validation against exact glyph metrics
+
 ## [0.3.14] - 2026-04-21
 
 ### Features
