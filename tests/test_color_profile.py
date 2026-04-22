@@ -102,12 +102,13 @@ def _make_icc_profile(**overrides: bytes | int) -> bytes:
     override specific header fields:
         version (int): major version byte at offset 8
         device_class (bytes): 4-byte class at offset 12-15
+        colorspace (bytes): 4-byte color space signature at offset 16-19
     """
     profile = bytearray(128)
     profile[0:4] = (128).to_bytes(4, "big")
     profile[8] = overrides.get("version", 2)
     profile[12:16] = overrides.get("device_class", b"mntr")
-    profile[16:20] = b"RGB "
+    profile[16:20] = overrides.get("colorspace", b"RGB ")
     profile[36:40] = b"acsp"
     return bytes(profile)
 
@@ -711,8 +712,146 @@ class TestEmbedColorProfiles:
 
         assert result == []
 
+    def test_valid_existing_srgb_output_intent_is_preserved(self) -> None:
+        """Valid existing sRGB PDF/A OutputIntent is not replaced."""
+        pdf = new_pdf()
+        profile_data = _make_icc_profile()
+        stream = pdf.make_stream(profile_data)
+        stream[Name.N] = 3
+        intent = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name.GTS_PDFA1,
+            OutputConditionIdentifier=pikepdf.String("Custom sRGB"),
+            DestOutputProfile=stream,
+        )
+        pdf.Root.OutputIntents = Array([intent])
+
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        assert len(pdf.Root.OutputIntents) == 1
+        preserved = pdf.Root.OutputIntents[0]
+        assert str(preserved["/OutputConditionIdentifier"]) == "Custom sRGB"
+        assert bytes(preserved["/DestOutputProfile"].read_bytes()) == profile_data
+        assert preserved["/DestOutputProfile"]["/N"] == 3
+
+    def test_valid_existing_cmyk_output_intent_is_preserved(self) -> None:
+        """Valid existing CMYK PDF/A OutputIntent is not replaced."""
+        pdf = new_pdf()
+        profile_data = _make_icc_profile(colorspace=b"CMYK")
+        stream = pdf.make_stream(profile_data)
+        stream[Name.N] = 4
+        intent = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name.GTS_PDFA1,
+            OutputConditionIdentifier=pikepdf.String("Custom CMYK"),
+            DestOutputProfile=stream,
+        )
+        pdf.Root.OutputIntents = Array([intent])
+
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"0 1 0 0 k")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        assert len(pdf.Root.OutputIntents) == 1
+        preserved = pdf.Root.OutputIntents[0]
+        assert str(preserved["/OutputConditionIdentifier"]) == "Custom CMYK"
+        assert bytes(preserved["/DestOutputProfile"].read_bytes()) == profile_data
+        assert preserved["/DestOutputProfile"]["/N"] == 4
+
+    def test_existing_output_intent_n_is_repaired(self) -> None:
+        """Missing or wrong /N is repaired from the ICC color-space signature."""
+        pdf = new_pdf()
+        profile_data = _make_icc_profile(colorspace=b"GRAY")
+        stream = pdf.make_stream(profile_data)
+        stream[Name.N] = 3
+        intent = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name.GTS_PDFA1,
+            OutputConditionIdentifier=pikepdf.String("Custom Gray"),
+            DestOutputProfile=stream,
+        )
+        pdf.Root.OutputIntents = Array([intent])
+
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"0.5 g")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        assert len(pdf.Root.OutputIntents) == 1
+        preserved = pdf.Root.OutputIntents[0]
+        assert bytes(preserved["/DestOutputProfile"].read_bytes()) == profile_data
+        assert preserved["/DestOutputProfile"]["/N"] == 1
+
+    def test_broken_existing_output_intent_is_replaced(self) -> None:
+        """Broken ICC stream falls back to generated dominant OutputIntent."""
+        pdf = new_pdf()
+        broken_profile = bytearray(_make_icc_profile())
+        broken_profile[36:40] = b"bad!"
+        stream = pdf.make_stream(bytes(broken_profile))
+        stream[Name.N] = 3
+        intent = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name.GTS_PDFA1,
+            OutputConditionIdentifier=pikepdf.String("Broken"),
+            DestOutputProfile=stream,
+        )
+        pdf.Root.OutputIntents = Array([intent])
+
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        replacement = pdf.Root.OutputIntents[0]
+        replacement_profile = bytes(replacement["/DestOutputProfile"].read_bytes())
+        assert len(pdf.Root.OutputIntents) == 1
+        assert str(replacement["/OutputConditionIdentifier"]) == "sRGB"
+        assert replacement_profile != bytes(broken_profile)
+        assert replacement_profile[36:40] == b"acsp"
+
+    def test_conflicting_pdfa_output_intents_are_replaced(self) -> None:
+        """Conflicting PDF/A OutputIntents fall back to generated dominant intent."""
+        pdf = new_pdf()
+        profile_rgb = _make_icc_profile()
+        profile_cmyk = _make_icc_profile(colorspace=b"CMYK")
+
+        stream1 = pdf.make_stream(profile_rgb)
+        stream1[Name.N] = 3
+        stream2 = pdf.make_stream(profile_cmyk)
+        stream2[Name.N] = 4
+        pdf.Root.OutputIntents = Array(
+            [
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.GTS_PDFA1,
+                    OutputConditionIdentifier=pikepdf.String("Custom RGB"),
+                    DestOutputProfile=stream1,
+                ),
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.GTS_PDFA1,
+                    OutputConditionIdentifier=pikepdf.String("Custom CMYK"),
+                    DestOutputProfile=stream2,
+                ),
+            ]
+        )
+
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        assert len(pdf.Root.OutputIntents) == 1
+        replacement = pdf.Root.OutputIntents[0]
+        assert str(replacement["/OutputConditionIdentifier"]) == "sRGB"
+        assert bytes(replacement["/DestOutputProfile"].read_bytes()) != profile_rgb
+
     def test_multiple_identical_output_intents_kept(self) -> None:
-        """Multiple OutputIntents with identical ICC profiles are left intact."""
+        """Multiple compatible OutputIntents are reduced to one PDF/A intent."""
         pdf = new_pdf()
         profile_data = _make_icc_profile()
 
@@ -729,7 +868,7 @@ class TestEmbedColorProfiles:
         stream2[Name.N] = 3
         oi2 = Dictionary(
             Type=Name.OutputIntent,
-            S=Name("/GTS_PDFX"),
+            S=Name.GTS_PDFA1,
             OutputConditionIdentifier=pikepdf.String("sRGB"),
             DestOutputProfile=stream2,
         )
@@ -804,7 +943,7 @@ class TestEmbedColorProfiles:
         stream2[Name.N] = 3
         oi2 = Dictionary(
             Type=Name.OutputIntent,
-            S=Name("/GTS_PDFX"),
+            S=Name.GTS_PDFA1,
             OutputConditionIdentifier=pikepdf.String("sRGB"),
             DestOutputProfile=stream2,
         )
@@ -912,7 +1051,7 @@ class TestEmbedColorProfiles:
         stream2[Name.N] = 3
         oi2 = Dictionary(
             Type=Name.OutputIntent,
-            S=Name("/GTS_PDFX"),
+            S=Name.GTS_PDFA1,
             OutputConditionIdentifier=pikepdf.String("sRGB"),
             DestOutputProfile=stream2,
         )

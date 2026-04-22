@@ -17,6 +17,7 @@ from ._detection import (
     _parse_colorspace_array,
     detect_color_spaces,
 )
+from ._output_intents import prepare_existing_output_intents
 from ._profiles import (
     _create_icc_colorspace,
     _validate_icc_profile,
@@ -167,80 +168,20 @@ def embed_color_profiles(
     """
     level = validate_pdfa_level(level)
 
+    existing_output_intent_colorspace: ColorSpaceType | None = None
     if has_output_intent(pdf):
         if replace_existing:
-            # ISO 19005-2 §6.2.3: multiple output intents must reference
-            # the same ICC profile.  Compare full profile bytes and keep
-            # only the first when they differ.
-            from ..utils import resolve_indirect as _ri
-
-            try:
-                existing = pdf.Root.get("/OutputIntents")
-                if existing is not None and len(existing) > 1:
-                    profiles: list[bytes | None] = []
-                    for oi in existing:
-                        oi = _ri(oi)
-                        dest = oi.get("/DestOutputProfile")
-                        if dest is not None:
-                            dest = _ri(dest)
-                            try:
-                                profiles.append(bytes(dest.read_bytes()))
-                            except Exception:
-                                profiles.append(None)
-                        else:
-                            profiles.append(None)
-
-                    # Deduplicate: keep only the first non-None profile
-                    first = next((p for p in profiles if p is not None), None)
-                    unique = {p for p in profiles if p is not None}
-                    if len(unique) > 1:
-                        logger.warning(
-                            "Multiple OutputIntents reference different"
-                            " ICC profiles (%d unique). Keeping only the"
-                            " first and discarding the rest per ISO"
-                            " 19005-2 §6.2.3.",
-                            len(unique),
-                        )
-                        # Replace array with only the first entry
-                        first_oi = _ri(existing[0])
-                        pdf.Root.OutputIntents = Array([first_oi])
-                    elif first is not None and any(p is None for p in profiles):
-                        # Some intents lack a profile entirely
-                        logger.warning(
-                            "Some OutputIntents lack a"
-                            " DestOutputProfile. Keeping only the first"
-                            " OutputIntent.",
-                        )
-                        first_oi = _ri(existing[0])
-                        pdf.Root.OutputIntents = Array([first_oi])
-            except Exception:
-                pass
-
-            # Rule 6.2.3-2: all DestOutputProfile entries must reference
-            # the same indirect object.
-            remaining = pdf.Root.get("/OutputIntents")
-            if remaining is not None and len(remaining) > 1:
-                canonical = None
-                for oi in remaining:
-                    oi = _ri(oi)
-                    dest = oi.get("/DestOutputProfile")
-                    if dest is not None:
-                        if canonical is None:
-                            canonical = dest
-                        else:
-                            oi["/DestOutputProfile"] = canonical
-
-            # Rule 6.2.3-3: DestOutputProfileRef shall not be present
-            # in any PDF/X OutputIntent.
-            remaining = pdf.Root.get("/OutputIntents")
-            if remaining is not None:
-                for oi in remaining:
-                    oi = _ri(oi)
-                    if oi.get("/S") == Name("/GTS_PDFX"):
-                        if "/DestOutputProfileRef" in oi:
-                            del oi["/DestOutputProfileRef"]
-
-            logger.info("Replacing existing OutputIntents")
+            output_intent_preparation = prepare_existing_output_intents(pdf)
+            if output_intent_preparation.keep_existing:
+                existing_output_intent_colorspace = (
+                    output_intent_preparation.document_colorspace
+                )
+                logger.info("Keeping existing PDF/A OutputIntent")
+            else:
+                logger.info(
+                    "Replacing existing OutputIntents: %s",
+                    output_intent_preparation.reason,
+                )
         else:
             logger.debug("OutputIntents already present, skipping")
             return []
@@ -263,6 +204,7 @@ def embed_color_profiles(
     else:
         dominant = ColorSpaceType.DEVICE_GRAY
 
+    document_colorspace = existing_output_intent_colorspace or dominant
     icc_stream_cache: dict[ColorSpaceType, Stream] = {}
 
     # Rule 6.2.10-2: add /Group to transparent pages missing one
@@ -273,11 +215,12 @@ def embed_color_profiles(
             groups_added,
         )
 
-    profile_data = get_profile_for_colorspace(dominant)
-    output_intent = create_output_intent_for_colorspace(
-        pdf, dominant, profile_data, level
-    )
-    pdf.Root.OutputIntents = Array([pdf.make_indirect(output_intent)])
+    if existing_output_intent_colorspace is None:
+        profile_data = get_profile_for_colorspace(dominant)
+        output_intent = create_output_intent_for_colorspace(
+            pdf, dominant, profile_data, level
+        )
+        pdf.Root.OutputIntents = Array([pdf.make_indirect(output_intent)])
 
     # Cover non-dominant Device color spaces with Default entries + image fixes.
     # Note: Separation/DeviceN spaces are not converted - they are PDF/A-2/3
@@ -289,7 +232,7 @@ def embed_color_profiles(
         ColorSpaceType.DEVICE_RGB,
         ColorSpaceType.DEVICE_CMYK,
     }
-    non_dominant = device_spaces - {dominant}
+    non_dominant = device_spaces - {document_colorspace}
     if non_dominant:
         _apply_default_colorspaces(pdf, non_dominant, icc_stream_cache)
 
@@ -303,8 +246,8 @@ def embed_color_profiles(
         _convert_calibrated_colorspaces(pdf, icc_stream_cache)
 
     logger.info(
-        "ICC color profile embedded: %s (PDF/A-%s), detected: %s",
-        dominant.value,
+        "ICC color profile ready: %s (PDF/A-%s), detected: %s",
+        document_colorspace.value,
         level,
         ", ".join(cs.value for cs in sorted(detected, key=lambda x: x.value)),
     )
