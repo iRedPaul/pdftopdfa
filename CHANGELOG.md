@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.0] - 2026-04-22
+
+### Changes
+
+- Centralize PDF/A save settings and hardening
+
+### Bug Fixes
+
+- Preserve valid OutputIntents in color profile handling
+
 ## [0.3.15] - 2026-04-22
 
 ### Changes
