@@ -378,6 +378,42 @@ class TestCreateXmpMetadata:
                 break
         assert trailing_space >= 2048
 
+    def test_xmp_omits_empty_optional_dublin_core_fields(self) -> None:
+        """Missing optional Dublin Core values are omitted, not filled."""
+        info = {
+            "title": "Invoice",
+            "author": None,
+            "subject": None,
+            "keywords": None,
+        }
+        xmp = create_xmp_metadata(info, pdfa_part=3, pdfa_conformance="U")
+        xmp_str = xmp.decode("utf-8")
+
+        assert "dc:title" in xmp_str
+        assert "dc:creator" not in xmp_str
+        assert "dc:description" not in xmp_str
+        assert "pdf:Keywords" not in xmp_str
+        assert ">Unknown<" not in xmp_str
+
+    def test_xmp_treats_python_placeholders_as_empty(self) -> None:
+        """Stringified Python placeholders are not written as metadata values."""
+        info = {
+            "title": "Invoice",
+            "author": "None",
+            "subject": "set()",
+            "keywords": "[]",
+            "creator": "{}",
+        }
+        xmp = create_xmp_metadata(info, pdfa_part=3, pdfa_conformance="U")
+        xmp_str = xmp.decode("utf-8")
+
+        assert "dc:creator" not in xmp_str
+        assert "dc:description" not in xmp_str
+        assert "pdf:Keywords" not in xmp_str
+        assert "xmp:CreatorTool" not in xmp_str
+        assert ">None<" not in xmp_str
+        assert "set()" not in xmp_str
+
 
 class TestEmbedXmpMetadata:
     """Tests for embed_xmp_metadata."""
@@ -598,6 +634,38 @@ class TestSyncMetadata:
             for record in caplog.records
         )
 
+    def test_sync_source_snapshot_removes_ocr_added_placeholders(
+        self, sample_pdf_bytes: bytes
+    ) -> None:
+        """An empty source snapshot removes metadata introduced by OCR."""
+        from io import BytesIO
+
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
+        pdf.docinfo["/Author"] = "Unknown"
+        pdf.docinfo["/Creator"] = "OCRmyPDF 17.3.0 / Tesseract OCR"
+        pdf.docinfo["/Producer"] = "OCRmyPDF"
+        source_info = {
+            "title": None,
+            "author": None,
+            "subject": None,
+            "keywords": None,
+            "creator": None,
+            "producer": None,
+            "creation_date": None,
+            "modification_date": None,
+            "trapped": None,
+        }
+
+        sync_metadata(pdf, "3u", source_info=source_info, source_xmp_tree=None)
+
+        assert "/Author" not in pdf.docinfo
+        assert "/Creator" not in pdf.docinfo
+        assert str(pdf.docinfo["/Producer"]) == "pdftopdfa"
+
+        xmp_str = bytes(pdf.Root.Metadata.read_bytes()).decode("utf-8")
+        assert "OCRmyPDF" not in xmp_str
+        assert ">Unknown<" not in xmp_str
+
     def test_sync_normalizes_trapped_in_docinfo(self, sample_pdf_bytes: bytes) -> None:
         """Normalizes /Trapped in DocInfo without writing pdf:Trapped to XMP."""
         from io import BytesIO
@@ -765,21 +833,20 @@ class TestSyncMetadata:
             assert new_dt is not None
             assert original_dt == new_dt
 
-    def test_sync_sets_author_unknown_when_missing(
-        self, pdf_with_metadata: Path
-    ) -> None:
-        """When /Author is missing, sync_metadata sets it to 'Unknown'."""
+    def test_sync_omits_author_when_missing(self, pdf_with_metadata: Path) -> None:
+        """When /Author is missing, sync_metadata omits Author/dc:creator."""
         with Pdf.open(pdf_with_metadata) as pdf:
             if "/Author" in pdf.docinfo:
                 del pdf.docinfo["/Author"]
 
             sync_metadata(pdf, "2b")
 
-            assert str(pdf.docinfo["/Author"]) == "Unknown"
+            assert "/Author" not in pdf.docinfo
 
             xmp_bytes = bytes(pdf.Root.Metadata.read_bytes())
             xmp_str = xmp_bytes.decode("utf-8")
-            assert "Unknown" in xmp_str
+            assert "dc:creator" not in xmp_str
+            assert "Unknown" not in xmp_str
 
     def test_sync_moddate_is_current_not_old(self, pdf_with_metadata: Path) -> None:
         """ModDate is set to current time, not the old modification date."""
@@ -1007,6 +1074,96 @@ class TestXmpPreservation:
         assert "xmpMM:OriginalDocumentID" not in xmp_str
         assert "xmpMM:DerivedFrom" not in xmp_str
         assert "xmpMM:History" not in xmp_str
+
+    def test_xmpmm_instance_id_is_refreshed(self) -> None:
+        """Existing xmpMM:InstanceID is replaced for the new PDF instance."""
+        ns_rdf = NAMESPACES["rdf"]
+        ns_xmpmm = NAMESPACES["xmpMM"]
+        xmp_xml = f"""\
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{ns_rdf}"
+           xmlns:pdfaid="{NAMESPACES["pdfaid"]}"
+           xmlns:xmpMM="{ns_xmpmm}">
+    <rdf:Description rdf:about="">
+      <pdfaid:part>2</pdfaid:part>
+      <pdfaid:conformance>B</pdfaid:conformance>
+      <xmpMM:DocumentID>urn:uuid:doc-1</xmpMM:DocumentID>
+      <xmpMM:InstanceID>urn:uuid:old-inst</xmpMM:InstanceID>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"""
+        tree = etree.fromstring(xmp_xml.encode("utf-8"))
+
+        xmp = create_xmp_metadata(
+            {"title": "Test"},
+            pdfa_part=3,
+            pdfa_conformance="U",
+            existing_xmp_tree=tree,
+        )
+        xmp_str = xmp.decode("utf-8")
+
+        assert "xmpMM:DocumentID" in xmp_str
+        assert "urn:uuid:doc-1" in xmp_str
+        assert "urn:uuid:old-inst" not in xmp_str
+        assert "xmpMM:InstanceID" in xmp_str
+
+    def test_empty_dc_subject_not_preserved(self) -> None:
+        """Empty dc:subject bags are stripped instead of surfacing as set()."""
+        tree = _build_xmp_with_extras(
+            f'<dc:subject xmlns:dc="{NAMESPACES["dc"]}">'
+            f'<rdf:Bag xmlns:rdf="{NAMESPACES["rdf"]}"/>'
+            "</dc:subject>"
+        )
+        xmp = create_xmp_metadata(
+            {"title": "Test"},
+            pdfa_part=2,
+            pdfa_conformance="B",
+            existing_xmp_tree=tree,
+        )
+
+        assert b"dc:subject" not in xmp
+
+    def test_structured_xmptpg_fonts_preserved(self) -> None:
+        """Structured predefined containers are preserved."""
+        tree = _build_xmp_with_extras(
+            f'<xmpTPg:Fonts xmlns:xmpTPg="{NAMESPACES["xmpTPg"]}" '
+            f'xmlns:rdf="{NAMESPACES["rdf"]}" '
+            f'xmlns:stFnt="{NAMESPACES["stFnt"]}">'
+            "<rdf:Bag>"
+            '<rdf:li rdf:parseType="Resource">'
+            "<stFnt:fontName>ExampleSans-Regular</stFnt:fontName>"
+            "<stFnt:fontFamily>ExampleSans</stFnt:fontFamily>"
+            "</rdf:li>"
+            "</rdf:Bag>"
+            "</xmpTPg:Fonts>"
+        )
+        xmp = create_xmp_metadata(
+            {"title": "Test"},
+            pdfa_part=2,
+            pdfa_conformance="B",
+            existing_xmp_tree=tree,
+        )
+        xmp_str = xmp.decode("utf-8")
+
+        assert "xmpTPg:Fonts" in xmp_str
+        assert "ExampleSans-Regular" in xmp_str
+
+    def test_empty_structured_xmptpg_fonts_not_preserved(self) -> None:
+        """Empty structured predefined containers are stripped."""
+        tree = _build_xmp_with_extras(
+            f'<xmpTPg:Fonts xmlns:xmpTPg="{NAMESPACES["xmpTPg"]}" '
+            f'xmlns:rdf="{NAMESPACES["rdf"]}">'
+            "<rdf:Bag/>"
+            "</xmpTPg:Fonts>"
+        )
+        xmp = create_xmp_metadata(
+            {"title": "Test"},
+            pdfa_part=2,
+            pdfa_conformance="B",
+            existing_xmp_tree=tree,
+        )
+
+        assert b"xmpTPg:Fonts" not in xmp
 
     def test_managed_properties_not_duplicated(self) -> None:
         """Managed properties (dc:title etc.) appear only once (new value wins)."""

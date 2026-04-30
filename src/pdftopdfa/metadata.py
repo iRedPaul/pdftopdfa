@@ -10,6 +10,7 @@ import re
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 import pikepdf
 from lxml import etree
@@ -43,6 +44,32 @@ _XMP_DATE_RE = re.compile(
 def _sanitize_xml_text(text: str) -> str:
     """Remove control characters that are illegal in XML 1.0."""
     return _XML_ILLEGAL_CTRL_RE.sub("", text)
+
+
+_EMPTY_METADATA_PLACEHOLDERS = frozenset(
+    {
+        "none",
+        "null",
+        "nil",
+        "set()",
+        "[]",
+        "{}",
+        "()",
+    }
+)
+
+
+def _clean_metadata_text(value: Any) -> str | None:
+    """Return a clean metadata string, or None for empty placeholder values."""
+    if value is None:
+        return None
+
+    text = _sanitize_xml_text(str(value)).strip()
+    if not text:
+        return None
+    if text.lower() in _EMPTY_METADATA_PLACEHOLDERS:
+        return None
+    return text
 
 
 def _strip_xpacket_wrapper(content: bytes) -> bytes:
@@ -123,6 +150,8 @@ _MANAGED_ELEMENTS = {
     f"{{{NAMESPACES['pdf']}}}Producer",
     f"{{{NAMESPACES['pdf']}}}Keywords",
     f"{{{NAMESPACES['pdf']}}}Trapped",
+    f"{{{NAMESPACES['xmpMM']}}}DocumentID",
+    f"{{{NAMESPACES['xmpMM']}}}InstanceID",
 }
 
 # Attribute-form equivalents of managed elements (Clark notation)
@@ -513,6 +542,16 @@ _PREDEFINED_PROPERTY_TYPES: dict[tuple[str, str], str] = {
     (_EXIF, "GPSVersionID"): "s",
     (_EXIF, "NativeDigest"): "s",
 }
+
+_PREDEFINED_STRUCTURED_CONTAINERS = frozenset(
+    {
+        (_XMP, "Thumbnails"),
+        (_XMPMM, "Ingredients"),
+        (_XMPMM, "Pantry"),
+        (_XMPTPG, "Fonts"),
+        (_XMPTPG, "Colorants"),
+    }
+)
 
 # Non-standard property names in structural namespaces -> corrected form
 _STRUCTURAL_PROPERTY_CORRECTIONS: dict[str, str] = {
@@ -1492,13 +1531,17 @@ def _validate_seq_items(
     """Check that Seq items match the expected simple type."""
     for child in elem:
         if child.tag == f"{{{ns_rdf}}}Seq":
+            valid_items = 0
             for li in child:
                 if li.tag != f"{{{ns_rdf}}}li":
                     continue
-                text = (li.text or "").strip()
+                text = _clean_metadata_text(li.text)
+                if text is None:
+                    return False
                 if not _is_valid_simple_value(text, item_type):
                     return False
-            return True
+                valid_items += 1
+            return valid_items > 0
     return False  # No Seq found
 
 
@@ -1507,13 +1550,70 @@ def _validate_alt_lang(elem: etree._Element, ns_rdf: str) -> bool:
     xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
     for child in elem:
         if child.tag == f"{{{ns_rdf}}}Alt":
+            valid_items = 0
             for li in child:
                 if li.tag != f"{{{ns_rdf}}}li":
                     continue
                 if li.get(xml_lang) is None:
                     return False
-            return True
+                if _clean_metadata_text(li.text) is None:
+                    return False
+                valid_items += 1
+            return valid_items > 0
     return False  # No Alt found
+
+
+def _validate_text_container(elem: etree._Element, ns_rdf: str, container: str) -> bool:
+    """Check that a text container has at least one useful list item."""
+    container_tag = f"{{{ns_rdf}}}{container}"
+    li_tag = f"{{{ns_rdf}}}li"
+
+    for child in elem:
+        if child.tag != container_tag:
+            continue
+        valid_items = 0
+        for li in child:
+            if li.tag != li_tag:
+                continue
+            if any(isinstance(grand.tag, str) for grand in li):
+                return False
+            if _clean_metadata_text(li.text) is None:
+                return False
+            valid_items += 1
+        return valid_items > 0
+
+    return False
+
+
+def _validate_structured_container(
+    elem: etree._Element,
+    ns_rdf: str,
+    container: str,
+) -> bool:
+    """Check that a structured container has at least one non-empty list item."""
+    container_tag = f"{{{ns_rdf}}}{container}"
+    li_tag = f"{{{ns_rdf}}}li"
+    parse_type = f"{{{ns_rdf}}}parseType"
+
+    for child in elem:
+        if child.tag != container_tag:
+            continue
+        valid_items = 0
+        for li in child:
+            if li.tag != li_tag:
+                continue
+            has_child_content = any(isinstance(grand.tag, str) for grand in li)
+            has_value_attr = any(attr_name != parse_type for attr_name in li.attrib)
+            if (
+                not has_child_content
+                and not has_value_attr
+                and _clean_metadata_text(li.text) is None
+            ):
+                return False
+            valid_items += 1
+        return valid_items > 0
+
+    return False
 
 
 def _normalize_extension_value_type(value_type: str) -> str:
@@ -1539,7 +1639,8 @@ def _validate_extension_attribute_value(
     type_code = _EXTENSION_VALUE_TYPE_MAP.get(normalized)
     if type_code is None:
         return False
-    return _is_valid_simple_value(value.strip(), type_code)
+    text = _clean_metadata_text(value)
+    return text is not None and _is_valid_simple_value(text, type_code)
 
 
 def _validate_extension_struct_fields(
@@ -1605,6 +1706,7 @@ def _validate_extension_container_items(
     for child in elem:
         if child.tag != container_tag:
             continue
+        valid_items = 0
         for li in child:
             if li.tag != li_tag:
                 continue
@@ -1615,8 +1717,10 @@ def _validate_extension_container_items(
             if type_code is not None:
                 if any(isinstance(grand.tag, str) for grand in li):
                     return False
-                if not _is_valid_simple_value((li.text or "").strip(), type_code):
+                text = _clean_metadata_text(li.text)
+                if text is None or not _is_valid_simple_value(text, type_code):
                     return False
+                valid_items += 1
                 continue
             custom_field_types = custom_types.get(item_value_type)
             if custom_field_types is None:
@@ -1625,7 +1729,8 @@ def _validate_extension_container_items(
                 li, custom_field_types, custom_types
             ):
                 return False
-        return True
+            valid_items += 1
+        return valid_items > 0
 
     return False
 
@@ -1647,7 +1752,8 @@ def _is_valid_extension_property_value(
     if type_code is not None:
         if actual != "s":
             return False
-        return _is_valid_simple_value((elem.text or "").strip(), type_code)
+        text = _clean_metadata_text(elem.text)
+        return text is not None and _is_valid_simple_value(text, type_code)
 
     container_info = _split_extension_container_type(normalized)
     if container_info is not None:
@@ -1706,8 +1812,8 @@ def _is_valid_preserved_property(
             actual = _detect_structure(elem, ns_rdf)
             if actual != "s":
                 return False
-            text = (elem.text or "").strip()
-            return _is_valid_simple_value(text, ext_code)
+            text = _clean_metadata_text(elem.text)
+            return text is not None and _is_valid_simple_value(text, ext_code)
         # Not a known predefined property — check for undeclarable structures
         return not _has_undeclarable_structure(elem)
 
@@ -1728,7 +1834,12 @@ def _is_valid_preserved_property(
         return _validate_alt_lang(elem, ns_rdf)
     # General Alt or plain containers
     if expected in ("b", "q", "a"):
-        return actual == expected
+        if actual != expected:
+            return False
+        container = {"b": "Bag", "q": "Seq", "a": "Alt"}[expected]
+        if (uri, local_name) in _PREDEFINED_STRUCTURED_CONTAINERS:
+            return _validate_structured_container(elem, ns_rdf, container)
+        return _validate_text_container(elem, ns_rdf, container)
     # Seq with typed items (qi, qr, qd)
     if expected.startswith("q") and len(expected) == 2:
         if actual != "q":
@@ -1739,7 +1850,9 @@ def _is_valid_preserved_property(
     # Expect simple value (s, i, r, d, B)
     if actual != "s":
         return False
-    text = (elem.text or "").strip()
+    text = _clean_metadata_text(elem.text)
+    if text is None:
+        return False
     return _is_valid_simple_value(text, expected)
 
 
@@ -2050,7 +2163,14 @@ def _collect_preserved_elements(
                             attr_value,
                         )
                         continue
-                    text = attr_value.strip()
+                    text = _clean_metadata_text(attr_value)
+                    if text is None:
+                        logger.debug(
+                            "Stripping empty preserved attribute: %s=%r",
+                            attr_name,
+                            attr_value,
+                        )
+                        continue
                     declared_value_type = declared_property_types.get(a_uri, {}).get(
                         a_local
                     )
@@ -2366,13 +2486,50 @@ def extract_pdf_info(pdf: pikepdf.Pdf, *, log_result: bool = True) -> dict[str, 
                 elif info_key == "trapped":
                     info[info_key] = _normalize_trapped(value)
                 else:
-                    info[info_key] = _sanitize_xml_text(str_value)
+                    info[info_key] = _clean_metadata_text(str_value)
         except Exception as e:
             logger.debug("Error reading %s: %s", pdf_key, e)
 
     if log_result:
         logger.debug("Extracted metadata: %s", info)
     return info
+
+
+def _new_xmp_identifier() -> str:
+    """Create a GUID suitable for xmpMM identifiers."""
+    return f"urn:uuid:{uuid4()}"
+
+
+def _extract_simple_xmp_property(
+    tree: etree._Element | None,
+    namespace: str,
+    local_name: str,
+) -> str | None:
+    """Extract a simple top-level XMP property from element or attribute form."""
+    if tree is None:
+        return None
+
+    ns_rdf = NAMESPACES["rdf"]
+    property_name = f"{{{namespace}}}{local_name}"
+
+    for rdf_root in tree.iter(f"{{{ns_rdf}}}RDF"):
+        for desc in rdf_root.findall(f"{{{ns_rdf}}}Description"):
+            attr_value = desc.get(property_name)
+            if attr_value is not None:
+                cleaned = _clean_metadata_text(attr_value)
+                if cleaned is not None:
+                    return cleaned
+
+            prop = desc.find(property_name)
+            if prop is None:
+                continue
+            if len(prop):
+                continue
+            cleaned = _clean_metadata_text(prop.text)
+            if cleaned is not None:
+                return cleaned
+
+    return None
 
 
 def create_xmp_metadata(
@@ -2413,6 +2570,7 @@ def create_xmp_metadata(
     ns_xmp = NAMESPACES["xmp"]
     ns_pdf = NAMESPACES["pdf"]
     ns_pdfaid = NAMESPACES["pdfaid"]
+    ns_xmpmm = NAMESPACES["xmpMM"]
 
     # Build the RDF description content
     nsmap = {
@@ -2421,6 +2579,7 @@ def create_xmp_metadata(
         "xmp": ns_xmp,
         "pdf": ns_pdf,
         "pdfaid": ns_pdfaid,
+        "xmpMM": ns_xmpmm,
         "pdfaExtension": _NS_PDFA_EXTENSION,
         "pdfaSchema": _NS_PDFA_SCHEMA,
         "pdfaProperty": _NS_PDFA_PROPERTY,
@@ -2432,31 +2591,36 @@ def create_xmp_metadata(
     dc = ElementMaker(namespace=ns_dc, nsmap=nsmap)
 
     # Get metadata values with defaults (strip XML-illegal control chars)
-    title = _sanitize_xml_text(info.get("title") or "Untitled")
-    author = _sanitize_xml_text(info.get("author") or "")
-    subject = _sanitize_xml_text(info.get("subject") or "")
+    title = _clean_metadata_text(info.get("title"))
+    author = _clean_metadata_text(info.get("author"))
+    subject = _clean_metadata_text(info.get("subject"))
     creation_date = _format_iso_date(info.get("creation_date") or now)
     modification_date = _format_iso_date(now)
+    document_id = _extract_simple_xmp_property(
+        existing_xmp_tree,
+        ns_xmpmm,
+        "DocumentID",
+    )
+    existing_instance_id = _extract_simple_xmp_property(
+        existing_xmp_tree,
+        ns_xmpmm,
+        "InstanceID",
+    )
 
-    # Build dc:title (rdf:Alt with language alternative)
-    title_elem = dc("title")
-    title_alt = etree.SubElement(title_elem, f"{{{ns_rdf}}}Alt")
-    title_li = etree.SubElement(title_alt, f"{{{ns_rdf}}}li")
-    title_li.set("{http://www.w3.org/XML/1998/namespace}lang", "x-default")
-    title_li.text = title
+    def _build_lang_alt(tag_name: str, text: str) -> etree._Element:
+        elem = dc(tag_name)
+        alt = etree.SubElement(elem, f"{{{ns_rdf}}}Alt")
+        li = etree.SubElement(alt, f"{{{ns_rdf}}}li")
+        li.set("{http://www.w3.org/XML/1998/namespace}lang", "x-default")
+        li.text = text
+        return elem
 
-    # Build dc:creator (rdf:Seq)
-    creator_elem = dc("creator")
-    creator_seq = etree.SubElement(creator_elem, f"{{{ns_rdf}}}Seq")
-    creator_li = etree.SubElement(creator_seq, f"{{{ns_rdf}}}li")
-    creator_li.text = author if author else "Unknown"
-
-    # Build dc:description (rdf:Alt)
-    desc_elem = dc("description")
-    desc_alt = etree.SubElement(desc_elem, f"{{{ns_rdf}}}Alt")
-    desc_li = etree.SubElement(desc_alt, f"{{{ns_rdf}}}li")
-    desc_li.set("{http://www.w3.org/XML/1998/namespace}lang", "x-default")
-    desc_li.text = subject if subject else ""
+    def _build_seq(tag_name: str, text: str) -> etree._Element:
+        elem = dc(tag_name)
+        seq = etree.SubElement(elem, f"{{{ns_rdf}}}Seq")
+        li = etree.SubElement(seq, f"{{{ns_rdf}}}li")
+        li.text = text
+        return elem
 
     # Build the RDF Description
     description = rdf(
@@ -2474,9 +2638,12 @@ def create_xmp_metadata(
     format_elem = dc("format")
     format_elem.text = "application/pdf"
     description.append(format_elem)
-    description.append(title_elem)
-    description.append(creator_elem)
-    description.append(desc_elem)
+    if title is not None:
+        description.append(_build_lang_alt("title", title))
+    if author is not None:
+        description.append(_build_seq("creator", author))
+    if subject is not None:
+        description.append(_build_lang_alt("description", subject))
 
     # Add XMP elements
     create_date_elem = etree.SubElement(description, f"{{{ns_xmp}}}CreateDate")
@@ -2486,20 +2653,27 @@ def create_xmp_metadata(
     metadata_date_elem = etree.SubElement(description, f"{{{ns_xmp}}}MetadataDate")
     metadata_date_elem.text = _format_iso_date(now)
 
+    if document_id is not None:
+        document_id_elem = etree.SubElement(description, f"{{{ns_xmpmm}}}DocumentID")
+        document_id_elem.text = document_id
+    if document_id is not None or existing_instance_id is not None:
+        instance_id_elem = etree.SubElement(description, f"{{{ns_xmpmm}}}InstanceID")
+        instance_id_elem.text = _new_xmp_identifier()
+
     # Add pdf:Producer (synchronized with DocInfo /Producer)
-    producer = info.get("producer") or "pdftopdfa"
+    producer = _clean_metadata_text(info.get("producer")) or "pdftopdfa"
     producer_elem = etree.SubElement(description, f"{{{ns_pdf}}}Producer")
     producer_elem.text = producer
 
     # Add xmp:CreatorTool (synchronized with DocInfo /Creator)
-    creator_tool = info.get("creator") or ""
-    if creator_tool:
+    creator_tool = _clean_metadata_text(info.get("creator"))
+    if creator_tool is not None:
         creator_tool_elem = etree.SubElement(description, f"{{{ns_xmp}}}CreatorTool")
         creator_tool_elem.text = creator_tool
 
     # Add pdf:Keywords (synchronized with DocInfo /Keywords)
-    keywords = info.get("keywords") or ""
-    if keywords:
+    keywords = _clean_metadata_text(info.get("keywords"))
+    if keywords is not None:
         keywords_elem = etree.SubElement(description, f"{{{ns_pdf}}}Keywords")
         keywords_elem.text = keywords
 
@@ -2995,10 +3169,9 @@ def sync_metadata(
     if source_info is not None:
         restored_fields: list[str] = []
         for key, value in source_info.items():
-            if value is not None:
-                if info.get(key) != value:
-                    restored_fields.append(key)
-                info[key] = value
+            if info.get(key) != value:
+                restored_fields.append(key)
+            info[key] = value
         if restored_fields:
             logger.debug(
                 "Restoring original metadata snapshot for: %s",
@@ -3059,21 +3232,26 @@ def sync_metadata(
         except Exception as e:
             logger.warning("Error removing non-standard DocInfo keys: %s", e)
 
-        # Synchronize Producer/Creator with the metadata we decided to keep.
+        # Synchronize standard DocInfo fields with the metadata we decided to keep.
         try:
-            if info.get("producer") is not None:
-                docinfo["/Producer"] = info["producer"]
-                logger.debug("Synchronized DocInfo Producer: %s", info["producer"])
-            elif "/Producer" in docinfo:
-                logger.debug("Using DocInfo Producer: %s", docinfo.get("/Producer"))
-
-            if info.get("creator") is not None:
-                docinfo["/Creator"] = info["creator"]
-                logger.debug("Synchronized DocInfo Creator: %s", info["creator"])
-            elif "/Creator" in docinfo:
-                logger.debug("Using DocInfo Creator: %s", docinfo.get("/Creator"))
+            text_fields = {
+                "/Title": _clean_metadata_text(info.get("title")),
+                "/Author": _clean_metadata_text(info.get("author")),
+                "/Subject": _clean_metadata_text(info.get("subject")),
+                "/Keywords": _clean_metadata_text(info.get("keywords")),
+                "/Creator": _clean_metadata_text(info.get("creator")),
+                "/Producer": _clean_metadata_text(info.get("producer")) or "pdftopdfa",
+            }
+            for key, value in text_fields.items():
+                if value is None:
+                    if key in docinfo:
+                        del docinfo[key]
+                        logger.debug("Removed empty DocInfo %s", key)
+                    continue
+                docinfo[key] = value
+                logger.debug("Synchronized DocInfo %s: %s", key, value)
         except Exception as e:
-            logger.warning("Error synchronizing Creator/Producer in DocInfo: %s", e)
+            logger.warning("Error synchronizing text fields in DocInfo: %s", e)
 
         # Synchronize /Trapped with XMP pdf:Trapped
         try:
@@ -3083,13 +3261,6 @@ def sync_metadata(
                 logger.debug("Normalized /Trapped in DocInfo to /%s", trapped_value)
         except Exception as e:
             logger.warning("Error normalizing /Trapped in DocInfo: %s", e)
-
-        # Synchronize /Author with XMP dc:creator fallback
-        try:
-            if "/Author" not in docinfo or not str(docinfo["/Author"]).strip():
-                docinfo["/Author"] = "Unknown"
-        except Exception as e:
-            logger.warning("Error synchronizing /Author in DocInfo: %s", e)
 
         # Synchronize date fields between DocInfo and XMP
         try:
