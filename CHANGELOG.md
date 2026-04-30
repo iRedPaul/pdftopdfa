@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.1] - 2026-04-30
+
+### Changes
+
+- Improve preservation of valid structured XMP metadata
+
+### Bug Fixes
+
+- Fix empty metadata placeholders and XMP identifier refresh handling
+
 ## [0.4.0] - 2026-04-22
 
 ### Changes
