@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.3] - 2026-06-01
+
+### Features
+
+- Add `--allow-signature-invalidation` for explicit signed PDF conversion
+
+### Changes
+
+- Skip digitally signed PDFs by default to avoid invalidating signatures
+
+### Documentation
+
+- Document signed PDF handling in README and usage/OCR guides
+
 ## [0.4.2] - 2026-06-01
 
 ### Bug Fixes
