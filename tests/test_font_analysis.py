@@ -127,6 +127,17 @@ class TestIsFontEmbedded:
         )
         assert not is_font_embedded(font_dict)
 
+    def test_type0_empty_descendantfonts_array_not_embedded(self):
+        """Type0 with no descendant font dictionaries is not embedded."""
+        font_dict = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/ABCDEF+Arial"),
+            DescendantFonts=Array(),
+            Encoding=Name("/Identity-H"),
+        )
+        assert not is_font_embedded(font_dict)
+
     def test_garbage_fontfile2_data_not_embedded(self):
         """FontFile2 with data but invalid signature is not embedded."""
         pdf = new_pdf()

@@ -12,6 +12,11 @@ font uses Unicode-based glyph names (e.g., 'uni2701') rather than Adobe names
 
 from fontTools.agl import AGL2UV
 
+ADOBE_GLYPH_NAME_FALLBACKS: dict[str, int] = {
+    "nbspace": 0x00A0,
+    "sfthyphen": 0x00AD,
+}
+
 # ZapfDingbats: Adobe glyph names (a1-a206) -> Unicode codepoints
 # Based on Adobe ZapfDingbats encoding specification
 ZAPFDINGBATS_GLYPH_TO_UNICODE: dict[str, int | None] = {
@@ -348,6 +353,22 @@ def resolve_glyph_name(
         glyph_name = cmap.get(unicode_val)
         if glyph_name and glyph_name in hmtx_metrics:
             return glyph_name
+
+    if adobe_name in ADOBE_GLYPH_NAME_FALLBACKS:
+        unicode_val = ADOBE_GLYPH_NAME_FALLBACKS[adobe_name]
+        glyph_name = cmap.get(unicode_val)
+        if glyph_name and glyph_name in hmtx_metrics:
+            return glyph_name
+
+    if adobe_name.startswith("uni") and len(adobe_name) == 7:
+        try:
+            unicode_val = int(adobe_name[3:], 16)
+        except ValueError:
+            unicode_val = None
+        if unicode_val is not None:
+            glyph_name = cmap.get(unicode_val)
+            if glyph_name and glyph_name in hmtx_metrics:
+                return glyph_name
 
     # Not found
     return None

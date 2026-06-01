@@ -1807,6 +1807,8 @@ class TestResolveSimpleFontEncoding:
         assert result is not None
         assert result[65] == "A"
         assert result[32] == "space"
+        assert result[160] == "space"
+        assert result[173] == "hyphen"
         assert result[178] == "twosuperior"
 
     def test_standard_encoding(self):
@@ -1870,6 +1872,8 @@ class TestResolveSimpleFontEncoding:
         assert result[129] == "ellipsis"
         # Base encoding still works for other codes
         assert result[65] == "A"
+        assert result[160] == "space"
+        assert result[173] == "hyphen"
 
     def test_no_encoding_returns_none(self):
         """Font without /Encoding returns None."""

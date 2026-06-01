@@ -155,17 +155,18 @@ def is_font_embedded(font: pikepdf.Object) -> bool:
     # Type0 (CIDFont) - check DescendantFonts
     if subtype_str == "/Type0":
         descendants = font.get("/DescendantFonts")
-        if descendants is not None:
-            for desc_font in descendants:
-                if isinstance(desc_font, pikepdf.Object):
-                    # Dereference if necessary
-                    if isinstance(desc_font, pikepdf.Array):
-                        continue
-                    resolved = _resolve_indirect(desc_font)
-                    if not _check_font_descriptor_embedded(resolved):
-                        return False
-            return True
-        return False
+        if descendants is None or len(descendants) == 0:
+            return False
+
+        for desc_font in descendants:
+            if isinstance(desc_font, pikepdf.Object):
+                # Dereference if necessary
+                if isinstance(desc_font, pikepdf.Array):
+                    continue
+                resolved = _resolve_indirect(desc_font)
+                if not _check_font_descriptor_embedded(resolved):
+                    return False
+        return True
 
     # Standard fonts without FontDescriptor check
     font_descriptor = font.get("/FontDescriptor")

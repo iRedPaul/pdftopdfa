@@ -67,6 +67,11 @@ _UNICODE_GLYPH_NAME_FALLBACKS: dict[int, str] = {
     0x00BE: "threequarters",
 }
 
+_WINANSI_GLYPH_NAME_OVERRIDES: dict[int, str] = {
+    0xA0: "space",
+    0xAD: "hyphen",
+}
+
 
 def _generate_subset_prefix() -> str:
     """Generates a random 6-letter uppercase subset prefix.
@@ -661,7 +666,7 @@ def _resolve_simple_font_encoding(
     if isinstance(encoding, pikepdf.Name):
         enc_name = _safe_str(encoding)
         if enc_name == "/WinAnsiEncoding":
-            return _build_glyphnames_from_unicode(generate_tounicode_for_winansi())
+            return _build_winansi_glyphnames()
         elif enc_name == "/MacRomanEncoding":
             return _build_glyphnames_from_unicode(generate_tounicode_for_macroman())
         elif enc_name == "/StandardEncoding":
@@ -675,9 +680,7 @@ def _resolve_simple_font_encoding(
         if base is not None:
             base_name = _safe_str(base)
             if base_name == "/WinAnsiEncoding":
-                code_to_glyphname = _build_glyphnames_from_unicode(
-                    generate_tounicode_for_winansi()
-                )
+                code_to_glyphname = _build_winansi_glyphnames()
             elif base_name == "/MacRomanEncoding":
                 code_to_glyphname = _build_glyphnames_from_unicode(
                     generate_tounicode_for_macroman()
@@ -708,6 +711,13 @@ def _resolve_simple_font_encoding(
         return code_to_glyphname if code_to_glyphname else None
     except Exception:
         return None
+
+
+def _build_winansi_glyphnames() -> dict[int, str]:
+    """Builds WinAnsiEncoding's PDF glyph-name mapping."""
+    code_to_glyphname = _build_glyphnames_from_unicode(generate_tounicode_for_winansi())
+    code_to_glyphname.update(_WINANSI_GLYPH_NAME_OVERRIDES)
+    return code_to_glyphname
 
 
 def _build_glyphnames_from_unicode(

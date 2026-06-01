@@ -57,6 +57,38 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_LATIN_CIDFONT_SYSTEM_ALIASES = {
+    "Arial": "ArialMT",
+}
+
+_CJK_CIDFONT_NAME_HINTS = (
+    "AdobeMing",
+    "AdobeMyungjo",
+    "AdobeSong",
+    "Batang",
+    "CJK",
+    "FangSong",
+    "Gothic",
+    "Gulim",
+    "Hei",
+    "Heisei",
+    "Kai",
+    "Koz",
+    "Malgun",
+    "Meiryo",
+    "Ming",
+    "Mincho",
+    "MSGothic",
+    "MSMincho",
+    "NotoSansCJK",
+    "SimHei",
+    "SimKai",
+    "SimSun",
+    "Song",
+    "YuGothic",
+    "YuMincho",
+)
+
 
 def _is_agl_glyph_name(glyph_name: str) -> bool:
     """Return True when a glyph name is explicitly listed in Adobe Glyph List."""
@@ -684,6 +716,32 @@ class FontEmbedder:
             pass
         return "Identity"
 
+    @staticmethod
+    def _looks_like_cjk_cidfont(font_name: str) -> bool:
+        """Return True when a CIDFont name likely belongs to a CJK font."""
+        normalized = font_name.replace(" ", "").replace("-", "")
+        return any(hint in normalized for hint in _CJK_CIDFONT_NAME_HINTS)
+
+    def _load_identity_cidfont_replacement(
+        self, font_name: str
+    ) -> tuple[bytes, "TTFont"]:
+        """Load a Latin replacement font for an Identity-H/V CIDFont."""
+        lookup_name = _LATIN_CIDFONT_SYSTEM_ALIASES.get(font_name, font_name)
+        use_fallback = resolve_standard14_alias(lookup_name) not in FONT_REPLACEMENTS
+        try:
+            return self._loader.load_replacement_font(
+                lookup_name,
+                use_fallback=use_fallback,
+            )
+        except FontEmbeddingError:
+            if lookup_name == font_name:
+                raise
+            use_fallback = resolve_standard14_alias(font_name) not in FONT_REPLACEMENTS
+            return self._loader.load_replacement_font(
+                font_name,
+                use_fallback=use_fallback,
+            )
+
     def _embed_cidfont(
         self,
         page: pikepdf.Page,
@@ -706,16 +764,29 @@ class FontEmbedder:
             True if successful, False on errors.
         """
         try:
-            # Load CIDFont replacement font with script-specific selection
             ordering = self._get_cidfont_ordering(font_obj)
-            font_data, tt_font = self._loader.load_cidfont_replacement_by_ordering(
-                ordering
+            original_tounicode = font_obj.get("/ToUnicode")
+            use_cjk_replacement = (
+                ordering != "Identity" or self._looks_like_cjk_cidfont(font_name)
             )
+
+            if use_cjk_replacement:
+                # Load CJK CIDFont replacement font with script-specific selection.
+                font_data, tt_font = self._loader.load_cidfont_replacement_by_ordering(
+                    ordering
+                )
+            else:
+                # Malformed Latin Type0 fonts can still encode glyph IDs through
+                # Identity-H/V. Keep that model and embed a Latin TrueType program
+                # as the descendant CIDFont instead of substituting a CJK font.
+                font_data, tt_font = self._load_identity_cidfont_replacement(font_name)
 
             # Build complete CIDFont structure
             new_font = self._cidfont_builder.build_structure(
                 font_name, tt_font, font_data, encoding=encoding
             )
+            if original_tounicode is not None:
+                new_font[Name.ToUnicode] = original_tounicode
 
             # Update the font object with the new structure
             # Delete old entries

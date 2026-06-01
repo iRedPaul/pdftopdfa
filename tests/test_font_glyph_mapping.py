@@ -92,6 +92,20 @@ class TestGlyphMapping:
         result = resolve_glyph_name("Alpha", cmap, hmtx)
         assert result == "uni0391"
 
+    def test_resolve_glyph_name_adobe_fallbacks(self):
+        """resolve_glyph_name handles Adobe names omitted by fontTools AGL."""
+        from pdftopdfa.fonts.glyph_mapping import resolve_glyph_name
+
+        cmap = {0x00A0: "uni00A0", 0x00AD: "uni00AD"}
+        hmtx = {
+            "uni00A0": (278, 0),
+            "uni00AD": (333, 0),
+            ".notdef": (500, 0),
+        }
+
+        assert resolve_glyph_name("nbspace", cmap, hmtx) == "uni00A0"
+        assert resolve_glyph_name("sfthyphen", cmap, hmtx) == "uni00AD"
+
     def test_resolve_glyph_name_not_found(self):
         """resolve_glyph_name returns None for unmapped glyphs."""
         from pdftopdfa.fonts.glyph_mapping import resolve_glyph_name

@@ -810,6 +810,48 @@ class TestSimpleFontGlyphMissing:
         assert len(tj_ops) == 1
         assert bytes(tj_ops[0].operands[0]) == b"A A"
 
+    def test_nbspace_and_soft_hyphen_kept_with_winansi_glyph_names(self):
+        """WinAnsi NBSP and soft hyphen stay when space and hyphen exist."""
+        pdf = new_pdf()
+
+        font_data = _make_ttfont_bytes(
+            ["A", "space", "hyphen"],
+            cmap={0x0041: "A", 0x0020: "space", 0x002D: "hyphen"},
+        )
+        font_stream = pdf.make_stream(font_data)
+
+        fd = Dictionary(
+            Type=Name.FontDescriptor,
+            FontName=Name("/TestFont"),
+            FontFile2=font_stream,
+        )
+
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/TestFont"),
+            FirstChar=65,
+            LastChar=173,
+            Encoding=Name.WinAnsiEncoding,
+            FontDescriptor=fd,
+        )
+
+        content = b"BT /F1 12 Tf (A\xa0\xadA) Tj ET"
+        stream = _make_page_with_font_and_content(pdf, font, content)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result["notdef_usage_fixed"] == 0
+        instructions = list(pikepdf.parse_content_stream(stream))
+        tj_ops = [
+            i
+            for i in instructions
+            if isinstance(i, pikepdf.ContentStreamInstruction)
+            and str(i.operator) == "Tj"
+        ]
+        assert len(tj_ops) == 1
+        assert bytes(tj_ops[0].operands[0]) == b"A\xa0\xadA"
+
     def test_no_font_descriptor_falls_back(self):
         """Font without FontDescriptor falls back to range-only check."""
         pdf = new_pdf()

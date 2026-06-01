@@ -869,6 +869,53 @@ class TestCIDFontEmbedding:
         assert missing == []
 
     @pytest.mark.skipif(
+        not _liberation_fonts_available(),
+        reason="Liberation fonts not available",
+    )
+    def test_empty_descendantfonts_type0_is_embedded_with_tounicode_preserved(self):
+        """Malformed Latin Type0 fonts are rebuilt with a CIDFont descendant."""
+        pdf = new_pdf()
+        custom_mapping = {
+            3: ord(" "),
+            36: ord("A"),
+        }
+        font_dict = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/ABCDEF+Arial"),
+            DescendantFonts=Array(),
+            Encoding=Name("/Identity-H"),
+            ToUnicode=pdf.make_indirect(
+                pikepdf.Stream(
+                    pdf,
+                    generate_tounicode_cmap_data(custom_mapping),
+                )
+            ),
+        )
+
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(
+                Font=Dictionary(F1=pdf.make_indirect(font_dict)),
+            ),
+        )
+        content_stream = pdf.make_stream(b"BT /F1 12 Tf <0024> Tj ET")
+        page_dict[Name.Contents] = content_stream
+        pdf.pages.append(pikepdf.Page(page_dict))
+
+        result = FontEmbedder(pdf).embed_missing_fonts()
+
+        assert "Arial" in result.fonts_embedded
+        rebuilt_font = _resolve_indirect(pdf.pages[0].Resources["/Font"]["/F1"])
+        assert is_font_embedded(rebuilt_font)
+        assert len(rebuilt_font["/DescendantFonts"]) == 1
+        parsed_mapping = parse_tounicode_cmap(
+            bytes(rebuilt_font.ToUnicode.read_bytes())
+        )
+        assert parsed_mapping == custom_mapping
+
+    @pytest.mark.skipif(
         not _noto_cjk_font_available(),
         reason="Noto Sans CJK Font not installed",
     )
