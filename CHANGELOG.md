@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2] - 2026-06-01
+
+### Bug Fixes
+
+- Fix WinAnsi and malformed Type0 font handling
+- Fix odd hex string parsing in structure limits sanitizer
+
 ## [0.4.1] - 2026-04-30
 
 ### Changes
