@@ -67,6 +67,15 @@ class TestCliHelp:
         assert result.exit_code == 0
         assert "--skip-any-pdfa" in result.output
 
+    def test_cli_help_shows_allow_signature_invalidation_option(
+        self, runner: CliRunner
+    ) -> None:
+        """--allow-signature-invalidation option appears in help."""
+        result = runner.invoke(main, ["--help"])
+
+        assert result.exit_code == 0
+        assert "--allow-signature-invalidation" in result.output
+
 
 class TestCliVersion:
     """Tests for --version option."""
@@ -140,6 +149,59 @@ class TestCliConvert:
 
         assert result.exit_code == EXIT_SUCCESS
         assert mock_convert_single.call_args.kwargs["skip_any_pdfa"] is True
+
+    @patch("pdftopdfa.cli._convert_single_file")
+    def test_cli_convert_passes_allow_signature_invalidation(
+        self,
+        mock_convert_single,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Single-file CLI forwards --allow-signature-invalidation."""
+        output_path = tmp_dir / "output.pdf"
+        mock_convert_single.return_value = EXIT_SUCCESS
+
+        result = runner.invoke(
+            main,
+            [str(sample_pdf), str(output_path), "--allow-signature-invalidation"],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert (
+            mock_convert_single.call_args.kwargs["allow_signature_invalidation"] is True
+        )
+
+    @patch("pdftopdfa.cli.validate_with_verapdf")
+    @patch("pdftopdfa.cli.convert_to_pdfa")
+    def test_cli_single_file_skipped_result_does_not_validate(
+        self,
+        mock_convert_to_pdfa,
+        mock_validate,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Single-file skipped results bypass manual veraPDF validation."""
+        output_path = tmp_dir / "output.pdf"
+        mock_convert_to_pdfa.return_value = ConversionResult(
+            success=True,
+            input_path=sample_pdf,
+            output_path=output_path,
+            level="3b",
+            skipped=True,
+        )
+
+        result = cli_module._convert_single_file(
+            sample_pdf,
+            str(output_path),
+            "3b",
+            do_validate=True,
+            force=False,
+            quiet=True,
+        )
+
+        assert result == EXIT_SUCCESS
+        mock_validate.assert_not_called()
 
     def test_cli_convert_simple(
         self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
@@ -266,6 +328,23 @@ class TestCliDirectory:
 
         assert result.exit_code == EXIT_SUCCESS
         assert mock_convert_directory.call_args.kwargs["skip_any_pdfa"] is True
+
+    @patch("pdftopdfa.cli._convert_directory")
+    def test_cli_convert_directory_passes_allow_signature_invalidation(
+        self, mock_convert_directory, runner: CliRunner, tmp_dir: Path
+    ) -> None:
+        """Directory CLI forwards --allow-signature-invalidation."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        mock_convert_directory.return_value = EXIT_SUCCESS
+
+        result = runner.invoke(main, [str(input_dir), "--allow-signature-invalidation"])
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert (
+            mock_convert_directory.call_args.kwargs["allow_signature_invalidation"]
+            is True
+        )
 
     def test_cli_convert_directory(
         self, runner: CliRunner, tmp_dir: Path, sample_pdf_bytes: bytes

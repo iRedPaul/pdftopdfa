@@ -11,6 +11,7 @@ from pikepdf import Array, Dictionary, Name
 
 from pdftopdfa.sanitizers.signatures import (
     _collect_signature_fields,
+    count_digital_signatures,
     sanitize_signatures,
 )
 
@@ -55,6 +56,45 @@ def _assert_sig_dict_neutralized(sig_dict):
     assert sig_dict.get("/SubFilter") is None
     assert sig_dict.get("/ByteRange") is None
     assert sig_dict.get("/Contents") is None
+
+
+class TestCountDigitalSignatures:
+    """Tests for non-mutating digital signature detection."""
+
+    def test_detects_signed_field_value(self, make_pdf_with_page):
+        """A /FT /Sig field with /V is counted as a live signature."""
+        pdf = make_pdf_with_page()
+        sig = _make_sig_dict(pdf)
+        field = _make_sig_field(pdf, sig)
+        _setup_acroform(pdf, [field])
+
+        assert count_digital_signatures(pdf) == 1
+        assert field.get("/V") is not None
+        assert sig.get("/ByteRange") is not None
+
+    def test_detects_catalog_perms_signature(self, make_pdf_with_page):
+        """A Catalog /Perms signature reference is counted."""
+        pdf = make_pdf_with_page()
+        sig = _make_sig_dict(pdf)
+        pdf.Root["/Perms"] = pdf.make_indirect(Dictionary(DocMDP=sig))
+
+        assert count_digital_signatures(pdf) == 1
+        assert "/Perms" in pdf.Root
+
+    def test_detects_orphaned_live_signature_dictionary(self, make_pdf_with_page):
+        """An orphaned dictionary with ByteRange signature material is counted."""
+        pdf = make_pdf_with_page()
+        _make_sig_dict(pdf)
+
+        assert count_digital_signatures(pdf) == 1
+
+    def test_ignores_unsigned_signature_field(self, make_pdf_with_page):
+        """An unsigned /FT /Sig field without /V is not counted."""
+        pdf = make_pdf_with_page()
+        field = _make_sig_field(pdf, sig_dict=None)
+        _setup_acroform(pdf, [field])
+
+        assert count_digital_signatures(pdf) == 0
 
 
 class TestSanitizeSignaturesNoOp:

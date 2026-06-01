@@ -86,6 +86,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
 | `--preserve-stamps` | Convert known proprietary stamp annotations to standard PDF Stamp annotations instead of flattening them |
 | `--skip-any-pdfa` | Skip inputs that veraPDF validates as any compliant PDF/A, regardless of target level |
+| `--allow-signature-invalidation` | Convert digitally signed PDFs even though conversion removes or invalidates their signatures |
 | `--version` | Show version and exit |
 | `--help` | Show help and exit |
 
@@ -138,6 +139,7 @@ def convert_to_pdfa(
     ocr_force: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
+    allow_signature_invalidation: bool = False,
 ) -> ConversionResult
 ```
 
@@ -182,6 +184,8 @@ def convert_directory(
     ocr_force: bool = False,
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
+    preserve_stamps: bool = False,
+    allow_signature_invalidation: bool = False,
 ) -> list[ConversionResult]
 ```
 
@@ -217,6 +221,8 @@ def convert_files(
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,
     convert_calibrated: bool = True,
+    preserve_stamps: bool = False,
+    allow_signature_invalidation: bool = False,
 ) -> list[ConversionResult]
 ```
 
@@ -265,6 +271,13 @@ except ConversionError as exc:
 Encrypted PDFs are copied to the output path unchanged and returned with
 `success=True`, `skipped=True`, and a warning that conversion was skipped.
 
+Digitally signed PDFs are also copied unchanged by default, because OCR,
+metadata repair, font embedding, and PDF/A rewriting would invalidate the
+cryptographic signature. Use `--allow-signature-invalidation` or
+`allow_signature_invalidation=True` only when you intentionally want an
+unsigned PDF/A copy. For signed archives, the recommended workflow is to
+convert to PDF/A first and sign the PDF/A output afterwards.
+
 ## PDF/A Levels
 
 | Level | ISO Standard | Attachments | Unicode Required | Recommended For |
@@ -303,6 +316,7 @@ Notes:
 - If veraPDF is unavailable, conversion is not skipped based only on metadata.
 - Skipped files return warning: `Conversion skipped: PDF already valid PDF/A (veraPDF compliant)`.
 - Forced OCR (`--ocr-force` or `ocr_force=True` with OCR languages configured) always runs and bypasses this skip logic.
+- Forced OCR does not bypass the signed-PDF protection; use `--allow-signature-invalidation` explicitly to convert signed inputs.
 
 ## Validation
 

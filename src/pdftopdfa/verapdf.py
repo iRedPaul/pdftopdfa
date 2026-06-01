@@ -136,7 +136,7 @@ def get_verapdf_version() -> str | None:
     except FileNotFoundError as e:
         logger.debug("veraPDF executable not found: %s", e)
         return None
-    except (subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError) as e:
         logger.debug("Error getting veraPDF version: %s", e)
         return None
 
@@ -334,6 +334,8 @@ def validate_with_verapdf(
         ) from e
     except subprocess.TimeoutExpired as e:
         raise VeraPDFError(f"veraPDF timeout after {timeout} seconds.") from e
+    except OSError as e:
+        raise VeraPDFError(f"Error launching veraPDF: {e}") from e
     except subprocess.SubprocessError as e:
         raise VeraPDFError(f"Error running veraPDF: {e}") from e
 

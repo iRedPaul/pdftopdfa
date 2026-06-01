@@ -34,6 +34,7 @@ from .fonts import check_font_compliance
 from .metadata import _extract_existing_xmp, extract_pdf_info, sync_metadata
 from .ocr import DEFAULT_OCR_FALLBACK_AFTER_SECONDS, DEFAULT_OCR_FALLBACK_QUALITY
 from .sanitizers import (
+    count_digital_signatures,
     sanitize_for_pdfa,
     sanitize_notdef_usage,
     sanitize_signatures,
@@ -148,6 +149,18 @@ _LATE_STRUCTURE_WARNINGS: list[tuple[str, str]] = [
     ("hex_odd_fixed", "odd-length hexadecimal string(s) fixed"),
     ("hex_invalid_fixed", "invalid hexadecimal string(s) repaired"),
 ]
+
+_SIGNATURE_SKIP_WARNING = (
+    "Conversion skipped: PDF contains digital signatures; conversion would "
+    "invalidate them"
+)
+
+
+def _signature_invalidation_warning(count: int) -> str:
+    """Build the warning emitted when signature invalidation is explicit."""
+    return (
+        f"{count} digital signature(s) will be removed/invalidated for PDF/A conversion"
+    )
 
 
 def _compare_pdfa_levels(detected: str, target: str) -> int:
@@ -656,6 +669,7 @@ def convert_to_pdfa(
     ocr_force: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
+    allow_signature_invalidation: bool = False,
 ) -> ConversionResult:
     """Converts a PDF file to the PDF/A format.
 
@@ -681,6 +695,8 @@ def convert_to_pdfa(
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
             flattened into page content.
+        allow_signature_invalidation: If True, convert signed PDFs even though
+            conversion removes or invalidates their digital signatures.
 
     Returns:
         ConversionResult with status and details.
@@ -727,6 +743,22 @@ def convert_to_pdfa(
                 )
             source_info = extract_pdf_info(check_pdf)
             source_xmp_tree = _extract_existing_xmp(check_pdf)
+            signature_count = count_digital_signatures(check_pdf)
+            if signature_count > 0 and not allow_signature_invalidation:
+                processing_time = time.perf_counter() - start_time
+                logger.warning("%s: %s", _SIGNATURE_SKIP_WARNING, input_path)
+                _copy_input_to_output(input_path, output_path)
+                return ConversionResult(
+                    success=True,
+                    input_path=input_path,
+                    output_path=output_path,
+                    level=level,
+                    warnings=[_SIGNATURE_SKIP_WARNING],
+                    processing_time=processing_time,
+                    skipped=True,
+                )
+            if signature_count > 0:
+                warnings.append(_signature_invalidation_warning(signature_count))
             detected_level = detect_pdfa_level(check_pdf)
 
         if detected_level is not None and force_ocr_requested:
@@ -814,10 +846,12 @@ def convert_to_pdfa(
                 )
                 if sig_result["signatures_found"] > 0:
                     ocr_source_base = ocr_signature_temp_file
-                    warnings.append(
-                        f"{sig_result['signatures_found']} digital signature(s) "
-                        "removed before OCR for PDF/A compliance"
-                    )
+                    if not any("digital signature" in w for w in warnings):
+                        warnings.append(
+                            _signature_invalidation_warning(
+                                sig_result["signatures_found"]
+                            )
+                        )
                 else:
                     try:
                         ocr_signature_temp_file.unlink()
@@ -1194,6 +1228,7 @@ def convert_files(
     cancel_event: threading.Event | None = None,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
+    allow_signature_invalidation: bool = False,
 ) -> list[ConversionResult]:
     """Converts a list of PDF files to PDF/A.
 
@@ -1219,6 +1254,8 @@ def convert_files(
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
             flattened into page content.
+        allow_signature_invalidation: If True, convert signed PDFs even though
+            conversion removes or invalidates their digital signatures.
         on_progress: Optional callback(current_idx, total, filename) called
             before each file.
         cancel_event: Optional threading.Event; when set, iteration stops.
@@ -1269,6 +1306,7 @@ def convert_files(
                 ocr_force=ocr_force,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
+                allow_signature_invalidation=allow_signature_invalidation,
             )
             results.append(result)
 
@@ -1310,6 +1348,7 @@ def convert_directory(
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
+    allow_signature_invalidation: bool = False,
 ) -> list[ConversionResult]:
     """Converts all PDFs in a directory to PDF/A.
 
@@ -1336,6 +1375,8 @@ def convert_directory(
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
             flattened into page content.
+        allow_signature_invalidation: If True, convert signed PDFs even though
+            conversion removes or invalidates their digital signatures.
         force_overwrite: If True, existing output files are overwritten.
 
     Returns:
@@ -1414,6 +1455,7 @@ def convert_directory(
         on_progress=_on_progress if show_progress else None,
         convert_calibrated=convert_calibrated,
         preserve_stamps=preserve_stamps,
+        allow_signature_invalidation=allow_signature_invalidation,
     )
 
     if progress_bar is not None:

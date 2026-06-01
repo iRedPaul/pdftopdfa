@@ -254,6 +254,14 @@ def _print_validation_result(
         "regardless of target level"
     ),
 )
+@click.option(
+    "--allow-signature-invalidation",
+    is_flag=True,
+    help=(
+        "Convert digitally signed PDFs even though conversion removes or "
+        "invalidates their signatures"
+    ),
+)
 @click.version_option(version=__version__)
 def main(
     input_path: str | None,
@@ -273,6 +281,7 @@ def main(
     convert_calibrated: bool,
     preserve_stamps: bool,
     skip_any_pdfa: bool,
+    allow_signature_invalidation: bool,
 ) -> None:
     """Converts PDF files to the archival PDF/A format.
 
@@ -339,6 +348,7 @@ def main(
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 skip_any_pdfa=skip_any_pdfa,
+                allow_signature_invalidation=allow_signature_invalidation,
             )
         elif input_path_obj.is_dir():
             # Convert directory
@@ -358,6 +368,7 @@ def main(
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 skip_any_pdfa=skip_any_pdfa,
+                allow_signature_invalidation=allow_signature_invalidation,
             )
         else:
             print_error(f"Invalid path: {input_path}")
@@ -405,6 +416,7 @@ def _convert_single_file(
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     skip_any_pdfa: bool = False,
+    allow_signature_invalidation: bool = False,
 ) -> int:
     """Converts a single PDF file.
 
@@ -426,6 +438,8 @@ def _convert_single_file(
             to standard PDF Stamp annotations instead of flattening them.
         skip_any_pdfa: If True, skip files that veraPDF validates as
             compliant PDF/A regardless of target level.
+        allow_signature_invalidation: If True, convert signed PDFs even though
+            conversion removes or invalidates their digital signatures.
 
     Returns:
         Exit code.
@@ -460,12 +474,15 @@ def _convert_single_file(
         ocr_force=ocr_force,
         convert_calibrated=convert_calibrated,
         preserve_stamps=preserve_stamps,
+        allow_signature_invalidation=allow_signature_invalidation,
     )
 
     _print_result(result, quiet)
 
     if not result.success:
         return EXIT_CONVERSION_FAILED
+    if result.skipped:
+        return EXIT_SUCCESS
 
     # Optional: Validation
     if do_validate:
@@ -517,6 +534,7 @@ def _convert_directory(
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     skip_any_pdfa: bool = False,
+    allow_signature_invalidation: bool = False,
 ) -> int:
     """Converts all PDFs in a directory.
 
@@ -539,6 +557,8 @@ def _convert_directory(
             to standard PDF Stamp annotations instead of flattening them.
         skip_any_pdfa: If True, skip files that veraPDF validates as
             compliant PDF/A regardless of target level.
+        allow_signature_invalidation: If True, convert signed PDFs even though
+            conversion removes or invalidates their digital signatures.
 
     Returns:
         Exit code.
@@ -565,6 +585,7 @@ def _convert_directory(
         force_overwrite=force,
         convert_calibrated=convert_calibrated,
         preserve_stamps=preserve_stamps,
+        allow_signature_invalidation=allow_signature_invalidation,
     )
 
     # Output summary

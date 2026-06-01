@@ -86,6 +86,21 @@ def _is_signature_dictionary(obj) -> bool:
     return False
 
 
+def _is_live_signature_dictionary(obj) -> bool:
+    """Check whether an object contains live digital signature bytes."""
+    if not isinstance(obj, Dictionary):
+        return False
+
+    try:
+        has_byte_range = obj.get("/ByteRange") is not None
+        has_contents = obj.get("/Contents") is not None
+        has_sub_filter = obj.get("/SubFilter") is not None
+    except Exception:
+        return False
+
+    return has_byte_range and (has_contents or has_sub_filter)
+
+
 def _log_signature_info(sig_dict: Dictionary, file_size: int | None = None) -> None:
     """Log information about a signature being removed.
 
@@ -209,44 +224,25 @@ def _collect_signature_fields(fields, visited=None):
     return result
 
 
-def sanitize_signatures(pdf: Pdf, level: str = "3b") -> dict:
-    """Sanitize digital signature structures for PDF/A compliance.
-
-    Removes signature values from signature fields (/FT /Sig with /V),
-    removes /Perms signature references, and neutralizes all signature
-    dictionaries found in the document to avoid digest-related failures.
-
-    Args:
-        pdf: Opened pikepdf PDF object (modified in place).
-        level: PDF/A conformance level ('2b', '2u', '3b', or '3u').
-
-    Returns:
-        Dictionary with statistics:
-        - signatures_found: Total signature dictionaries found
-        - signatures_removed: Signature structures removed/neutralized
-        - sigflags_fixed: Whether SigFlags was modified
-        - signatures_type_fixed: Kept for backward compatibility (always 0)
-    """
-    del level  # Signature removal is currently level-independent.
-
-    stats = {
-        "signatures_found": 0,
-        "signatures_removed": 0,
-        "sigflags_fixed": 0,
-        "signatures_type_fixed": 0,
-    }
-
+def _collect_signature_data(pdf: Pdf):
+    """Collect live signature fields and dictionaries without mutating the PDF."""
     visited_fields: set[tuple[int, int]] = set()
     visited_sig_dicts: set[tuple[int, int]] = set()
     sig_fields: list[tuple[Dictionary, Dictionary]] = []
     sig_dicts: list[Dictionary] = []
 
-    def _collect_sig_dict(candidate) -> None:
+    def _collect_sig_dict(
+        candidate, *, assume_signature: bool = False, require_live: bool = False
+    ) -> None:
         try:
             resolved = _resolve(candidate)
         except Exception:
             return
-        if not _is_signature_dictionary(resolved):
+        if not isinstance(resolved, Dictionary):
+            return
+        if require_live and not _is_live_signature_dictionary(resolved):
+            return
+        if not assume_signature and not _is_signature_dictionary(resolved):
             return
         key = _obj_key(resolved)
         if key is not None:
@@ -255,7 +251,6 @@ def sanitize_signatures(pdf: Pdf, level: str = "3b") -> dict:
             visited_sig_dicts.add(key)
         sig_dicts.append(resolved)
 
-    # From AcroForm /Fields
     try:
         acroform = _resolve(pdf.Root.AcroForm) if "/AcroForm" in pdf.Root else None
     except Exception:
@@ -269,7 +264,7 @@ def sanitize_signatures(pdf: Pdf, level: str = "3b") -> dict:
         except Exception:
             pass
 
-    # From page annotations (may find fields not in AcroForm /Fields).
+    # Page annotations may contain signature widgets not listed in AcroForm /Fields.
     for page in pdf.pages:
         try:
             annots = page.get("/Annots")
@@ -300,7 +295,6 @@ def sanitize_signatures(pdf: Pdf, level: str = "3b") -> dict:
                             try:
                                 sig_dict = _resolve(v)
                                 sig_fields.append((annot, sig_dict))
-                                _collect_sig_dict(sig_dict)
                             except Exception:
                                 pass
                 except Exception:
@@ -308,9 +302,72 @@ def sanitize_signatures(pdf: Pdf, level: str = "3b") -> dict:
         except Exception:
             pass
 
+    for _field, sig_dict in sig_fields:
+        _collect_sig_dict(sig_dict, assume_signature=True)
+
+    try:
+        perms = pdf.Root.get("/Perms")
+        if perms is not None:
+            perms = _resolve(perms)
+            for key in ("/DocMDP", "/UR", "/UR3"):
+                try:
+                    sig_ref = perms.get(key)
+                    if sig_ref is not None:
+                        _collect_sig_dict(sig_ref, assume_signature=True)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # Orphaned signature dictionaries are only treated as live signatures when
+    # they still contain byte-range signature material.
+    for obj in pdf.objects:
+        try:
+            resolved = _resolve(obj)
+        except Exception:
+            continue
+        _collect_sig_dict(resolved, require_live=True)
+
+    return acroform, sig_fields, sig_dicts
+
+
+def count_digital_signatures(pdf: Pdf) -> int:
+    """Return the number of live digital signature dictionaries in a PDF."""
+    _acroform, _sig_fields, sig_dicts = _collect_signature_data(pdf)
+    return len(sig_dicts)
+
+
+def sanitize_signatures(pdf: Pdf, level: str = "3b") -> dict:
+    """Sanitize digital signature structures for PDF/A compliance.
+
+    Removes signature values from signature fields (/FT /Sig with /V),
+    removes /Perms signature references, and neutralizes all signature
+    dictionaries found in the document to avoid digest-related failures.
+
+    Args:
+        pdf: Opened pikepdf PDF object (modified in place).
+        level: PDF/A conformance level ('2b', '2u', '3b', or '3u').
+
+    Returns:
+        Dictionary with statistics:
+        - signatures_found: Total signature dictionaries found
+        - signatures_removed: Signature structures removed/neutralized
+        - sigflags_fixed: Whether SigFlags was modified
+        - signatures_type_fixed: Kept for backward compatibility (always 0)
+    """
+    del level  # Signature removal is currently level-independent.
+
+    stats = {
+        "signatures_found": 0,
+        "signatures_removed": 0,
+        "sigflags_fixed": 0,
+        "signatures_type_fixed": 0,
+    }
+
+    acroform, sig_fields, sig_dicts = _collect_signature_data(pdf)
+
     # Collect signature dicts from field /V values.
     for field, sig_dict in sig_fields:
-        _collect_sig_dict(sig_dict)
         try:
             if "/V" in field:
                 del field["/V"]
@@ -328,7 +385,6 @@ def sanitize_signatures(pdf: Pdf, level: str = "3b") -> dict:
                 try:
                     sig_ref = perms.get(key)
                     if sig_ref is not None:
-                        _collect_sig_dict(sig_ref)
                         del perms[key]
                         perms_refs_removed += 1
                 except Exception:
@@ -340,15 +396,6 @@ def sanitize_signatures(pdf: Pdf, level: str = "3b") -> dict:
                 pass
     except Exception:
         pass
-
-    # Global scan as fallback (catches orphaned signature dictionaries that
-    # may still be validated by tools even when unreferenced).
-    for obj in pdf.objects:
-        try:
-            resolved = _resolve(obj)
-        except Exception:
-            continue
-        _collect_sig_dict(resolved)
 
     stats["signatures_found"] = len(sig_dicts)
 

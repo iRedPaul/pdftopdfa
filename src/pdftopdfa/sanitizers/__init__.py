@@ -85,7 +85,7 @@ from .optional_content import sanitize_optional_content
 from .page_boxes import sanitize_page_boxes
 from .pua_actualtext import sanitize_pua_actualtext
 from .rendering_intent import sanitize_rendering_intent
-from .signatures import sanitize_signatures
+from .signatures import count_digital_signatures, sanitize_signatures
 from .structure_limits import sanitize_structure_limits
 from .tounicode_values import fill_tounicode_gaps, sanitize_tounicode_values
 from .truetype_encoding import sanitize_truetype_encoding
@@ -739,6 +739,7 @@ __all__ = [
     "sanitize_pua_actualtext",
     "sanitize_tounicode_values",
     "sanitize_page_boxes",
+    "count_digital_signatures",
     "sanitize_signatures",
     "convert_lzw_streams",
     "remove_crypt_streams",

@@ -97,6 +97,9 @@ Behavior notes:
 - `--ocr-force` implies `--ocr`.
 - Existing OCR text layers are replaced.
 - Forced OCR bypasses the "already compliant PDF/A" skip path so OCR still runs.
+- Forced OCR does not bypass the signed-PDF protection. Use
+  `--allow-signature-invalidation` only when an unsigned OCR/PDF/A copy is
+  intentional.
 - With forced OCR, options incompatible with ocrmypdf's `redo_ocr`
   mode are disabled automatically.
 - Original annotations are preserved when possible.
@@ -175,5 +178,7 @@ Possible reasons:
 - OCR was not enabled (`--ocr` missing).
 - The document already had sufficient text coverage.
 - The file had fewer than 50% OCR-relevant pages.
+- The input PDF was digitally signed and was skipped to avoid invalidating the
+  signature.
 
 Use `--ocr-force` to enforce OCR.

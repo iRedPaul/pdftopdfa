@@ -31,6 +31,35 @@ from pdftopdfa.exceptions import ConversionError, VeraPDFError
 from pdftopdfa.verapdf import VeraPDFResult
 
 
+def _write_signed_pdf(source_path: Path, signed_path: Path) -> None:
+    """Write a copy of source_path with a live digital signature field."""
+    with Pdf.open(source_path) as pdf:
+        sig_dict = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Sig,
+                Filter=Name("/Adobe.PPKLite"),
+                SubFilter=Name("/adbe.pkcs7.detached"),
+                ByteRange=Array([0, 100, 200, 300]),
+                Contents=pdf.make_stream(b"\x00" * 64),
+            )
+        )
+        sig_field = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name.Widget,
+                FT=Name.Sig,
+                T="Signature1",
+                Rect=Array([0, 0, 200, 50]),
+                V=sig_dict,
+            )
+        )
+        pdf.pages[0].obj["/Annots"] = Array([sig_field])
+        pdf.Root["/AcroForm"] = pdf.make_indirect(
+            Dictionary(Fields=Array([sig_field]), SigFlags=1)
+        )
+        pdf.save(signed_path)
+
+
 class TestComparePdfaLevels:
     """Tests for _compare_pdfa_levels."""
 
@@ -626,6 +655,84 @@ class TestConvertToPdfa:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_signed_pdf_is_skipped_without_explicit_invalidation(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Signed PDFs are copied unchanged by default, even when OCR is requested."""
+        signed_input = tmp_dir / "signed_input.pdf"
+        _write_signed_pdf(sample_pdf, signed_input)
+
+        output_path = tmp_dir / "output.pdf"
+        result = convert_to_pdfa(
+            signed_input,
+            output_path,
+            ocr_languages=["eng"],
+            ocr_force=True,
+        )
+
+        assert result.success is True
+        assert result.skipped is True
+        assert any("digital signatures" in warning for warning in result.warnings)
+        assert output_path.read_bytes() == signed_input.read_bytes()
+        mock_is_ocr_available.assert_not_called()
+        mock_apply_ocr.assert_not_called()
+
+    def test_signed_pdf_can_be_converted_with_explicit_invalidation(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Opt-in conversion removes live signature structures."""
+        signed_input = tmp_dir / "signed_input.pdf"
+        _write_signed_pdf(sample_pdf, signed_input)
+
+        output_path = tmp_dir / "output.pdf"
+        result = convert_to_pdfa(
+            signed_input,
+            output_path,
+            allow_signature_invalidation=True,
+        )
+
+        assert result.success is True
+        assert result.skipped is False
+        assert any("removed/invalidated" in warning for warning in result.warnings)
+
+        with Pdf.open(output_path) as output_pdf:
+            if "/AcroForm" in output_pdf.Root:
+                assert output_pdf.Root.AcroForm.Fields[0].get("/V") is None
+            for obj in output_pdf.objects:
+                if isinstance(obj, Dictionary):
+                    assert obj.get("/ByteRange") is None
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    @patch("pdftopdfa.converter.detect_pdfa_level")
+    def test_signed_pdf_skip_precedes_pdfa_skip_logic(
+        self,
+        mock_detect: MagicMock,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """A signed PDF/A input is skipped because conversion would invalidate it."""
+        signed_input = tmp_dir / "signed_input.pdf"
+        _write_signed_pdf(sample_pdf, signed_input)
+
+        output_path = tmp_dir / "output.pdf"
+        result = convert_to_pdfa(signed_input, output_path, level="3b")
+
+        assert result.success is True
+        assert result.skipped is True
+        assert any("digital signatures" in warning for warning in result.warnings)
+        assert output_path.read_bytes() == signed_input.read_bytes()
+        mock_detect.assert_not_called()
+        mock_verapdf.assert_not_called()
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_with_ocr_sanitizes_signed_pdf_before_ocr(
         self,
         mock_is_ocr_available: MagicMock,
@@ -637,31 +744,7 @@ class TestConvertToPdfa:
         mock_is_ocr_available.return_value = True
 
         signed_input = tmp_dir / "signed_input.pdf"
-        with Pdf.open(sample_pdf) as pdf:
-            sig_dict = pdf.make_indirect(
-                Dictionary(
-                    Type=Name.Sig,
-                    Filter=Name("/Adobe.PPKLite"),
-                    SubFilter=Name("/adbe.pkcs7.detached"),
-                    ByteRange=Array([0, 100, 200, 300]),
-                    Contents=pdf.make_stream(b"\x00" * 64),
-                )
-            )
-            sig_field = pdf.make_indirect(
-                Dictionary(
-                    Type=Name.Annot,
-                    Subtype=Name.Widget,
-                    FT=Name.Sig,
-                    T="Signature1",
-                    Rect=Array([0, 0, 200, 50]),
-                    V=sig_dict,
-                )
-            )
-            pdf.pages[0].obj["/Annots"] = Array([sig_field])
-            pdf.Root["/AcroForm"] = pdf.make_indirect(
-                Dictionary(Fields=Array([sig_field]), SigFlags=1)
-            )
-            pdf.save(signed_input)
+        _write_signed_pdf(sample_pdf, signed_input)
 
         def create_ocr_output(
             input_path: Path, output_path: Path, langs: list[str], **kwargs: object
@@ -680,13 +763,16 @@ class TestConvertToPdfa:
         mock_apply_ocr.side_effect = create_ocr_output
 
         output_path = tmp_dir / "output.pdf"
-        result = convert_to_pdfa(signed_input, output_path, ocr_languages=["eng"])
+        result = convert_to_pdfa(
+            signed_input,
+            output_path,
+            ocr_languages=["eng"],
+            allow_signature_invalidation=True,
+        )
 
         assert result.success is True
-        assert any(
-            "digital signature(s) removed before OCR" in warning
-            for warning in result.warnings
-        )
+        assert sum("digital signature" in warning for warning in result.warnings) == 1
+        assert any("removed/invalidated" in warning for warning in result.warnings)
 
         with Pdf.open(output_path) as output_pdf:
             if "/AcroForm" in output_pdf.Root:
@@ -1293,6 +1379,26 @@ class TestConvertDirectory:
 
         assert mock_convert_files.call_args.kwargs["skip_any_pdfa"] is True
 
+    @patch("pdftopdfa.converter.convert_files")
+    def test_convert_directory_passes_allow_signature_invalidation(
+        self, mock_convert_files: MagicMock, tmp_dir: Path, sample_pdf_bytes: bytes
+    ) -> None:
+        """convert_directory forwards allow_signature_invalidation."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        (input_dir / "test.pdf").write_bytes(sample_pdf_bytes)
+        mock_convert_files.return_value = []
+
+        convert_directory(
+            input_dir,
+            show_progress=False,
+            allow_signature_invalidation=True,
+        )
+
+        assert (
+            mock_convert_files.call_args.kwargs["allow_signature_invalidation"] is True
+        )
+
 
 class TestConvertFiles:
     """Tests for convert_files."""
@@ -1376,6 +1482,28 @@ class TestConvertFiles:
         convert_files([(in_path, out_path)], skip_any_pdfa=True)
 
         assert mock_convert_to_pdfa.call_args.kwargs["skip_any_pdfa"] is True
+
+    @patch("pdftopdfa.converter.convert_to_pdfa")
+    def test_convert_files_passes_allow_signature_invalidation(
+        self, mock_convert_to_pdfa: MagicMock, tmp_dir: Path
+    ) -> None:
+        """convert_files forwards allow_signature_invalidation to convert_to_pdfa."""
+        in_path = tmp_dir / "test.pdf"
+        out_path = tmp_dir / "test_pdfa.pdf"
+        in_path.write_bytes(b"%PDF-1.4 dummy")
+        mock_convert_to_pdfa.return_value = ConversionResult(
+            success=True,
+            input_path=in_path,
+            output_path=out_path,
+            level="3b",
+        )
+
+        convert_files([(in_path, out_path)], allow_signature_invalidation=True)
+
+        assert (
+            mock_convert_to_pdfa.call_args.kwargs["allow_signature_invalidation"]
+            is True
+        )
 
     def test_convert_files_cancellation(
         self, tmp_dir: Path, sample_pdf_bytes: bytes
