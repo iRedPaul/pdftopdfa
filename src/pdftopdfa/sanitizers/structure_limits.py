@@ -227,7 +227,7 @@ def _fix_odd_hex_string(value: pikepdf.String) -> pikepdf.String:
         return value
 
     try:
-        return pikepdf.String.parse(b"<" + inner + b"0>")
+        return pikepdf.Object.parse(b"<" + inner + b"0>")
     except Exception:
         return value
 
