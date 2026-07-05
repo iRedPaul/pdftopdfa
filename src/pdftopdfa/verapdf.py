@@ -65,15 +65,21 @@ def _get_verapdf_cmd() -> str:
     """Returns the veraPDF command from VERAPDF_PATH or falls back to 'verapdf'."""
     verapdf_path = os.environ.get("VERAPDF_PATH")
     if not verapdf_path:
-        return "verapdf"
-    p = Path(verapdf_path)
-    if p.is_dir():
-        for candidate in _get_verapdf_candidates():
-            candidate_path = p / candidate
-            if candidate_path.is_file():
-                return str(candidate_path)
-        return str(p / "verapdf")
-    return verapdf_path
+        cmd = "verapdf"
+    else:
+        p = Path(verapdf_path)
+        if p.is_dir():
+            for candidate in _get_verapdf_candidates():
+                candidate_path = p / candidate
+                if candidate_path.is_file():
+                    cmd = str(candidate_path)
+                    break
+            else:
+                cmd = str(p / "verapdf")
+        else:
+            cmd = verapdf_path
+
+    return shutil.which(cmd) or cmd
 
 
 @dataclass
