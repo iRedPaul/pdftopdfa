@@ -365,6 +365,69 @@ class TestCollectFontUsage:
         usage = collect_font_usage(pdf)
         assert usage == {}
 
+    def test_type3_charproc_with_own_resources(self):
+        """Collects usage from Type3 CharProcs using the font's own resources."""
+        pdf = new_pdf()
+
+        inner_font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/InnerFont"),
+        )
+        inner_font_obj = pdf.make_indirect(inner_font)
+
+        charproc = pdf.make_stream(b"BT /F2 10 Tf (AB) Tj ET")
+        type3 = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type3,
+            FontBBox=Array([0, 0, 1000, 1000]),
+            FontMatrix=Array([0.001, 0, 0, 0.001, 0, 0]),
+            CharProcs=Dictionary(a=pdf.make_indirect(charproc)),
+            Resources=Dictionary(Font=Dictionary(F2=inner_font_obj)),
+        )
+        type3_obj = pdf.make_indirect(type3)
+
+        font_dict = Dictionary(F1=type3_obj)
+        content = b"BT /F1 12 Tf (a) Tj ET"
+        _make_page_with_content(pdf, content, font_dict)
+
+        usage = collect_font_usage(pdf)
+
+        assert inner_font_obj.objgen in usage
+        assert usage[inner_font_obj.objgen] == {ord("A"), ord("B")}
+
+    def test_type3_charproc_inherits_enclosing_resources(self):
+        """Type3 fonts without /Resources fall back to the enclosing resources."""
+        pdf = new_pdf()
+
+        inner_font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/InnerFont"),
+        )
+        inner_font_obj = pdf.make_indirect(inner_font)
+
+        charproc = pdf.make_stream(b"BT /F2 10 Tf (XY) Tj ET")
+        type3 = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type3,
+            FontBBox=Array([0, 0, 1000, 1000]),
+            FontMatrix=Array([0.001, 0, 0, 0.001, 0, 0]),
+            CharProcs=Dictionary(a=pdf.make_indirect(charproc)),
+        )
+        type3_obj = pdf.make_indirect(type3)
+
+        resources = Dictionary(
+            Font=Dictionary(F1=type3_obj, F2=inner_font_obj),
+        )
+        content = b"BT /F1 12 Tf (a) Tj ET"
+        _make_page_with_content(pdf, content, Dictionary(), resources)
+
+        usage = collect_font_usage(pdf)
+
+        assert inner_font_obj.objgen in usage
+        assert usage[inner_font_obj.objgen] == {ord("X"), ord("Y")}
+
     def test_direct_font_object_skipped(self):
         """Direct font objects (objgen 0,0) are not tracked."""
         pdf = new_pdf()

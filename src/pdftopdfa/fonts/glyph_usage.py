@@ -5,9 +5,10 @@
 """Glyph usage collection from PDF content streams.
 
 Parses all content streams (pages, Form XObjects, Tiling Patterns,
-Annotation Appearance Streams) and collects character codes used
-with each font. This is needed for font subsetting — only glyphs
-that are actually used need to be kept in the font program.
+Type3 CharProcs, Annotation Appearance Streams) and collects
+character codes used with each font. This is needed for font
+subsetting — only glyphs that are actually used need to be kept
+in the font program.
 """
 
 import logging
@@ -186,7 +187,7 @@ def _iter_nested_streams(
     resources: pikepdf.Object,
     visited: set[tuple[int, int]],
 ) -> Iterator[tuple[pikepdf.Object, pikepdf.Object]]:
-    """Yields (stream_owner, resources) from nested XObjects and Patterns.
+    """Yields (stream_owner, resources) from nested XObjects, Patterns, and Type3 fonts.
 
     Args:
         resources: A PDF Resources dictionary.
@@ -240,6 +241,48 @@ def _iter_nested_streams(
                         nested_res = _resolve_indirect(nested_res)
                         yield (pattern, nested_res)
                         yield from _iter_nested_streams(nested_res, visited)
+            except Exception:
+                continue
+
+    # Type3 font CharProcs
+    font_dict = resources.get("/Font")
+    if font_dict is not None:
+        try:
+            font_dict = _resolve_indirect(font_dict)
+        except Exception:
+            font_dict = None
+
+    if font_dict is not None:
+        for font_key in list(font_dict.keys()):
+            try:
+                font_obj = _resolve_indirect(font_dict[font_key])
+                subtype = font_obj.get("/Subtype")
+                if subtype is None or str(subtype) != "/Type3":
+                    continue
+                if _check_visited(font_obj, visited):
+                    continue
+                # Per PDF spec, CharProcs resolve named resources through
+                # the Type3 font's own /Resources; when absent, the
+                # resources of the enclosing content stream apply.
+                t3_resources = font_obj.get("/Resources")
+                if t3_resources is not None:
+                    t3_resources = _resolve_indirect(t3_resources)
+                else:
+                    t3_resources = resources
+                charprocs = font_obj.get("/CharProcs")
+                if charprocs is not None:
+                    charprocs = _resolve_indirect(charprocs)
+                    for proc_key in list(charprocs.keys()):
+                        try:
+                            proc = _resolve_indirect(charprocs[proc_key])
+                            if isinstance(proc, pikepdf.Stream) and not _check_visited(
+                                proc, visited
+                            ):
+                                yield (proc, t3_resources)
+                        except Exception:
+                            continue
+                if t3_resources is not resources:
+                    yield from _iter_nested_streams(t3_resources, visited)
             except Exception:
                 continue
 

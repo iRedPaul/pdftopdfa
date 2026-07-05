@@ -583,6 +583,114 @@ class TestFontSubsetter:
         assert len(result.fonts_subsetted) == 0
 
 
+class TestNoUsageFontsNotSubsetted:
+    """Fonts without any collected glyph usage must not be subsetted."""
+
+    def test_simple_font_without_usage_is_skipped(self):
+        """A font never seen in a text operator is skipped, not emptied."""
+        pdf = new_pdf()
+        font_data = _load_liberation_sans()
+
+        font_obj = _make_embedded_truetype_font(pdf, "LiberationSans", font_data)
+        font_dict = Dictionary(F1=font_obj)
+
+        # Content selects the font but never shows any text with it
+        content = b"BT /F1 12 Tf ET"
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(Font=font_dict),
+            Contents=pdf.make_stream(content),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+
+        subsetter = FontSubsetter(pdf)
+        result = subsetter.subset_all_fonts()
+
+        assert len(result.fonts_subsetted) == 0
+        assert any("no glyph usage" in s for s in result.fonts_skipped)
+
+        # Font program and name are untouched
+        assert "+" not in str(font_obj.get("/BaseFont"))
+        fd = font_obj.get("/FontDescriptor")
+        assert len(bytes(fd["/FontFile2"].read_bytes())) == len(font_data)
+
+    def test_cidfont_without_usage_is_skipped(self):
+        """A CIDFont without collected usage is skipped, not emptied."""
+        pdf = new_pdf()
+        font_data = _load_liberation_sans()
+
+        font_obj = _make_embedded_cidfont(pdf, "TestCID", font_data)
+        font_dict = Dictionary(F1=font_obj)
+
+        content = b"BT /F1 12 Tf ET"
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(Font=font_dict),
+            Contents=pdf.make_stream(content),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+
+        subsetter = FontSubsetter(pdf)
+        result = subsetter.subset_all_fonts()
+
+        assert len(result.fonts_subsetted) == 0
+        assert any("no glyph usage" in s for s in result.fonts_skipped)
+
+        desc_font = font_obj["/DescendantFonts"][0]
+        fd = desc_font["/FontDescriptor"]
+        assert len(bytes(fd["/FontFile2"].read_bytes())) == len(font_data)
+
+
+class TestType3CharProcUsage:
+    """Fonts used only inside Type3 CharProcs keep their glyphs."""
+
+    def test_font_used_only_in_type3_charproc_keeps_glyphs(self):
+        """Glyphs drawn only via a Type3 CharProc survive subsetting."""
+        from fontTools.ttLib import TTFont
+
+        pdf = new_pdf()
+        font_data = _load_liberation_sans()
+
+        inner_font_obj = _make_embedded_truetype_font(pdf, "LiberationSans", font_data)
+
+        charproc = pdf.make_stream(b"BT /F2 10 Tf (AB) Tj ET")
+        type3 = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type3,
+            FontBBox=Array([0, 0, 1000, 1000]),
+            FontMatrix=Array([0.001, 0, 0, 0.001, 0, 0]),
+            CharProcs=Dictionary(a=pdf.make_indirect(charproc)),
+            Resources=Dictionary(Font=Dictionary(F2=inner_font_obj)),
+        )
+        type3_obj = pdf.make_indirect(type3)
+
+        font_dict = Dictionary(F1=type3_obj)
+        content = b"BT /F1 12 Tf (a) Tj ET"
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(Font=font_dict),
+            Contents=pdf.make_stream(content),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+
+        subsetter = FontSubsetter(pdf)
+        result = subsetter.subset_all_fonts()
+
+        # The embedded font is subsetted using the CharProc usage
+        assert any("LiberationSans" in s for s in result.fonts_subsetted)
+
+        # The glyphs used inside the CharProc are still present
+        fd = inner_font_obj["/FontDescriptor"]
+        subsetted = TTFont(BytesIO(bytes(fd["/FontFile2"].read_bytes())))
+        glyf = subsetted["glyf"]
+        assert glyf["A"].numberOfContours > 0
+        assert glyf["B"].numberOfContours > 0
+        subsetted.close()
+
+
 def _make_cff_otf_font_data() -> bytes:
     """Creates a minimal CFF-based OpenType font programmatically."""
     from fontTools.fontBuilder import FontBuilder

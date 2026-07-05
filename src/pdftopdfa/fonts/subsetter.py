@@ -211,6 +211,15 @@ class FontSubsetter:
             result.fonts_skipped.append(f"{font_name} (already subsetted)")
             return
 
+        # Skip fonts without any recorded glyph usage. Usage collection
+        # has blind spots (e.g. unparsable content streams, text drawn
+        # with a font inherited from the parent context without a local
+        # Tf); subsetting such a font would strip it down to .notdef
+        # and lose glyphs in the rendered output.
+        if obj_key not in font_usage:
+            result.fonts_skipped.append(f"{font_name} (no glyph usage found)")
+            return
+
         # Route to CIDFont or simple font handler
         if font_type == "CIDFont":
             self._subset_cidfont(font_obj, obj_key, font_usage, font_name, result)
