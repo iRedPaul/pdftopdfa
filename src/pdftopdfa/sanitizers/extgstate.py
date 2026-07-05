@@ -20,7 +20,6 @@ ISO 19005-2, Section 6.4 constrains transparency-related entries:
 
 import logging
 
-import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..utils import iter_type3_fonts as _iter_type3_fonts
@@ -318,16 +317,16 @@ def _clamp_opacity(gs_dict: Dictionary, key: str) -> int:
         val = float(gs_dict[key])
     except (TypeError, ValueError):
         # Non-numeric value — reset to fully opaque
-        gs_dict[key] = pikepdf.objects.Decimal("1.0")
+        gs_dict[key] = 1.0
         logger.debug("Reset non-numeric %s to 1.0 in ExtGState", key)
         return 1
 
     if val < 0.0:
-        gs_dict[key] = pikepdf.objects.Decimal("0.0")
+        gs_dict[key] = 0.0
         logger.debug("Clamped %s from %s to 0.0 in ExtGState", key, val)
         return 1
     if val > 1.0:
-        gs_dict[key] = pikepdf.objects.Decimal("1.0")
+        gs_dict[key] = 1.0
         logger.debug("Clamped %s from %s to 1.0 in ExtGState", key, val)
         return 1
 

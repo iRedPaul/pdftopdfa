@@ -618,8 +618,8 @@ class TestNoChangesNeeded:
         pdf = new_pdf()
         gs = Dictionary(
             Type=Name.ExtGState,
-            CA=pikepdf.objects.Decimal("0.5"),
-            ca=pikepdf.objects.Decimal("0.8"),
+            CA=0.5,
+            ca=0.8,
             BM=Name.Normal,
         )
         _make_pdf_with_extgstate(pdf, gs)
@@ -733,8 +733,8 @@ class TestOpacityValidation:
         pdf = new_pdf()
         gs = Dictionary(
             Type=Name.ExtGState,
-            CA=pikepdf.objects.Decimal("0.5"),
-            ca=pikepdf.objects.Decimal("0.8"),
+            CA=0.5,
+            ca=0.8,
         )
         _make_pdf_with_extgstate(pdf, gs)
 
@@ -747,7 +747,7 @@ class TestOpacityValidation:
     def test_ca_zero_preserved(self) -> None:
         """Preserves /ca = 0.0 (fully transparent, but valid)."""
         pdf = new_pdf()
-        gs = Dictionary(Type=Name.ExtGState, ca=pikepdf.objects.Decimal("0.0"))
+        gs = Dictionary(Type=Name.ExtGState, ca=0.0)
         _make_pdf_with_extgstate(pdf, gs)
 
         result = sanitize_extgstate(pdf)
@@ -756,7 +756,7 @@ class TestOpacityValidation:
     def test_ca_one_preserved(self) -> None:
         """Preserves /CA = 1.0 (fully opaque, valid)."""
         pdf = new_pdf()
-        gs = Dictionary(Type=Name.ExtGState, CA=pikepdf.objects.Decimal("1.0"))
+        gs = Dictionary(Type=Name.ExtGState, CA=1.0)
         _make_pdf_with_extgstate(pdf, gs)
 
         result = sanitize_extgstate(pdf)
@@ -765,7 +765,7 @@ class TestOpacityValidation:
     def test_ca_above_one_clamped(self) -> None:
         """Clamps /CA > 1.0 to 1.0."""
         pdf = new_pdf()
-        gs = Dictionary(Type=Name.ExtGState, CA=pikepdf.objects.Decimal("1.5"))
+        gs = Dictionary(Type=Name.ExtGState, CA=1.5)
         _make_pdf_with_extgstate(pdf, gs)
 
         result = sanitize_extgstate(pdf)
@@ -775,7 +775,7 @@ class TestOpacityValidation:
     def test_ca_negative_clamped(self) -> None:
         """Clamps /ca < 0.0 to 0.0."""
         pdf = new_pdf()
-        gs = Dictionary(Type=Name.ExtGState, ca=pikepdf.objects.Decimal("-0.5"))
+        gs = Dictionary(Type=Name.ExtGState, ca=-0.5)
         _make_pdf_with_extgstate(pdf, gs)
 
         result = sanitize_extgstate(pdf)
@@ -787,8 +787,8 @@ class TestOpacityValidation:
         pdf = new_pdf()
         gs = Dictionary(
             Type=Name.ExtGState,
-            CA=pikepdf.objects.Decimal("2.0"),
-            ca=pikepdf.objects.Decimal("-1.0"),
+            CA=2.0,
+            ca=-1.0,
         )
         _make_pdf_with_extgstate(pdf, gs)
 
@@ -947,8 +947,8 @@ class TestTransparencyCombined:
         gs = Dictionary(
             Type=Name.ExtGState,
             BM=Name.Multiply,
-            CA=pikepdf.objects.Decimal("0.7"),
-            ca=pikepdf.objects.Decimal("0.3"),
+            CA=0.7,
+            ca=0.3,
             SMask=Name("/None"),
         )
         _make_pdf_with_extgstate(pdf, gs)
@@ -962,8 +962,8 @@ class TestTransparencyCombined:
         gs = Dictionary(
             Type=Name.ExtGState,
             BM=Name("/Invalid"),
-            CA=pikepdf.objects.Decimal("5.0"),
-            ca=pikepdf.objects.Decimal("-2.0"),
+            CA=5.0,
+            ca=-2.0,
             SMask=Name("/Bad"),
         )
         _make_pdf_with_extgstate(pdf, gs)
@@ -985,7 +985,7 @@ class TestTransparencyCombined:
             Type=Name.ExtGState,
             TR=tr_stream,
             BM=Name("/Bogus"),
-            CA=pikepdf.objects.Decimal("3.0"),
+            CA=3.0,
         )
         _make_pdf_with_extgstate(pdf, gs)
 
