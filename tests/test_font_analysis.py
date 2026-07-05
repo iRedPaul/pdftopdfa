@@ -13,7 +13,7 @@ from font_helpers import _liberation_fonts_available
 from pikepdf import Array, Dictionary, Name
 
 from pdftopdfa.fonts import FontEmbedder, check_font_compliance
-from pdftopdfa.fonts.analysis import is_font_embedded, is_symbolic_font
+from pdftopdfa.fonts.analysis import analyze_fonts, is_font_embedded, is_symbolic_font
 from pdftopdfa.utils import resolve_indirect as _resolve_indirect
 
 
@@ -649,3 +649,87 @@ class TestIsSymbolicFont:
             ),
         )
         assert is_symbolic_font(font_dict) is True
+
+
+class TestDuplicateFontNames:
+    """Distinct font objects sharing name and type must not mask each other."""
+
+    @staticmethod
+    def _make_embedded_arial(pdf):
+        """Creates an indirect embedded Arial TrueType font object."""
+        font_stream = pdf.make_stream(b"\x00\x01\x00\x00" + b"\x00" * 100)
+        font_stream[Name.Length1] = 104
+        fd = pdf.make_indirect(
+            Dictionary(
+                Type=Name.FontDescriptor,
+                FontName=Name("/Arial"),
+                Flags=32,
+                FontFile2=font_stream,
+            )
+        )
+        return pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.TrueType,
+                BaseFont=Name("/Arial"),
+                FontDescriptor=fd,
+            )
+        )
+
+    @staticmethod
+    def _make_non_embedded_arial(pdf):
+        """Creates an indirect non-embedded Arial TrueType font object."""
+        return pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.TrueType,
+                BaseFont=Name("/Arial"),
+            )
+        )
+
+    def test_non_embedded_duplicate_not_masked_by_embedded(self):
+        """Embedded font seen first must not mask a non-embedded duplicate."""
+        pdf = new_pdf()
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(
+                Font=Dictionary(
+                    F1=self._make_embedded_arial(pdf),
+                    F2=self._make_non_embedded_arial(pdf),
+                )
+            ),
+        )
+        page_dict[Name.Contents] = pdf.make_stream(
+            b"BT /F1 12 Tf (x) Tj /F2 12 Tf (y) Tj ET"
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+
+        arial_fonts = [f for f in analyze_fonts(pdf) if f.name == "Arial"]
+        assert len(arial_fonts) == 2
+        assert sorted(f.embedded for f in arial_fonts) == [False, True]
+
+        is_compliant, missing = check_font_compliance(pdf, raise_on_error=False)
+        assert not is_compliant
+        assert missing == ["Arial"]
+
+    def test_non_embedded_acroform_dr_duplicate_not_masked(self):
+        """Non-embedded DR font is reported despite embedded page font of same name."""
+        pdf = new_pdf()
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(Font=Dictionary(F1=self._make_embedded_arial(pdf))),
+        )
+        page_dict[Name.Contents] = pdf.make_stream(b"BT /F1 12 Tf (x) Tj ET")
+        pdf.pages.append(pikepdf.Page(page_dict))
+        pdf.Root.AcroForm = pdf.make_indirect(
+            Dictionary(
+                Fields=Array([]),
+                DR=Dictionary(Font=Dictionary(Helv=self._make_non_embedded_arial(pdf))),
+            )
+        )
+
+        is_compliant, missing = check_font_compliance(pdf, raise_on_error=False)
+        assert not is_compliant
+        assert missing == ["Arial"]

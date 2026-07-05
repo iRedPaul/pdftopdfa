@@ -415,7 +415,7 @@ def analyze_fonts(pdf: pikepdf.Pdf) -> list[FontInfo]:
     Returns:
         List of FontInfo objects for all found fonts.
     """
-    fonts_seen: dict[str, FontInfo] = {}
+    fonts: list[FontInfo] = []
     seen_font_ids: set[tuple[int, int]] = set()
 
     for page_num, page in enumerate(pdf.pages, start=1):
@@ -435,10 +435,11 @@ def analyze_fonts(pdf: pikepdf.Pdf) -> list[FontInfo]:
                 tounicode = has_tounicode_cmap(font)
                 derivable = can_derive_unicode(font)
 
-                # Use combined key for deduplication
-                key = f"{font_name}:{font_type}"
-                if key not in fonts_seen:
-                    fonts_seen[key] = FontInfo(
+                # Distinct objects sharing name and type may differ in
+                # embedding status (e.g. merged PDFs), so each object
+                # gets its own entry
+                fonts.append(
+                    FontInfo(
                         name=font_name,
                         type=font_type,
                         embedded=embedded,
@@ -446,17 +447,18 @@ def analyze_fonts(pdf: pikepdf.Pdf) -> list[FontInfo]:
                         has_tounicode=tounicode,
                         unicode_derivable=derivable,
                     )
-                    logger.debug(
-                        "Font found on page %d: %s (%s, embedded=%s,"
-                        " subset=%s, tounicode=%s, derivable=%s)",
-                        page_num,
-                        font_name,
-                        font_type,
-                        embedded,
-                        subset,
-                        tounicode,
-                        derivable,
-                    )
+                )
+                logger.debug(
+                    "Font found on page %d: %s (%s, embedded=%s,"
+                    " subset=%s, tounicode=%s, derivable=%s)",
+                    page_num,
+                    font_name,
+                    font_type,
+                    embedded,
+                    subset,
+                    tounicode,
+                    derivable,
+                )
             except UnicodeDecodeError:
                 logger.debug(
                     "Skipping font %s on page %d: non-UTF-8 bytes in font data",
@@ -500,9 +502,8 @@ def analyze_fonts(pdf: pikepdf.Pdf) -> list[FontInfo]:
                             tounicode = has_tounicode_cmap(font)
                             derivable = can_derive_unicode(font)
 
-                            key = f"{font_name}:{font_type}"
-                            if key not in fonts_seen:
-                                fonts_seen[key] = FontInfo(
+                            fonts.append(
+                                FontInfo(
                                     name=font_name,
                                     type=font_type,
                                     embedded=embedded,
@@ -510,18 +511,19 @@ def analyze_fonts(pdf: pikepdf.Pdf) -> list[FontInfo]:
                                     has_tounicode=tounicode,
                                     unicode_derivable=derivable,
                                 )
-                                logger.debug(
-                                    "Font found in AcroForm DR: %s (%s, embedded=%s)",
-                                    font_name,
-                                    font_type,
-                                    embedded,
-                                )
+                            )
+                            logger.debug(
+                                "Font found in AcroForm DR: %s (%s, embedded=%s)",
+                                font_name,
+                                font_type,
+                                embedded,
+                            )
                         except Exception:
                             continue
     except Exception:
         pass
 
-    return list(fonts_seen.values())
+    return fonts
 
 
 def get_missing_fonts(pdf: pikepdf.Pdf) -> list[str]:
@@ -531,10 +533,10 @@ def get_missing_fonts(pdf: pikepdf.Pdf) -> list[str]:
         pdf: Opened pikepdf PDF object.
 
     Returns:
-        List of names of non-embedded fonts.
+        List of names of non-embedded fonts (unique, in discovery order).
     """
     fonts = analyze_fonts(pdf)
-    return [font.name for font in fonts if not font.embedded]
+    return list(dict.fromkeys(font.name for font in fonts if not font.embedded))
 
 
 def check_font_compliance(
@@ -586,14 +588,17 @@ def get_fonts_missing_tounicode(pdf: pikepdf.Pdf) -> list[str]:
         pdf: Opened pikepdf PDF object.
 
     Returns:
-        List of names of embedded fonts missing ToUnicode.
+        List of names of embedded fonts missing ToUnicode (unique, in
+        discovery order).
     """
     fonts = analyze_fonts(pdf)
-    return [
-        font.name
-        for font in fonts
-        if font.embedded and not font.has_tounicode and not font.unicode_derivable
-    ]
+    return list(
+        dict.fromkeys(
+            font.name
+            for font in fonts
+            if font.embedded and not font.has_tounicode and not font.unicode_derivable
+        )
+    )
 
 
 def check_unicode_compliance(
