@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=80.10.2"]
+requires = ["setuptools>=83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -27,12 +27,12 @@ classifiers = [
     "Topic :: Text Processing :: General",
 ]
 dependencies = [
-    "pikepdf>=10.3.0,<11",
-    "lxml>=6.0.2",
-    "click>=8.3.1",
+    "pikepdf>=10.9.1,<11",
+    "lxml>=6.1.1",
+    "click>=8.4.2",
     "colorama>=0.4.6",
-    "tqdm>=4.67.3",
-    "fonttools>=4.61.1",
+    "tqdm>=4.68.3",
+    "fonttools>=4.63.0",
 ]
 
 [project.urls]
@@ -42,13 +42,13 @@ Issues = "https://github.com/iredpaul/pdftopdfa/issues"
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=9.0.2",
-    "pytest-cov>=7.0.0",
-    "ruff>=0.15.0",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.20",
 ]
 ocr = [
-    "ocrmypdf>=17.1.0",
-    "pypdfium2>=5.0.0",
+    "ocrmypdf>=17.8.0",
+    "pypdfium2>=5.11.0",
 ]
 
 [project.scripts]

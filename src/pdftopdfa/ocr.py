@@ -260,6 +260,7 @@ def _run_tesseract_orientation(image_path: Path) -> _OrientationResult | None:
             completed = subprocess.run(
                 command,
                 check=False,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
             )

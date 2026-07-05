@@ -123,6 +123,7 @@ def get_verapdf_version() -> str | None:
     try:
         result = subprocess.run(
             [_get_verapdf_cmd(), "--version"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=10,
@@ -322,6 +323,7 @@ def validate_with_verapdf(
     try:
         result = subprocess.run(
             cmd,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout,
