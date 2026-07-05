@@ -17,6 +17,7 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from ..fonts.analysis import is_symbolic_font
+from ..fonts.glyph_usage import collect_font_usage
 from ..fonts.tounicode import (
     generate_tounicode_for_macroman,
     generate_tounicode_for_standard_encoding,
@@ -211,10 +212,18 @@ def sanitize_font_widths(pdf: Pdf) -> dict[str, int]:
         "type3_font_widths_fixed": 0,
     }
 
+    # Codes used in content streams may lie outside [FirstChar, LastChar];
+    # their width falls back to MissingWidth, which veraPDF flags as a
+    # mismatch, so the declared range must be widened to cover them.
+    usage = collect_font_usage(pdf)
+
     for font_name, font_obj, font_type in _iter_all_embedded_fonts(pdf):
         try:
             if font_type in ("Type1", "TrueType", "MMType1"):
-                if _fix_simple_font_widths(font_obj, font_name):
+                extended = _extend_simple_font_width_range(
+                    font_obj, font_name, usage.get(font_obj.objgen)
+                )
+                if _fix_simple_font_widths(font_obj, font_name) or extended:
                     result["simple_font_widths_fixed"] += 1
             elif font_type == "CIDFont":
                 if _fix_cidfont_widths(font_obj, font_name):
@@ -910,6 +919,84 @@ def _fix_type3_font_widths(font: pikepdf.Object, font_name: str) -> bool:
         "Fixed %d width mismatches in Type3 font %s",
         mismatches,
         font_name,
+    )
+    return True
+
+
+def _extend_simple_font_width_range(
+    font: pikepdf.Object,
+    font_name: str,
+    used_codes: set[int] | None,
+) -> bool:
+    """Extends [FirstChar, LastChar] and /Widths to cover used codes.
+
+    Character codes outside [FirstChar, LastChar] still render their
+    encoded glyph but fall back to MissingWidth, which veraPDF flags as
+    a width mismatch (rule 6.2.11.5).  New entries are padded with
+    MissingWidth so that _fix_simple_font_widths fills in the correct
+    widths from the font program afterwards.
+
+    Args:
+        font: Simple font dictionary.
+        font_name: Font name for logging.
+        used_codes: Character codes used with this font, or None.
+
+    Returns:
+        True if the range was extended.
+    """
+    if not used_codes:
+        return False
+
+    first_char_obj = font.get("/FirstChar")
+    last_char_obj = font.get("/LastChar")
+    widths_obj = font.get("/Widths")
+    if first_char_obj is None or last_char_obj is None or widths_obj is None:
+        return False
+
+    try:
+        first_char = int(first_char_obj)
+        last_char = int(last_char_obj)
+        widths = [int(w) for w in _resolve(widths_obj)]
+    except (TypeError, ValueError):
+        return False
+
+    if len(widths) != (last_char - first_char + 1):
+        return False
+
+    byte_codes = {code for code in used_codes if 0 <= code <= 255}
+    if not byte_codes:
+        return False
+
+    new_first = min(first_char, min(byte_codes))
+    new_last = max(last_char, max(byte_codes))
+    if new_first == first_char and new_last == last_char:
+        return False
+
+    missing_width = 0
+    try:
+        fd = font.get("/FontDescriptor")
+        if fd is not None:
+            mw = _resolve(fd).get("/MissingWidth")
+            if mw is not None:
+                missing_width = int(mw)
+    except (TypeError, ValueError):
+        pass
+
+    widths = (
+        [missing_width] * (first_char - new_first)
+        + widths
+        + [missing_width] * (new_last - last_char)
+    )
+    font[Name.FirstChar] = new_first
+    font[Name.LastChar] = new_last
+    font[Name.Widths] = Array(widths)
+    logger.info(
+        "Extended width range of font %s from [%d, %d] to [%d, %d]",
+        font_name,
+        first_char,
+        last_char,
+        new_first,
+        new_last,
     )
     return True
 

@@ -16,7 +16,7 @@ import logging
 import struct
 
 import pikepdf
-from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
+from pikepdf import Array, Dictionary, Name, Operator, Pdf, Stream, String
 
 from ..fonts.glyph_mapping import resolve_glyph_name
 from ..fonts.subsetter import (
@@ -236,10 +236,8 @@ def _get_notdef_codes(
     return result
 
 
-def _find_missing_glyphs_in_simple_font(
-    font_obj: pikepdf.Object, first_char: int, last_char: int
-) -> set[int]:
-    """Finds codes in [first_char, last_char] whose glyph is missing.
+def _find_missing_glyphs_in_simple_font(font_obj: pikepdf.Object) -> set[int]:
+    """Finds character codes (0-255) whose glyph is missing.
 
     Parses the embedded font program with fontTools, resolves the font's
     encoding to map codes to glyph names, and returns codes whose glyph
@@ -247,8 +245,6 @@ def _find_missing_glyphs_in_simple_font(
 
     Args:
         font_obj: Resolved simple font dictionary.
-        first_char: First valid character code.
-        last_char: Last valid character code.
 
     Returns:
         Set of character codes whose encoded glyph is missing.
@@ -296,7 +292,7 @@ def _find_missing_glyphs_in_simple_font(
             hmtx_metrics = tt_font["hmtx"].metrics if "hmtx" in tt_font else {}
             cmap = _get_any_cmap(tt_font)
             missing = set()
-            for code in range(first_char, last_char + 1):
+            for code in range(256):
                 name = encoding.get(code)
                 if name is None or name == ".notdef":
                     # No encoding entry or explicit .notdef → maps to .notdef
@@ -343,10 +339,11 @@ def _get_any_cmap(tt_font) -> dict[int, str]:
 def _get_simple_font_notdef_codes(font_obj: pikepdf.Object) -> _NotdefCodes:
     """Computes character codes that resolve to .notdef for simple fonts.
 
-    For simple fonts (TrueType/Type1/MMType1), codes outside the
-    [FirstChar, LastChar] range always map to .notdef.  Additionally,
-    codes within the range whose encoded glyph name is absent from the
-    embedded font program are also flagged.
+    The encoding selects the glyph for every code regardless of the
+    [FirstChar, LastChar] range (that range only affects widths, which
+    fall back to MissingWidth outside it), so a code is only .notdef
+    when its encoded glyph is actually absent from the embedded font
+    program.  Fonts without an embedded program are left untouched.
 
     Args:
         font_obj: Resolved simple font dictionary.
@@ -354,22 +351,7 @@ def _get_simple_font_notdef_codes(font_obj: pikepdf.Object) -> _NotdefCodes:
     Returns:
         _NotdefCodes for byte values (0-255) that are .notdef.
     """
-    try:
-        first_char = int(font_obj.get("/FirstChar", 0))
-    except (TypeError, ValueError):
-        first_char = 0
-    try:
-        last_char = int(font_obj.get("/LastChar", 255))
-    except (TypeError, ValueError):
-        last_char = 255
-
-    # Codes outside [FirstChar, LastChar] are always .notdef
-    notdef = set(range(0, first_char)) | set(range(last_char + 1, 256))
-
-    # Also check for codes within range whose glyph is missing
-    notdef |= _find_missing_glyphs_in_simple_font(font_obj, first_char, last_char)
-
-    return _NotdefCodes(frozenset(notdef))
+    return _NotdefCodes(frozenset(_find_missing_glyphs_in_simple_font(font_obj)))
 
 
 def _get_cidfont_num_glyphs(cidfont: pikepdf.Object) -> int | None:
@@ -601,6 +583,10 @@ def _filter_text_operand(
             cid = (raw[i] << 8) | raw[i + 1]
             if cid not in notdef_codes:
                 filtered.extend(raw[i : i + 2])
+        if len(raw) % 2:
+            # Keep the trailing byte of a malformed odd-length string so
+            # that a string without .notdef CIDs stays byte-identical
+            filtered.append(raw[-1])
         filtered = bytes(filtered)
     else:
         filtered = bytes(b for b in raw if b not in notdef_codes)
@@ -673,18 +659,17 @@ def _fix_notdef_in_stream(
                 notdef_codes = _get_notdef_codes(font_obj, notdef_cache)
                 if notdef_codes:
                     is_cid = _is_cidfont(font_obj)
-                    modified = _fix_single_string_op(
+                    replacement = _fix_single_string_op(
                         operands,
                         operator,
                         op_str,
                         notdef_codes,
                         is_cid=is_cid,
                     )
-                    if modified is not None:
+                    if replacement is not None:
                         fixed += 1
-                        if modified:
-                            new_instructions.append(modified)
-                        # modified is empty list → operator removed
+                        # Empty list → operator removed entirely
+                        new_instructions.extend(replacement)
                         continue
 
             new_instructions.append(item)
@@ -697,16 +682,16 @@ def _fix_notdef_in_stream(
                 notdef_codes = _get_notdef_codes(font_obj, notdef_cache)
                 if notdef_codes:
                     is_cid = _is_cidfont(font_obj)
-                    modified_tj = _fix_tj_array_op(
+                    replacement_tj = _fix_tj_array_op(
                         operands,
                         operator,
                         notdef_codes,
                         is_cid=is_cid,
                     )
-                    if modified_tj is not None:
+                    if replacement_tj is not None:
                         fixed += 1
-                        if modified_tj:
-                            new_instructions.append(modified_tj)
+                        # Empty list → operator removed entirely
+                        new_instructions.extend(replacement_tj)
                         continue
 
             new_instructions.append(item)
@@ -727,7 +712,7 @@ def _fix_single_string_op(
     notdef_codes: _NotdefCodes,
     *,
     is_cid: bool = False,
-) -> pikepdf.ContentStreamInstruction | None:
+) -> list[pikepdf.ContentStreamInstruction] | None:
     """Filters .notdef codes from a single-string text operator.
 
     Args:
@@ -739,8 +724,8 @@ def _fix_single_string_op(
 
     Returns:
         - None if no change needed
-        - A new ContentStreamInstruction if the string was filtered
-        - Empty list if the operator should be removed entirely
+        - A list of replacement instructions otherwise (empty if the
+          operator can be dropped without side effects)
     """
     if not operands:
         return None
@@ -762,12 +747,22 @@ def _fix_single_string_op(
         return None  # No change
 
     if filtered is None:
-        # String became empty → remove operator
+        # String became empty.  ' and " have side effects beyond showing
+        # text (moving to the next line; " also sets word/char spacing),
+        # which must be preserved when the operator is dropped.
+        if op_str == "'":
+            return [pikepdf.ContentStreamInstruction([], Operator("T*"))]
+        if op_str == '"':
+            return [
+                pikepdf.ContentStreamInstruction([operands[0]], Operator("Tw")),
+                pikepdf.ContentStreamInstruction([operands[1]], Operator("Tc")),
+                pikepdf.ContentStreamInstruction([], Operator("T*")),
+            ]
         return []
 
     new_operands = list(operands)
     new_operands[string_idx] = filtered
-    return pikepdf.ContentStreamInstruction(new_operands, operator)
+    return [pikepdf.ContentStreamInstruction(new_operands, operator)]
 
 
 def _fix_tj_array_op(
@@ -776,7 +771,7 @@ def _fix_tj_array_op(
     notdef_codes: _NotdefCodes,
     *,
     is_cid: bool = False,
-) -> pikepdf.ContentStreamInstruction | None:
+) -> list[pikepdf.ContentStreamInstruction] | None:
     """Filters .notdef codes from a TJ array operator.
 
     Args:
@@ -787,8 +782,8 @@ def _fix_tj_array_op(
 
     Returns:
         - None if no change needed
-        - A new ContentStreamInstruction if strings were filtered
-        - Empty list if all strings became empty
+        - A list with the filtered instruction otherwise (empty if all
+          strings became empty and the operator is removed)
     """
     if not operands or not isinstance(operands[0], Array):
         return None
@@ -820,7 +815,7 @@ def _fix_tj_array_op(
         return []  # Remove operator entirely
 
     new_arr = Array(new_items)
-    return pikepdf.ContentStreamInstruction([new_arr], operator)
+    return [pikepdf.ContentStreamInstruction([new_arr], operator)]
 
 
 # ---------------------------------------------------------------------------

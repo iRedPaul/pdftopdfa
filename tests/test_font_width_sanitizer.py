@@ -504,6 +504,97 @@ class TestSimpleFontWidthFix:
                 )
 
 
+class TestWidthRangeExtension:
+    """Tests for extending [FirstChar, LastChar] to cover used codes.
+
+    Codes outside [FirstChar, LastChar] still render their encoded
+    glyph but fall back to MissingWidth, which veraPDF flags as a
+    width mismatch (rule 6.2.11.5).
+    """
+
+    @staticmethod
+    def _build_pdf_with_font_and_content(pdf, font, content_bytes):
+        """Add a page with the given font and content stream to the PDF."""
+        stream = pdf.make_stream(content_bytes)
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(
+                Font=Dictionary(F1=font),
+            ),
+            Contents=stream,
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+
+    def test_used_code_beyond_lastchar_extends_range(self) -> None:
+        """A used code above LastChar widens the range with its width."""
+        pdf = new_pdf()
+        # Correct widths for 32..66; code 67 ('C', width 700) is used
+        # in content but lies beyond LastChar=66.
+        font = _make_simple_font_with_widths(
+            pdf,
+            first_char=32,
+            last_char=66,
+            widths=[250] + [500] * 32 + [600, 650],
+        )
+        self._build_pdf_with_font_and_content(pdf, font, b"BT /F1 12 Tf (C) Tj ET")
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["simple_font_widths_fixed"] == 1
+        font = resolve(pdf.pages[0].Resources.Font.F1)
+        assert int(font.FirstChar) == 32
+        assert int(font.LastChar) == 67
+        widths = [int(w) for w in font.Widths]
+        assert len(widths) == 36
+        assert widths[-1] == 700
+
+    def test_used_code_below_firstchar_extends_range(self) -> None:
+        """A used code below FirstChar widens the range with its width."""
+        pdf = new_pdf()
+        # Correct widths for 65..67; code 32 (space, width 250) is used
+        # in content but lies below FirstChar=65.
+        font = _make_simple_font_with_widths(
+            pdf,
+            first_char=65,
+            last_char=67,
+            widths=[600, 650, 700],
+        )
+        self._build_pdf_with_font_and_content(pdf, font, b"BT /F1 12 Tf ( A) Tj ET")
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["simple_font_widths_fixed"] == 1
+        font = resolve(pdf.pages[0].Resources.Font.F1)
+        assert int(font.FirstChar) == 32
+        assert int(font.LastChar) == 67
+        widths = [int(w) for w in font.Widths]
+        assert len(widths) == 36
+        assert widths[0] == 250
+        assert widths[33] == 600
+
+    def test_used_codes_within_range_leave_range_unchanged(self) -> None:
+        """In-range usage with correct widths changes nothing."""
+        pdf = new_pdf()
+        font = _make_simple_font_with_widths(
+            pdf,
+            first_char=32,
+            last_char=67,
+            widths=[250] + [500] * 32 + [600, 650, 700],
+        )
+        self._build_pdf_with_font_and_content(pdf, font, b"BT /F1 12 Tf (ABC) Tj ET")
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["simple_font_widths_fixed"] == 0
+        font = resolve(pdf.pages[0].Resources.Font.F1)
+        assert int(font.FirstChar) == 32
+        assert int(font.LastChar) == 67
+
+
 class TestCIDFontWidthFix:
     """Tests for CIDFont width correction."""
 

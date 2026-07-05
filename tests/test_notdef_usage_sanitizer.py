@@ -18,8 +18,46 @@ from pdftopdfa.sanitizers.notdef_usage import (
 )
 
 
-def _make_simple_font(pdf, first_char=32, last_char=114, base_font="TestFont"):
-    """Creates a minimal simple TrueType font dictionary."""
+def _make_ttfont_bytes(glyph_names, cmap=None):
+    """Creates minimal TrueType font data containing given glyph names.
+
+    Uses fontTools to build a minimal font with .notdef + the given names.
+    """
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.ttLib.tables._g_l_y_f import Glyph
+
+    all_names = [".notdef"] + list(glyph_names)
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder(all_names)
+    fb.setupCharacterMap(cmap or {})
+    # Use empty Glyph objects (zero-contour) instead of dicts
+    fb.setupGlyf({name: Glyph() for name in all_names})
+    fb.setupHorizontalMetrics({name: (500, 0) for name in all_names})
+    fb.setupHorizontalHeader()
+    fb.setupNameTable({"familyName": "Test", "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    fb.setupHead(unitsPerEm=1000)
+    buf = io.BytesIO()
+    fb.font.save(buf)
+    return buf.getvalue()
+
+
+def _make_simple_font(
+    pdf,
+    first_char=32,
+    last_char=114,
+    base_font="TestFont",
+    glyphs=("A", "B", "C"),
+):
+    """Creates a simple TrueType font dict with an embedded font program."""
+    font_stream = pdf.make_stream(_make_ttfont_bytes(list(glyphs)))
+    fd = Dictionary(
+        Type=Name.FontDescriptor,
+        FontName=Name(f"/{base_font}"),
+        Flags=32,
+        FontFile2=font_stream,
+    )
     font = Dictionary(
         Type=Name.Font,
         Subtype=Name.TrueType,
@@ -27,6 +65,7 @@ def _make_simple_font(pdf, first_char=32, last_char=114, base_font="TestFont"):
         FirstChar=first_char,
         LastChar=last_char,
         Encoding=Name.WinAnsiEncoding,
+        FontDescriptor=fd,
     )
     return font
 
@@ -49,10 +88,37 @@ def _make_page_with_font_and_content(pdf, font_dict, content_bytes):
 
 
 class TestSimpleFontCodeOutsideRange:
-    """Tests for character codes outside [FirstChar, LastChar]."""
+    """Tests for character codes outside [FirstChar, LastChar].
 
-    def test_simple_font_code_outside_range_removed(self):
-        """Code 0 with FirstChar=32 is removed from Tj string."""
+    The [FirstChar, LastChar] range only affects widths — the encoding
+    still selects the glyph for out-of-range codes, so such codes must
+    only be stripped when the encoded glyph is actually missing.
+    """
+
+    def test_out_of_range_code_with_glyph_present_kept(self):
+        """Code 0xFC beyond LastChar=126 stays when udieresis exists."""
+        pdf = new_pdf()
+        font = _make_simple_font(
+            pdf, first_char=32, last_char=126, glyphs=("A", "udieresis")
+        )
+        content = b"BT /F1 12 Tf (A\xfc) Tj ET"
+        stream = _make_page_with_font_and_content(pdf, font, content)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result["notdef_usage_fixed"] == 0
+        instructions = list(pikepdf.parse_content_stream(stream))
+        tj_ops = [
+            i
+            for i in instructions
+            if isinstance(i, pikepdf.ContentStreamInstruction)
+            and str(i.operator) == "Tj"
+        ]
+        assert len(tj_ops) == 1
+        assert bytes(tj_ops[0].operands[0]) == b"A\xfc"
+
+    def test_unencoded_code_outside_range_removed(self):
+        """Code 0 (no WinAnsi mapping, glyph missing) is removed."""
         pdf = new_pdf()
         font = _make_simple_font(pdf, first_char=32, last_char=114)
         # Content: select font, then show string with \x00 + 'A'
@@ -110,6 +176,71 @@ class TestFullyStrippedOperator:
         # The Tj operator should be completely removed
         assert len(tj_ops) == 0
 
+    def test_quote_operator_fully_stripped_replaced_with_tstar(self):
+        """' with only .notdef codes keeps the implicit line advance."""
+        pdf = new_pdf()
+        font = _make_simple_font(pdf)
+        content = b"BT /F1 12 Tf 14 TL (\x00) ' ET"
+        stream = _make_page_with_font_and_content(pdf, font, content)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result["notdef_usage_fixed"] == 1
+        instructions = list(pikepdf.parse_content_stream(stream))
+        ops = [
+            str(i.operator)
+            for i in instructions
+            if isinstance(i, pikepdf.ContentStreamInstruction)
+        ]
+        assert "'" not in ops
+        assert "T*" in ops
+
+    def test_quote_operator_partial_strip_keeps_operator(self):
+        """' with remaining text keeps the operator itself."""
+        pdf = new_pdf()
+        font = _make_simple_font(pdf)
+        content = b"BT /F1 12 Tf 14 TL (\x00A) ' ET"
+        stream = _make_page_with_font_and_content(pdf, font, content)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result["notdef_usage_fixed"] == 1
+        instructions = list(pikepdf.parse_content_stream(stream))
+        quote_ops = [
+            i
+            for i in instructions
+            if isinstance(i, pikepdf.ContentStreamInstruction)
+            and str(i.operator) == "'"
+        ]
+        assert len(quote_ops) == 1
+        assert bytes(quote_ops[0].operands[0]) == b"A"
+
+    def test_doublequote_fully_stripped_keeps_spacing_and_tstar(self):
+        """Emptied " keeps its word/char spacing and line advance."""
+        pdf = new_pdf()
+        font = _make_simple_font(pdf)
+        content = b'BT /F1 12 Tf 14 TL 2 3 (\x00) " ET'
+        stream = _make_page_with_font_and_content(pdf, font, content)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result["notdef_usage_fixed"] == 1
+        instructions = [
+            i
+            for i in list(pikepdf.parse_content_stream(stream))
+            if isinstance(i, pikepdf.ContentStreamInstruction)
+        ]
+        ops = [str(i.operator) for i in instructions]
+        assert '"' not in ops
+        # The side effects of " must be preserved: aw Tw, ac Tc, T*
+        tw_ops = [i for i in instructions if str(i.operator) == "Tw"]
+        tc_ops = [i for i in instructions if str(i.operator) == "Tc"]
+        assert len(tw_ops) == 1
+        assert int(tw_ops[0].operands[0]) == 2
+        assert len(tc_ops) == 1
+        assert int(tc_ops[0].operands[0]) == 3
+        assert "T*" in ops
+
 
 class TestTJArray:
     """Tests for TJ array operator filtering."""
@@ -166,22 +297,9 @@ class TestNoChanges:
         """Restoring graphics state also restores the active font."""
         pdf = new_pdf()
 
-        font1 = Dictionary(
-            Type=Name.Font,
-            Subtype=Name.TrueType,
-            BaseFont=Name("/Font1"),
-            FirstChar=32,
-            LastChar=200,
-            Encoding=Name.WinAnsiEncoding,
-        )
-        font2 = Dictionary(
-            Type=Name.Font,
-            Subtype=Name.TrueType,
-            BaseFont=Name("/Font2"),
-            FirstChar=32,
-            LastChar=114,
-            Encoding=Name.WinAnsiEncoding,
-        )
+        # Font1 provides the endash glyph (WinAnsi 0x96), Font2 does not
+        font1 = _make_simple_font(pdf, base_font="Font1", glyphs=("A", "B", "endash"))
+        font2 = _make_simple_font(pdf, base_font="Font2", glyphs=("A", "B"))
 
         stream = pdf.make_stream(
             b"BT /F1 12 Tf ET q BT /F2 12 Tf (A\x96B) Tj ET Q BT (A\x96B) Tj ET"
@@ -423,19 +541,98 @@ class TestCIDFont:
         assert result["notdef_usage_fixed"] == 0
 
 
+class TestCIDOddLengthString:
+    """Tests for malformed CID strings with an odd byte count."""
+
+    @staticmethod
+    def _make_identity_type0_font():
+        """Type0 font with Identity CIDToGIDMap — only CID 0 is .notdef."""
+        cidfont = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.CIDFontType2,
+            BaseFont=Name("/TestCIDFont"),
+            CIDToGIDMap=Name.Identity,
+            CIDSystemInfo=Dictionary(
+                Registry=String(b"Adobe"),
+                Ordering=String(b"Identity"),
+                Supplement=0,
+            ),
+        )
+        return Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCIDFont"),
+            Encoding=Name("/Identity-H"),
+            DescendantFonts=Array([cidfont]),
+        )
+
+    def _make_page(self, pdf, content):
+        stream = pdf.make_stream(content)
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Resources=Dictionary(
+                    Font=Dictionary(F1=self._make_identity_type0_font()),
+                ),
+                Contents=stream,
+            )
+        )
+        pdf.pages.append(page)
+        return stream
+
+    def test_odd_length_string_without_notdef_untouched(self):
+        """Odd-length string with only valid CIDs is not counted as fix."""
+        pdf = new_pdf()
+        # CID 87 (valid) + trailing lone byte
+        stream = self._make_page(pdf, b"BT /F1 12 Tf <005700> Tj ET")
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result["notdef_usage_fixed"] == 0
+        instructions = list(pikepdf.parse_content_stream(stream))
+        tj_ops = [
+            i
+            for i in instructions
+            if isinstance(i, pikepdf.ContentStreamInstruction)
+            and str(i.operator) == "Tj"
+        ]
+        assert len(tj_ops) == 1
+        assert bytes(tj_ops[0].operands[0]) == b"\x00\x57\x00"
+
+    def test_odd_length_string_with_notdef_keeps_trailing_byte(self):
+        """Filtering .notdef CIDs preserves the trailing lone byte."""
+        pdf = new_pdf()
+        # CID 0 (.notdef) + CID 87 (valid) + trailing lone byte
+        stream = self._make_page(pdf, b"BT /F1 12 Tf <0000005700> Tj ET")
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result["notdef_usage_fixed"] == 1
+        instructions = list(pikepdf.parse_content_stream(stream))
+        tj_ops = [
+            i
+            for i in instructions
+            if isinstance(i, pikepdf.ContentStreamInstruction)
+            and str(i.operator) == "Tj"
+        ]
+        assert len(tj_ops) == 1
+        assert bytes(tj_ops[0].operands[0]) == b"\x00\x57\x00"
+
+
 class TestMultipleFonts:
     """Tests for pages with multiple fonts."""
 
     def test_multiple_fonts_on_page(self):
         """Different fonts with different notdef code sets."""
         pdf = new_pdf()
-        # F1: FirstChar=32, LastChar=114 — code 0 is .notdef
-        font1 = _make_simple_font(pdf, first_char=32, last_char=114, base_font="Font1")
-        # F2: FirstChar=0, LastChar=255 — no codes are out-of-range
-        font2 = _make_simple_font(pdf, first_char=0, last_char=255, base_font="Font2")
+        # F1 lacks the endash glyph (WinAnsi 0x96) — code 0x96 is .notdef
+        font1 = _make_simple_font(pdf, base_font="Font1", glyphs=("A", "B"))
+        # F2 provides endash — code 0x96 maps to a real glyph
+        font2 = _make_simple_font(pdf, base_font="Font2", glyphs=("A", "B", "endash"))
 
-        # F1: \x00 should be removed; F2: \x00 should be kept
-        content = b"BT /F1 12 Tf (\x00A) Tj /F2 12 Tf (\x00B) Tj ET"
+        # F1: \x96 should be removed; F2: \x96 should be kept
+        content = b"BT /F1 12 Tf (\x96A) Tj /F2 12 Tf (\x96B) Tj ET"
         stream = pdf.make_stream(content)
         page = pikepdf.Page(
             Dictionary(
@@ -463,8 +660,8 @@ class TestMultipleFonts:
         assert len(tj_ops) == 2
         # First Tj: only 'A' remains
         assert bytes(tj_ops[0].operands[0]) == b"A"
-        # Second Tj: \x00B stays (F2 has FirstChar=0)
-        assert bytes(tj_ops[1].operands[0]) == b"\x00B"
+        # Second Tj: \x96B stays (F2 provides the endash glyph)
+        assert bytes(tj_ops[1].operands[0]) == b"\x96B"
 
 
 class TestFormXObject:
@@ -626,31 +823,6 @@ class TestNotdefCodesClass:
     def test_bool_threshold(self):
         """_NotdefCodes with only max_valid_code is truthy."""
         assert _NotdefCodes(frozenset(), max_valid_code=10)
-
-
-def _make_ttfont_bytes(glyph_names, cmap=None):
-    """Creates minimal TrueType font data containing given glyph names.
-
-    Uses fontTools to build a minimal font with .notdef + the given names.
-    """
-    from fontTools.fontBuilder import FontBuilder
-    from fontTools.ttLib.tables._g_l_y_f import Glyph
-
-    all_names = [".notdef"] + list(glyph_names)
-    fb = FontBuilder(1000, isTTF=True)
-    fb.setupGlyphOrder(all_names)
-    fb.setupCharacterMap(cmap or {})
-    # Use empty Glyph objects (zero-contour) instead of dicts
-    fb.setupGlyf({name: Glyph() for name in all_names})
-    fb.setupHorizontalMetrics({name: (500, 0) for name in all_names})
-    fb.setupHorizontalHeader()
-    fb.setupNameTable({"familyName": "Test", "styleName": "Regular"})
-    fb.setupOS2()
-    fb.setupPost()
-    fb.setupHead(unitsPerEm=1000)
-    buf = io.BytesIO()
-    fb.font.save(buf)
-    return buf.getvalue()
 
 
 class TestSimpleFontGlyphMissing:
@@ -852,17 +1024,28 @@ class TestSimpleFontGlyphMissing:
         assert len(tj_ops) == 1
         assert bytes(tj_ops[0].operands[0]) == b"A\xa0\xadA"
 
-    def test_no_font_descriptor_falls_back(self):
-        """Font without FontDescriptor falls back to range-only check."""
+    def test_no_font_descriptor_leaves_text_untouched(self):
+        """Without an embedded font program nothing is stripped.
+
+        Glyph presence cannot be verified, and codes outside
+        [FirstChar, LastChar] still select glyphs via the encoding,
+        so no code may be treated as .notdef.
+        """
         pdf = new_pdf()
-        font = _make_simple_font(pdf, first_char=32, last_char=114)
-        # Code 0 is outside range → still stripped
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/TestFont"),
+            FirstChar=32,
+            LastChar=114,
+            Encoding=Name.WinAnsiEncoding,
+        )
         content = b"BT /F1 12 Tf (\x00A) Tj ET"
         _make_page_with_font_and_content(pdf, font, content)
 
         result = sanitize_notdef_usage(pdf)
 
-        assert result["notdef_usage_fixed"] == 1
+        assert result["notdef_usage_fixed"] == 0
 
 
 class TestCIDFontBeyondNumGlyphs:
