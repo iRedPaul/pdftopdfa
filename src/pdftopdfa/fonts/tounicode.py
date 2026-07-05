@@ -743,43 +743,36 @@ def parse_tounicode_cmap(data: bytes) -> dict[int, int]:
     # Parse bfrange blocks: <start> <end> <unicode_start> or
     # <start> <end> [<u1> <u2> ... <un>]
     bfrange_pattern = re.compile(r"beginbfrange\s*(.*?)\s*endbfrange", re.DOTALL)
-    range_inc_pattern = re.compile(
-        r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>"
-    )
-    range_array_pattern = re.compile(
-        r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\[([^\]]*)\]"
+    # Both destination forms in one pattern so that each entry is consumed
+    # atomically: hex tokens inside an array body must never be matched as
+    # a separate incrementing entry.
+    range_entry_pattern = re.compile(
+        r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(?:<([0-9A-Fa-f]+)>|\[([^\]]*)\])"
     )
     array_element_pattern = re.compile(r"<([0-9A-Fa-f]+)>")
 
     for block_match in bfrange_pattern.finditer(text):
         block = block_match.group(1)
-        # Incrementing destination form
-        for entry_match in range_inc_pattern.finditer(block):
+        for entry_match in range_entry_pattern.finditer(block):
             start_hex = entry_match.group(1)
             end_hex = entry_match.group(2)
             dst_hex = entry_match.group(3)
             try:
                 start_code = int(start_hex, 16)
                 end_code = int(end_hex, 16)
-                unicode_start = _decode_unicode_hex(dst_hex)
-                for offset in range(end_code - start_code + 1):
-                    code_to_unicode[start_code + offset] = unicode_start + offset
-            except ValueError:
-                continue
-        # Array destination form
-        for entry_match in range_array_pattern.finditer(block):
-            start_hex = entry_match.group(1)
-            end_hex = entry_match.group(2)
-            array_body = entry_match.group(3)
-            try:
-                start_code = int(start_hex, 16)
-                end_code = int(end_hex, 16)
-                elements = array_element_pattern.findall(array_body)
-                for offset, elem_hex in enumerate(
-                    elements[: end_code - start_code + 1]
-                ):
-                    unicode_val = _decode_unicode_hex(elem_hex)
-                    code_to_unicode[start_code + offset] = unicode_val
+                if dst_hex is not None:
+                    # Incrementing destination form
+                    unicode_start = _decode_unicode_hex(dst_hex)
+                    for offset in range(end_code - start_code + 1):
+                        code_to_unicode[start_code + offset] = unicode_start + offset
+                else:
+                    # Array destination form
+                    elements = array_element_pattern.findall(entry_match.group(4))
+                    for offset, elem_hex in enumerate(
+                        elements[: end_code - start_code + 1]
+                    ):
+                        unicode_val = _decode_unicode_hex(elem_hex)
+                        code_to_unicode[start_code + offset] = unicode_val
             except ValueError:
                 continue
 

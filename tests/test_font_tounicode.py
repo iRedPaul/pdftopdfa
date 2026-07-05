@@ -18,6 +18,7 @@ from pdftopdfa.fonts.tounicode import (
     build_identity_unicode_mapping,
     generate_cidfont_tounicode_cmap,
     parse_cidtogidmap_stream,
+    parse_tounicode_cmap,
 )
 from pdftopdfa.utils import resolve_indirect as _resolve_indirect
 
@@ -567,6 +568,54 @@ class TestParseCIDToGIDMapStream:
         stream = b"\x00\x00\x00\x00\x00\x2a"
         result = parse_cidtogidmap_stream(stream)
         assert result == {2: 42}
+
+
+class TestParseToUnicodeCmap:
+    """Tests for parse_tounicode_cmap() bfchar/bfrange parsing."""
+
+    def test_bfrange_array_body_not_parsed_as_increment_entry(self):
+        """Hex tokens inside an array body must not create phantom mappings."""
+        cmap = (
+            b"1 beginbfchar\n"
+            b"<41> <0041>\n"
+            b"endbfchar\n"
+            b"1 beginbfrange\n"
+            b"<10> <12> [<0058> <0059> <005A>]\n"
+            b"endbfrange\n"
+        )
+        mapping = parse_tounicode_cmap(cmap)
+        assert mapping == {0x41: 0x0041, 0x10: 0x0058, 0x11: 0x0059, 0x12: 0x005A}
+
+    def test_bfrange_mixed_increment_and_array_entries(self):
+        """Increment and array entries in one block are both parsed."""
+        cmap = (
+            b"3 beginbfrange\n"
+            b"<20> <22> <0041>\n"
+            b"<30> <31> [<00E4> <00F6>]\n"
+            b"<40> <40> <005A>\n"
+            b"endbfrange\n"
+        )
+        mapping = parse_tounicode_cmap(cmap)
+        assert mapping == {
+            0x20: 0x0041,
+            0x21: 0x0042,
+            0x22: 0x0043,
+            0x30: 0x00E4,
+            0x31: 0x00F6,
+            0x40: 0x005A,
+        }
+
+    def test_bfrange_array_with_surrogate_pair(self):
+        """Surrogate pairs in array elements decode to full codepoints."""
+        cmap = b"1 beginbfrange\n<01> <01> [<D835DC00>]\nendbfrange\n"
+        mapping = parse_tounicode_cmap(cmap)
+        assert mapping == {0x01: 0x1D400}
+
+    def test_bfrange_array_excess_elements_ignored(self):
+        """Array elements beyond the code range are ignored."""
+        cmap = b"1 beginbfrange\n<05> <06> [<0041> <0042> <0043>]\nendbfrange\n"
+        mapping = parse_tounicode_cmap(cmap)
+        assert mapping == {0x05: 0x0041, 0x06: 0x0042}
 
 
 class TestBuildIdentityUnicodeMapping:
