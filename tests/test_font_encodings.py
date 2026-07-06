@@ -936,6 +936,44 @@ class TestEnsureEncoding:
             raise AssertionError("Expected (3,0) cmap subtable")
         tt.close()
 
+    def test_nonsymbolic_truetype_ms_unicode_cmap_from_mac_roman(self):
+        """(3,1) cmap built from (1,0) source translates Mac Roman codes."""
+
+        from fontTools.ttLib import TTFont
+
+        # Mac Roman 0x8A is "ä" (U+00E4), not U+008A
+        tt_data = self._make_ttfont_data(
+            [
+                (1, 0, {65: "A", 0x8A: "B"}),
+            ]
+        )
+        pdf = new_pdf()
+        font_dict = self._make_embedded_font_with_ttdata(pdf, tt_data, flags=32)
+        enc_dict = Dictionary(
+            Type=Name.Encoding,
+            BaseEncoding=Name.WinAnsiEncoding,
+            Differences=Array([65, Name("/A"), 66, Name("/B")]),
+        )
+        font_dict[Name.Encoding] = pdf.make_indirect(enc_dict)
+        self._build_pdf_with_font(pdf, font_dict)
+
+        embedder = FontEmbedder(pdf)
+        embedder.fix_font_encodings()
+
+        fd = _resolve_indirect(font_dict.get("/FontDescriptor"))
+        ff2 = _resolve_indirect(fd.get("/FontFile2"))
+        tt = TTFont(BytesIO(bytes(ff2.read_bytes())))
+        cmap = tt.get("cmap")
+        for st in cmap.tables:
+            if st.platformID == 3 and st.platEncID == 1:
+                assert st.cmap.get(65) == "A"
+                assert st.cmap.get(0xE4) == "B", "Mac Roman 0x8A must map to U+00E4"
+                assert 0x8A not in st.cmap
+                break
+        else:
+            raise AssertionError("Expected (3,1) MS Unicode cmap subtable")
+        tt.close()
+
     def test_symbolic_truetype_cmap_no_cmap_table(self):
         """Symbolic TrueType with no cmap table at all is not modified."""
         pdf = new_pdf()

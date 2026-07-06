@@ -1544,7 +1544,17 @@ class FontEmbedder:
             new_subtable.platformID = 3
             new_subtable.platEncID = 1
             new_subtable.language = 0
-            new_subtable.cmap = dict(source.cmap)
+            if source.platformID == 1 and source.platEncID == 0:
+                # Mac Roman byte codes >= 0x80 are not Unicode code points;
+                # translate them before using as (3,1) keys.
+                new_mapping: dict[int, str] = {}
+                for code, glyph_name in source.cmap.items():
+                    if 0 <= code <= 0xFF:
+                        code = ord(bytes([code]).decode("mac_roman"))
+                    new_mapping[code] = glyph_name
+                new_subtable.cmap = new_mapping
+            else:
+                new_subtable.cmap = dict(source.cmap)
 
             cmap_table.tables.append(new_subtable)
 
