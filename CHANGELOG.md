@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.5.0] - 2026-07-07
+
+### Changes
+
+- Resolve veraPDF launcher via PATH lookup
+- Harden OCR and veraPDF subprocess stdin handling
+- Simplify ExtGState opacity values
+
+### Bug Fixes
+
+- Fix ToUnicode CMap bfrange parsing
+- Fix Type3 glyph usage during font subsetting
+- Preserve duplicate font entries during analysis
+- Fix out-of-range simple font code handling
+- Translate Mac Roman cmap codes when building Unicode subtables
+- Preserve XMP Dublin Core metadata when DocInfo is missing
+
+### CI / Build
+
+- Pin pikepdf below 11 and update dependency minimums
+
 ## [0.4.3] - 2026-06-01
 
 ### Features
