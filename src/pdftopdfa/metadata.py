@@ -2532,6 +2532,72 @@ def _extract_simple_xmp_property(
     return None
 
 
+def _extract_lang_alt_xmp_property(
+    tree: etree._Element | None,
+    namespace: str,
+    local_name: str,
+) -> str | None:
+    """Extract a Lang-Alt XMP property, preferring the x-default entry."""
+    if tree is None:
+        return None
+
+    ns_rdf = NAMESPACES["rdf"]
+    property_name = f"{{{namespace}}}{local_name}"
+    xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
+
+    for rdf_root in tree.iter(f"{{{ns_rdf}}}RDF"):
+        for desc in rdf_root.findall(f"{{{ns_rdf}}}Description"):
+            prop = desc.find(property_name)
+            if prop is None:
+                continue
+            fallback = None
+            for li in prop.findall(f"{{{ns_rdf}}}Alt/{{{ns_rdf}}}li"):
+                cleaned = _clean_metadata_text(li.text)
+                if cleaned is None:
+                    continue
+                if li.get(xml_lang, "x-default") == "x-default":
+                    return cleaned
+                if fallback is None:
+                    fallback = cleaned
+            if fallback is not None:
+                return fallback
+
+    # Some producers write Lang-Alt properties in simple text or
+    # attribute form; accept those as a last resort.
+    return _extract_simple_xmp_property(tree, namespace, local_name)
+
+
+def _extract_array_xmp_property(
+    tree: etree._Element | None,
+    namespace: str,
+    local_name: str,
+) -> list[str]:
+    """Extract item texts of an rdf:Seq/rdf:Bag/rdf:Alt XMP array property."""
+    if tree is None:
+        return []
+
+    ns_rdf = NAMESPACES["rdf"]
+    property_name = f"{{{namespace}}}{local_name}"
+
+    for rdf_root in tree.iter(f"{{{ns_rdf}}}RDF"):
+        for desc in rdf_root.findall(f"{{{ns_rdf}}}Description"):
+            prop = desc.find(property_name)
+            if prop is None:
+                continue
+            for container in ("Seq", "Bag", "Alt"):
+                items = prop.findall(f"{{{ns_rdf}}}{container}/{{{ns_rdf}}}li")
+                values = [
+                    cleaned
+                    for li in items
+                    if (cleaned := _clean_metadata_text(li.text)) is not None
+                ]
+                if values:
+                    return values
+
+    simple = _extract_simple_xmp_property(tree, namespace, local_name)
+    return [simple] if simple is not None else []
+
+
 def create_xmp_metadata(
     info: dict[str, Any],
     pdfa_part: int,
@@ -2594,6 +2660,21 @@ def create_xmp_metadata(
     title = _clean_metadata_text(info.get("title"))
     author = _clean_metadata_text(info.get("author"))
     subject = _clean_metadata_text(info.get("subject"))
+
+    # dc:title/creator/description are managed properties, so they are not
+    # copied over from the existing XMP. Modern producers often store these
+    # values only in XMP (no DocInfo entries); fall back to the source XMP
+    # so they are not lost.
+    if title is None:
+        title = _extract_lang_alt_xmp_property(existing_xmp_tree, ns_dc, "title")
+    if author is None:
+        creators = _extract_array_xmp_property(existing_xmp_tree, ns_dc, "creator")
+        if creators:
+            author = ", ".join(creators)
+    if subject is None:
+        subject = _extract_lang_alt_xmp_property(
+            existing_xmp_tree, ns_dc, "description"
+        )
     creation_date = _format_iso_date(info.get("creation_date") or now)
     modification_date = _format_iso_date(now)
     document_id = _extract_simple_xmp_property(

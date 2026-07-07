@@ -834,10 +834,12 @@ class TestSyncMetadata:
             assert original_dt == new_dt
 
     def test_sync_omits_author_when_missing(self, pdf_with_metadata: Path) -> None:
-        """When /Author is missing, sync_metadata omits Author/dc:creator."""
+        """When neither /Author nor dc:creator exist, both are omitted."""
         with Pdf.open(pdf_with_metadata) as pdf:
             if "/Author" in pdf.docinfo:
                 del pdf.docinfo["/Author"]
+            with pdf.open_metadata() as meta:
+                del meta["dc:creator"]
 
             sync_metadata(pdf, "2b")
 
@@ -847,6 +849,20 @@ class TestSyncMetadata:
             xmp_str = xmp_bytes.decode("utf-8")
             assert "dc:creator" not in xmp_str
             assert "Unknown" not in xmp_str
+
+    def test_sync_keeps_xmp_creator_when_docinfo_author_missing(
+        self, pdf_with_metadata: Path
+    ) -> None:
+        """dc:creator from source XMP survives when DocInfo has no /Author."""
+        with Pdf.open(pdf_with_metadata) as pdf:
+            if "/Author" in pdf.docinfo:
+                del pdf.docinfo["/Author"]
+
+            sync_metadata(pdf, "2b")
+
+            xmp_bytes = bytes(pdf.Root.Metadata.read_bytes())
+            xmp_str = xmp_bytes.decode("utf-8")
+            assert "Test Author" in xmp_str
 
     def test_sync_moddate_is_current_not_old(self, pdf_with_metadata: Path) -> None:
         """ModDate is set to current time, not the old modification date."""
@@ -1277,6 +1293,123 @@ class TestXmpPreservation:
             conf_elem = desc.find(f"{{{ns_pdfaid}}}conformance")
             if conf_elem is not None:
                 assert conf_elem.text == "U"
+
+
+class TestXmpOnlyDublinCoreFallback:
+    """Tests for falling back to XMP-only dc:title/creator/description."""
+
+    def test_xmp_only_title_preserved(self) -> None:
+        """dc:title from source XMP is kept when DocInfo has no /Title."""
+        tree = _build_xmp_with_extras(
+            "<dc:title><rdf:Alt>"
+            '<rdf:li xml:lang="x-default">XMP Only Title</rdf:li>'
+            "</rdf:Alt></dc:title>"
+        )
+        info: dict = {}
+        xmp = create_xmp_metadata(
+            info,
+            pdfa_part=2,
+            pdfa_conformance="B",
+            existing_xmp_tree=tree,
+        )
+        assert b"XMP Only Title" in xmp
+
+    def test_xmp_only_creator_preserved(self) -> None:
+        """dc:creator from source XMP is kept when DocInfo has no /Author."""
+        tree = _build_xmp_with_extras(
+            "<dc:creator><rdf:Seq>"
+            "<rdf:li>Alice</rdf:li><rdf:li>Bob</rdf:li>"
+            "</rdf:Seq></dc:creator>"
+        )
+        info: dict = {}
+        xmp = create_xmp_metadata(
+            info,
+            pdfa_part=2,
+            pdfa_conformance="B",
+            existing_xmp_tree=tree,
+        )
+        assert b"Alice, Bob" in xmp
+
+    def test_xmp_only_description_preserved(self) -> None:
+        """dc:description from source XMP is kept when DocInfo has no /Subject."""
+        tree = _build_xmp_with_extras(
+            "<dc:description><rdf:Alt>"
+            '<rdf:li xml:lang="x-default">XMP Only Subject</rdf:li>'
+            "</rdf:Alt></dc:description>"
+        )
+        info: dict = {}
+        xmp = create_xmp_metadata(
+            info,
+            pdfa_part=2,
+            pdfa_conformance="B",
+            existing_xmp_tree=tree,
+        )
+        assert b"XMP Only Subject" in xmp
+
+    def test_docinfo_wins_over_xmp(self) -> None:
+        """DocInfo values take precedence over source XMP values."""
+        tree = _build_xmp_with_extras(
+            "<dc:title><rdf:Alt>"
+            '<rdf:li xml:lang="x-default">Old XMP Title</rdf:li>'
+            "</rdf:Alt></dc:title>"
+        )
+        info: dict = {"title": "DocInfo Title"}
+        xmp = create_xmp_metadata(
+            info,
+            pdfa_part=2,
+            pdfa_conformance="B",
+            existing_xmp_tree=tree,
+        )
+        assert b"DocInfo Title" in xmp
+        assert b"Old XMP Title" not in xmp
+
+    def test_lang_alt_prefers_x_default(self) -> None:
+        """The x-default entry is preferred over other language entries."""
+        tree = _build_xmp_with_extras(
+            "<dc:title><rdf:Alt>"
+            '<rdf:li xml:lang="de">Deutscher Titel</rdf:li>'
+            '<rdf:li xml:lang="x-default">Default Title</rdf:li>'
+            "</rdf:Alt></dc:title>"
+        )
+        info: dict = {}
+        xmp = create_xmp_metadata(
+            info,
+            pdfa_part=2,
+            pdfa_conformance="B",
+            existing_xmp_tree=tree,
+        )
+        assert b"Default Title" in xmp
+        assert b"Deutscher Titel" not in xmp
+
+    def test_lang_alt_falls_back_to_first_language(self) -> None:
+        """Without an x-default entry, the first language entry is used."""
+        tree = _build_xmp_with_extras(
+            "<dc:title><rdf:Alt>"
+            '<rdf:li xml:lang="de">Deutscher Titel</rdf:li>'
+            "</rdf:Alt></dc:title>"
+        )
+        info: dict = {}
+        xmp = create_xmp_metadata(
+            info,
+            pdfa_part=2,
+            pdfa_conformance="B",
+            existing_xmp_tree=tree,
+        )
+        assert b"Deutscher Titel" in xmp
+
+    def test_no_dc_values_anywhere_omits_elements(self) -> None:
+        """Without DocInfo or XMP values, no dc:title/creator/description."""
+        tree = _build_xmp_with_extras("")
+        info: dict = {}
+        xmp = create_xmp_metadata(
+            info,
+            pdfa_part=2,
+            pdfa_conformance="B",
+            existing_xmp_tree=tree,
+        )
+        assert b"<dc:title" not in xmp
+        assert b"<dc:creator" not in xmp
+        assert b"<dc:description" not in xmp
 
 
 class TestExtractExistingXmp:
