@@ -9,6 +9,7 @@ import mimetypes
 import re
 import tempfile
 from collections.abc import Iterator
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -130,11 +131,24 @@ def _is_pdfa_compliant_embedded(filespec: object) -> bool:
         return False
 
 
+# Maximum nesting depth for converting embedded PDFs. Each conversion of an
+# embedded PDF runs the full pipeline, which may again find embedded PDFs;
+# without a limit, maliciously nested documents cause exponential work.
+_MAX_EMBEDDED_PDF_CONVERSION_DEPTH = 2
+_embedded_pdf_conversion_depth: ContextVar[int] = ContextVar(
+    "_embedded_pdf_conversion_depth", default=0
+)
+
+
 def _try_convert_embedded_pdf_to_pdfa2(data: bytes) -> bytes | None:
     """Attempt to convert embedded PDF bytes to PDF/A-2b.
 
     Uses a deferred import of convert_to_pdfa to avoid a circular dependency
     (converter → sanitizers/__init__ → files → converter).
+
+    Conversion recursion is limited to _MAX_EMBEDDED_PDF_CONVERSION_DEPTH
+    levels of nesting; deeper embedded PDFs are not converted (the caller
+    then removes them).
 
     Args:
         data: Raw bytes of an embedded PDF file.
@@ -145,8 +159,18 @@ def _try_convert_embedded_pdf_to_pdfa2(data: bytes) -> bytes | None:
     # Deferred import breaks the circular dependency at module load time.
     from ..converter import convert_to_pdfa  # noqa: PLC0415
 
+    depth = _embedded_pdf_conversion_depth.get()
+    if depth >= _MAX_EMBEDDED_PDF_CONVERSION_DEPTH:
+        logger.warning(
+            "Embedded PDF nesting exceeds %d level(s); "
+            "not converting deeper embedded PDF",
+            _MAX_EMBEDDED_PDF_CONVERSION_DEPTH,
+        )
+        return None
+
     tmp_in_path: Path | None = None
     tmp_out_path: Path | None = None
+    depth_token = _embedded_pdf_conversion_depth.set(depth + 1)
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_in:
             tmp_in.write(data)
@@ -168,6 +192,7 @@ def _try_convert_embedded_pdf_to_pdfa2(data: bytes) -> bytes | None:
         logger.debug("Error converting embedded PDF to PDF/A-2b: %s", e)
         return None
     finally:
+        _embedded_pdf_conversion_depth.reset(depth_token)
         if tmp_in_path is not None:
             tmp_in_path.unlink(missing_ok=True)
         if tmp_out_path is not None:

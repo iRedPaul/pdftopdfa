@@ -95,6 +95,23 @@ def _is_agl_glyph_name(glyph_name: str) -> bool:
     return glyph_name == ".notdef" or glyph_name in AGL2UV
 
 
+def _cidfont_replacement_warning(base_name: str) -> str:
+    """Build the warning issued when a non-embedded CIDFont is replaced.
+
+    Content streams of Identity-encoded CIDFonts reference glyph IDs of the
+    original font. After substituting a different font program, the same
+    glyph IDs point to different (or missing) glyphs, so rendering of the
+    affected text is unreliable even though text extraction stays correct
+    via the preserved ToUnicode CMap.
+    """
+    return (
+        f"Non-embedded CIDFont '{base_name}' was replaced with a substitute "
+        "font: its glyph IDs do not match the original font, so affected text "
+        "may render incorrectly or invisibly (text extraction and copy/paste "
+        "remain intact)"
+    )
+
+
 def _is_utf16_encoding(encoding_name: str) -> bool:
     """Checks if the encoding name indicates a UTF-16/UCS-2 CMap.
 
@@ -221,11 +238,9 @@ class FontEmbedder:
                             processed_fonts.add(base_name)
                             if success:
                                 result.fonts_embedded.append(base_name)
-                                logger.info(
-                                    "CIDFont embedded: %s (Encoding: %s)",
-                                    base_name,
-                                    encoding,
-                                )
+                                warning = _cidfont_replacement_warning(base_name)
+                                result.warnings.append(warning)
+                                logger.warning(warning)
                             else:
                                 result.fonts_failed.append(base_name)
                         continue
@@ -326,10 +341,17 @@ class FontEmbedder:
                                     processed_fonts.add(base_name)
                                     if success:
                                         result.fonts_embedded.append(base_name)
-                                        logger.info(
-                                            "AcroForm DR font embedded: %s",
-                                            base_name,
-                                        )
+                                        if font_type == "CIDFont":
+                                            warning = _cidfont_replacement_warning(
+                                                base_name
+                                            )
+                                            result.warnings.append(warning)
+                                            logger.warning(warning)
+                                        else:
+                                            logger.info(
+                                                "AcroForm DR font embedded: %s",
+                                                base_name,
+                                            )
                                     else:
                                         result.fonts_failed.append(base_name)
                             except Exception as e:

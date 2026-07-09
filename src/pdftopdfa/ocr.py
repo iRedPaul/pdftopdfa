@@ -227,6 +227,18 @@ def _cap_tesseract_timeout(
         ocr_kwargs["tesseract_timeout"] = timeout
 
 
+def _count_pdf_pages(pdf_path: Path) -> int:
+    """Return the page count of a PDF, or 1 if it cannot be determined."""
+    import pikepdf
+
+    try:
+        with pikepdf.open(pdf_path) as pdf:
+            return len(pdf.pages)
+    except Exception as exc:
+        logger.debug("Could not count pages of %s: %s", pdf_path, exc)
+        return 1
+
+
 def _parse_tesseract_osd(output: str) -> _OrientationResult | None:
     """Parse Tesseract OSD output into a structured result."""
     rotate = None
@@ -774,10 +786,13 @@ def apply_ocr(
             Example: ``["deu", "eng"]`` for German + English.
         quality: OCR quality preset (default: OcrQuality.DEFAULT).
         fallback_quality: Faster OCR quality to retry with if the initial OCR
-            run exceeds ``fallback_after_seconds``. Use ``None`` to disable.
-        fallback_after_seconds: Runtime threshold for OCR fallback. The initial
-            Tesseract timeout is capped to this value so fallback can happen
-            promptly. Use ``None`` to disable time-based retry.
+            run exceeds the fallback threshold. Use ``None`` to disable.
+        fallback_after_seconds: Per-page runtime budget for OCR fallback. The
+            retry triggers when the whole run takes longer than this value
+            multiplied by the page count, so large documents are not penalized
+            for their size. The per-page Tesseract timeout of the initial run
+            is capped to this value so fallback can happen promptly. Use
+            ``None`` to disable time-based retry.
         force: If True, use ocrmypdf's ``redo_ocr`` mode to remove the
             existing OCR layer and re-apply OCR. Options incompatible with
             ``redo_ocr`` are disabled automatically (default: False).
@@ -804,7 +819,12 @@ def apply_ocr(
     )
 
     fallback = _effective_fallback_quality(quality, fallback_quality)
-    fallback_limit = fallback_after_seconds if fallback is not None else None
+    per_page_limit = fallback_after_seconds if fallback is not None else None
+    # The threshold is a per-page budget: scale it by the page count so a
+    # large document that OCRs each page quickly does not trigger fallback.
+    total_limit: float | None = None
+    if per_page_limit is not None:
+        total_limit = per_page_limit * max(1, _count_pdf_pages(input_path))
 
     def run_ocr_with_quality(
         run_quality: OcrQuality,
@@ -841,20 +861,16 @@ def apply_ocr(
         return time.perf_counter() - started
 
     try:
-        elapsed = run_ocr_with_quality(quality, timeout_limit=fallback_limit)
+        elapsed = run_ocr_with_quality(quality, timeout_limit=per_page_limit)
 
-        if (
-            fallback is not None
-            and fallback_after_seconds is not None
-            and elapsed > fallback_after_seconds
-        ):
+        if fallback is not None and total_limit is not None and elapsed > total_limit:
             logger.warning(
                 "Retrying OCR with fallback quality '%s' after '%s' took %.2fs "
                 "(limit: %.2fs)",
                 fallback.value,
                 quality.value,
                 elapsed,
-                fallback_after_seconds,
+                total_limit,
             )
             try:
                 output_path.unlink()

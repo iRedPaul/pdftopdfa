@@ -574,6 +574,71 @@ class TestApplyOcr:
 
         mock_ocrmypdf.ocr.assert_called_once()
 
+    @staticmethod
+    def _write_multipage_pdf(path: Path, page_count: int) -> None:
+        pdf = new_pdf()
+        for _ in range(page_count):
+            pdf.pages.append(
+                pikepdf.Page(
+                    Dictionary(Type=Name.Page, MediaBox=Array([0, 0, 612, 792]))
+                )
+            )
+        pdf.save(path)
+
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    @patch("pdftopdfa.ocr.time.perf_counter")
+    def test_apply_ocr_fallback_threshold_scales_with_page_count(
+        self,
+        mock_perf_counter: MagicMock,
+        mock_ocrmypdf: MagicMock,
+        tmp_dir: Path,
+    ) -> None:
+        """The fallback threshold is a per-page budget, not a total limit."""
+        input_pdf = tmp_dir / "multipage.pdf"
+        self._write_multipage_pdf(input_pdf, page_count=3)
+        output_path = tmp_dir / "output.pdf"
+        # 61s for 3 pages stays within the 3 * 60s budget -> no fallback
+        mock_perf_counter.side_effect = [0.0, 61.0]
+
+        def create_output(input_path: Path, output: Path, **kwargs: object) -> None:
+            import shutil
+
+            shutil.copy(input_path, output)
+
+        mock_ocrmypdf.ocr.side_effect = create_output
+
+        apply_ocr(input_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
+
+        mock_ocrmypdf.ocr.assert_called_once()
+
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    @patch("pdftopdfa.ocr.time.perf_counter")
+    def test_apply_ocr_fallback_triggers_above_scaled_threshold(
+        self,
+        mock_perf_counter: MagicMock,
+        mock_ocrmypdf: MagicMock,
+        tmp_dir: Path,
+    ) -> None:
+        """Fallback still triggers when the per-page budget is exceeded."""
+        input_pdf = tmp_dir / "multipage.pdf"
+        self._write_multipage_pdf(input_pdf, page_count=3)
+        output_path = tmp_dir / "output.pdf"
+        # 181s for 3 pages exceeds the 3 * 60s budget -> fallback
+        mock_perf_counter.side_effect = [0.0, 181.0, 181.0, 182.0]
+
+        def create_output(input_path: Path, output: Path, **kwargs: object) -> None:
+            import shutil
+
+            shutil.copy(input_path, output)
+
+        mock_ocrmypdf.ocr.side_effect = create_output
+
+        apply_ocr(input_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
+
+        assert mock_ocrmypdf.ocr.call_count == 2
+
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
     def test_apply_ocr_default_language(

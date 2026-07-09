@@ -437,6 +437,44 @@ class TestConvertNonCompliantEmbeddedFiles:
         assert isinstance(result["embedded_files_converted"], int)
 
 
+class TestEmbeddedPdfConversionDepthLimit:
+    """Tests for the recursion depth limit of embedded PDF conversion."""
+
+    def test_conversion_skipped_at_max_depth(self) -> None:
+        """At the maximum nesting depth, conversion is refused without work."""
+        from pdftopdfa.sanitizers import files as files_mod
+
+        token = files_mod._embedded_pdf_conversion_depth.set(
+            files_mod._MAX_EMBEDDED_PDF_CONVERSION_DEPTH
+        )
+        try:
+            with patch("pdftopdfa.converter.convert_to_pdfa") as mock_convert:
+                result = files_mod._try_convert_embedded_pdf_to_pdfa2(
+                    b"%PDF-1.4 nested data"
+                )
+                mock_convert.assert_not_called()
+            assert result is None
+        finally:
+            files_mod._embedded_pdf_conversion_depth.reset(token)
+
+    def test_conversion_increments_and_resets_depth(self) -> None:
+        """The depth is incremented during conversion and reset afterwards."""
+        from pdftopdfa.sanitizers import files as files_mod
+
+        seen_depths: list[int] = []
+
+        def fake_convert(*args: object, **kwargs: object) -> None:
+            seen_depths.append(files_mod._embedded_pdf_conversion_depth.get())
+            raise RuntimeError("stop conversion")
+
+        with patch("pdftopdfa.converter.convert_to_pdfa", side_effect=fake_convert):
+            result = files_mod._try_convert_embedded_pdf_to_pdfa2(b"%PDF-1.4 data")
+
+        assert result is None
+        assert seen_depths == [1]
+        assert files_mod._embedded_pdf_conversion_depth.get() == 0
+
+
 # --- Integration tests for sanitize_for_pdfa ---
 
 

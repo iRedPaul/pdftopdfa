@@ -686,7 +686,8 @@ def convert_to_pdfa(
         ocr_quality: OCR quality preset. If None, uses OcrQuality.DEFAULT.
         ocr_fallback_quality: Faster OCR quality to retry with if OCR leaves
             the selected preset takes too long. Use None to disable.
-        ocr_fallback_after_seconds: Runtime threshold for OCR fallback.
+        ocr_fallback_after_seconds: Per-page runtime budget for OCR fallback
+            (total threshold is this value times the page count).
             Use None to disable time-based retry.
         ocr_force: If True, force OCR even on pages that already contain
             text by using ocrmypdf's ``redo_ocr`` mode. Options
@@ -711,6 +712,8 @@ def convert_to_pdfa(
     warnings: list[str] = []
     ocr_temp_file: Path | None = None
     ocr_signature_temp_file: Path | None = None
+    ocr_clean_temp_file: Path | None = None
+    ocr_merged_temp_file: Path | None = None
     pdf: pikepdf.Pdf | None = None
     source_info: dict | None = None
     source_xmp_tree = None
@@ -862,7 +865,6 @@ def convert_to_pdfa(
                 # Strip annotations before OCR so they are not
                 # rasterized into page images.
                 preserve_annots = _has_annotations(ocr_source_base)
-                clean_temp_file: Path | None = None
                 ocr_source = ocr_source_base
                 if preserve_annots:
                     fd2, clean_tmp = tempfile.mkstemp(
@@ -870,9 +872,9 @@ def convert_to_pdfa(
                         prefix=f".{input_path.stem}_clean_",
                     )
                     os.close(fd2)
-                    clean_temp_file = Path(clean_tmp)
-                    if _strip_annotations_for_ocr(ocr_source_base, clean_temp_file):
-                        ocr_source = clean_temp_file
+                    ocr_clean_temp_file = Path(clean_tmp)
+                    if _strip_annotations_for_ocr(ocr_source_base, ocr_clean_temp_file):
+                        ocr_source = ocr_clean_temp_file
                     else:
                         preserve_annots = False
 
@@ -893,26 +895,28 @@ def convert_to_pdfa(
                         prefix=f".{input_path.stem}_merged_",
                     )
                     os.close(fd3)
-                    merged_temp_file = Path(merged_tmp)
+                    ocr_merged_temp_file = Path(merged_tmp)
                     count = _restore_annotations_after_ocr(
-                        ocr_source_base, ocr_temp_file, merged_temp_file
+                        ocr_source_base, ocr_temp_file, ocr_merged_temp_file
                     )
                     if count > 0:
-                        os.replace(str(merged_temp_file), str(ocr_temp_file))
+                        os.replace(str(ocr_merged_temp_file), str(ocr_temp_file))
                         logger.debug("%d annotation(s) preserved through OCR", count)
                         warnings.append(f"{count} annotation(s) preserved through OCR")
                     else:
                         try:
-                            Path(merged_tmp).unlink()
+                            ocr_merged_temp_file.unlink()
                         except Exception:
                             pass
+                    ocr_merged_temp_file = None
 
                 # Clean up the stripped copy.
-                if clean_temp_file is not None:
+                if ocr_clean_temp_file is not None:
                     try:
-                        clean_temp_file.unlink()
+                        ocr_clean_temp_file.unlink()
                     except Exception:
                         pass
+                    ocr_clean_temp_file = None
 
                 actual_input = ocr_temp_file
                 lang_str = "+".join(ocr_languages)
@@ -1185,29 +1189,24 @@ def convert_to_pdfa(
             except Exception:
                 pass
 
-        # Cleanup: Delete OCR temporary file
-        if ocr_temp_file is not None and ocr_temp_file.exists():
+        # Cleanup: Delete OCR temporary files
+        ocr_cleanup_files = (
+            (ocr_temp_file, "OCR temporary file"),
+            (ocr_signature_temp_file, "OCR signature temporary file"),
+            (ocr_clean_temp_file, "OCR annotation-stripped temporary file"),
+            (ocr_merged_temp_file, "OCR annotation-merged temporary file"),
+        )
+        for cleanup_file, cleanup_label in ocr_cleanup_files:
+            if cleanup_file is None or not cleanup_file.exists():
+                continue
             try:
-                ocr_temp_file.unlink()
-                logger.debug("OCR temporary file deleted: %s", ocr_temp_file)
+                cleanup_file.unlink()
+                logger.debug("%s deleted: %s", cleanup_label, cleanup_file)
             except Exception as cleanup_error:
                 logger.warning(
-                    "Could not delete OCR temporary file: %s (%s)",
-                    ocr_temp_file,
-                    cleanup_error,
-                )
-
-        if ocr_signature_temp_file is not None and ocr_signature_temp_file.exists():
-            try:
-                ocr_signature_temp_file.unlink()
-                logger.debug(
-                    "OCR signature temporary file deleted: %s",
-                    ocr_signature_temp_file,
-                )
-            except Exception as cleanup_error:
-                logger.warning(
-                    "Could not delete OCR signature temporary file: %s (%s)",
-                    ocr_signature_temp_file,
+                    "Could not delete %s: %s (%s)",
+                    cleanup_label,
+                    cleanup_file,
                     cleanup_error,
                 )
 
@@ -1245,7 +1244,8 @@ def convert_files(
         ocr_quality: OCR quality preset.
         ocr_fallback_quality: Faster OCR quality to retry with if OCR leaves
             the selected preset takes too long.
-        ocr_fallback_after_seconds: Runtime threshold for OCR fallback.
+        ocr_fallback_after_seconds: Per-page runtime budget for OCR fallback
+            (total threshold is this value times the page count).
         ocr_force: If True, force OCR even on pages that already contain
             text. Options incompatible with ocrmypdf's ``redo_ocr``
             mode are disabled automatically.
@@ -1368,7 +1368,8 @@ def convert_directory(
         ocr_quality: OCR quality preset.
         ocr_fallback_quality: Faster OCR quality to retry with if OCR leaves
             the selected preset takes too long.
-        ocr_fallback_after_seconds: Runtime threshold for OCR fallback.
+        ocr_fallback_after_seconds: Per-page runtime budget for OCR fallback
+            (total threshold is this value times the page count).
         ocr_force: If True, force OCR even on pages that already contain
             text. Options incompatible with ocrmypdf's ``redo_ocr``
             mode are disabled automatically.

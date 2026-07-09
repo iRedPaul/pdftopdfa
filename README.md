@@ -99,6 +99,7 @@ See [docs/usage.md](docs/usage.md) for the full CLI reference, Python API docume
 - **Encrypted PDFs** -- password-protected PDFs cannot be converted
 - **Digitally signed PDFs** -- signed PDFs are copied unchanged by default because conversion would invalidate their signatures; use `--allow-signature-invalidation` only when an unsigned archival copy is intentional
 - **Font replacement** -- fonts without a suitable metrically compatible replacement produce a warning; the resulting file may not be fully compliant
+- **Non-embedded CIDFonts (Identity encoding)** -- content streams reference glyph IDs of the original font; after replacement with a substitute font the same glyph IDs point to different or missing glyphs, so the affected text may render incorrectly or invisibly. Text extraction and copy/paste stay correct because the original ToUnicode mapping is preserved. A warning is emitted for each replaced CIDFont
 
 ## Font Sourcing
 

@@ -231,7 +231,7 @@ def _print_validation_result(
     default=60.0,
     show_default=True,
     help="Retry with --ocr-fallback-quality if the selected OCR preset takes "
-    "longer than this many seconds.",
+    "longer than this many seconds per page.",
 )
 @click.option(
     "--convert-calibrated/--no-convert-calibrated",
@@ -431,7 +431,8 @@ def _convert_single_file(
             (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
         ocr_fallback_quality: Faster OCR quality used if OCR takes too long.
-        ocr_fallback_after_seconds: Runtime threshold for OCR fallback.
+        ocr_fallback_after_seconds: Per-page runtime budget for OCR fallback
+            (total threshold is this value times the page count).
         ocr_force: If True, force OCR even on pages with existing text.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations
@@ -550,7 +551,8 @@ def _convert_directory(
             (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
         ocr_fallback_quality: Faster OCR quality used if OCR takes too long.
-        ocr_fallback_after_seconds: Runtime threshold for OCR fallback.
+        ocr_fallback_after_seconds: Per-page runtime budget for OCR fallback
+            (total threshold is this value times the page count).
         ocr_force: If True, force OCR even on pages with existing text.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations

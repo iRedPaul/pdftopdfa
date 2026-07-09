@@ -569,6 +569,12 @@ class TestFontLoader:
         assert "MSGothic" in result.fonts_embedded
         assert "MSGothic" not in result.fonts_failed
 
+        # Replacing a CIDFont breaks the glyph-ID mapping of the content
+        # stream, so a prominent per-font warning must be emitted.
+        assert any("MSGothic" in w and "render" in w for w in result.warnings), (
+            result.warnings
+        )
+
 
 class TestFontMetrics:
     """Tests for font metrics extraction."""

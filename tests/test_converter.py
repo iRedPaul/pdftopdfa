@@ -410,6 +410,61 @@ class TestConvertToPdfa:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_convert_cleans_ocr_temp_files_when_apply_ocr_raises(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """All OCR temp files are removed when apply_ocr raises.
+
+        This includes the annotation-stripped copy created for PDFs with
+        annotations, which is only cleaned up inline on the success path.
+        """
+        import tempfile
+
+        from pdftopdfa.exceptions import OCRError
+
+        # PDF with an annotation so the annotation-stripped copy is created
+        annotated_pdf = tmp_dir / "annotated.pdf"
+        with Pdf.open(sample_pdf) as pdf:
+            annot = pdf.make_indirect(
+                Dictionary(
+                    Type=Name.Annot,
+                    Subtype=Name.Text,
+                    Rect=Array([10, 10, 30, 30]),
+                )
+            )
+            pdf.pages[0].obj["/Annots"] = Array([annot])
+            pdf.save(annotated_pdf)
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = OCRError("OCR failed")
+
+        created: list[Path] = []
+        real_mkstemp = tempfile.mkstemp
+
+        def tracking_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+            fd, path = real_mkstemp(*args, **kwargs)
+            created.append(Path(path))
+            return fd, path
+
+        output_path = tmp_dir / "output.pdf"
+        with patch(
+            "pdftopdfa.converter.tempfile.mkstemp", side_effect=tracking_mkstemp
+        ):
+            with pytest.raises(OCRError):
+                convert_to_pdfa(annotated_pdf, output_path, ocr_languages=["eng"])
+
+        # OCR output temp + annotation-stripped copy were created ...
+        assert len(created) >= 2
+        # ... and none of them survived the failed conversion
+        leftovers = [path for path in created if path.exists()]
+        assert leftovers == []
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_with_ocr_adds_warning_message(
         self,
         mock_is_ocr_available: MagicMock,
@@ -1836,3 +1891,46 @@ class TestEnsureBinaryComment:
         result = convert_to_pdfa(sample_pdf, output, level="2b")
         assert result.success is True
         assert self._has_binary_comment(output)
+
+
+class TestStripAnnotationsForOcr:
+    """Tests for _strip_annotations_for_ocr."""
+
+    def test_removes_acroform_from_root(self, sample_pdf: Path, tmp_dir: Path) -> None:
+        """/AcroForm is stripped from the document root."""
+        from pdftopdfa.converter import _strip_annotations_for_ocr
+
+        input_pdf = tmp_dir / "acroform.pdf"
+        with Pdf.open(sample_pdf) as pdf:
+            pdf.Root["/AcroForm"] = pdf.make_indirect(Dictionary(Fields=Array([])))
+            pdf.save(input_pdf)
+
+        clean_pdf = tmp_dir / "clean.pdf"
+        removed = _strip_annotations_for_ocr(input_pdf, clean_pdf)
+
+        assert removed is True
+        with Pdf.open(clean_pdf) as pdf:
+            assert "/AcroForm" not in pdf.Root
+
+    def test_removes_page_annotations(self, sample_pdf: Path, tmp_dir: Path) -> None:
+        """/Annots arrays are stripped from all pages."""
+        from pdftopdfa.converter import _strip_annotations_for_ocr
+
+        input_pdf = tmp_dir / "annotated.pdf"
+        with Pdf.open(sample_pdf) as pdf:
+            annot = pdf.make_indirect(
+                Dictionary(
+                    Type=Name.Annot,
+                    Subtype=Name.Text,
+                    Rect=Array([10, 10, 30, 30]),
+                )
+            )
+            pdf.pages[0].obj["/Annots"] = Array([annot])
+            pdf.save(input_pdf)
+
+        clean_pdf = tmp_dir / "clean.pdf"
+        removed = _strip_annotations_for_ocr(input_pdf, clean_pdf)
+
+        assert removed is True
+        with Pdf.open(clean_pdf) as pdf:
+            assert pdf.pages[0].get("/Annots") is None
