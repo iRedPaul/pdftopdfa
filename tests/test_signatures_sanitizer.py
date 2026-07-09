@@ -96,6 +96,23 @@ class TestCountDigitalSignatures:
 
         assert count_digital_signatures(pdf) == 0
 
+    def test_ignores_empty_signature_value(self, make_pdf_with_page):
+        """A /FT /Sig field with an empty /V dictionary is not counted."""
+        pdf = make_pdf_with_page()
+        empty_sig = pdf.make_indirect(Dictionary())
+        field = _make_sig_field(pdf, empty_sig)
+        _setup_acroform(pdf, [field])
+
+        assert count_digital_signatures(pdf) == 0
+
+    def test_ignores_neutralized_perms_signature(self, make_pdf_with_page):
+        """A /Perms reference without live signature material is not counted."""
+        pdf = make_pdf_with_page()
+        empty_sig = pdf.make_indirect(Dictionary())
+        pdf.Root["/Perms"] = pdf.make_indirect(Dictionary(DocMDP=empty_sig))
+
+        assert count_digital_signatures(pdf) == 0
+
 
 class TestSanitizeSignaturesNoOp:
     """No-op scenarios."""
@@ -136,6 +153,20 @@ class TestSanitizeSignaturesRemoval:
         assert result["signatures_removed"] == 2
         assert "/V" not in field
         _assert_sig_dict_neutralized(sig)
+
+    def test_empty_signature_value_is_still_removed(self, make_pdf_with_page):
+        """An empty /V dictionary is not counted but still removed."""
+        pdf = make_pdf_with_page()
+        empty_sig = pdf.make_indirect(Dictionary())
+        field = _make_sig_field(pdf, empty_sig)
+        _setup_acroform(pdf, [field])
+
+        assert count_digital_signatures(pdf) == 0
+
+        result = sanitize_signatures(pdf, "3b")
+
+        assert result["signatures_removed"] >= 1
+        assert "/V" not in field
 
     def test_page_annotation_signature_is_handled(self, make_pdf_with_page):
         """Signature field only in page /Annots is still handled."""

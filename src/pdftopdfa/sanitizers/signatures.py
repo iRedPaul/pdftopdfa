@@ -332,9 +332,15 @@ def _collect_signature_data(pdf: Pdf):
 
 
 def count_digital_signatures(pdf: Pdf) -> int:
-    """Return the number of live digital signature dictionaries in a PDF."""
+    """Return the number of live digital signature dictionaries in a PDF.
+
+    Only dictionaries that still contain live signature material (a
+    /ByteRange with /Contents or /SubFilter) are counted. Empty or already
+    neutralized signature values do not block conversion; they are still
+    cleaned up liberally by sanitize_signatures().
+    """
     _acroform, _sig_fields, sig_dicts = _collect_signature_data(pdf)
-    return len(sig_dicts)
+    return sum(1 for sig_dict in sig_dicts if _is_live_signature_dictionary(sig_dict))
 
 
 def sanitize_signatures(pdf: Pdf, level: str = "3b") -> dict:
