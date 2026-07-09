@@ -379,6 +379,11 @@ def generate_tounicode_for_type3_font(
     except (TypeError, ValueError):
         pass
 
+    # Simple fonts use an 8-bit codespace (<00> <FF>); codes outside that
+    # range would produce invalid multi-byte entries in the ToUnicode CMap.
+    first_char = max(first_char, 0)
+    last_char = min(last_char, 255)
+
     # Build code → glyph name mapping from encoding
     code_to_glyph: dict[int, str] = {}
 
@@ -463,6 +468,9 @@ def generate_tounicode_cmap_data(
         CMap data as bytes.
     """
     code_to_unicode = filter_invalid_unicode_values(code_to_unicode)
+    # The declared codespace is <00> <FF>; codes outside the 8-bit range
+    # cannot be represented and are dropped.
+    code_to_unicode = {c: u for c, u in code_to_unicode.items() if 0 <= c <= 255}
     lines = [
         "/CIDInit /ProcSet findresource begin",
         "12 dict begin",

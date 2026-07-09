@@ -2352,7 +2352,7 @@ def _parse_pdf_date(date_str: str) -> datetime | None:
         date_str = date_str[2:]
 
     # Pattern for PDF date: YYYYMMDDHHMMSS with optional timezone
-    pattern = r"(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?([+-Z])?([\d']+)?"
+    pattern = r"(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?([-+Z])?([\d']+)?"
 
     match = re.match(pattern, date_str)
     if not match:
@@ -2415,16 +2415,19 @@ def _format_iso_date(dt: datetime | None) -> str:
     Format datetime to ISO 8601 for XMP.
 
     Args:
-        dt: Datetime object or None.
+        dt: Datetime object or None. Naive datetimes are assumed to be UTC;
+            timezone-aware datetimes are converted to UTC.
 
     Returns:
-        ISO 8601 formatted string or current time if dt is None.
+        ISO 8601 formatted string in UTC or current time if dt is None.
     """
     if dt is None:
         dt = datetime.now(UTC)
+    elif dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
 
     # Format: YYYY-MM-DDTHH:MM:SS+00:00
-    return dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 
 def extract_pdf_info(pdf: pikepdf.Pdf, *, log_result: bool = True) -> dict[str, Any]:
@@ -2924,6 +2927,64 @@ def _reserialize_xmp(tree: etree._Element) -> bytes:
         pretty_print=True,
     )
     return XMP_HEADER + xml_bytes + XMP_TRAILER
+
+
+def remove_pdfx_identification(pdf: pikepdf.Pdf) -> bool:
+    """Remove PDF/X identification properties from the catalog XMP.
+
+    A PDF/X identification (pdfxid namespace) is only meaningful together
+    with a PDF/X OutputIntent. When conversion drops the PDF/X OutputIntent,
+    the XMP claim must be removed as well so the file does not assert PDF/X
+    conformance it no longer declares.
+
+    Args:
+        pdf: pikepdf Pdf object to modify.
+
+    Returns:
+        True if any PDF/X identification property was removed.
+    """
+    metadata = pdf.Root.get("/Metadata")
+    if metadata is None:
+        return False
+
+    try:
+        data = bytes(metadata.read_bytes())
+    except Exception:
+        return False
+
+    tree = _parse_xmp_bytes(data)
+    if tree is None:
+        return False
+
+    pdfxid_prefix = f"{{{NAMESPACES['pdfxid']}}}"
+    removed = False
+    for elem in list(tree.iter()):
+        tag = elem.tag
+        if isinstance(tag, str) and tag.startswith(pdfxid_prefix):
+            parent = elem.getparent()
+            if parent is not None:
+                parent.remove(elem)
+                removed = True
+            continue
+        for attr_name in list(elem.attrib):
+            if attr_name.startswith(pdfxid_prefix):
+                del elem.attrib[attr_name]
+                removed = True
+
+    if not removed:
+        return False
+
+    # Drop rdf:Description elements left empty by the removal
+    ns_rdf = NAMESPACES["rdf"]
+    about_attr = f"{{{ns_rdf}}}about"
+    for rdf_root in tree.iter(f"{{{ns_rdf}}}RDF"):
+        for desc in list(rdf_root.findall(f"{{{ns_rdf}}}Description")):
+            if len(desc) == 0 and all(a == about_attr for a in desc.attrib):
+                rdf_root.remove(desc)
+
+    embed_xmp_metadata(pdf, _reserialize_xmp(tree))
+    logger.info("Removed PDF/X identification from XMP metadata")
+    return True
 
 
 def _sanitize_non_catalog_xmp_tree(tree: etree._Element) -> None:

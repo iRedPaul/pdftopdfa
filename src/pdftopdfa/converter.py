@@ -31,7 +31,12 @@ from .exceptions import (
 )
 from .extensions import add_extensions_if_needed
 from .fonts import check_font_compliance
-from .metadata import _extract_existing_xmp, extract_pdf_info, sync_metadata
+from .metadata import (
+    _extract_existing_xmp,
+    extract_pdf_info,
+    remove_pdfx_identification,
+    sync_metadata,
+)
 from .ocr import DEFAULT_OCR_FALLBACK_AFTER_SECONDS, DEFAULT_OCR_FALLBACK_QUALITY
 from .sanitizers import (
     count_digital_signatures,
@@ -58,6 +63,11 @@ _SANITIZE_WARNINGS: list[tuple[str, str]] = [
         "non_compliant_annotations_flattened",
         "non-compliant annotation(s) flattened into page content",
     ),
+    (
+        "forbidden_annotations_removed",
+        "forbidden annotation(s) removed (rule 6.3.1)",
+    ),
+    ("notdef_usage_fixed", ".notdef usage operator(s) fixed"),
     (
         "proprietary_stamps_normalized",
         "proprietary stamp annotation(s) converted to standard PDF Stamp annotation(s)",
@@ -108,6 +118,7 @@ _SANITIZE_WARNINGS: list[tuple[str, str]] = [
     ("structure_reals_normalized", "out-of-range real operand(s) clamped/normalized"),
     ("structure_q_nesting_rebalanced", "q/Q graphics-state operator(s) rebalanced"),
     ("structure_hex_odd_fixed", "odd-length hexadecimal string(s) fixed"),
+    ("structure_hex_odd_obj_fixed", "odd-length hexadecimal string object(s) fixed"),
     ("structure_hex_invalid_fixed", "invalid hexadecimal string(s) repaired"),
 ]
 
@@ -147,6 +158,7 @@ _LATE_STRUCTURE_WARNINGS: list[tuple[str, str]] = [
     ("reals_normalized", "out-of-range real operand(s) clamped or normalized"),
     ("q_nesting_rebalanced", "q/Q graphics-state operator(s) rebalanced"),
     ("hex_odd_fixed", "odd-length hexadecimal string(s) fixed"),
+    ("hex_odd_obj_fixed", "odd-length hexadecimal string object(s) fixed"),
     ("hex_invalid_fixed", "invalid hexadecimal string(s) repaired"),
 ]
 
@@ -249,19 +261,18 @@ def generate_output_path(
 def _copy_input_to_output(input_path: Path, output_path: Path) -> None:
     """Copy the input file to the requested output location.
 
+    Overwrites an existing output file, matching the behavior of the
+    regular conversion path. Overwrite protection is enforced by the
+    callers (CLI and convert_files()).
+
     Args:
         input_path: Original file path.
         output_path: Destination file path.
-
-    Raises:
-        ConversionError: If a different output file already exists.
     """
     if input_path.resolve() == output_path.resolve():
         return
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.exists():
-        raise ConversionError(f"Output file already exists: {output_path}")
     shutil.copy2(str(input_path), str(output_path))
 
 
@@ -1087,6 +1098,15 @@ def convert_to_pdfa(
                 f"{', '.join(cs.value for cs in embedded_spaces)}"
             )
 
+        # embed_color_profiles() keeps at most a single PDF/A OutputIntent,
+        # so any PDF/X OutputIntent is gone. Remove a stale PDF/X claim from
+        # the XMP so the file does not assert PDF/X without its OutputIntent.
+        if remove_pdfx_identification(pdf):
+            warnings.append(
+                "PDF/X identification removed from XMP metadata "
+                "(PDF/X OutputIntent not preserved)"
+            )
+
         # Final pass for structural limits:
         # embed_color_profiles() may materialize or rewrite ColorSpace names.
         late_structure_result = sanitize_structure_limits(pdf)
@@ -1394,7 +1414,7 @@ def convert_directory(
     pdf_files = sorted(input_dir.glob(pattern))
 
     # When output goes to the same directory, exclude previous conversion outputs
-    if output_dir is None:
+    if output_dir is None or output_dir.resolve() == input_dir.resolve():
         pdf_files = [p for p in pdf_files if not p.stem.endswith("_pdfa")]
 
     if not pdf_files:
@@ -1439,7 +1459,10 @@ def convert_directory(
 
     def _on_progress(current_idx: int, total: int, filename: str) -> None:
         if progress_bar is not None:
-            progress_bar.update(1)
+            # The callback fires before each file, so current_idx equals the
+            # number of already completed files.
+            progress_bar.n = current_idx
+            progress_bar.refresh()
             progress_bar.set_postfix_str(filename)
 
     results = convert_files(
@@ -1460,6 +1483,8 @@ def convert_directory(
     )
 
     if progress_bar is not None:
+        progress_bar.n = len(results)
+        progress_bar.refresh()
         progress_bar.close()
 
     # Log summary

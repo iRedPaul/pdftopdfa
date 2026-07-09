@@ -31,7 +31,6 @@ from .exceptions import (
     FontEmbeddingError,
     OCRError,
     UnsupportedPDFError,
-    ValidationError,
     VeraPDFError,
 )
 from .utils import setup_logging
@@ -40,7 +39,7 @@ from .verapdf import VeraPDFResult, validate_with_verapdf
 if TYPE_CHECKING:
     from .ocr import OcrQuality
 
-# Exit codes as per CLAUDE.md
+# Exit codes
 EXIT_SUCCESS = 0
 EXIT_GENERAL_ERROR = 1
 EXIT_FILE_NOT_FOUND = 2
@@ -159,7 +158,7 @@ def _print_validation_result(
     "--validate",
     "do_validate",
     is_flag=True,
-    help="Validate after conversion",
+    help="Validate after conversion (note: -v is not verbose; use --verbose)",
 )
 @click.option(
     "-r",
@@ -389,9 +388,6 @@ def main(
     ) as e:
         print_error(str(e))
         exit_code = EXIT_CONVERSION_FAILED
-    except ValidationError as e:
-        print_error(str(e))
-        exit_code = EXIT_VALIDATION_FAILED
     except Exception as e:
         logger.exception("Unexpected error")
         print_error(f"Unexpected error: {e}")
@@ -480,8 +476,8 @@ def _convert_single_file(
 
     _print_result(result, quiet)
 
-    if not result.success:
-        return EXIT_CONVERSION_FAILED
+    # Note: convert_to_pdfa() raises on failure instead of returning
+    # success=False, so no failure branch is needed here.
     if result.skipped:
         return EXIT_SUCCESS
 

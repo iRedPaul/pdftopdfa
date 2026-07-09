@@ -581,6 +581,10 @@ def is_ocr_available() -> bool:
 def needs_ocr(pdf: "pikepdf.Pdf", *, threshold: float = 0.5) -> bool:
     """Analyzes whether a PDF needs OCR.
 
+    Public library helper; not called by the conversion pipeline itself
+    (OCR is opt-in via ``ocr_languages``/``--ocr``). Use it to decide
+    programmatically whether to enable OCR for a document.
+
     Checks each page for the presence of images without recognizable text.
     A page is considered to need OCR if it contains images but has no
     text operators (Tj/TJ) in the content stream.

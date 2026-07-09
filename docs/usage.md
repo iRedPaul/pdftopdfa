@@ -72,7 +72,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | Option | Description |
 |---|---|
 | `-l, --level [2b\|2u\|3b\|3u]` | Target PDF/A level (default: `3b`) |
-| `-v, --validate` | Validate output with veraPDF |
+| `-v, --validate` | Validate output with veraPDF. Note: unlike the common CLI convention, `-v` does **not** mean verbose — use `--verbose` for detailed logs |
 | `-r, --recursive` | Process directories recursively |
 | `-f, --force` | Overwrite existing output files |
 | `-q, --quiet` | Show only errors |
@@ -225,6 +225,31 @@ def convert_files(
     allow_signature_invalidation: bool = False,
 ) -> list[ConversionResult]
 ```
+
+### `needs_ocr()`
+
+Library helper to analyze whether a PDF would benefit from OCR. It is not
+called by the conversion pipeline itself (OCR is opt-in via `ocr_languages`
+or `--ocr`); use it to decide programmatically whether to enable OCR.
+
+```python
+import pikepdf
+from pdftopdfa.ocr import needs_ocr
+
+with pikepdf.open("scan.pdf") as pdf:
+    if needs_ocr(pdf, threshold=0.5):
+        ...  # convert with ocr_languages=["eng"]
+```
+
+Signature:
+
+```python
+def needs_ocr(pdf: pikepdf.Pdf, *, threshold: float = 0.5) -> bool
+```
+
+A page counts as needing OCR when it contains images but no text operators.
+`needs_ocr()` returns `True` when at least `threshold` (0.0-1.0) of the pages
+need OCR.
 
 ### `ConversionResult`
 

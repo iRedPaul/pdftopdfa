@@ -229,6 +229,7 @@ def sanitize_for_pdfa(
         "structure_reals_normalized": 0,
         "structure_q_nesting_rebalanced": 0,
         "structure_hex_odd_fixed": 0,
+        "structure_hex_odd_obj_fixed": 0,
         "structure_hex_invalid_fixed": 0,
         "catalog_version_removed": False,
         "oc_ocg_names_added": 0,
@@ -420,6 +421,7 @@ def sanitize_for_pdfa(
         "q_nesting_rebalanced", 0
     )
     result["structure_hex_odd_fixed"] = structure_result.get("hex_odd_fixed", 0)
+    result["structure_hex_odd_obj_fixed"] = structure_result.get("hex_odd_obj_fixed", 0)
     result["structure_hex_invalid_fixed"] = structure_result.get("hex_invalid_fixed", 0)
 
     # Sanitize CIDFont structures for PDF/A-2 compliance (all levels)

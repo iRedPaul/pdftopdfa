@@ -61,7 +61,7 @@ pdftopdfa document.pdf
 # Specific PDF/A level
 pdftopdfa -l 2b document.pdf
 
-# With validation
+# With validation (note: -v = --validate, not verbose; use --verbose for logs)
 pdftopdfa -v document.pdf
 
 # Skip any existing veraPDF-compliant PDF/A
@@ -156,7 +156,7 @@ Contributions are welcome! Please open an [issue](https://github.com/iredpaul/pd
 **Optional:**
 
 - [ocrmypdf](https://ocrmypdf.readthedocs.io/) -- OCR support (requires [Tesseract](https://github.com/tesseract-ocr/tesseract))
-- [pypdfium2](https://github.com/nicfit/pypdfium2) -- PDF page rasterizer for OCR
+- [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) -- PDF page rasterizer for OCR
 - [veraPDF](https://verapdf.org/) -- ISO-compliant PDF/A validation
 
 ## Acknowledgments
