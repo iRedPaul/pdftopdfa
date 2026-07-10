@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 
 # Local
 from .exceptions import OCRError
+from .utils import log_suppressed_error
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +236,9 @@ def _count_pdf_pages(pdf_path: Path) -> int:
         with pikepdf.open(pdf_path) as pdf:
             return len(pdf.pages)
     except Exception as exc:
-        logger.debug("Could not count pages of %s: %s", pdf_path, exc)
+        log_suppressed_error(
+            logger, exc, "Could not count pages of %s: %s", pdf_path, exc
+        )
         return 1
 
 
@@ -280,7 +283,9 @@ def _run_tesseract_orientation(image_path: Path) -> _OrientationResult | None:
         logger.debug("Tesseract not available for OCR rotation normalization")
         return None
     except Exception as exc:
-        logger.debug("Tesseract OSD failed for %s: %s", image_path, exc)
+        log_suppressed_error(
+            logger, exc, "Tesseract OSD failed for %s: %s", image_path, exc
+        )
         return None
 
     if completed.returncode != 0:
@@ -369,7 +374,7 @@ def _extract_text_matrix_angles(page) -> list[float]:
                 continue
             angles.append(angle)
     except Exception as exc:
-        logger.debug("Failed to inspect text matrix skew: %s", exc)
+        log_suppressed_error(logger, exc, "Failed to inspect text matrix skew: %s", exc)
 
     return angles
 
@@ -541,7 +546,9 @@ def _normalize_best_quality_text_page_rotations(pdf_path: Path) -> list[int]:
         logger.debug("pypdfium2 not available for OCR rotation normalization")
         return []
     except Exception as exc:
-        logger.debug("OCR rotation normalization skipped for %s: %s", pdf_path, exc)
+        log_suppressed_error(
+            logger, exc, "OCR rotation normalization skipped for %s: %s", pdf_path, exc
+        )
         return []
 
     if not changed_pages:
@@ -651,7 +658,7 @@ def _page_has_images(page: "pikepdf.Page") -> bool:
             except Exception:
                 continue
     except Exception as e:
-        logger.debug("Error during image analysis: %s", e)
+        log_suppressed_error(logger, e, "Error during image analysis: %s", e)
 
     return False
 
@@ -680,7 +687,7 @@ def _page_has_text(page: "pikepdf.Page") -> bool:
             if str(operator) in text_operators:
                 return True
     except Exception as e:
-        logger.debug("Error during text analysis: %s", e)
+        log_suppressed_error(logger, e, "Error during text analysis: %s", e)
 
     # Check Form XObjects for text operators
     try:
@@ -700,7 +707,7 @@ def _page_has_text(page: "pikepdf.Page") -> bool:
             if _form_xobject_has_text(xobj, text_operators, visited):
                 return True
     except Exception as e:
-        logger.debug("Error checking XObjects for text: %s", e)
+        log_suppressed_error(logger, e, "Error checking XObjects for text: %s", e)
 
     return False
 
@@ -743,7 +750,9 @@ def _form_xobject_has_text(
             if str(operator) in text_operators:
                 return True
     except Exception as e:
-        logger.debug("Error parsing Form XObject content stream: %s", e)
+        log_suppressed_error(
+            logger, e, "Error parsing Form XObject content stream: %s", e
+        )
         return False
 
     # Check nested Form XObjects
@@ -763,7 +772,7 @@ def _form_xobject_has_text(
             if _form_xobject_has_text(nested, text_operators, visited):
                 return True
     except Exception as e:
-        logger.debug("Error checking nested XObjects: %s", e)
+        log_suppressed_error(logger, e, "Error checking nested XObjects: %s", e)
 
     return False
 

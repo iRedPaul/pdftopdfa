@@ -45,6 +45,7 @@ from pdftopdfa.utils import (
     get_pdf_version,
     get_required_pdf_version,
     is_pdf_encrypted,
+    log_suppressed_error,
     setup_logging,
     validate_pdfa_level,
 )
@@ -92,6 +93,51 @@ class TestSetupLogging:
         handler = logger.handlers[0]
         assert handler.formatter is not None
         assert handler.formatter._fmt == LOG_FORMAT
+
+
+class TestLogSuppressedError:
+    """Tests for log_suppressed_error."""
+
+    def test_data_error_logged_at_debug(self, caplog) -> None:
+        """Ordinary data errors are logged at DEBUG by default."""
+        test_logger = logging.getLogger("test_log_suppressed_error")
+        with caplog.at_level(logging.DEBUG, logger=test_logger.name):
+            log_suppressed_error(
+                test_logger, ValueError("bad data"), "Error: %s", "bad data"
+            )
+        assert caplog.records[-1].levelno == logging.DEBUG
+        assert "Error: bad data" in caplog.records[-1].getMessage()
+
+    def test_custom_level_for_data_errors(self, caplog) -> None:
+        """The fallback level for data errors is configurable."""
+        test_logger = logging.getLogger("test_log_suppressed_error")
+        with caplog.at_level(logging.DEBUG, logger=test_logger.name):
+            log_suppressed_error(
+                test_logger,
+                ValueError("bad data"),
+                "Error: %s",
+                "bad data",
+                level=logging.INFO,
+            )
+        assert caplog.records[-1].levelno == logging.INFO
+
+    def test_attribute_error_logged_at_warning(self, caplog) -> None:
+        """AttributeError is escalated to WARNING as a possible bug."""
+        test_logger = logging.getLogger("test_log_suppressed_error")
+        with caplog.at_level(logging.DEBUG, logger=test_logger.name):
+            log_suppressed_error(
+                test_logger, AttributeError("oops"), "Error: %s", "oops"
+            )
+        assert caplog.records[-1].levelno == logging.WARNING
+        assert "programming error" in caplog.records[-1].getMessage()
+        assert "AttributeError" in caplog.records[-1].getMessage()
+
+    def test_name_error_logged_at_warning(self, caplog) -> None:
+        """NameError is escalated to WARNING as a possible bug."""
+        test_logger = logging.getLogger("test_log_suppressed_error")
+        with caplog.at_level(logging.DEBUG, logger=test_logger.name):
+            log_suppressed_error(test_logger, NameError("oops"), "Error: %s", "oops")
+        assert caplog.records[-1].levelno == logging.WARNING
 
 
 class TestIsPdfEncrypted:

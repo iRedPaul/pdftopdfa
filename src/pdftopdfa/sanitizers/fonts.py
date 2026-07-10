@@ -23,6 +23,7 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..fonts.traversal import iter_all_page_fonts
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
 logger = logging.getLogger(__name__)
@@ -491,7 +492,9 @@ def sanitize_fontname_consistency(pdf: Pdf) -> dict[str, int]:
                         )
 
             except Exception as e:
-                logger.debug(
+                log_suppressed_error(
+                    logger,
+                    e,
                     "Error checking FontName for font %s: %s",
                     font_key,
                     e,

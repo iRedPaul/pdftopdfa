@@ -10,6 +10,7 @@ from collections.abc import Iterator
 
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 from .base import (
     ANNOT_FLAG_HIDDEN,
@@ -328,7 +329,9 @@ def flatten_non_compliant_annotations(pdf: Pdf, level: str = "3b") -> int:
                     subtype_str,
                 )
             except Exception as e:
-                logger.debug("Error flattening non-compliant annotation: %s", e)
+                log_suppressed_error(
+                    logger, e, "Error flattening non-compliant annotation: %s", e
+                )
 
         for index in reversed(indices_to_remove):
             del annots[index]
@@ -393,7 +396,9 @@ def normalize_proprietary_stamp_annotations(pdf: Pdf, level: str = "3b") -> int:
                     subtype_str,
                 )
             except Exception as e:
-                logger.debug("Error normalizing proprietary stamp annotation: %s", e)
+                log_suppressed_error(
+                    logger, e, "Error normalizing proprietary stamp annotation: %s", e
+                )
 
     if normalized_count > 0:
         logger.info(
@@ -449,7 +454,7 @@ def remove_forbidden_annotations(pdf: Pdf, level: str = "3b") -> int:
                 del owner["/Annots"]
 
         except Exception as e:
-            logger.debug("Error processing annotation array: %s", e)
+            log_suppressed_error(logger, e, "Error processing annotation array: %s", e)
 
     if removed_count > 0:
         _invalidate_annotation_arrays_cache(pdf)
@@ -535,10 +540,12 @@ def fix_annotation_flags(pdf: Pdf, level: str = "3b") -> int:
                         )
 
                 except Exception as e:
-                    logger.debug("Error processing annotation flags: %s", e)
+                    log_suppressed_error(
+                        logger, e, "Error processing annotation flags: %s", e
+                    )
 
         except Exception as e:
-            logger.debug("Error processing annotation array: %s", e)
+            log_suppressed_error(logger, e, "Error processing annotation array: %s", e)
 
     if fixed_count > 0:
         logger.info("%d annotation flag(s) fixed", fixed_count)
@@ -615,7 +622,7 @@ def remove_needs_appearances(pdf: Pdf) -> bool:
         logger.debug("Removed /NeedAppearances from /AcroForm")
         return True
     except Exception as e:
-        logger.debug("Error removing /NeedAppearances: %s", e)
+        log_suppressed_error(logger, e, "Error removing /NeedAppearances: %s", e)
         return False
 
 
@@ -797,7 +804,9 @@ def ensure_appearance_streams(pdf: Pdf, level: str = "3b") -> int:
                         )
 
             except Exception as e:
-                logger.debug(
+                log_suppressed_error(
+                    logger,
+                    e,
                     "Error processing annotation: %s",
                     e,
                 )
@@ -842,9 +851,13 @@ def remove_non_normal_appearance_keys(pdf: Pdf) -> int:
                             del ap[key]
                             removed_count += 1
                 except Exception as e:
-                    logger.debug("Error processing annotation /AP keys: %s", e)
+                    log_suppressed_error(
+                        logger, e, "Error processing annotation /AP keys: %s", e
+                    )
         except Exception as e:
-            logger.debug("Error processing annotation array for /AP keys: %s", e)
+            log_suppressed_error(
+                logger, e, "Error processing annotation array for /AP keys: %s", e
+            )
 
     if removed_count > 0:
         logger.info("%d annotation /AP key(s) removed (/R,/D)", removed_count)
@@ -881,7 +894,9 @@ def remove_annotation_colors(pdf: Pdf, level: str = "3b") -> int:
                         logger.debug("Removed %s from annotation", key)
 
             except Exception as e:
-                logger.debug(
+                log_suppressed_error(
+                    logger,
+                    e,
                     "Error processing annotation colors: %s",
                     e,
                 )
@@ -994,7 +1009,7 @@ def fix_button_appearance_subdicts(pdf: Pdf) -> int:
                     state_key,
                 )
             except Exception as e:
-                logger.debug("Error fixing Btn AP subdict: %s", e)
+                log_suppressed_error(logger, e, "Error fixing Btn AP subdict: %s", e)
 
     if fixed_count > 0:
         logger.info(
@@ -1048,7 +1063,9 @@ def fix_annotation_opacity(pdf: Pdf, level: str = "3b") -> int:
                     )
 
             except Exception as e:
-                logger.debug(
+                log_suppressed_error(
+                    logger,
+                    e,
                     "Error processing annotation /CA: %s",
                     e,
                 )

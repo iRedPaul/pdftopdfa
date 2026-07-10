@@ -29,8 +29,9 @@ from fontTools.ttLib.tables._c_m_a_p import cmap_format_4
 from pikepdf import Dictionary, Name, Pdf, Stream
 
 from ..fonts.analysis import is_symbolic_font
-from ..fonts.traversal import iter_all_page_fonts
+from ..fonts.traversal import iter_acroform_dr_fonts, iter_all_page_fonts
 from ..fonts.utils import safe_str as _safe_str
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
 logger = logging.getLogger(__name__)
@@ -81,7 +82,7 @@ def sanitize_truetype_encoding(pdf: Pdf) -> dict[str, int]:
                 _fix_nonsymbolic_truetype(pdf, font, fd, result)
         except Exception as e:
             name = _safe_str(font.get("/BaseFont") or b"")
-            logger.debug("Error processing font %s: %s", name, e)
+            log_suppressed_error(logger, e, "Error processing font %s: %s", name, e)
             continue
 
     total = sum(result.values())
@@ -145,7 +146,8 @@ def _iter_embedded_simple_fonts(pdf: Pdf):
     """Yields (font, fd, subtype) tuples for embedded simple fonts.
 
     Covers TrueType fonts with /FontFile2 or /FontFile3 /OpenType and
-    Type1/MMType1 fonts with any embedded font program.
+    Type1/MMType1 fonts with any embedded font program.  Scans page
+    resources (recursively) and AcroForm /DR Default Resources.
 
     Args:
         pdf: Opened pikepdf PDF object.
@@ -156,52 +158,68 @@ def _iter_embedded_simple_fonts(pdf: Pdf):
     """
     seen_objgens: set[tuple[int, int]] = set()
 
-    for page in pdf.pages:
-        for _font_key, font_obj in iter_all_page_fonts(pikepdf.Page(page)):
-            try:
-                font = _resolve(font_obj)
-                if not isinstance(font, Dictionary):
-                    continue
+    def _all_fonts():
+        for page in pdf.pages:
+            yield from iter_all_page_fonts(pikepdf.Page(page))
+        # AcroForm /DR fonts render widget field appearances and must
+        # satisfy the same encoding rules as page fonts.
+        yield from iter_acroform_dr_fonts(pdf)
 
-                # Deduplicate by objgen
-                objgen = font.objgen
-                if objgen != (0, 0):
-                    if objgen in seen_objgens:
-                        continue
-                    seen_objgens.add(objgen)
+    for _font_key, font_obj in _all_fonts():
+        try:
+            entry = _as_embedded_simple_font(font_obj, seen_objgens)
+            if entry is not None:
+                yield entry
+        except Exception as e:
+            log_suppressed_error(logger, e, "Error iterating font: %s", e)
+            continue
 
-                subtype = font.get("/Subtype")
-                if subtype is None:
-                    continue
-                subtype_str = _safe_str(subtype)
-                if subtype_str not in ("/TrueType", "/Type1", "/MMType1"):
-                    continue
 
-                # Must have a FontDescriptor
-                fd_obj = font.get("/FontDescriptor")
-                if fd_obj is None:
-                    continue
-                fd = _resolve(fd_obj)
-                if not isinstance(fd, Dictionary):
-                    continue
+def _as_embedded_simple_font(
+    font_obj: pikepdf.Object,
+    seen_objgens: set[tuple[int, int]],
+) -> tuple[pikepdf.Object, pikepdf.Object, str] | None:
+    """Returns (font, fd, subtype) for an embedded simple font, or None.
 
-                # Must be embedded: TrueType handling supports /FontFile2 and
-                # /FontFile3 /OpenType; Type1/MMType1 accepts any embedded
-                # font program.
-                if subtype_str == "/TrueType":
-                    if _get_truetype_font_stream(fd) is None:
-                        continue
-                elif all(
-                    fd.get(key) is None
-                    for key in ("/FontFile", "/FontFile2", "/FontFile3")
-                ):
-                    continue
+    Deduplicates indirect fonts via ``seen_objgens`` and filters out
+    unsupported subtypes and non-embedded fonts.
+    """
+    font = _resolve(font_obj)
+    if not isinstance(font, Dictionary):
+        return None
 
-                yield font, fd, subtype_str
+    # Deduplicate by objgen
+    objgen = font.objgen
+    if objgen != (0, 0):
+        if objgen in seen_objgens:
+            return None
+        seen_objgens.add(objgen)
 
-            except Exception as e:
-                logger.debug("Error iterating font: %s", e)
-                continue
+    subtype = font.get("/Subtype")
+    if subtype is None:
+        return None
+    subtype_str = _safe_str(subtype)
+    if subtype_str not in ("/TrueType", "/Type1", "/MMType1"):
+        return None
+
+    # Must have a FontDescriptor
+    fd_obj = font.get("/FontDescriptor")
+    if fd_obj is None:
+        return None
+    fd = _resolve(fd_obj)
+    if not isinstance(fd, Dictionary):
+        return None
+
+    # Must be embedded: TrueType handling supports /FontFile2 and
+    # /FontFile3 /OpenType; Type1/MMType1 accepts any embedded
+    # font program.
+    if subtype_str == "/TrueType":
+        if _get_truetype_font_stream(fd) is None:
+            return None
+    elif all(fd.get(key) is None for key in ("/FontFile", "/FontFile2", "/FontFile3")):
+        return None
+
+    return font, fd, subtype_str
 
 
 def _load_tt_font(fd: pikepdf.Object) -> TTFont | None:
@@ -221,7 +239,9 @@ def _load_tt_font(fd: pikepdf.Object) -> TTFont | None:
         data = bytes(font_file.read_bytes())
         return TTFont(BytesIO(data))
     except Exception as e:
-        logger.debug("Could not load embedded TrueType/OpenType font: %s", e)
+        log_suppressed_error(
+            logger, e, "Could not load embedded TrueType/OpenType font: %s", e
+        )
         return None
 
 
@@ -515,7 +535,7 @@ def _ensure_ms_unicode_cmap(pdf: Pdf, fd: pikepdf.Object) -> bool:
         return True
 
     except Exception as e:
-        logger.debug("Error ensuring MS Unicode (3,1) cmap: %s", e)
+        log_suppressed_error(logger, e, "Error ensuring MS Unicode (3,1) cmap: %s", e)
         return False
 
     finally:

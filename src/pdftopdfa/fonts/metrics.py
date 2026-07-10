@@ -7,6 +7,7 @@
 from typing import TYPE_CHECKING
 
 from .glyph_mapping import resolve_glyph_name
+from .utils import get_any_cmap
 
 if TYPE_CHECKING:
     from fontTools.ttLib import TTFont
@@ -141,16 +142,11 @@ class FontMetricsExtractor:
         """
         head = tt_font["head"]
         hmtx = tt_font["hmtx"]
-        try:
-            cmap = tt_font.getBestCmap()
-        except KeyError:
-            cmap = None
-        if cmap is None:
-            cmap = self._get_any_cmap(tt_font)
+        cmap = get_any_cmap(tt_font)
         units_per_em = head.unitsPerEm
         scale = 1000.0 / units_per_em
 
-        if cmap is None:
+        if not cmap:
             notdef_width = hmtx.metrics.get(".notdef", (500, 0))[0]
             return [round(notdef_width * scale)] * 256
 
@@ -188,12 +184,7 @@ class FontMetricsExtractor:
         """
         head = tt_font["head"]
         hmtx = tt_font["hmtx"]
-        try:
-            cmap = tt_font.getBestCmap()
-        except KeyError:
-            cmap = None
-        if cmap is None:
-            cmap = self._get_any_cmap(tt_font)
+        cmap = get_any_cmap(tt_font)
         units_per_em = head.unitsPerEm
         scale = 1000.0 / units_per_em
         notdef_width = hmtx.metrics.get(".notdef", (500, 0))[0]
@@ -239,18 +230,13 @@ class FontMetricsExtractor:
         """
         head = tt_font["head"]
         hmtx = tt_font["hmtx"]
-        try:
-            cmap = tt_font.getBestCmap()
-        except KeyError:
-            cmap = None
         units_per_em = head.unitsPerEm
         scale = 1000.0 / units_per_em
 
-        # If getBestCmap() returns None (e.g. symbol fonts like Wingdings),
-        # try to get a cmap dict from any available subtable.
-        if cmap is None:
-            cmap = self._get_any_cmap(tt_font)
-        if cmap is None:
+        # Symbol fonts like Wingdings have no "best" cmap; get_any_cmap()
+        # falls back to any available subtable.
+        cmap = get_any_cmap(tt_font)
+        if not cmap:
             return {}
 
         result: dict[int, int] = {}
@@ -277,29 +263,6 @@ class FontMetricsExtractor:
                         result[code] = round(hmtx.metrics[glyph_name][0] * scale)
 
         return result
-
-    @staticmethod
-    def _get_any_cmap(tt_font: "TTFont") -> dict[int, str] | None:
-        """Gets a cmap dict from any available subtable.
-
-        Used as fallback when getBestCmap() returns None, which happens
-        for symbol fonts (platform 3, encoding 0) and Mac-only fonts.
-        """
-        if "cmap" not in tt_font:
-            return None
-        cmap_table = tt_font["cmap"]
-        # Prefer Windows Symbol (3,0), then Mac Roman (1,0)
-        for subtable in cmap_table.tables:
-            if subtable.platformID == 3 and subtable.platEncID == 0:
-                return subtable.cmap
-        for subtable in cmap_table.tables:
-            if subtable.platformID == 1 and subtable.platEncID == 0:
-                return subtable.cmap
-        # Return any available subtable
-        for subtable in cmap_table.tables:
-            if subtable.cmap:
-                return subtable.cmap
-        return None
 
     def compute_widths_for_gids(
         self,

@@ -8,6 +8,7 @@ import logging
 
 from pikepdf import Array, Dictionary, Name, Pdf
 
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 
 logger = logging.getLogger(__name__)
@@ -181,7 +182,7 @@ def sanitize_optional_content(pdf: Pdf) -> dict:
                         )
 
     except Exception as e:
-        logger.debug("Error sanitizing optional content: %s", e)
+        log_suppressed_error(logger, e, "Error sanitizing optional content: %s", e)
 
     changes = (
         result["as_entries_removed"]

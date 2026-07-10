@@ -10,7 +10,7 @@ from conftest import new_pdf
 from font_helpers import _liberation_fonts_available
 from pikepdf import Array, Dictionary, Name
 
-from pdftopdfa.fonts.traversal import iter_all_page_fonts
+from pdftopdfa.fonts.traversal import iter_acroform_dr_fonts, iter_all_page_fonts
 
 
 class TestIterAllPageFonts:
@@ -549,6 +549,20 @@ class TestIterAllPageFonts:
 
         fonts = list(iter_all_page_fonts(pdf.pages[0]))
         assert len(fonts) == 1
+
+
+class TestIterAcroformDrFonts:
+    """Tests for the iter_acroform_dr_fonts generator."""
+
+    def test_malformed_font_entry_is_ignored(self):
+        """A non-dictionary AcroForm /DR/Font entry does not abort traversal."""
+        pdf = new_pdf()
+        pdf.Root[Name.AcroForm] = Dictionary(
+            DR=Dictionary(Font=Array([])),
+            Fields=Array([]),
+        )
+
+        assert list(iter_acroform_dr_fonts(pdf)) == []
 
 
 class TestNestedFontEmbedding:

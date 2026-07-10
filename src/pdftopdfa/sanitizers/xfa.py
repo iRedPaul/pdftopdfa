@@ -8,6 +8,7 @@ import logging
 
 from pikepdf import Pdf
 
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,7 @@ def remove_xfa_forms(pdf: Pdf) -> int:
             logger.debug("NeedsRendering flag removed from AcroForm")
 
     except Exception as e:
-        logger.debug("Error removing XFA forms: %s", e)
+        log_suppressed_error(logger, e, "Error removing XFA forms: %s", e)
 
     if removed_count > 0:
         logger.info("%d XFA element(s) removed", removed_count)

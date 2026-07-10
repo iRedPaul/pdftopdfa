@@ -9,6 +9,7 @@ import logging
 import pikepdf
 from pikepdf import Array, Name, Pdf, String
 
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 from .base import _is_non_compliant_action, _sanitize_next_chain
 
@@ -41,7 +42,7 @@ def remove_actions(pdf: Pdf) -> int:
             else:
                 removed_count += _sanitize_next_chain(open_action)
     except Exception as e:
-        logger.debug("Error checking OpenAction: %s", e)
+        log_suppressed_error(logger, e, "Error checking OpenAction: %s", e)
 
     # Check Document AA — forbidden entirely (ISO 19005-2 Section 6.6.1)
     try:
@@ -50,7 +51,7 @@ def remove_actions(pdf: Pdf) -> int:
             removed_count += 1
             logger.debug("Catalog /AA removed (ISO 19005-2 Section 6.6.1)")
     except Exception as e:
-        logger.debug("Error processing Document AA: %s", e)
+        log_suppressed_error(logger, e, "Error processing Document AA: %s", e)
 
     # Process pages and annotations
     for page_num, page in enumerate(pdf.pages, start=1):
@@ -64,7 +65,9 @@ def remove_actions(pdf: Pdf) -> int:
                     page_num,
                 )
         except Exception as e:
-            logger.debug("Error with Page AA on page %d: %s", page_num, e)
+            log_suppressed_error(
+                logger, e, "Error with Page AA on page %d: %s", page_num, e
+            )
 
         # Annotations
         try:
@@ -111,7 +114,9 @@ def remove_actions(pdf: Pdf) -> int:
                             if len(aa) == 0:
                                 del annot["/AA"]
         except Exception as e:
-            logger.debug("Error with Annotations on page %d: %s", page_num, e)
+            log_suppressed_error(
+                logger, e, "Error with Annotations on page %d: %s", page_num, e
+            )
 
     # Check Outline (bookmark) actions
     try:
@@ -119,7 +124,7 @@ def remove_actions(pdf: Pdf) -> int:
             outlines = _resolve_indirect(pdf.Root.Outlines)
             removed_count += _remove_actions_from_outlines(outlines)
     except Exception as e:
-        logger.debug("Error processing Outline actions: %s", e)
+        log_suppressed_error(logger, e, "Error processing Outline actions: %s", e)
 
     # Check AcroForm field actions
     try:
@@ -129,7 +134,7 @@ def remove_actions(pdf: Pdf) -> int:
             if fields is not None:
                 removed_count += _remove_actions_from_fields(fields)
     except Exception as e:
-        logger.debug("Error processing AcroForm actions: %s", e)
+        log_suppressed_error(logger, e, "Error processing AcroForm actions: %s", e)
 
     if removed_count > 0:
         logger.info("%d non-compliant action(s) removed", removed_count)
@@ -184,7 +189,9 @@ def _remove_actions_from_outlines(
             if "/First" in item:
                 removed_count += _remove_actions_from_outlines(item, _visited)
         except Exception as e:
-            logger.debug("Error processing outline item action: %s", e)
+            log_suppressed_error(
+                logger, e, "Error processing outline item action: %s", e
+            )
 
         try:
             item = item.get("/Next")
@@ -239,7 +246,7 @@ def _remove_actions_from_fields(
             if kids is not None:
                 removed_count += _remove_actions_from_fields(kids, _visited)
         except Exception as e:
-            logger.debug("Error processing form field action: %s", e)
+            log_suppressed_error(logger, e, "Error processing form field action: %s", e)
 
     return removed_count
 
@@ -276,7 +283,9 @@ def _collect_named_destinations(pdf: Pdf) -> set[str]:
                 dests_tree = _resolve_indirect(names_dict.Dests)
                 _collect_from_name_tree(dests_tree, names)
     except Exception as e:
-        logger.debug("Error collecting named destinations from name tree: %s", e)
+        log_suppressed_error(
+            logger, e, "Error collecting named destinations from name tree: %s", e
+        )
 
     # Legacy format: /Root/Dests (plain dictionary)
     try:
@@ -285,7 +294,9 @@ def _collect_named_destinations(pdf: Pdf) -> set[str]:
             for key in dests.keys():
                 names.add(str(key))
     except Exception as e:
-        logger.debug("Error collecting named destinations from /Root/Dests: %s", e)
+        log_suppressed_error(
+            logger, e, "Error collecting named destinations from /Root/Dests: %s", e
+        )
 
     return names
 
@@ -384,7 +395,9 @@ def validate_destinations(pdf: Pdf) -> int:
                     removed += 1
                     logger.debug("Invalid OpenAction destination removed")
     except Exception as e:
-        logger.debug("Error validating OpenAction destination: %s", e)
+        log_suppressed_error(
+            logger, e, "Error validating OpenAction destination: %s", e
+        )
 
     # 2. GoTo actions and /Dest entries on annotations
     for page in pdf.pages:
@@ -414,7 +427,9 @@ def validate_destinations(pdf: Pdf) -> int:
                                 del annot["/A"]
                                 removed += 1
                 except Exception as e:
-                    logger.debug("Error validating annotation action: %s", e)
+                    log_suppressed_error(
+                        logger, e, "Error validating annotation action: %s", e
+                    )
 
                 # Direct /Dest on annotation
                 try:
@@ -424,9 +439,13 @@ def validate_destinations(pdf: Pdf) -> int:
                             del annot["/Dest"]
                             removed += 1
                 except Exception as e:
-                    logger.debug("Error validating annotation /Dest: %s", e)
+                    log_suppressed_error(
+                        logger, e, "Error validating annotation /Dest: %s", e
+                    )
         except Exception as e:
-            logger.debug("Error validating annotations on page: %s", e)
+            log_suppressed_error(
+                logger, e, "Error validating annotations on page: %s", e
+            )
 
     # 3. Outline items
     try:
@@ -436,7 +455,7 @@ def validate_destinations(pdf: Pdf) -> int:
                 outlines, valid_objgens, named_dests
             )
     except Exception as e:
-        logger.debug("Error validating outline destinations: %s", e)
+        log_suppressed_error(logger, e, "Error validating outline destinations: %s", e)
 
     # 4. Named destinations tree — remove entries with invalid page refs
     removed += _validate_named_dest_tree(pdf, valid_objgens)
@@ -494,7 +513,9 @@ def _validate_outline_destinations(
                         del item["/A"]
                         removed += 1
         except Exception as e:
-            logger.debug("Error validating outline action dest: %s", e)
+            log_suppressed_error(
+                logger, e, "Error validating outline action dest: %s", e
+            )
 
         # Direct /Dest on outline item
         try:
@@ -504,7 +525,7 @@ def _validate_outline_destinations(
                     del item["/Dest"]
                     removed += 1
         except Exception as e:
-            logger.debug("Error validating outline /Dest: %s", e)
+            log_suppressed_error(logger, e, "Error validating outline /Dest: %s", e)
 
         # Recurse into children
         try:
@@ -535,7 +556,7 @@ def _validate_named_dest_tree(pdf: Pdf, valid_objgens: set[tuple[int, int]]) -> 
                 dests_tree = _resolve_indirect(names_dict.Dests)
                 removed += _prune_name_tree_node(dests_tree, valid_objgens)
     except Exception as e:
-        logger.debug("Error pruning name tree: %s", e)
+        log_suppressed_error(logger, e, "Error pruning name tree: %s", e)
 
     # Legacy dict: /Root/Dests
     try:
@@ -553,7 +574,7 @@ def _validate_named_dest_tree(pdf: Pdf, valid_objgens: set[tuple[int, int]]) -> 
                 del dests[key]
                 removed += 1
     except Exception as e:
-        logger.debug("Error pruning legacy /Dests dict: %s", e)
+        log_suppressed_error(logger, e, "Error pruning legacy /Dests dict: %s", e)
 
     return removed
 

@@ -14,6 +14,7 @@ from fontTools.agl import AGL2UV, UV2AGL
 from pikepdf import Array, Dictionary, Name, Stream
 
 from ..exceptions import FontEmbeddingError
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 from .analysis import (
     _is_subset_font,
@@ -48,7 +49,7 @@ from .tounicode import (
     parse_tounicode_cmap,
     resolve_symbol_glyph_to_unicode,
 )
-from .traversal import iter_all_page_fonts
+from .traversal import iter_acroform_dr_fonts, iter_all_page_fonts
 from .utils import get_encoding_name as _get_encoding_name
 from .utils import safe_str as _safe_str
 
@@ -188,8 +189,9 @@ class FontEmbedder:
     def embed_missing_fonts(self) -> EmbeddingResult:
         """Embeds all missing fonts.
 
-        Scans page-level Resources, Form XObjects, Tiling Patterns, and
-        Annotation Appearance Streams recursively.
+        Scans page-level Resources, Form XObjects, Tiling Patterns,
+        Annotation Appearance Streams (recursively), and AcroForm /DR
+        Default Resources.
 
         Returns:
             EmbeddingResult with embedding status.
@@ -199,170 +201,82 @@ class FontEmbedder:
         preserved_fonts: set[str] = set()
         processed_font_ids: set[tuple[int, int]] = set()
 
-        for page in self.pdf.pages:
-            for font_key, font_obj in iter_all_page_fonts(page):
-                try:
-                    # Skip same indirect object seen on another page
-                    obj_key = font_obj.objgen
-                    if obj_key != (0, 0):
-                        if obj_key in processed_font_ids:
-                            continue
-                        processed_font_ids.add(obj_key)
+        for font_key, font_obj in self._iter_unique_fonts(processed_font_ids):
+            try:
+                font_name = get_font_name(font_obj)
+                base_name = get_base_font_name(font_name)
 
-                    font_name = get_font_name(font_obj)
-                    base_name = get_base_font_name(font_name)
-
-                    # Check if already embedded
-                    if is_font_embedded(font_obj):
-                        # Track already embedded fonts (without duplicates)
-                        if (
-                            base_name not in preserved_fonts
-                            and base_name not in processed_fonts
-                        ):
-                            preserved_fonts.add(base_name)
-                            logger.debug(
-                                "Font already embedded, preserving: %s",
-                                base_name,
-                            )
-                        continue
-
-                    # Check for CIDFont/Type0 (CJK fonts)
-                    font_type = get_font_type(font_obj)
-                    if font_type == "CIDFont":
-                        # Extract encoding (Identity-H or Identity-V)
-                        encoding = self._get_cidfont_encoding(font_obj)
-                        success = self._embed_cidfont(
-                            page, font_key, font_obj, base_name, encoding=encoding
+                # Track already embedded fonts (without duplicates)
+                if is_font_embedded(font_obj):
+                    if (
+                        base_name not in preserved_fonts
+                        and base_name not in processed_fonts
+                    ):
+                        preserved_fonts.add(base_name)
+                        logger.debug(
+                            "Font already embedded, preserving: %s",
+                            base_name,
                         )
-                        if base_name not in processed_fonts:
-                            processed_fonts.add(base_name)
-                            if success:
-                                result.fonts_embedded.append(base_name)
-                                warning = _cidfont_replacement_warning(base_name)
-                                result.warnings.append(warning)
-                                logger.warning(warning)
-                            else:
-                                result.fonts_failed.append(base_name)
-                        continue
+                    continue
 
+                font_type = get_font_type(font_obj)
+                use_fallback = False
+                if font_type == "CIDFont":
+                    # Preserve encoding (Identity-H or Identity-V)
+                    encoding = self._get_cidfont_encoding(font_obj)
+                    success = self._embed_cidfont(
+                        font_obj, base_name, encoding=encoding
+                    )
+                else:
                     # Replace font (use fallback for unknown fonts)
                     use_fallback = (
                         resolve_standard14_alias(base_name) not in FONT_REPLACEMENTS
                     )
-                    success = self._replace_font_in_page(
-                        page,
-                        font_key,
+                    success = self._replace_simple_font(
                         font_obj,
                         base_name,
                         use_fallback=use_fallback,
                     )
-                    if base_name not in processed_fonts:
-                        processed_fonts.add(base_name)
-                        if success:
-                            result.fonts_embedded.append(base_name)
-                            if use_fallback:
-                                warning = (
-                                    f"No specific replacement for"
-                                    f" font '{base_name}',"
-                                    f" using LiberationSans as"
-                                    f" fallback"
-                                )
-                                result.warnings.append(warning)
-                                logger.warning(warning)
-                            else:
-                                logger.info("Font embedded: %s", base_name)
-                        else:
-                            result.fonts_failed.append(base_name)
 
-                except UnicodeDecodeError:
-                    logger.debug(
-                        "Skipping font %s: non-UTF-8 bytes in font data",
-                        font_key,
+                if base_name in processed_fonts:
+                    continue
+                processed_fonts.add(base_name)
+
+                if not success:
+                    result.fonts_failed.append(base_name)
+                    continue
+
+                result.fonts_embedded.append(base_name)
+                if font_type == "CIDFont":
+                    warning = _cidfont_replacement_warning(base_name)
+                    result.warnings.append(warning)
+                    logger.warning(warning)
+                elif use_fallback:
+                    warning = (
+                        f"No specific replacement for font '{base_name}',"
+                        f" using LiberationSans as fallback"
                     )
-                    continue
-                except Exception as e:
-                    logger.info("Error with font %s: %s", font_key, e)
-                    continue
+                    result.warnings.append(warning)
+                    logger.warning(warning)
+                else:
+                    logger.info("Font embedded: %s", base_name)
 
-        # Embed non-embedded fonts in AcroForm DR (Default Resources)
-        try:
-            root = self.pdf.Root
-            if root is not None and "/AcroForm" in root:
-                acroform = _resolve_indirect(root.AcroForm)
-                dr = acroform.get("/DR")
-                if dr is not None:
-                    dr = _resolve_indirect(dr)
-                    font_dict = dr.get("/Font")
-                    if font_dict is not None:
-                        font_dict = _resolve_indirect(font_dict)
-                        for font_key in list(font_dict.keys()):
-                            try:
-                                font_obj = _resolve_indirect(font_dict[font_key])
-                                obj_key = font_obj.objgen
-                                if obj_key != (0, 0):
-                                    if obj_key in processed_font_ids:
-                                        continue
-                                    processed_font_ids.add(obj_key)
-
-                                font_name = get_font_name(font_obj)
-                                base_name = get_base_font_name(font_name)
-
-                                if is_font_embedded(font_obj):
-                                    if (
-                                        base_name not in preserved_fonts
-                                        and base_name not in processed_fonts
-                                    ):
-                                        preserved_fonts.add(base_name)
-                                    continue
-
-                                font_type = get_font_type(font_obj)
-                                if font_type == "CIDFont":
-                                    encoding = self._get_cidfont_encoding(font_obj)
-                                    success = self._embed_cidfont(
-                                        self.pdf.pages[0],
-                                        str(font_key),
-                                        font_obj,
-                                        base_name,
-                                        encoding=encoding,
-                                    )
-                                else:
-                                    use_fallback = (
-                                        resolve_standard14_alias(base_name)
-                                        not in FONT_REPLACEMENTS
-                                    )
-                                    success = self._replace_font_in_page(
-                                        self.pdf.pages[0],
-                                        str(font_key),
-                                        font_obj,
-                                        base_name,
-                                        use_fallback=use_fallback,
-                                    )
-                                if base_name not in processed_fonts:
-                                    processed_fonts.add(base_name)
-                                    if success:
-                                        result.fonts_embedded.append(base_name)
-                                        if font_type == "CIDFont":
-                                            warning = _cidfont_replacement_warning(
-                                                base_name
-                                            )
-                                            result.warnings.append(warning)
-                                            logger.warning(warning)
-                                        else:
-                                            logger.info(
-                                                "AcroForm DR font embedded: %s",
-                                                base_name,
-                                            )
-                                    else:
-                                        result.fonts_failed.append(base_name)
-                            except Exception as e:
-                                logger.info(
-                                    "Error with AcroForm DR font %s: %s",
-                                    font_key,
-                                    e,
-                                )
-                                continue
-        except Exception:
-            pass
+            except UnicodeDecodeError:
+                logger.debug(
+                    "Skipping font %s: non-UTF-8 bytes in font data",
+                    font_key,
+                )
+                continue
+            except Exception as e:
+                log_suppressed_error(
+                    logger,
+                    e,
+                    "Error with font %s: %s",
+                    font_key,
+                    e,
+                    level=logging.INFO,
+                )
+                continue
 
         # Add preserved fonts to result
         result.fonts_preserved = sorted(preserved_fonts)
@@ -518,9 +432,7 @@ class FontEmbedder:
                     if font_type not in {"TrueType", "Type1", "MMType1"}:
                         continue
 
-                    success = self._replace_font_in_page(
-                        page,
-                        font_key,
+                    success = self._replace_simple_font(
                         font_obj,
                         base_name,
                         preserve_existing_encoding=True,
@@ -547,7 +459,9 @@ class FontEmbedder:
                     )
 
                 except Exception as e:
-                    logger.debug(
+                    log_suppressed_error(
+                        logger,
+                        e,
                         "Error refreshing subsetted Standard-14 font %s: %s",
                         font_key,
                         e,
@@ -556,41 +470,44 @@ class FontEmbedder:
 
         return result
 
+    def _iter_unique_fonts(
+        self,
+        processed_font_ids: set[tuple[int, int]],
+        *,
+        skip_direct: bool = False,
+    ):
+        """Yield unique (font_key, font_obj) pairs from pages and AcroForm /DR.
+
+        Indirect fonts are deduplicated via ``processed_font_ids``. Direct
+        (inline) font objects cannot be deduplicated; they are yielded
+        as-is unless ``skip_direct`` is True.
+        """
+
+        def _fonts():
+            for page in self.pdf.pages:
+                yield from iter_all_page_fonts(page)
+            yield from iter_acroform_dr_fonts(self.pdf)
+
+        for font_key, font_obj in _fonts():
+            obj_key = font_obj.objgen
+            if obj_key == (0, 0):
+                if skip_direct:
+                    continue
+            else:
+                if obj_key in processed_font_ids:
+                    continue
+                processed_font_ids.add(obj_key)
+            yield font_key, font_obj
+
     def _iter_unique_embedded_fonts(
         self,
         processed_font_ids: set[tuple[int, int]],
     ):
-        """Yield unique page and AcroForm fonts."""
-        for page in self.pdf.pages:
-            for _font_key, font_obj in iter_all_page_fonts(page):
-                obj_key = font_obj.objgen
-                if obj_key == (0, 0) or obj_key in processed_font_ids:
-                    continue
-                processed_font_ids.add(obj_key)
-                yield font_obj
-
-        try:
-            root = self.pdf.Root
-            if root is None or "/AcroForm" not in root:
-                return
-            acroform = _resolve_indirect(root.AcroForm)
-            dr = acroform.get("/DR")
-            if dr is None:
-                return
-            dr = _resolve_indirect(dr)
-            font_dict = dr.get("/Font")
-            if font_dict is None:
-                return
-            font_dict = _resolve_indirect(font_dict)
-            for font_key in list(font_dict.keys()):
-                font_obj = _resolve_indirect(font_dict[font_key])
-                obj_key = font_obj.objgen
-                if obj_key == (0, 0) or obj_key in processed_font_ids:
-                    continue
-                processed_font_ids.add(obj_key)
-                yield font_obj
-        except Exception:
-            return
+        """Yield unique indirect page and AcroForm fonts."""
+        for _font_key, font_obj in self._iter_unique_fonts(
+            processed_font_ids, skip_direct=True
+        ):
+            yield font_obj
 
     def _get_font_descriptor_for_font(
         self,
@@ -766,8 +683,6 @@ class FontEmbedder:
 
     def _embed_cidfont(
         self,
-        page: pikepdf.Page,
-        font_key: str,
         font_obj: pikepdf.Object,
         font_name: str,
         *,
@@ -775,9 +690,10 @@ class FontEmbedder:
     ) -> bool:
         """Embeds CIDFont with Noto Sans CJK.
 
+        The font object is rewritten in place, so all pages and resources
+        referencing it pick up the replacement.
+
         Args:
-            page: Page where the font is used.
-            font_key: Key of the font in the font dictionary.
             font_obj: The font object.
             font_name: Base name of the font (without subset prefix).
             encoding: CIDFont encoding ('Identity-H' or 'Identity-V').
@@ -891,25 +807,26 @@ class FontEmbedder:
         """
         return resolve_symbol_glyph_to_unicode(glyph_name)
 
-    def _replace_font_in_page(
+    def _replace_simple_font(
         self,
-        page: pikepdf.Page,
-        font_key: str,
         font_obj: pikepdf.Object,
         font_name: str,
         *,
         use_fallback: bool = False,
         preserve_existing_encoding: bool = False,
     ) -> bool:
-        """Replaces a non-embedded font with an embedded one.
+        """Replaces a non-embedded simple font with an embedded one.
+
+        The font object is rewritten in place, so all pages and resources
+        referencing it pick up the replacement.
 
         Args:
-            page: Page where the font is used.
-            font_key: Key of the font in the font dictionary.
             font_obj: The font object.
             font_name: Base name of the font (without subset prefix).
             use_fallback: If True, use the fallback font (LiberationSans)
                 instead of looking up font_name in FONT_REPLACEMENTS.
+            preserve_existing_encoding: If True, keep the font's current
+                code-to-Unicode mapping (used when refreshing subset fonts).
 
         Returns:
             True if successful, False on errors.
@@ -1157,7 +1074,14 @@ class FontEmbedder:
                     )
                     continue
                 except Exception as e:
-                    logger.info("Error processing font %s: %s", font_key, e)
+                    log_suppressed_error(
+                        logger,
+                        e,
+                        "Error processing font %s: %s",
+                        font_key,
+                        e,
+                        level=logging.INFO,
+                    )
                     continue
 
         return result
@@ -1190,7 +1114,14 @@ class FontEmbedder:
                 return self._add_tounicode_to_simple_font(font_obj, font_name)
 
         except Exception as e:
-            logger.info("Error adding ToUnicode to font '%s': %s", font_name, e)
+            log_suppressed_error(
+                logger,
+                e,
+                "Error adding ToUnicode to font '%s': %s",
+                font_name,
+                e,
+                level=logging.INFO,
+            )
             return False
 
     def _add_tounicode_to_simple_font(
@@ -1464,7 +1395,9 @@ class FontEmbedder:
                 tt_font.close()
 
         except Exception as e:
-            logger.debug("Error parsing embedded font %s: %s", font_name, e)
+            log_suppressed_error(
+                logger, e, "Error parsing embedded font %s: %s", font_name, e
+            )
             return False
 
     def _add_tounicode_from_cid_collection(

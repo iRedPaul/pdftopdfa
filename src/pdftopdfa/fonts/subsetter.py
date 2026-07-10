@@ -11,8 +11,8 @@ modification.
 """
 
 import functools
+import hashlib
 import logging
-import random
 import string
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -20,6 +20,7 @@ from io import BytesIO
 import pikepdf
 from pikepdf import Name, Stream
 
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 from .analysis import (
     _is_subset_font,
@@ -73,13 +74,21 @@ _WINANSI_GLYPH_NAME_OVERRIDES: dict[int, str] = {
 }
 
 
-def _generate_subset_prefix() -> str:
-    """Generates a random 6-letter uppercase subset prefix.
+def _generate_subset_prefix(font_data: bytes) -> str:
+    """Generates a 6-letter uppercase subset prefix from the font data.
+
+    The prefix is derived from a hash of the subsetted font program so
+    that repeated conversions of the same input produce byte-identical
+    output (reproducible builds with ``deterministic_id=True``).
+
+    Args:
+        font_data: The subsetted font program bytes.
 
     Returns:
         String like "ABCDEF+" for use as a font subset tag.
     """
-    letters = "".join(random.choices(string.ascii_uppercase, k=6))
+    digest = hashlib.sha256(font_data).digest()
+    letters = "".join(string.ascii_uppercase[b % 26] for b in digest[:6])
     return f"{letters}+"
 
 
@@ -127,7 +136,9 @@ def _resolve_cidfont_used_gids(
         cidtogidmap = _resolve_indirect(cidtogidmap)
         cid_to_gid = parse_cidtogidmap_stream(bytes(cidtogidmap.read_bytes()))
     except Exception as exc:
-        logger.debug("Error parsing CIDToGIDMap during subsetting: %s", exc)
+        log_suppressed_error(
+            logger, exc, "Error parsing CIDToGIDMap during subsetting: %s", exc
+        )
         return set(used_codes)
 
     return {cid_to_gid[cid] for cid in used_codes if cid in cid_to_gid}
@@ -310,7 +321,7 @@ class FontSubsetter:
             )
 
             # Add subset prefix
-            prefix = _generate_subset_prefix()
+            prefix = _generate_subset_prefix(subsetted_data)
             base_name = get_base_font_name(font_name)
             new_name = f"{prefix}{base_name}"
 
@@ -434,7 +445,7 @@ class FontSubsetter:
             )
 
             # Add subset prefix
-            prefix = _generate_subset_prefix()
+            prefix = _generate_subset_prefix(subsetted_data)
             base_name = get_base_font_name(font_name)
             new_name = f"{prefix}{base_name}"
 
@@ -894,7 +905,7 @@ def _rebuild_symbolic_cmap(
             original_tt.close()
             subsetted_tt.close()
     except Exception as e:
-        logger.debug("Error rebuilding symbolic cmap: %s", e)
+        log_suppressed_error(logger, e, "Error rebuilding symbolic cmap: %s", e)
         return subsetted_data
 
 
@@ -984,7 +995,7 @@ def _subset_font_data(
         return output.getvalue()
 
     except Exception as e:
-        logger.debug("fontTools subsetting error: %s", e)
+        log_suppressed_error(logger, e, "fontTools subsetting error: %s", e)
         try:
             tt_font.close()
         except Exception:

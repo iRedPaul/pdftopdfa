@@ -18,6 +18,7 @@ import warnings
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 
 logger = logging.getLogger(__name__)
@@ -943,7 +944,9 @@ def sanitize_rendering_intent(pdf: Pdf) -> dict[str, int]:
                             )
 
         except Exception as e:
-            logger.debug(
+            log_suppressed_error(
+                logger,
+                e,
                 "Error sanitizing content streams on page %d: %s",
                 page_num,
                 e,

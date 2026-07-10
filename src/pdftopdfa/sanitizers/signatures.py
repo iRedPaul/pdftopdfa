@@ -14,6 +14,7 @@ import logging
 
 from pikepdf import Dictionary, Name, Pdf
 
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
 logger = logging.getLogger(__name__)
@@ -379,7 +380,7 @@ def sanitize_signatures(pdf: Pdf, level: str = "3b") -> dict:
                 del field["/V"]
                 stats["signatures_removed"] += 1
         except Exception as e:
-            logger.debug("Failed to remove signature /V: %s", e)
+            log_suppressed_error(logger, e, "Failed to remove signature /V: %s", e)
 
     # Remove signature references from Catalog /Perms.
     perms_refs_removed = 0
@@ -435,6 +436,6 @@ def sanitize_signatures(pdf: Pdf, level: str = "3b") -> dict:
                     acroform["/SigFlags"] = new_val
                 stats["sigflags_fixed"] = 1
         except Exception as e:
-            logger.debug("Failed to fix /SigFlags: %s", e)
+            log_suppressed_error(logger, e, "Failed to fix /SigFlags: %s", e)
 
     return stats

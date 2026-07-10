@@ -13,6 +13,7 @@ import logging
 
 from pikepdf import Pdf
 
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,6 @@ def remove_javascript(pdf: Pdf) -> int:
                 logger.info("Named JavaScript removed from Names dictionary")
                 return 1
     except Exception as e:
-        logger.debug("Error removing named JavaScript: %s", e)
+        log_suppressed_error(logger, e, "Error removing named JavaScript: %s", e)
 
     return 0

@@ -31,6 +31,7 @@ from ..fonts.glyph_usage import (
     collect_font_usage,
 )
 from ..fonts.traversal import iter_all_page_fonts
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
 logger = logging.getLogger(__name__)
@@ -397,7 +398,9 @@ def _sanitize_content_stream(stream_obj: Stream, stats: dict[str, int]) -> None:
     try:
         raw = stream_obj.read_bytes()
     except Exception as e:
-        logger.debug("Skipping unreadable content stream %s: %s", stream_obj.objgen, e)
+        log_suppressed_error(
+            logger, e, "Skipping unreadable content stream %s: %s", stream_obj.objgen, e
+        )
         return
 
     try:

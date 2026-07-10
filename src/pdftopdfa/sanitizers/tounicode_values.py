@@ -30,6 +30,7 @@ from ..fonts.tounicode import (
     parse_tounicode_cmap,
 )
 from ..fonts.traversal import iter_all_page_fonts
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
 logger = logging.getLogger(__name__)
@@ -110,7 +111,9 @@ def sanitize_tounicode_values(pdf: Pdf) -> dict[str, int]:
                 )
 
             except Exception as e:
-                logger.debug(
+                log_suppressed_error(
+                    logger,
+                    e,
                     "Error fixing ToUnicode values for font %s: %s",
                     _font_key,
                     e,
@@ -235,7 +238,9 @@ def fill_tounicode_gaps(pdf: Pdf) -> dict[str, int]:
             )
 
         except Exception as e:
-            logger.debug(
+            log_suppressed_error(
+                logger,
+                e,
                 "Error filling ToUnicode gaps for font objgen %s: %s",
                 obj_key,
                 e,

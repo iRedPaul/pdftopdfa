@@ -23,6 +23,7 @@ import logging
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..utils import iter_type3_fonts as _iter_type3_fonts
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 from .rendering_intent import VALID_RENDERING_INTENTS
 
@@ -967,7 +968,9 @@ def sanitize_extgstate(pdf: Pdf) -> dict[str, int]:
                             )
 
         except Exception as e:
-            logger.debug("Error sanitizing ExtGState on page %d: %s", page_num, e)
+            log_suppressed_error(
+                logger, e, "Error sanitizing ExtGState on page %d: %s", page_num, e
+            )
 
     if total_removed > 0:
         logger.info("ExtGState sanitized: %d forbidden entries removed", total_removed)

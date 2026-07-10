@@ -112,6 +112,40 @@ def get_fstype(font_data: bytes) -> int | None:
         return None
 
 
+def get_any_cmap(tt_font) -> dict[int, str]:
+    """Returns the most useful character map available from a font.
+
+    Tries ``getBestCmap()`` first; for fonts where that yields nothing
+    (symbol fonts, Mac-only fonts) falls back to Windows Symbol (3,0),
+    then Mac Roman (1,0), then any non-empty subtable.
+
+    Args:
+        tt_font: fonttools TTFont object.
+
+    Returns:
+        Mapping of codepoint to glyph name; empty dict if none available.
+    """
+    try:
+        cmap = tt_font.getBestCmap()
+    except KeyError:
+        cmap = None
+    if cmap:
+        return cmap
+    if "cmap" not in tt_font:
+        return {}
+    cmap_table = tt_font["cmap"]
+    for subtable in cmap_table.tables:
+        if subtable.platformID == 3 and subtable.platEncID == 0 and subtable.cmap:
+            return subtable.cmap
+    for subtable in cmap_table.tables:
+        if subtable.platformID == 1 and subtable.platEncID == 0 and subtable.cmap:
+            return subtable.cmap
+    for subtable in cmap_table.tables:
+        if subtable.cmap:
+            return subtable.cmap
+    return {}
+
+
 def get_encoding_name(encoding: pikepdf.Object) -> str:
     """Extracts the encoding name from a Name or CMap Stream.
 

@@ -15,6 +15,7 @@ import zlib
 
 from pikepdf import Array, Name, Pdf, Stream
 
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 
 logger = logging.getLogger(__name__)
@@ -343,7 +344,9 @@ def _reencode_jbig2_to_flatedecode(stream: Stream) -> bool:
             pass
         return True
     except Exception as e:
-        logger.debug("Failed to re-encode JBIG2 to FlateDecode: %s", e)
+        log_suppressed_error(
+            logger, e, "Failed to re-encode JBIG2 to FlateDecode: %s", e
+        )
         return False
 
 
@@ -406,7 +409,7 @@ def _convert_jbig2_array_stream(stream: Stream, pdf: Pdf) -> bool:
         return True
 
     except Exception as e:
-        logger.debug("Cannot convert JBIG2 array stream: %s", e)
+        log_suppressed_error(logger, e, "Cannot convert JBIG2 array stream: %s", e)
         return False
 
 
@@ -434,7 +437,7 @@ def _convert_jbig2_stream(stream: Stream, pdf: Pdf) -> bool:
         stream.write(combined, filter=Name("/JBIG2Decode"))
         return True
     except Exception as e:
-        logger.debug("Cannot inline JBIG2 globals: %s", e)
+        log_suppressed_error(logger, e, "Cannot inline JBIG2 globals: %s", e)
         return False
 
 
@@ -517,10 +520,12 @@ def convert_jbig2_external_globals(pdf: Pdf) -> dict[str, int]:
                         failed += 1
                         logger.debug("Failed to re-encode JBIG2: %s", obj.objgen)
             except Exception as e:
-                logger.debug("Error checking JBIG2 refinement: %s", e)
+                log_suppressed_error(
+                    logger, e, "Error checking JBIG2 refinement: %s", e
+                )
 
         except Exception as e:
-            logger.debug("Error processing object: %s", e)
+            log_suppressed_error(logger, e, "Error processing object: %s", e)
 
     if converted > 0:
         logger.info("%d JBIG2 stream(s) with external globals inlined", converted)

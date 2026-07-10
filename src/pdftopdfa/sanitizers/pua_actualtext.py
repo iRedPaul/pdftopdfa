@@ -19,6 +19,7 @@ from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
 from ..fonts.subsetter import _resolve_simple_font_encoding
 from ..fonts.tounicode import parse_tounicode_cmap, resolve_glyph_to_unicode
 from ..utils import iter_type3_fonts as _iter_type3_fonts
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
 logger = logging.getLogger(__name__)
@@ -135,7 +136,9 @@ def sanitize_pua_actualtext(pdf: Pdf) -> dict[str, int]:
                             total_warnings += w
 
         except Exception as e:
-            logger.debug(
+            log_suppressed_error(
+                logger,
+                e,
                 "Error fixing PUA ActualText on page %d: %s",
                 page_num,
                 e,

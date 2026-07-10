@@ -138,116 +138,17 @@ def sanitize_for_pdfa(
 
     logger.info("Sanitizing PDF for PDF/A-%s conformance", level)
 
+    # Every sanitization step below records its statistics in this dict.
+    # Only keys that are computed conditionally (depending on level or
+    # options) need explicit defaults so callers can always rely on them.
     result: dict[str, Any] = {
-        "javascript_removed": 0,
         "files_removed": 0,
         "embedded_files_kept": 0,
         "embedded_files_converted": 0,
-        "actions_removed": 0,
-        "invalid_destinations_removed": 0,
-        "xfa_removed": 0,
-        "forbidden_annotations_removed": 0,
-        "non_compliant_annotations_flattened": 0,
         "proprietary_stamps_normalized": 0,
-        "forbidden_xobjects_removed": 0,
-        "appearance_streams_added": 0,
-        "annotation_flags_fixed": 0,
-        "annotation_opacity_fixed": 0,
-        "lzw_streams_converted": 0,
-        "crypt_streams_removed": 0,
-        "external_stream_keys_removed": 0,
-        "stream_lengths_fixed": 0,
-        "nonstandard_inline_filters_fixed": 0,
-        "jbig2_converted": 0,
-        "jbig2_reencoded": 0,
-        "jbig2_failed": 0,
-        "jpx_fixed": 0,
-        "jpx_wrapped": 0,
-        "jpx_reencoded": 0,
-        "jpx_already_valid": 0,
-        "jpx_failed": 0,
-        "oc_as_entries_removed": 0,
-        "oc_intents_fixed": 0,
-        "oc_d_created": False,
-        "oc_d_name_added": False,
-        "oc_list_mode_fixed": 0,
-        "oc_base_state_fixed": 0,
-        "oc_config_names_added": 0,
-        "oc_missing_ocgs_added": 0,
-        "oc_rbgroups_fixed": 0,
-        "oc_order_ocgs_added": 0,
-        "extgstate_fixed": 0,
-        "ri_operators_fixed": 0,
-        "undefined_operators_removed": 0,
-        "resources_dictionaries_added": 0,
-        "resources_entries_merged": 0,
-        "af_relationships_fixed": 0,
-        "embedded_file_subtypes_fixed": 0,
-        "embedded_file_params_fixed": 0,
-        "filespec_uf_fixed": 0,
-        "filespec_desc_fixed": 0,
-        "embedded_file_lzw_converted": 0,
-        "embedded_file_crypt_removed": 0,
-        "forbidden_catalog_entries_removed": 0,
-        "forbidden_name_dict_entries_removed": 0,
-        "forbidden_page_entries_removed": 0,
-        "viewer_prefs_entries_removed": 0,
-        "catalog_lang_set": False,
-        "mark_info_added": False,
-        "image_interpolate_fixed": 0,
-        "invalid_bpc_fixed": 0,
-        "mask_bpc_fixed": 0,
-        "cidsysteminfo_fixed": 0,
-        "cidtogidmap_fixed": 0,
-        "cidset_removed": 0,
-        "type1_charset_removed": 0,
-        "simple_font_widths_fixed": 0,
-        "cidfont_widths_fixed": 0,
-        "notdef_fixed": 0,
-        "glyphs_added": 0,
-        "tounicode_values_fixed": 0,
         "tounicode_gaps_filled": 0,
         "pua_actualtext_added": 0,
         "pua_actualtext_warnings": 0,
-        "notdef_usage_fixed": 0,
-        "signatures_found": 0,
-        "signatures_removed": 0,
-        "sigflags_fixed": 0,
-        "signatures_type_fixed": 0,
-        "annotation_colors_removed": 0,
-        "annotation_ap_keys_removed": 0,
-        "btn_ap_subdicts_fixed": 0,
-        "needs_appearances_removed": False,
-        "mediabox_inherited": 0,
-        "boxes_normalized": 0,
-        "boxes_clipped": 0,
-        "trimbox_added": 0,
-        "malformed_boxes_removed": 0,
-        "structure_strings_truncated": 0,
-        "structure_names_shortened": 0,
-        "structure_utf8_names_fixed": 0,
-        "structure_integers_clamped": 0,
-        "structure_reals_normalized": 0,
-        "structure_q_nesting_rebalanced": 0,
-        "structure_hex_odd_fixed": 0,
-        "structure_hex_odd_obj_fixed": 0,
-        "structure_hex_invalid_fixed": 0,
-        "catalog_version_removed": False,
-        "oc_ocg_names_added": 0,
-        "image_intents_fixed": 0,
-        "font_type_added": 0,
-        "font_subtype_fixed": 0,
-        "font_basefont_added": 0,
-        "font_firstchar_added": 0,
-        "font_lastchar_added": 0,
-        "font_widths_size_fixed": 0,
-        "font_stream_subtype_removed": 0,
-        "tt_nonsymbolic_cmap_added": 0,
-        "tt_nonsymbolic_encoding_fixed": 0,
-        "tt_symbolic_encoding_removed": 0,
-        "tt_symbolic_flag_set": 0,
-        "tt_symbolic_cmap_added": 0,
-        "type1_encoding_added": 0,
     }
 
     # Convert LZW-compressed streams to FlateDecode (all levels)
@@ -552,149 +453,16 @@ def sanitize_for_pdfa(
     result["embedded_file_lzw_converted"] = ef_filter_result["lzw_converted"]
     result["embedded_file_crypt_removed"] = ef_filter_result["crypt_removed"]
 
-    logger.info(
-        "Sanitization completed: %d JS, %d actions, %d invalid dests, "
-        "%d files removed, "
-        "%d embedded files converted, %d embedded files kept, "
-        "%d XFA, %d forbidden catalog entries, "
-        "%d viewer prefs entries removed, "
-        "catalog /Lang set: %s, "
-        "%d forbidden annots, %d non-compliant annots flattened, "
-        "%d proprietary stamps normalized, "
-        "%d forbidden XObjects removed, "
-        "%d AP streams added, %d annot flags fixed, %d annot /CA fixed, "
-        "%d annot colors removed, %d annot AP keys removed, "
-        "%d Btn AP subdicts fixed, "
-        "%d LZW streams converted, %d Crypt filters removed, "
-        "%d external stream keys removed, "
-        "%d non-standard inline filters fixed, "
-        "%d JBIG2 streams converted, %d JBIG2 reencoded, %d JBIG2 failed, "
-        "%d JPX colr fixed, %d JPX wrapped, %d JPX reencoded, %d JPX failed, "
-        "%d OC AS entries removed, %d OC intents fixed, "
-        "OC D /Name added: %s, %d OC ListMode fixed, "
-        "%d OC BaseState fixed, %d OC config names added, "
-        "%d OC missing OCGs added, %d OC RBGroups fixed, "
-        "%d OC order OCGs added, "
-        "%d ExtGState entries fixed, %d ri operators fixed, "
-        "%d undefined operators removed, "
-        "%d resources dicts added, %d resource entries merged, "
-        "%d image intents fixed, "
-        "%d CIDSystemInfo fixed, %d CIDToGIDMap fixed, %d CIDSet removed, "
-        "%d Type1 /CharSet removed, "
-        "%d AF relationships fixed, %d embedded file subtypes fixed, "
-        "%d embedded file params fixed, "
-        "%d FileSpec /UF entries fixed, "
-        "%d FileSpec /Desc entries fixed, "
-        "%d image interpolate fixed, "
-        "%d simple font widths fixed, %d CIDFont widths fixed, "
-        "%d .notdef glyphs fixed, "
-        "%d glyph coverage glyphs added, "
-        "%d .notdef usage operators fixed, "
-        "%d ToUnicode values fixed, "
-        "%d PUA ActualText added, "
-        "%d signatures found, %d signatures removed, "
-        "%d sigflags fixed, %d signature /Type fixed, "
-        "NeedAppearances removed: %s, "
-        "%d MediaBox inherited, %d boxes normalized, "
-        "%d boxes clipped, %d TrimBox added, "
-        "%d malformed boxes removed, "
-        "MarkInfo added: %s, "
-        "%d font /Type added, %d font /Subtype fixed, "
-        "%d font /BaseFont added, %d font /FirstChar added, "
-        "%d font /LastChar added, %d font /Widths size fixed, "
-        "%d font stream subtypes removed, "
-        "%d TT non-symbolic (3,1) cmaps added, "
-        "%d TT non-symbolic encodings fixed, "
-        "%d TT symbolic /Encoding entries removed, "
-        "%d TT symbolic Symbolic flags set, "
-        "%d TT symbolic (3,0) cmaps added",
-        result["javascript_removed"],
-        result["actions_removed"],
-        result["invalid_destinations_removed"],
-        result["files_removed"],
-        result["embedded_files_converted"],
-        result["embedded_files_kept"],
-        result["xfa_removed"],
-        result["forbidden_catalog_entries_removed"],
-        result["viewer_prefs_entries_removed"],
-        result["catalog_lang_set"],
-        result["forbidden_annotations_removed"],
-        result["non_compliant_annotations_flattened"],
-        result["proprietary_stamps_normalized"],
-        result["forbidden_xobjects_removed"],
-        result["appearance_streams_added"],
-        result["annotation_flags_fixed"],
-        result["annotation_opacity_fixed"],
-        result["annotation_colors_removed"],
-        result["annotation_ap_keys_removed"],
-        result["btn_ap_subdicts_fixed"],
-        result["lzw_streams_converted"],
-        result["crypt_streams_removed"],
-        result["external_stream_keys_removed"],
-        result["nonstandard_inline_filters_fixed"],
-        result["jbig2_converted"],
-        result["jbig2_reencoded"],
-        result["jbig2_failed"],
-        result["jpx_fixed"],
-        result["jpx_wrapped"],
-        result["jpx_reencoded"],
-        result["jpx_failed"],
-        result["oc_as_entries_removed"],
-        result["oc_intents_fixed"],
-        result["oc_d_name_added"],
-        result["oc_list_mode_fixed"],
-        result["oc_base_state_fixed"],
-        result["oc_config_names_added"],
-        result["oc_missing_ocgs_added"],
-        result["oc_rbgroups_fixed"],
-        result["oc_order_ocgs_added"],
-        result["extgstate_fixed"],
-        result["ri_operators_fixed"],
-        result["undefined_operators_removed"],
-        result["resources_dictionaries_added"],
-        result["resources_entries_merged"],
-        result["image_intents_fixed"],
-        result["cidsysteminfo_fixed"],
-        result["cidtogidmap_fixed"],
-        result["cidset_removed"],
-        result["type1_charset_removed"],
-        result["af_relationships_fixed"],
-        result["embedded_file_subtypes_fixed"],
-        result["embedded_file_params_fixed"],
-        result["filespec_uf_fixed"],
-        result["filespec_desc_fixed"],
-        result["image_interpolate_fixed"],
-        result["simple_font_widths_fixed"],
-        result["cidfont_widths_fixed"],
-        result["notdef_fixed"],
-        result["glyphs_added"],
-        result["notdef_usage_fixed"],
-        result["tounicode_values_fixed"],
-        result["pua_actualtext_added"],
-        result["signatures_found"],
-        result["signatures_removed"],
-        result["sigflags_fixed"],
-        result["signatures_type_fixed"],
-        result["needs_appearances_removed"],
-        result["mediabox_inherited"],
-        result["boxes_normalized"],
-        result["boxes_clipped"],
-        result["trimbox_added"],
-        result["malformed_boxes_removed"],
-        result["mark_info_added"],
-        result["font_type_added"],
-        result["font_subtype_fixed"],
-        result["font_basefont_added"],
-        result["font_firstchar_added"],
-        result["font_lastchar_added"],
-        result["font_widths_size_fixed"],
-        result["font_stream_subtype_removed"],
-        result["tt_nonsymbolic_cmap_added"],
-        result["tt_nonsymbolic_encoding_fixed"],
-        result["tt_symbolic_encoding_removed"],
-        result["tt_symbolic_flag_set"],
-        result["tt_symbolic_cmap_added"],
-    )
+    # Log all statistics generically: only report keys with a non-zero
+    # count (or a True flag), in pipeline order.
+    changes = {key: value for key, value in result.items() if value}
+    if changes:
+        logger.info(
+            "Sanitization completed: %s",
+            ", ".join(f"{key}={value}" for key, value in changes.items()),
+        )
+    else:
+        logger.info("Sanitization completed: no changes required")
 
     return result
 

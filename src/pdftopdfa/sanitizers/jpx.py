@@ -24,6 +24,7 @@ import struct
 from pikepdf import Array, Name, Pdf, Stream
 
 from ..color_profile import get_cmyk_profile
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 
 logger = logging.getLogger(__name__)
@@ -644,7 +645,7 @@ def _reencode_to_flatedecode(stream: Stream) -> bool:
 
         return True
     except Exception as e:
-        logger.debug("Failed to re-encode JPX to FlateDecode: %s", e)
+        log_suppressed_error(logger, e, "Failed to re-encode JPX to FlateDecode: %s", e)
         return False
 
 
@@ -759,7 +760,7 @@ def sanitize_jpx_color_boxes(pdf: Pdf) -> dict[str, int]:
                     logger.warning("Failed to fix unknown JPX stream: %s", obj.objgen)
 
         except Exception as e:
-            logger.debug("Error processing JPX object: %s", e)
+            log_suppressed_error(logger, e, "Error processing JPX object: %s", e)
 
     total_fixed = result["jpx_fixed"] + result["jpx_wrapped"]
     if total_fixed > 0:

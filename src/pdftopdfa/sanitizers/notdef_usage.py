@@ -22,8 +22,10 @@ from ..fonts.glyph_mapping import resolve_glyph_name
 from ..fonts.subsetter import (
     _resolve_simple_font_encoding,
 )
+from ..fonts.utils import get_any_cmap as _get_any_cmap
 from ..fonts.utils import safe_str as _safe_str
 from ..utils import iter_type3_fonts as _iter_type3_fonts
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
 logger = logging.getLogger(__name__)
@@ -138,7 +140,9 @@ def sanitize_notdef_usage(pdf: Pdf) -> dict[str, int]:
                             )
 
         except Exception as e:
-            logger.debug("Error fixing .notdef usage on page %d: %s", page_num, e)
+            log_suppressed_error(
+                logger, e, "Error fixing .notdef usage on page %d: %s", page_num, e
+            )
 
     if total_fixed > 0:
         logger.info("Notdef usage: %d text operators fixed", total_fixed)
@@ -310,30 +314,6 @@ def _find_missing_glyphs_in_simple_font(font_obj: pikepdf.Object) -> set[int]:
     except Exception:
         logger.debug("Error analyzing simple font glyphs", exc_info=True)
         return set()
-
-
-def _get_any_cmap(tt_font) -> dict[int, str]:
-    """Return the most useful cmap available for glyph-name resolution."""
-    try:
-        cmap = tt_font.getBestCmap()
-    except KeyError:
-        cmap = None
-    if cmap:
-        return cmap
-    if "cmap" not in tt_font:
-        return {}
-
-    cmap_table = tt_font["cmap"]
-    for subtable in cmap_table.tables:
-        if subtable.platformID == 3 and subtable.platEncID == 0 and subtable.cmap:
-            return subtable.cmap
-    for subtable in cmap_table.tables:
-        if subtable.platformID == 1 and subtable.platEncID == 0 and subtable.cmap:
-            return subtable.cmap
-    for subtable in cmap_table.tables:
-        if subtable.cmap:
-            return subtable.cmap
-    return {}
 
 
 def _get_simple_font_notdef_codes(font_obj: pikepdf.Object) -> _NotdefCodes:

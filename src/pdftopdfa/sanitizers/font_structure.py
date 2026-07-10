@@ -22,6 +22,7 @@ from pikepdf import Array, Dictionary, Name, Pdf
 from ..fonts.constants import STANDARD_14_FONTS
 from ..fonts.traversal import iter_all_page_fonts
 from ..fonts.utils import safe_str as _safe_str
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
 logger = logging.getLogger(__name__)
@@ -287,7 +288,9 @@ def _fix_basefont(font: pikepdf.Object, result: dict[str, int]) -> None:
         else:
             logger.debug("FontDescriptor has no /FontName — cannot add /BaseFont")
     except Exception as e:
-        logger.debug("Error reading FontDescriptor for /BaseFont: %s", e)
+        log_suppressed_error(
+            logger, e, "Error reading FontDescriptor for /BaseFont: %s", e
+        )
 
 
 def _fix_char_range_and_widths(font: pikepdf.Object, result: dict[str, int]) -> None:

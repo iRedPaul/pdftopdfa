@@ -18,6 +18,7 @@ from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
 from ..color_profile import get_cmyk_profile, get_gray_profile, get_srgb_profile
 from ..exceptions import ConversionError
 from ..utils import iter_type3_fonts as _iter_type3_fonts
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 
 logger = logging.getLogger(__name__)
@@ -554,7 +555,9 @@ def validate_embedded_icc_profiles(
                                 )
 
         except Exception as e:
-            logger.debug("Error validating ICC on page %d: %s", page_num, e)
+            log_suppressed_error(
+                logger, e, "Error validating ICC on page %d: %s", page_num, e
+            )
 
     if fatal_repair_error is not None:
         raise fatal_repair_error
@@ -1148,8 +1151,12 @@ def sanitize_special_colorspace_consistency(pdf: Pdf) -> tuple[int, int]:
         except ConversionError:
             raise
         except Exception as e:
-            logger.debug(
-                "Error sanitizing special color spaces on page %d: %s", page_num, e
+            log_suppressed_error(
+                logger,
+                e,
+                "Error sanitizing special color spaces on page %d: %s",
+                page_num,
+                e,
             )
 
     if colorants_added or separations_normalized:
@@ -1225,7 +1232,9 @@ def _warn_device_dependent_alternates(pdf: Pdf) -> int:
                     continue
 
         except Exception as e:
-            logger.debug("Error checking alternates on page %d: %s", page_num, e)
+            log_suppressed_error(
+                logger, e, "Error checking alternates on page %d: %s", page_num, e
+            )
 
     return count
 

@@ -17,6 +17,7 @@ from collections.abc import Iterator
 
 import pikepdf
 
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 from .utils import check_visited as _check_visited
 
@@ -53,6 +54,53 @@ def iter_all_page_fonts(
 
     # Annotation Appearance Streams
     yield from _iter_fonts_from_appearance_streams(page, visited)
+
+
+def iter_acroform_dr_fonts(
+    pdf: pikepdf.Pdf,
+) -> Iterator[tuple[str, pikepdf.Object]]:
+    """Yields all (font_key, font_obj) pairs from the AcroForm /DR font dict.
+
+    AcroForm Default Resources fonts may never appear in page resources,
+    but they are still used to render widget field appearances and must
+    satisfy the same PDF/A font rules as page fonts.
+
+    Args:
+        pdf: Opened pikepdf PDF object.
+
+    Yields:
+        Tuples of (font_key, dereferenced_font_obj).
+    """
+    try:
+        root = pdf.Root
+        if root is None or "/AcroForm" not in root:
+            return
+        acroform = _resolve_indirect(root.AcroForm)
+        dr = acroform.get("/DR")
+        if dr is None:
+            return
+        dr = _resolve_indirect(dr)
+        font_dict = dr.get("/Font")
+        if font_dict is None:
+            return
+        font_dict = _resolve_indirect(font_dict)
+        if not isinstance(font_dict, pikepdf.Dictionary):
+            return
+        font_keys = list(font_dict.keys())
+    except Exception as e:
+        log_suppressed_error(logger, e, "Error accessing AcroForm /DR fonts: %s", e)
+        return
+
+    for font_key in font_keys:
+        try:
+            font_obj = _resolve_indirect(font_dict[font_key])
+            try:
+                key_str = str(font_key)
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                key_str = repr(font_key)
+            yield (key_str, font_obj)
+        except Exception:
+            continue
 
 
 def _iter_fonts_from_resources(

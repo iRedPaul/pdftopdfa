@@ -215,7 +215,7 @@ class TestFontEmbedder:
         embedder = FontEmbedder(pdf)
         with patch.object(
             embedder,
-            "_replace_font_in_page",
+            "_replace_simple_font",
             return_value=True,
         ) as mock_replace:
             result = embedder.embed_missing_fonts()

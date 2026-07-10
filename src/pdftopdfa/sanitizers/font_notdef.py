@@ -22,6 +22,7 @@ from pikepdf import Array, Dictionary, Name, Pdf
 
 from ..fonts.traversal import iter_all_page_fonts
 from ..fonts.utils import safe_str as _safe_str
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,9 @@ def sanitize_font_notdef(pdf: Pdf) -> dict[str, int]:
             if _fix_notdef(pdf, font_obj, font_file_key, font_name):
                 result["notdef_fixed"] += 1
         except Exception as e:
-            logger.debug(
+            log_suppressed_error(
+                logger,
+                e,
                 "Skipping .notdef validation for font %s: %s",
                 font_name,
                 e,

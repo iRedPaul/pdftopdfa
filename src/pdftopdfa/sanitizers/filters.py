@@ -18,6 +18,7 @@ import zlib
 from pikepdf import Array, Dictionary, Name, Pdf, Stream, parse_content_stream
 from pikepdf import unparse_content_stream as _unparse_content_stream
 
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 
 logger = logging.getLogger(__name__)
@@ -563,7 +564,7 @@ def convert_lzw_streams(pdf: Pdf) -> int:
             # possible, and this should not surface as a generic error log.
             continue
         except Exception as e:
-            logger.debug("Error processing object: %s", e)
+            log_suppressed_error(logger, e, "Error processing object: %s", e)
 
     if converted > 0:
         logger.info("%d LZW stream(s) converted to FlateDecode", converted)
@@ -694,7 +695,7 @@ def remove_crypt_streams(pdf: Pdf) -> int:
         except UnicodeDecodeError:
             continue
         except Exception as e:
-            logger.debug("Error processing object: %s", e)
+            log_suppressed_error(logger, e, "Error processing object: %s", e)
 
     if removed > 0:
         logger.info("%d Crypt filter(s) removed from streams", removed)
@@ -782,7 +783,7 @@ def remove_external_stream_keys(pdf: Pdf) -> int:
         except UnicodeDecodeError:
             continue
         except Exception as e:
-            logger.debug("Error processing object: %s", e)
+            log_suppressed_error(logger, e, "Error processing object: %s", e)
 
     if fixed > 0:
         logger.info("%d stream(s) had forbidden external keys removed", fixed)
@@ -826,7 +827,7 @@ def sanitize_nonstandard_inline_filters(pdf: Pdf) -> int:
         except UnicodeDecodeError:
             continue
         except Exception as e:
-            logger.debug("Error processing object: %s", e)
+            log_suppressed_error(logger, e, "Error processing object: %s", e)
 
     if fixed > 0:
         logger.info(
@@ -924,7 +925,7 @@ def fix_stream_lengths(pdf: Pdf) -> int:
             reencoded += 1
 
         except Exception as e:
-            logger.debug("Error re-encoding stream: %s", e)
+            log_suppressed_error(logger, e, "Error re-encoding stream: %s", e)
 
     if reencoded > 0:
         logger.info("%d stream(s) re-encoded to fix /Length", reencoded)

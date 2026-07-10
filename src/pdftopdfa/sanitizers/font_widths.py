@@ -25,8 +25,10 @@ from ..fonts.tounicode import (
     generate_tounicode_from_encoding_dict,
     parse_cidtogidmap_stream,
 )
-from ..fonts.traversal import iter_all_page_fonts
+from ..fonts.traversal import iter_acroform_dr_fonts, iter_all_page_fonts
+from ..fonts.utils import get_any_cmap as _get_any_cmap
 from ..fonts.utils import safe_str as _safe_str
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
 logger = logging.getLogger(__name__)
@@ -54,23 +56,6 @@ def _scaled_width(advance_width: int | float, units_per_em: int) -> float:
     return float(advance_width) * 1000.0 / units_per_em
 
 
-def _get_any_cmap(tt_font) -> dict[int, str] | None:
-    """Gets a cmap dict from any available subtable."""
-    if "cmap" not in tt_font:
-        return None
-    cmap_table = tt_font["cmap"]
-    for subtable in cmap_table.tables:
-        if subtable.platformID == 3 and subtable.platEncID == 0:
-            return subtable.cmap
-    for subtable in cmap_table.tables:
-        if subtable.platformID == 1 and subtable.platEncID == 0:
-            return subtable.cmap
-    for subtable in cmap_table.tables:
-        if subtable.cmap:
-            return subtable.cmap
-    return None
-
-
 def _compute_exact_widths_for_encoding(
     tt_font,
     code_to_unicode: dict[int, int],
@@ -78,13 +63,8 @@ def _compute_exact_widths_for_encoding(
     """Computes exact scaled glyph widths for a code-to-Unicode mapping."""
     head = tt_font["head"]
     hmtx = tt_font["hmtx"]
-    try:
-        cmap = tt_font.getBestCmap()
-    except KeyError:
-        cmap = None
-    if cmap is None:
-        cmap = _get_any_cmap(tt_font)
-    if cmap is None:
+    cmap = _get_any_cmap(tt_font)
+    if not cmap:
         return {}
 
     result: dict[int, float] = {}
@@ -237,7 +217,9 @@ def sanitize_font_widths(
                 if _fix_type3_font_widths(font_obj, font_name):
                     result["type3_font_widths_fixed"] += 1
         except Exception as e:
-            logger.debug(
+            log_suppressed_error(
+                logger,
+                e,
                 "Skipping width validation for font %s: %s",
                 font_name,
                 e,
@@ -283,29 +265,11 @@ def _iter_all_embedded_fonts(
     # AcroForm /DR fonts may never appear in page resources directly, but they
     # are still used for rendering widget field appearances and must satisfy
     # the same width-consistency rules as page fonts.
-    try:
-        acroform = pdf.Root.get("/AcroForm")
-        if acroform is None:
-            return
-        acroform = _resolve(acroform)
-        dr = acroform.get("/DR")
-        if dr is None:
-            return
-        dr = _resolve(dr)
-        font_dict = dr.get("/Font")
-        if font_dict is None:
-            return
-        font_dict = _resolve(font_dict)
-        if not isinstance(font_dict, Dictionary):
-            return
-
-        for font_key in list(font_dict.keys()):
-            try:
-                yield from _iter_embedded_font(font_dict[font_key], seen_objgens)
-            except Exception:
-                continue
-    except Exception:
-        return
+    for _font_key, font_obj in iter_acroform_dr_fonts(pdf):
+        try:
+            yield from _iter_embedded_font(font_obj, seen_objgens)
+        except Exception:
+            continue
 
 
 def _iter_embedded_font(
@@ -1129,7 +1093,9 @@ def _fix_simple_font_widths(font: pikepdf.Object, font_name: str) -> bool:
         )
         return True
     except Exception as e:
-        logger.debug("Error validating widths for %s: %s", font_name, e)
+        log_suppressed_error(
+            logger, e, "Error validating widths for %s: %s", font_name, e
+        )
         return False
     finally:
         tt_font.close()
@@ -1455,7 +1421,9 @@ def _fix_cidfont_widths(font: pikepdf.Object, font_name: str) -> bool:
         )
         return True
     except Exception as e:
-        logger.debug("Error validating CIDFont widths for %s: %s", font_name, e)
+        log_suppressed_error(
+            logger, e, "Error validating CIDFont widths for %s: %s", font_name, e
+        )
         return False
     finally:
         tt_font.close()

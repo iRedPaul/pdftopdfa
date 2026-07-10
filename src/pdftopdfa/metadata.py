@@ -17,7 +17,7 @@ from lxml import etree
 from lxml.builder import ElementMaker
 
 from .exceptions import ConversionError
-from .utils import validate_pdfa_level
+from .utils import log_suppressed_error, validate_pdfa_level
 
 logger = logging.getLogger(__name__)
 
@@ -2050,7 +2050,7 @@ def _extract_existing_xmp(pdf: pikepdf.Pdf) -> etree._Element | None:
         logger.debug("Existing XMP XML parsing error: %s", e)
         return None
     except Exception as e:
-        logger.debug("Error parsing existing XMP metadata: %s", e)
+        log_suppressed_error(logger, e, "Error parsing existing XMP metadata: %s", e)
         return None
 
 
@@ -2491,7 +2491,7 @@ def extract_pdf_info(pdf: pikepdf.Pdf, *, log_result: bool = True) -> dict[str, 
                 else:
                     info[info_key] = _clean_metadata_text(str_value)
         except Exception as e:
-            logger.debug("Error reading %s: %s", pdf_key, e)
+            log_suppressed_error(logger, e, "Error reading %s: %s", pdf_key, e)
 
     if log_result:
         logger.debug("Extracted metadata: %s", info)
@@ -3153,7 +3153,9 @@ def _collect_non_catalog_extension_needs(
                             result.setdefault(uri, set()).update(safe_props)
 
         except Exception as e:
-            logger.debug(
+            log_suppressed_error(
+                logger,
+                e,
                 "Error scanning non-catalog /Metadata for extensions: %s",
                 e,
             )
@@ -3221,7 +3223,9 @@ def _sanitize_non_catalog_metadata(pdf: pikepdf.Pdf) -> tuple[int, int]:
             sanitized += 1
 
         except Exception as e:
-            logger.debug(
+            log_suppressed_error(
+                logger,
+                e,
                 "Error processing non-catalog /Metadata reference: %s",
                 e,
             )

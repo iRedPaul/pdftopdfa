@@ -25,6 +25,7 @@ from ..fonts.glyph_usage import FontUsageCache, collect_font_usage
 from ..fonts.tounicode import parse_cidtogidmap_stream
 from ..fonts.traversal import iter_all_page_fonts
 from ..fonts.utils import safe_str as _safe_str
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
 logger = logging.getLogger(__name__)
@@ -308,7 +309,9 @@ def _process_simple_font(pdf: Pdf, font: pikepdf.Object, used_codes: set[int]) -
 
         return len(missing_names)
     except Exception as e:
-        logger.debug("Font %s: error fixing glyph coverage: %s", font_name, e)
+        log_suppressed_error(
+            logger, e, "Font %s: error fixing glyph coverage: %s", font_name, e
+        )
         return 0
     finally:
         tt_font.close()
@@ -443,7 +446,9 @@ def _fix_missing_gids(
 
         return len(missing_gids)
     except Exception as e:
-        logger.debug("Font %s: error fixing glyph coverage: %s", font_name, e)
+        log_suppressed_error(
+            logger, e, "Font %s: error fixing glyph coverage: %s", font_name, e
+        )
         return 0
     finally:
         tt_font.close()
@@ -579,7 +584,9 @@ def _fix_missing_cids_in_cff(
 
         return len(missing_cids)
     except Exception as e:
-        logger.debug("Font %s: error fixing CID glyph coverage: %s", font_name, e)
+        log_suppressed_error(
+            logger, e, "Font %s: error fixing CID glyph coverage: %s", font_name, e
+        )
         return 0
     finally:
         tt_font.close()

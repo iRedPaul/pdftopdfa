@@ -495,3 +495,46 @@ def test_not_embedded_skipped():
     result = sanitize_truetype_encoding(pdf)
 
     assert sum(result.values()) == 0
+
+
+def test_acroform_dr_font_gets_encoding_fixed():
+    """Embedded TrueType fonts in AcroForm /DR must get encoding fixes too."""
+    pdf = _new_page_pdf()
+    font_bytes = _make_tt_font_bytes([(3, 1, {0x0041: "A"})], symbolic=False)
+
+    stream = Stream(pdf, font_bytes)
+    stream[Name.Length1] = len(font_bytes)
+    font_file2 = pdf.make_indirect(stream)
+
+    fd = Dictionary()
+    fd[Name.Type] = Name.FontDescriptor
+    fd[Name.FontName] = Name.TestFont
+    fd[Name.Flags] = 32
+    fd[Name.FontBBox] = Array([0, -200, 1000, 800])
+    fd[Name.ItalicAngle] = 0
+    fd[Name.Ascent] = 800
+    fd[Name.Descent] = -200
+    fd[Name.CapHeight] = 700
+    fd[Name.StemV] = 80
+    fd[Name("/FontFile2")] = font_file2
+
+    font = Dictionary()
+    font[Name.Type] = Name.Font
+    font[Name.Subtype] = Name.TrueType
+    font[Name.BaseFont] = Name.TestFont
+    font[Name.FirstChar] = 65
+    font[Name.LastChar] = 65
+    font[Name.Widths] = Array([600])
+    font[Name("/FontDescriptor")] = pdf.make_indirect(fd)
+    # No /Encoding — rule 6.2.11.6-2 requires WinAnsiEncoding to be added
+    font_ref = pdf.make_indirect(font)
+
+    pdf.Root[Name.AcroForm] = Dictionary(
+        DR=Dictionary(Font=Dictionary(Helv=font_ref)),
+        Fields=Array([]),
+    )
+
+    result = sanitize_truetype_encoding(pdf)
+
+    assert result["tt_nonsymbolic_encoding_fixed"] == 1
+    assert font.get("/Encoding") == Name.WinAnsiEncoding

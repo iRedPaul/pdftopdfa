@@ -18,6 +18,7 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..metadata import _format_pdf_date
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 from ..validator import detect_pdfa_level
 from ..verapdf import is_verapdf_available, validate_with_verapdf
@@ -127,7 +128,9 @@ def _is_pdfa_compliant_embedded(filespec: object) -> bool:
         return True
 
     except Exception as e:
-        logger.debug("Error checking embedded file compliance: %s", e)
+        log_suppressed_error(
+            logger, e, "Error checking embedded file compliance: %s", e
+        )
         return False
 
 
@@ -189,7 +192,9 @@ def _try_convert_embedded_pdf_to_pdfa2(data: bytes) -> bytes | None:
         logger.debug("Embedded PDF conversion failed: %s", result.error)
         return None
     except Exception as e:
-        logger.debug("Error converting embedded PDF to PDF/A-2b: %s", e)
+        log_suppressed_error(
+            logger, e, "Error converting embedded PDF to PDF/A-2b: %s", e
+        )
         return None
     finally:
         _embedded_pdf_conversion_depth.reset(depth_token)
@@ -389,7 +394,7 @@ def _iter_all_filespecs(pdf: Pdf) -> Iterator[object]:
                     if result is not None:
                         yield result
     except Exception as e:
-        logger.debug("Error reading EmbeddedFiles: %s", e)
+        log_suppressed_error(logger, e, "Error reading EmbeddedFiles: %s", e)
 
     # 2. FileSpecs from FileAttachment annotations on all pages
     for page_num, page in enumerate(pdf.pages, start=1):
@@ -410,7 +415,9 @@ def _iter_all_filespecs(pdf: Pdf) -> Iterator[object]:
                 except Exception:
                     continue
         except Exception as e:
-            logger.debug("Error processing annotations on page %d: %s", page_num, e)
+            log_suppressed_error(
+                logger, e, "Error processing annotations on page %d: %s", page_num, e
+            )
 
     # 3. Full pdf.objects scan for orphan indirect FileSpecs
     for obj in _iter_all_filespecs_by_scan(pdf):
@@ -569,7 +576,7 @@ def remove_non_compliant_embedded_files(pdf: Pdf) -> dict[str, int]:
                     del names["/EmbeddedFiles"]
                     logger.debug("All embedded files removed, deleted EmbeddedFiles")
     except Exception as e:
-        logger.debug("Error processing EmbeddedFiles: %s", e)
+        log_suppressed_error(logger, e, "Error processing EmbeddedFiles: %s", e)
 
     # 2. Process FileAttachment annotations
     for page_num, page in enumerate(pdf.pages, start=1):
@@ -649,7 +656,9 @@ def remove_non_compliant_embedded_files(pdf: Pdf) -> dict[str, int]:
             if len(annots) == 0:
                 del page["/Annots"]
         except Exception as e:
-            logger.debug("Error processing annotations on page %d: %s", page_num, e)
+            log_suppressed_error(
+                logger, e, "Error processing annotations on page %d: %s", page_num, e
+            )
 
     # 3. Scan ALL remaining FileSpecs for orphans not in Name Tree or annotations
     removed_objgens: set[tuple[int, int]] = set()
@@ -772,7 +781,7 @@ def ensure_af_relationships(pdf: Pdf) -> int:
 
             all_filespecs.append(obj)
         except Exception as e:
-            logger.debug("Error processing FileSpec: %s", e)
+            log_suppressed_error(logger, e, "Error processing FileSpec: %s", e)
 
     for filespec in _iter_all_filespecs(pdf):
         _collect_filespec(filespec)
@@ -862,7 +871,7 @@ def ensure_embedded_file_subtypes(pdf: Pdf) -> int:
                 logger.debug("Set /Subtype=%s on embedded file stream", mime)
             return True
         except Exception as e:
-            logger.debug("Error fixing stream /Subtype: %s", e)
+            log_suppressed_error(logger, e, "Error fixing stream /Subtype: %s", e)
             return False
 
     def _process_filespec(obj: object) -> None:
@@ -885,7 +894,9 @@ def ensure_embedded_file_subtypes(pdf: Pdf) -> int:
                     if _fix_stream(stream, mime):
                         fixed_count += 1
         except Exception as e:
-            logger.debug("Error processing FileSpec for /Subtype: %s", e)
+            log_suppressed_error(
+                logger, e, "Error processing FileSpec for /Subtype: %s", e
+            )
 
     for filespec in _iter_all_filespecs(pdf):
         _process_filespec(filespec)
@@ -954,7 +965,7 @@ def ensure_embedded_file_params(pdf: Pdf) -> int:
             logger.debug("Added /Params with /ModDate on embedded file stream")
             return True
         except Exception as e:
-            logger.debug("Error fixing stream /Params: %s", e)
+            log_suppressed_error(logger, e, "Error fixing stream /Params: %s", e)
             return False
 
     def _process_filespec(obj: object) -> None:
@@ -975,7 +986,9 @@ def ensure_embedded_file_params(pdf: Pdf) -> int:
                     if _fix_stream(stream):
                         fixed_count += 1
         except Exception as e:
-            logger.debug("Error processing FileSpec for /Params: %s", e)
+            log_suppressed_error(
+                logger, e, "Error processing FileSpec for /Params: %s", e
+            )
 
     for filespec in _iter_all_filespecs(pdf):
         _process_filespec(filespec)
@@ -1048,7 +1061,7 @@ def ensure_filespec_uf_entries(pdf: Pdf) -> int:
                         ef["/F"] = ef["/UF"]
                         logger.debug("Added /F from /UF in /EF dictionary")
         except Exception as e:
-            logger.debug("Error fixing FileSpec /UF: %s", e)
+            log_suppressed_error(logger, e, "Error fixing FileSpec /UF: %s", e)
 
     for filespec in _iter_all_filespecs(pdf):
         _fix_filespec(filespec)
@@ -1109,7 +1122,7 @@ def ensure_filespec_desc(pdf: Pdf) -> int:
             fixed_count += 1
             logger.debug("Added /Desc to FileSpec: %s", desc)
         except Exception as e:
-            logger.debug("Error fixing FileSpec /Desc: %s", e)
+            log_suppressed_error(logger, e, "Error fixing FileSpec /Desc: %s", e)
 
     for filespec in _iter_all_filespecs(pdf):
         _fix_filespec(filespec)
@@ -1194,7 +1207,9 @@ def sanitize_embedded_file_filters(pdf: Pdf) -> dict[str, int]:
                 logger.debug("Removed Crypt filter from embedded file stream: %s", og)
 
         except Exception as e:
-            logger.debug("Error fixing embedded file stream filter: %s", e)
+            log_suppressed_error(
+                logger, e, "Error fixing embedded file stream filter: %s", e
+            )
 
     def _process_filespec(obj: object) -> None:
         try:
@@ -1208,7 +1223,9 @@ def sanitize_embedded_file_filters(pdf: Pdf) -> dict[str, int]:
                 if stream is not None:
                     _fix_stream(stream)
         except Exception as e:
-            logger.debug("Error processing FileSpec for filter sanitization: %s", e)
+            log_suppressed_error(
+                logger, e, "Error processing FileSpec for filter sanitization: %s", e
+            )
 
     for filespec in _iter_all_filespecs(pdf):
         _process_filespec(filespec)
@@ -1261,7 +1278,7 @@ def remove_embedded_files(pdf: Pdf) -> int:
                 del names["/EmbeddedFiles"]
                 logger.debug("EmbeddedFiles removed from Names dictionary")
     except Exception as e:
-        logger.debug("Error removing EmbeddedFiles: %s", e)
+        log_suppressed_error(logger, e, "Error removing EmbeddedFiles: %s", e)
 
     # 2. Remove FileAttachment Annotations
     for page_num, page in enumerate(pdf.pages, start=1):
@@ -1300,7 +1317,9 @@ def remove_embedded_files(pdf: Pdf) -> int:
             if len(annots) == 0:
                 del page["/Annots"]
         except Exception as e:
-            logger.debug(
+            log_suppressed_error(
+                logger,
+                e,
                 "Error processing Annotations on page %d: %s",
                 page_num,
                 e,

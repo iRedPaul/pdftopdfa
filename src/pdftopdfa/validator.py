@@ -16,6 +16,7 @@ import pikepdf
 from lxml import etree
 
 from .metadata import NAMESPACES
+from .utils import log_suppressed_error
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ def _extract_xmp_bytes(pdf: pikepdf.Pdf) -> bytes | None:
         # Read stream data
         return bytes(metadata.read_bytes())
     except Exception as e:
-        logger.debug("Error extracting XMP metadata: %s", e)
+        log_suppressed_error(logger, e, "Error extracting XMP metadata: %s", e)
         return None
 
 
@@ -84,7 +85,7 @@ def _parse_xmp_tree(xmp_bytes: bytes) -> etree._Element | None:
         logger.debug("XMP XML parsing error: %s", e)
         return None
     except Exception as e:
-        logger.debug("Error parsing XMP metadata: %s", e)
+        log_suppressed_error(logger, e, "Error parsing XMP metadata: %s", e)
         return None
 
 

@@ -214,13 +214,19 @@ class TestGenerateSubsetPrefix:
 
     def test_format(self):
         """Prefix is 6 uppercase letters followed by +."""
-        prefix = _generate_subset_prefix()
+        prefix = _generate_subset_prefix(b"font data")
         assert re.match(r"^[A-Z]{6}\+$", prefix)
 
-    def test_uniqueness(self):
-        """Consecutive calls produce different prefixes (with high probability)."""
-        prefixes = {_generate_subset_prefix() for _ in range(100)}
-        # With 26^6 possibilities, 100 should all be unique
+    def test_deterministic(self):
+        """Same font data always yields the same prefix."""
+        assert _generate_subset_prefix(b"font data") == _generate_subset_prefix(
+            b"font data"
+        )
+
+    def test_distinct_data_distinct_prefixes(self):
+        """Different font data yields different prefixes (with high probability)."""
+        prefixes = {_generate_subset_prefix(f"font {i}".encode()) for i in range(100)}
+        # With 26^6 possibilities, 100 hashes should all be unique
         assert len(prefixes) == 100
 
 

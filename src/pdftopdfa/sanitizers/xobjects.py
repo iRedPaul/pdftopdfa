@@ -11,6 +11,7 @@ from pikepdf import Array, Dictionary, Name, Pdf, Stream
 from pikepdf import parse_content_stream as _parse_content_stream
 from pikepdf import unparse_content_stream as _unparse_content_stream
 
+from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 from .base import FORBIDDEN_XOBJECT_SUBTYPES
 
@@ -128,7 +129,7 @@ def _process_xobjects_for_removal(
                             removed_count += nested_removed
 
         except Exception as e:
-            logger.debug("Error processing XObject %s: %s", key, e)
+            log_suppressed_error(logger, e, "Error processing XObject %s: %s", key, e)
 
     return keys_to_remove, removed_count
 
@@ -257,7 +258,9 @@ def remove_forbidden_xobjects(pdf: Pdf) -> int:
                             )
 
         except Exception as e:
-            logger.debug("Error processing XObjects on page %d: %s", page_num, e)
+            log_suppressed_error(
+                logger, e, "Error processing XObjects on page %d: %s", page_num, e
+            )
 
     if removed_count > 0:
         logger.info("%d forbidden XObject element(s) removed", removed_count)
@@ -321,7 +324,9 @@ def _fix_interpolate_in_xobjects(
                         )
 
         except Exception as e:
-            logger.debug("Error checking /Interpolate on XObject %s: %s", key, e)
+            log_suppressed_error(
+                logger, e, "Error checking /Interpolate on XObject %s: %s", key, e
+            )
 
     return fixed_count
 
@@ -616,7 +621,9 @@ def fix_image_interpolate(pdf: Pdf) -> int:
                             )
 
         except Exception as e:
-            logger.debug("Error checking /Interpolate on page %d: %s", page_num, e)
+            log_suppressed_error(
+                logger, e, "Error checking /Interpolate on page %d: %s", page_num, e
+            )
 
     if fixed_count > 0:
         logger.info("%d image(s) had /Interpolate set to false", fixed_count)
@@ -968,7 +975,9 @@ def _fix_bpc_in_xobjects(
                         result["mask_bpc_fixed"] += nested["mask_bpc_fixed"]
 
         except Exception as e:
-            logger.debug("Error fixing BPC on XObject %s: %s", key, e)
+            log_suppressed_error(
+                logger, e, "Error fixing BPC on XObject %s: %s", key, e
+            )
 
     return result
 
@@ -1073,7 +1082,9 @@ def fix_bits_per_component(pdf: Pdf) -> dict[str, int]:
                             total["mask_bpc_fixed"] += r["mask_bpc_fixed"]
 
         except Exception as e:
-            logger.debug("Error fixing BPC on page %d: %s", page_num, e)
+            log_suppressed_error(
+                logger, e, "Error fixing BPC on page %d: %s", page_num, e
+            )
 
     fixed = total["invalid_bpc_fixed"] + total["mask_bpc_fixed"]
     if fixed > 0:

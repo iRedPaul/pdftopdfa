@@ -67,6 +67,38 @@ def setup_logging(verbose: bool = False, quiet: bool = False) -> logging.Logger:
     return pdftopdfa_logger
 
 
+def log_suppressed_error(
+    module_logger: logging.Logger,
+    exc: BaseException,
+    msg: str,
+    *args: object,
+    level: int = logging.DEBUG,
+) -> None:
+    """Logs an exception swallowed by a robustness handler.
+
+    Broken PDFs routinely raise data errors that are safe to skip, so
+    they are logged at ``level`` (DEBUG by default). AttributeError and
+    NameError, however, almost always indicate a programming error rather
+    than a data error; they are logged at WARNING so they stay visible
+    instead of being silently mistaken for malformed input.
+
+    Args:
+        module_logger: Logger of the calling module.
+        exc: The suppressed exception.
+        msg: %-style log message (same as for logging calls).
+        *args: Arguments for the log message.
+        level: Log level for ordinary data errors.
+    """
+    if isinstance(exc, (AttributeError, NameError)):
+        module_logger.warning(
+            msg + " (%s may indicate a programming error)",
+            *args,
+            type(exc).__name__,
+        )
+    else:
+        module_logger.log(level, msg, *args)
+
+
 def is_pdf_encrypted(pdf: Pdf) -> bool:
     """Checks if a PDF is encrypted.
 
