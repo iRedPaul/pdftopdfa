@@ -25,7 +25,11 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..exceptions import UnsupportedPDFError
-from ..fonts.glyph_usage import _iter_content_streams_with_resources, collect_font_usage
+from ..fonts.glyph_usage import (
+    FontUsageCache,
+    _iter_content_streams_with_resources,
+    collect_font_usage,
+)
 from ..fonts.traversal import iter_all_page_fonts
 from ..utils import resolve_indirect as _resolve
 
@@ -773,9 +777,15 @@ def _repair_unused_cid_overflow_entries(
     return changed_entries, remaining_overflow
 
 
-def _ensure_no_cid_overflow(pdf: Pdf) -> int:
+def _ensure_no_cid_overflow(
+    pdf: Pdf,
+    usage_cache: FontUsageCache | None = None,
+) -> int:
     """Repair unused CMap CID overflows and raise on remaining ones."""
-    font_usage = collect_font_usage(pdf)
+    if usage_cache is not None:
+        font_usage = usage_cache.get()
+    else:
+        font_usage = collect_font_usage(pdf)
     seen_fonts: set[tuple[int, int]] = set()
     repaired = 0
     for page in pdf.pages:
@@ -817,8 +827,21 @@ def _ensure_no_cid_overflow(pdf: Pdf) -> int:
     return repaired
 
 
-def sanitize_structure_limits(pdf: Pdf) -> dict[str, int]:
-    """Sanitize structural implementation-limit violations for PDF/A."""
+def sanitize_structure_limits(
+    pdf: Pdf,
+    usage_cache: FontUsageCache | None = None,
+) -> dict[str, int]:
+    """Sanitize structural implementation-limit violations for PDF/A.
+
+    Args:
+        pdf: Opened pikepdf PDF object (modified in place).
+        usage_cache: Optional shared font usage cache. It is used for the
+            CID overflow check and invalidated when this pass rewrites
+            strings, names, operands or q/Q nesting in content streams.
+
+    Returns:
+        Dictionary with counts of fixes applied.
+    """
     stats: dict[str, int] = {
         "strings_truncated": 0,
         "names_shortened": 0,
@@ -832,7 +855,7 @@ def sanitize_structure_limits(pdf: Pdf) -> dict[str, int]:
         "cid_overflow_entries_repaired": 0,
     }
 
-    stats["cid_overflow_entries_repaired"] = _ensure_no_cid_overflow(pdf)
+    stats["cid_overflow_entries_repaired"] = _ensure_no_cid_overflow(pdf, usage_cache)
 
     visited: set[tuple[int, int]] = set()
     for obj in pdf.objects:
@@ -857,6 +880,15 @@ def sanitize_structure_limits(pdf: Pdf) -> dict[str, int]:
                         continue
                     processed_streams.add(objgen)
                 _sanitize_content_stream(stream, stats)
+
+    # The passes above rewrite strings, names, operands and q/Q nesting in
+    # content streams, any of which can change the collected font usage.
+    if usage_cache is not None and any(
+        count > 0
+        for key, count in stats.items()
+        if key != "cid_overflow_entries_repaired"
+    ):
+        usage_cache.invalidate()
 
     logger.info(
         "Structure limits sanitized: %d strings truncated, %d names shortened, "

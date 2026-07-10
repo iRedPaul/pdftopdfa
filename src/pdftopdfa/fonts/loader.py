@@ -6,6 +6,7 @@
 
 import logging
 import os
+import threading
 from importlib import resources
 from io import BytesIO
 from pathlib import Path
@@ -29,6 +30,13 @@ logger = logging.getLogger(__name__)
 _WINDOWS_ALLOWED_SYSTEM_FONT_NAMES = frozenset(
     name.replace(" ", "").lower() for name in WINDOWS_SYSTEM_FONT_POSTSCRIPT_NAMES
 )
+
+# Process-wide cache of the scanned system font index, keyed by the fonts
+# directory. Building the index walks every font file under %WINDIR%\Fonts
+# and parses it with fontTools, which is expensive; the result is stable
+# for the lifetime of the process.
+_SYSTEM_FONT_INDEX_LOCK = threading.Lock()
+_SYSTEM_FONT_INDEX_CACHE: dict[str, dict[str, tuple[Path, int | None]]] = {}
 
 
 class FontLoader:
@@ -306,10 +314,28 @@ class FontLoader:
         return font_name.lstrip("/").replace(" ", "").lower()
 
     def _build_system_font_index(self) -> dict[str, tuple[Path, int | None]]:
-        """Index policy-eligible Windows system fonts by PostScript name."""
+        """Index policy-eligible Windows system fonts by PostScript name.
+
+        The scan result is cached process-wide (keyed by the fonts
+        directory) so repeated conversions do not rebuild the index.
+        """
         if self._system_font_index is not None:
             return self._system_font_index
 
+        fonts_root = self._get_windows_fonts_dir()
+        cache_key = os.path.normcase(str(fonts_root)) if fonts_root is not None else ""
+
+        with _SYSTEM_FONT_INDEX_LOCK:
+            index = _SYSTEM_FONT_INDEX_CACHE.get(cache_key)
+            if index is None:
+                index = self._scan_system_font_files()
+                _SYSTEM_FONT_INDEX_CACHE[cache_key] = index
+
+        self._system_font_index = index
+        return index
+
+    def _scan_system_font_files(self) -> dict[str, tuple[Path, int | None]]:
+        """Scan the system fonts directory and index allowlisted fonts."""
         from fontTools.ttLib import TTCollection, TTFont
 
         index: dict[str, tuple[Path, int | None]] = {}
@@ -342,7 +368,6 @@ class FontLoader:
             except Exception:
                 continue
 
-        self._system_font_index = index
         return index
 
     @classmethod

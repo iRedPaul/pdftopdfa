@@ -7,9 +7,16 @@
 Covers ISO 19005-2 rules 6.2.11.6-1 through 6.2.11.6-4:
 - 6.2.11.6-1: Non-symbolic TrueType must have a (3,1) or non-(3,0) cmap
 - 6.2.11.6-2: Non-symbolic TrueType /Encoding must name WinAnsiEncoding or
-              MacRomanEncoding (and Differences must use AGL names only)
+              MacRomanEncoding (and Differences must use AGL names only);
+              fonts with valid Differences also get a (3,1) cmap ensured
 - 6.2.11.6-3: Symbolic TrueType must NOT have /Encoding; Symbolic flag must be set
 - 6.2.11.6-4: Symbolic TrueType with multiple cmaps must have a (3,0) subtable
+
+Additionally, embedded non-symbolic Type1/MMType1 fonts without an
+/Encoding entry get /WinAnsiEncoding added.
+
+This sanitizer must run after font subsetting: cmap subtables added here
+would otherwise be pruned by the subsetter.
 """
 
 import logging
@@ -53,6 +60,7 @@ def sanitize_truetype_encoding(pdf: Pdf) -> dict[str, int]:
         - tt_symbolic_encoding_removed: /Encoding removed from symbolic font
         - tt_symbolic_flag_set: Symbolic bit set in /Flags
         - tt_symbolic_cmap_added: (3,0) cmap added to symbolic font
+        - type1_encoding_added: /WinAnsiEncoding added to Type1/MMType1 font
     """
     result: dict[str, int] = {
         "tt_nonsymbolic_cmap_added": 0,
@@ -60,17 +68,20 @@ def sanitize_truetype_encoding(pdf: Pdf) -> dict[str, int]:
         "tt_symbolic_encoding_removed": 0,
         "tt_symbolic_flag_set": 0,
         "tt_symbolic_cmap_added": 0,
+        "type1_encoding_added": 0,
     }
 
-    for font, fd in _iter_embedded_truetype_fonts(pdf):
+    for font, fd, subtype in _iter_embedded_simple_fonts(pdf):
         try:
-            if is_symbolic_font(font):
+            if subtype in ("/Type1", "/MMType1"):
+                _fix_type1_encoding(font, result)
+            elif is_symbolic_font(font):
                 _fix_symbolic_truetype(pdf, font, fd, result)
             else:
                 _fix_nonsymbolic_truetype(pdf, font, fd, result)
         except Exception as e:
             name = _safe_str(font.get("/BaseFont") or b"")
-            logger.debug("Error processing TrueType font %s: %s", name, e)
+            logger.debug("Error processing font %s: %s", name, e)
             continue
 
     total = sum(result.values())
@@ -78,25 +89,70 @@ def sanitize_truetype_encoding(pdf: Pdf) -> dict[str, int]:
         logger.info(
             "TrueType encoding sanitization: %d (3,1) cmaps added, "
             "%d encodings fixed, %d /Encoding entries removed, "
-            "%d Symbolic flags set, %d (3,0) cmaps added",
+            "%d Symbolic flags set, %d (3,0) cmaps added, "
+            "%d Type1 encodings added",
             result["tt_nonsymbolic_cmap_added"],
             result["tt_nonsymbolic_encoding_fixed"],
             result["tt_symbolic_encoding_removed"],
             result["tt_symbolic_flag_set"],
             result["tt_symbolic_cmap_added"],
+            result["type1_encoding_added"],
         )
 
     return result
 
 
-def _iter_embedded_truetype_fonts(pdf: Pdf):
-    """Yields (font, fd) tuples for embedded TrueType fonts.
+def _get_truetype_font_stream(
+    fd: pikepdf.Object,
+) -> tuple[str, pikepdf.Object] | None:
+    """Returns the embedded TrueType/OpenType stream and descriptor key.
+
+    Simple TrueType font dictionaries may embed an OpenType program through
+    ``/FontFile3 /OpenType`` as well as a TrueType program through
+    ``/FontFile2``.  Other FontFile3 subtypes contain different program
+    formats and are not handled by ``TTFont`` here.
+
+    Args:
+        fd: Resolved FontDescriptor Dictionary.
+
+    Returns:
+        Tuple of descriptor key and resolved font stream, or None when no
+        supported embedded program is present.
+    """
+    font_file2 = fd.get("/FontFile2")
+    if font_file2 is not None:
+        try:
+            return "/FontFile2", _resolve(font_file2)
+        except Exception:
+            return None
+
+    font_file3 = fd.get("/FontFile3")
+    if font_file3 is None:
+        return None
+
+    try:
+        stream = _resolve(font_file3)
+        if not isinstance(stream, Stream):
+            return None
+        if _safe_str(stream.get("/Subtype") or b"") != "/OpenType":
+            return None
+        return "/FontFile3", stream
+    except Exception:
+        return None
+
+
+def _iter_embedded_simple_fonts(pdf: Pdf):
+    """Yields (font, fd, subtype) tuples for embedded simple fonts.
+
+    Covers TrueType fonts with /FontFile2 or /FontFile3 /OpenType and
+    Type1/MMType1 fonts with any embedded font program.
 
     Args:
         pdf: Opened pikepdf PDF object.
 
     Yields:
-        Tuples of (resolved font Dictionary, resolved FontDescriptor Dictionary).
+        Tuples of (resolved font Dictionary, resolved FontDescriptor
+        Dictionary, subtype string).
     """
     seen_objgens: set[tuple[int, int]] = set()
 
@@ -114,9 +170,11 @@ def _iter_embedded_truetype_fonts(pdf: Pdf):
                         continue
                     seen_objgens.add(objgen)
 
-                # Only process TrueType fonts
                 subtype = font.get("/Subtype")
-                if subtype is None or _safe_str(subtype) != "/TrueType":
+                if subtype is None:
+                    continue
+                subtype_str = _safe_str(subtype)
+                if subtype_str not in ("/TrueType", "/Type1", "/MMType1"):
                     continue
 
                 # Must have a FontDescriptor
@@ -127,19 +185,27 @@ def _iter_embedded_truetype_fonts(pdf: Pdf):
                 if not isinstance(fd, Dictionary):
                     continue
 
-                # Must be embedded (has /FontFile2)
-                if fd.get("/FontFile2") is None:
+                # Must be embedded: TrueType handling supports /FontFile2 and
+                # /FontFile3 /OpenType; Type1/MMType1 accepts any embedded
+                # font program.
+                if subtype_str == "/TrueType":
+                    if _get_truetype_font_stream(fd) is None:
+                        continue
+                elif all(
+                    fd.get(key) is None
+                    for key in ("/FontFile", "/FontFile2", "/FontFile3")
+                ):
                     continue
 
-                yield font, fd
+                yield font, fd, subtype_str
 
             except Exception as e:
-                logger.debug("Error iterating TrueType font: %s", e)
+                logger.debug("Error iterating font: %s", e)
                 continue
 
 
 def _load_tt_font(fd: pikepdf.Object) -> TTFont | None:
-    """Loads a TTFont from the /FontFile2 stream in a FontDescriptor.
+    """Loads a TTFont from a supported stream in a FontDescriptor.
 
     Args:
         fd: Resolved FontDescriptor Dictionary.
@@ -148,28 +214,61 @@ def _load_tt_font(fd: pikepdf.Object) -> TTFont | None:
         TTFont object, or None on failure.
     """
     try:
-        font_file = _resolve(fd["/FontFile2"])
+        font_file_info = _get_truetype_font_stream(fd)
+        if font_file_info is None:
+            return None
+        _font_file_key, font_file = font_file_info
         data = bytes(font_file.read_bytes())
         return TTFont(BytesIO(data))
     except Exception as e:
-        logger.debug("Could not load TTFont from /FontFile2: %s", e)
+        logger.debug("Could not load embedded TrueType/OpenType font: %s", e)
         return None
 
 
 def _save_tt_font(pdf: Pdf, fd: pikepdf.Object, tt_font: TTFont) -> None:
-    """Saves a modified TTFont back to the /FontFile2 stream.
+    """Saves a modified TTFont back to its original descriptor entry.
 
     Args:
         pdf: The PDF to make indirect objects in.
         fd: Resolved FontDescriptor Dictionary.
         tt_font: The modified TTFont to save.
     """
+    font_file_info = _get_truetype_font_stream(fd)
+    if font_file_info is None:
+        raise ValueError("FontDescriptor has no supported TrueType/OpenType stream")
+    font_file_key, _old_stream = font_file_info
+
     out = BytesIO()
     tt_font.save(out)
     new_font_data = out.getvalue()
     new_stream = Stream(pdf, new_font_data)
-    new_stream[Name.Length1] = len(new_font_data)
-    fd[Name("/FontFile2")] = pdf.make_indirect(new_stream)
+    if font_file_key == "/FontFile2":
+        new_stream[Name.Length1] = len(new_font_data)
+    else:
+        new_stream[Name.Subtype] = Name.OpenType
+    fd[Name(font_file_key)] = pdf.make_indirect(new_stream)
+
+
+def _fix_type1_encoding(
+    font: pikepdf.Object,
+    result: dict[str, int],
+) -> None:
+    """Adds /WinAnsiEncoding to embedded non-symbolic Type1/MMType1 fonts.
+
+    Args:
+        font: Resolved font Dictionary.
+        result: Result counters dict (modified in place).
+    """
+    if font.get("/Encoding") is not None:
+        return
+    if is_symbolic_font(font):
+        return
+    font[Name.Encoding] = Name.WinAnsiEncoding
+    result["type1_encoding_added"] += 1
+    logger.info(
+        "Added /WinAnsiEncoding to Type1 font: %s (ISO 19005-2, 6.2.11.6)",
+        _safe_str(font.get("/BaseFont") or b""),
+    )
 
 
 def _fix_nonsymbolic_truetype(
@@ -187,7 +286,7 @@ def _fix_nonsymbolic_truetype(
         result: Result counters dict (modified in place).
     """
     # Rule 6.2.11.6-2 first (encoding dict), then rule 6.2.11.6-1 (cmap)
-    _apply_rule_6_2_11_6_2(font, result)
+    _apply_rule_6_2_11_6_2(pdf, font, fd, result)
     _apply_rule_6_2_11_6_1(pdf, fd, result)
 
 
@@ -275,7 +374,9 @@ def _apply_rule_6_2_11_6_1(
 
 
 def _apply_rule_6_2_11_6_2(
+    pdf: Pdf,
     font: pikepdf.Object,
+    fd: pikepdf.Object,
     result: dict[str, int],
 ) -> None:
     """Rule 6.2.11.6-2: Non-symbolic TrueType /Encoding must be compliant.
@@ -283,10 +384,14 @@ def _apply_rule_6_2_11_6_2(
     - If no /Encoding: add /WinAnsiEncoding Name
     - If /Encoding is a Name: must be WinAnsiEncoding or MacRomanEncoding
     - If /Encoding is a Dictionary: BaseEncoding must be compliant; Differences
-      must use only AGL glyph names
+      must use only AGL glyph names.  Fonts that keep valid Differences also
+      get a Microsoft Unicode (3,1) cmap ensured in the font program so the
+      AGL names can be mapped reliably.
 
     Args:
+        pdf: The PDF object.
         font: Resolved font Dictionary.
+        fd: Resolved FontDescriptor Dictionary.
         result: Result counters dict (modified in place).
     """
     encoding_obj = font.get("/Encoding")
@@ -333,17 +438,88 @@ def _apply_rule_6_2_11_6_2(
         # Check /Differences — remove if any non-AGL names
         differences = encoding_obj.get("/Differences")
         if differences is not None:
+            keep_differences = False
             try:
                 differences = _resolve(differences)
                 if _has_non_agl_differences(differences):
                     del encoding_obj["/Differences"]
                     changed = True
+                else:
+                    keep_differences = True
             except Exception:
                 del encoding_obj["/Differences"]
                 changed = True
 
+            # Valid AGL Differences stay — ensure the font program has a
+            # Microsoft Unicode (3,1) cmap so the names map reliably.
+            if keep_differences and _ensure_ms_unicode_cmap(pdf, fd):
+                result["tt_nonsymbolic_cmap_added"] += 1
+
         if changed:
             result["tt_nonsymbolic_encoding_fixed"] += 1
+
+
+def _ensure_ms_unicode_cmap(pdf: Pdf, fd: pikepdf.Object) -> bool:
+    """Ensures the font program has a Microsoft Unicode (3,1) cmap subtable.
+
+    Builds the (3,1) subtable from the best available source cmap.  Mac
+    Roman byte codes >= 0x80 are not Unicode code points and are translated
+    before being used as (3,1) keys.
+
+    Args:
+        pdf: The PDF object.
+        fd: Resolved FontDescriptor Dictionary.
+
+    Returns:
+        True if the font program was modified, False otherwise.
+    """
+    tt_font = _load_tt_font(fd)
+    if tt_font is None:
+        return False
+
+    try:
+        cmap_table = tt_font.get("cmap")
+        if cmap_table is None:
+            return False
+
+        # Check if (3,1) already exists
+        for st in cmap_table.tables:
+            if st.platformID == 3 and st.platEncID == 1:
+                return False
+
+        source = _find_best_cmap_source(cmap_table.tables)
+        if source is None:
+            return False
+
+        new_subtable = cmap_format_4(4)
+        new_subtable.platformID = 3
+        new_subtable.platEncID = 1
+        new_subtable.language = 0
+        if source.platformID == 1 and source.platEncID == 0:
+            new_mapping: dict[int, str] = {}
+            for code, glyph_name in source.cmap.items():
+                if 0 <= code <= 0xFF:
+                    code = ord(bytes([code]).decode("mac_roman"))
+                new_mapping[code] = glyph_name
+            new_subtable.cmap = new_mapping
+        else:
+            new_subtable.cmap = dict(source.cmap)
+
+        cmap_table.tables.append(new_subtable)
+
+        _save_tt_font(pdf, fd, tt_font)
+        logger.info(
+            "Added Microsoft Unicode (3,1) cmap for TrueType font with "
+            "Differences (rule 6.2.11.6-2)"
+        )
+        return True
+
+    except Exception as e:
+        logger.debug("Error ensuring MS Unicode (3,1) cmap: %s", e)
+        return False
+
+    finally:
+        tt_font.close()
 
 
 def _apply_rule_6_2_11_6_3(

@@ -320,6 +320,36 @@ def _resolve_font_object(
         return None
 
 
+class FontUsageCache:
+    """Lazily computed, invalidatable cache around collect_font_usage().
+
+    collect_font_usage() parses every content stream in the document,
+    which is expensive. Passes that only read glyph usage can share a
+    single collection through this cache; passes that rewrite content
+    streams (and thereby may change which codes are used) must call
+    invalidate() so the next consumer sees fresh data.
+    """
+
+    def __init__(self, pdf: pikepdf.Pdf) -> None:
+        """Initializes the cache for a specific PDF.
+
+        Args:
+            pdf: Opened pikepdf PDF object.
+        """
+        self._pdf = pdf
+        self._usage: dict[tuple[int, int], set[int]] | None = None
+
+    def get(self) -> dict[tuple[int, int], set[int]]:
+        """Returns the font usage map, collecting it on first access."""
+        if self._usage is None:
+            self._usage = collect_font_usage(self._pdf)
+        return self._usage
+
+    def invalidate(self) -> None:
+        """Drops the cached usage map after content streams changed."""
+        self._usage = None
+
+
 def collect_font_usage(
     pdf: pikepdf.Pdf,
 ) -> dict[tuple[int, int], set[int]]:

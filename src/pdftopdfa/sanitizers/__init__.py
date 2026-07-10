@@ -14,6 +14,7 @@ from typing import Any
 from pikepdf import Pdf
 
 from ..exceptions import ConversionError
+from ..fonts.glyph_usage import FontUsageCache
 from ..utils import get_required_pdf_version, validate_pdfa_level
 from .actions import remove_actions, validate_destinations
 from .annotations import (
@@ -246,6 +247,7 @@ def sanitize_for_pdfa(
         "tt_symbolic_encoding_removed": 0,
         "tt_symbolic_flag_set": 0,
         "tt_symbolic_cmap_added": 0,
+        "type1_encoding_added": 0,
     }
 
     # Convert LZW-compressed streams to FlateDecode (all levels)
@@ -410,8 +412,15 @@ def sanitize_for_pdfa(
     result["resources_entries_merged"] = ri_result.get("resources_entries_merged", 0)
     result["image_intents_fixed"] = ri_result.get("image_intents_fixed", 0)
 
+    # Shared font usage analysis: collect_font_usage() parses every content
+    # stream, so the read-only consumers below (structure limits, glyph
+    # coverage, font widths) share a single collection.  The cache is created
+    # here, after the annotation/content passes above already ran, and is
+    # invalidated by sanitize_structure_limits() when it rewrites content.
+    usage_cache = FontUsageCache(pdf)
+
     # Sanitize implementation limits and structural name/string constraints
-    structure_result = sanitize_structure_limits(pdf)
+    structure_result = sanitize_structure_limits(pdf, usage_cache)
     result["structure_strings_truncated"] = structure_result.get("strings_truncated", 0)
     result["structure_names_shortened"] = structure_result.get("names_shortened", 0)
     result["structure_utf8_names_fixed"] = structure_result.get("utf8_names_fixed", 0)
@@ -470,6 +479,7 @@ def sanitize_for_pdfa(
     )
     result["tt_symbolic_flag_set"] = tt_enc_result.get("tt_symbolic_flag_set", 0)
     result["tt_symbolic_cmap_added"] = tt_enc_result.get("tt_symbolic_cmap_added", 0)
+    result["type1_encoding_added"] = tt_enc_result.get("type1_encoding_added", 0)
 
     # Ensure .notdef glyph in all embedded fonts (ISO 19005-2, 6.3.3)
     # Must run BEFORE width validation — adds .notdef which changes font programs
@@ -478,12 +488,12 @@ def sanitize_for_pdfa(
 
     # Ensure all referenced glyphs exist in embedded fonts (ISO 19005-2, 6.2.11.4.1)
     # Must run BEFORE width validation — adds glyphs which changes font programs
-    glyph_coverage_result = sanitize_glyph_coverage(pdf)
+    glyph_coverage_result = sanitize_glyph_coverage(pdf, usage_cache)
     result["glyphs_added"] = glyph_coverage_result.get("glyphs_added", 0)
 
     # Validate and fix font widths (ISO 19005-2, 6.3.7)
     # Must run AFTER notdef/glyph_coverage — reads final font program state
-    font_widths_result = sanitize_font_widths(pdf)
+    font_widths_result = sanitize_font_widths(pdf, usage_cache)
     result["simple_font_widths_fixed"] = font_widths_result.get(
         "simple_font_widths_fixed", 0
     )

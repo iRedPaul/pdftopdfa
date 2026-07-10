@@ -17,7 +17,7 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from ..fonts.analysis import is_symbolic_font
-from ..fonts.glyph_usage import collect_font_usage
+from ..fonts.glyph_usage import FontUsageCache, collect_font_usage
 from ..fonts.tounicode import (
     generate_tounicode_for_macroman,
     generate_tounicode_for_standard_encoding,
@@ -194,7 +194,10 @@ def _validate_font_program(tt_font, font_name: str = "") -> bool:
     return True
 
 
-def sanitize_font_widths(pdf: Pdf) -> dict[str, int]:
+def sanitize_font_widths(
+    pdf: Pdf,
+    usage_cache: FontUsageCache | None = None,
+) -> dict[str, int]:
     """Validates and corrects font widths for all embedded fonts.
 
     Iterates all fonts in the PDF, compares declared widths against the
@@ -202,6 +205,8 @@ def sanitize_font_widths(pdf: Pdf) -> dict[str, int]:
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
+        usage_cache: Optional shared font usage cache; when absent, the
+            usage is collected locally.
 
     Returns:
         Dictionary with counts of fixes applied.
@@ -215,7 +220,7 @@ def sanitize_font_widths(pdf: Pdf) -> dict[str, int]:
     # Codes used in content streams may lie outside [FirstChar, LastChar];
     # their width falls back to MissingWidth, which veraPDF flags as a
     # mismatch, so the declared range must be widened to cover them.
-    usage = collect_font_usage(pdf)
+    usage = usage_cache.get() if usage_cache is not None else collect_font_usage(pdf)
 
     for font_name, font_obj, font_type in _iter_all_embedded_fonts(pdf):
         try:

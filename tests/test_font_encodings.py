@@ -17,6 +17,7 @@ from pdftopdfa.fonts.encodings import (
     SYMBOL_ENCODING,
     ZAPFDINGBATS_ENCODING,
 )
+from pdftopdfa.sanitizers.truetype_encoding import sanitize_truetype_encoding
 from pdftopdfa.utils import resolve_indirect as _resolve_indirect
 
 
@@ -401,7 +402,7 @@ class TestStandardEncoding:
 
 
 class TestEnsureEncoding:
-    """Tests for _ensure_encoding_on_font (ISO 19005-2, 6.2.11.6)."""
+    """Tests for sanitize_truetype_encoding (ISO 19005-2, 6.2.11.6)."""
 
     def _make_embedded_font(
         self, pdf, *, subtype="/TrueType", flags=32, encoding=None, has_tounicode=False
@@ -459,8 +460,7 @@ class TestEnsureEncoding:
         font_dict = self._make_embedded_font(pdf, subtype="/TrueType", flags=32)
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         assert font_dict.get("/Encoding") == Name.WinAnsiEncoding
 
@@ -470,8 +470,7 @@ class TestEnsureEncoding:
         font_dict = self._make_embedded_font(pdf, subtype="/Type1", flags=32)
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         assert font_dict.get("/Encoding") == Name.WinAnsiEncoding
 
@@ -486,8 +485,7 @@ class TestEnsureEncoding:
         )
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         assert font_dict.get("/Encoding") == Name.MacRomanEncoding
 
@@ -497,8 +495,7 @@ class TestEnsureEncoding:
         font_dict = self._make_embedded_font(pdf, subtype="/Type1", flags=4)
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         assert font_dict.get("/Encoding") is None
 
@@ -513,8 +510,7 @@ class TestEnsureEncoding:
         )
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         assert font_dict.get("/Encoding") == Name.WinAnsiEncoding
 
@@ -529,8 +525,7 @@ class TestEnsureEncoding:
         )
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         assert font_dict.get("/Encoding") is None
 
@@ -552,8 +547,7 @@ class TestEnsureEncoding:
         )
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         # Type0 already has /Encoding (Identity-H), method should not touch it
         assert font_dict.get("/Encoding") == Name("/Identity-H")
@@ -575,8 +569,7 @@ class TestEnsureEncoding:
         )
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         # Type3 should keep its encoding dict, not get WinAnsiEncoding
         enc = font_dict.get("/Encoding")
@@ -596,8 +589,7 @@ class TestEnsureEncoding:
         )
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         assert font_dict.get("/Encoding") == Name.WinAnsiEncoding
 
@@ -618,8 +610,7 @@ class TestEnsureEncoding:
         )
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         enc = _resolve_indirect(font_dict.get("/Encoding"))
         assert enc.get("/BaseEncoding") == Name.WinAnsiEncoding
@@ -647,8 +638,7 @@ class TestEnsureEncoding:
         )
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         enc = _resolve_indirect(font_dict.get("/Encoding"))
         assert enc.get("/Differences") is None
@@ -671,8 +661,7 @@ class TestEnsureEncoding:
         )
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         enc = _resolve_indirect(font_dict.get("/Encoding"))
         assert enc.get("/Differences") is None
@@ -688,8 +677,7 @@ class TestEnsureEncoding:
         )
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         assert font_dict.get("/Encoding") == Name.MacRomanEncoding
 
@@ -725,8 +713,7 @@ class TestEnsureEncoding:
         )
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         assert font_dict.get("/Encoding") is None
 
@@ -740,8 +727,7 @@ class TestEnsureEncoding:
         )
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         assert font_dict.get("/Encoding") is None
 
@@ -840,8 +826,7 @@ class TestEnsureEncoding:
         font_dict = self._make_embedded_font_with_ttdata(pdf, tt_data, flags=4)
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         # Font data should not be modified (single subtable is OK)
         fd = _resolve_indirect(font_dict.get("/FontDescriptor"))
@@ -861,8 +846,7 @@ class TestEnsureEncoding:
         font_dict = self._make_embedded_font_with_ttdata(pdf, tt_data, flags=4)
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         fd = _resolve_indirect(font_dict.get("/FontDescriptor"))
         ff2 = _resolve_indirect(fd.get("/FontFile2"))
@@ -884,8 +868,7 @@ class TestEnsureEncoding:
         font_dict = self._make_embedded_font_with_ttdata(pdf, tt_data, flags=4)
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         # Font should now have a (3,0) subtable
         fd = _resolve_indirect(font_dict.get("/FontDescriptor"))
@@ -917,8 +900,7 @@ class TestEnsureEncoding:
         font_dict = self._make_embedded_font_with_ttdata(pdf, tt_data, flags=4)
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         fd = _resolve_indirect(font_dict.get("/FontDescriptor"))
         ff2 = _resolve_indirect(fd.get("/FontFile2"))
@@ -957,8 +939,7 @@ class TestEnsureEncoding:
         font_dict[Name.Encoding] = pdf.make_indirect(enc_dict)
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         fd = _resolve_indirect(font_dict.get("/FontDescriptor"))
         ff2 = _resolve_indirect(fd.get("/FontFile2"))
@@ -985,9 +966,8 @@ class TestEnsureEncoding:
         )
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
         # Should not crash, just return without changes
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
     # --- Backward compatibility ---
 
@@ -1002,8 +982,7 @@ class TestEnsureEncoding:
         )
         self._build_pdf_with_font(pdf, font_dict)
 
-        embedder = FontEmbedder(pdf)
-        embedder.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         # Type1 symbolic: encoding should be preserved
         assert font_dict.get("/Encoding") == Name.WinAnsiEncoding
@@ -1037,8 +1016,7 @@ class TestEnsureEncoding:
         embedder.subset_embedded_fonts()
 
         # Step 2: Fix encodings (removes /Encoding, adds (3,0) cmap)
-        embedder2 = FontEmbedder(pdf)
-        embedder2.fix_font_encodings()
+        sanitize_truetype_encoding(pdf)
 
         # Verify: /Encoding removed
         assert font_dict.get("/Encoding") is None

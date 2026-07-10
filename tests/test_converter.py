@@ -1126,7 +1126,6 @@ class TestConvertToPdfa:
             bytes_saved=12871064,
             warnings=[],
         )
-        embedder.fix_font_encodings.return_value = 2
         mock_font_embedder.return_value = embedder
 
         info_output = tmp_dir / "info_output.pdf"
@@ -1139,7 +1138,6 @@ class TestConvertToPdfa:
             or record.message.startswith("Fonts embedded:")
             or record.message.startswith("ToUnicode added to fonts:")
             or record.message.startswith("Fonts subsetted:")
-            or record.message.startswith("Fixed encoding on ")
             for record in caplog.records
         )
 
@@ -1164,10 +1162,6 @@ class TestConvertToPdfa:
         )
         assert any(
             record.message == "Fonts subsetted: Arial, Unknown (saved 12871064 bytes)"
-            for record in caplog.records
-        )
-        assert any(
-            record.message == "Fixed encoding on 2 font(s) (rule 6.2.11.6)"
             for record in caplog.records
         )
 
@@ -1202,7 +1196,6 @@ class TestConvertToPdfa:
             bytes_saved=1024,
             warnings=[],
         )
-        embedder.fix_font_encodings.return_value = 0
         embedder.replace_subsetted_standard14_fonts.return_value = SimpleNamespace(
             fonts_embedded=[],
             fonts_failed=[],
@@ -1248,7 +1241,6 @@ class TestConvertToPdfa:
             bytes_saved=0,
             warnings=[],
         )
-        embedder.fix_font_encodings.return_value = 0
         embedder.replace_subsetted_standard14_fonts.return_value = SimpleNamespace(
             fonts_embedded=[],
             fonts_failed=[],

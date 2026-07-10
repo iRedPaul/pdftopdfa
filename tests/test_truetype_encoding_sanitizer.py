@@ -164,7 +164,10 @@ def _get_cmap_subtables(fd: Dictionary) -> list[tuple[int, int]]:
     Returns:
         List of (platformID, platEncID) tuples.
     """
-    font_file = _resolve(fd["/FontFile2"])
+    font_file_ref = fd.get("/FontFile2")
+    if font_file_ref is None:
+        font_file_ref = fd["/FontFile3"]
+    font_file = _resolve(font_file_ref)
     data = bytes(font_file.read_bytes())
     tt = TTFont(BytesIO(data))
     try:
@@ -301,6 +304,32 @@ def test_rule2_keeps_valid_agl_differences():
     assert result["tt_nonsymbolic_encoding_fixed"] == 0
     enc_resolved = _resolve(font["/Encoding"])
     assert enc_resolved.get("/Differences") is not None
+
+
+def test_fontfile3_opentype_is_fixed_and_preserved():
+    """TrueType dictionaries may embed OpenType programs through FontFile3."""
+    pdf = _new_page_pdf()
+    font_bytes = _make_tt_font_bytes([(3, 0, {0xF041: "A"})], symbolic=False)
+    font, fd = _add_truetype_font(
+        pdf, font_bytes, flags=32, encoding=Name.StandardEncoding
+    )
+
+    font_stream = _resolve(fd["/FontFile2"])
+    del font_stream["/Length1"]
+    font_stream[Name.Subtype] = Name.OpenType
+    del fd["/FontFile2"]
+    fd[Name.FontFile3] = font_stream
+
+    result = sanitize_truetype_encoding(pdf)
+
+    assert result["tt_nonsymbolic_encoding_fixed"] == 1
+    assert result["tt_nonsymbolic_cmap_added"] == 1
+    assert font["/Encoding"] == Name.WinAnsiEncoding
+    assert fd.get("/FontFile2") is None
+    rewritten_stream = _resolve(fd["/FontFile3"])
+    assert rewritten_stream.get("/Subtype") == Name.OpenType
+    assert rewritten_stream.get("/Length1") is None
+    assert (3, 1) in set(_get_cmap_subtables(fd))
 
 
 # ---------------------------------------------------------------------------

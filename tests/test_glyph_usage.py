@@ -9,6 +9,7 @@ from conftest import new_pdf
 from pikepdf import Array, Dictionary, Name
 
 from pdftopdfa.fonts.glyph_usage import (
+    FontUsageCache,
     _extract_char_codes,
     _is_cidfont,
     collect_font_usage,
@@ -446,3 +447,48 @@ class TestCollectFontUsage:
         usage = collect_font_usage(pdf)
         # Direct objects have objgen (0,0) and are skipped
         assert usage == {}
+
+
+class TestFontUsageCache:
+    """Tests for FontUsageCache."""
+
+    def _make_pdf_with_usage(self):
+        pdf = new_pdf()
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.TrueType,
+                BaseFont=Name("/CachedFont"),
+            )
+        )
+        content = b"BT /F1 12 Tf (AB) Tj ET"
+        _make_page_with_content(pdf, content, Dictionary(F1=font))
+        return pdf, font
+
+    def test_get_returns_collected_usage(self):
+        """get() returns the same result as collect_font_usage()."""
+        pdf, font = self._make_pdf_with_usage()
+        cache = FontUsageCache(pdf)
+
+        assert cache.get() == collect_font_usage(pdf)
+        assert cache.get()[font.objgen] == {65, 66}
+
+    def test_get_is_cached_until_invalidated(self):
+        """Repeated get() calls reuse the collection; invalidate() drops it."""
+        pdf, font = self._make_pdf_with_usage()
+        cache = FontUsageCache(pdf)
+
+        first = cache.get()
+        assert cache.get() is first
+
+        # Add a second page using the same font with another code.
+        content = b"BT /F1 12 Tf (C) Tj ET"
+        _make_page_with_content(pdf, content, Dictionary(F1=font))
+
+        # Still cached: the new code is not visible yet.
+        assert cache.get() is first
+
+        cache.invalidate()
+        refreshed = cache.get()
+        assert refreshed is not first
+        assert refreshed[font.objgen] == {65, 66, 67}

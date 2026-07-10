@@ -107,6 +107,7 @@ _SANITIZE_WARNINGS: list[tuple[str, str]] = [
         "tt_symbolic_cmap_added",
         "symbolic TrueType font program(s) had (3,0) cmap added",
     ),
+    ("type1_encoding_added", "Type1 font(s) had /WinAnsiEncoding added"),
     ("boxes_normalized", "page box(es) normalized"),
     ("boxes_clipped", "page box(es) clipped to MediaBox"),
     ("malformed_boxes_removed", "malformed page box(es) removed"),
@@ -949,111 +950,97 @@ def convert_to_pdfa(
                 logger.debug(msg)
                 warnings.append(msg)
 
-        # 3. Check font compliance and embed missing fonts
+        # 3. Check font compliance and embed missing fonts.
+        # A single FontEmbedder serves all font passes so loaded replacement
+        # fonts stay cached across the steps.
         from .fonts import FontEmbedder
 
         logger.debug("Checking font compliance")
         is_compliant, missing_fonts = check_font_compliance(pdf, raise_on_error=False)
-        if not is_compliant:
-            logger.debug(
-                "Attempting to embed missing fonts: %s",
-                ", ".join(missing_fonts),
-            )
-            with FontEmbedder(pdf) as embedder:
+        with FontEmbedder(pdf) as embedder:
+            if not is_compliant:
+                logger.debug(
+                    "Attempting to embed missing fonts: %s",
+                    ", ".join(missing_fonts),
+                )
                 embed_result = embedder.embed_missing_fonts()
 
-            if embed_result.fonts_embedded:
-                logger.debug(
-                    "Fonts embedded: %s",
-                    ", ".join(embed_result.fonts_embedded),
-                )
+                if embed_result.fonts_embedded:
+                    logger.debug(
+                        "Fonts embedded: %s",
+                        ", ".join(embed_result.fonts_embedded),
+                    )
 
-            if embed_result.fonts_failed:
-                raise FontEmbeddingError(
-                    "Could not embed fonts: "
-                    f"{', '.join(embed_result.fonts_failed)}. "
-                    "All fonts must be embedded for PDF/A compliance "
-                    "(ISO 19005, clause 6.3.1)."
-                )
+                if embed_result.fonts_failed:
+                    raise FontEmbeddingError(
+                        "Could not embed fonts: "
+                        f"{', '.join(embed_result.fonts_failed)}. "
+                        "All fonts must be embedded for PDF/A compliance "
+                        "(ISO 19005, clause 6.3.1)."
+                    )
 
-            warnings.extend(embed_result.warnings)
+                warnings.extend(embed_result.warnings)
 
-        # 3.5. Unicode compliance — always add ToUnicode to all embedded
-        # fonts (ISO 19005-2/3, rule 6.2.11.7.2).  veraPDF requires
-        # explicit ToUnicode even when Unicode is theoretically derivable.
-        logger.debug("Adding ToUnicode to embedded fonts for PDF/A-%s", level)
-        with FontEmbedder(pdf) as embedder:
+            # 3.5. Unicode compliance — always add ToUnicode to all embedded
+            # fonts (ISO 19005-2/3, rule 6.2.11.7.2).  veraPDF requires
+            # explicit ToUnicode even when Unicode is theoretically derivable.
+            logger.debug("Adding ToUnicode to embedded fonts for PDF/A-%s", level)
             tounicode_result = embedder.add_tounicode_to_embedded_fonts()
 
-        if tounicode_result.fonts_embedded:
-            logger.debug(
-                "ToUnicode added to fonts: %s",
-                ", ".join(tounicode_result.fonts_embedded),
-            )
+            if tounicode_result.fonts_embedded:
+                logger.debug(
+                    "ToUnicode added to fonts: %s",
+                    ", ".join(tounicode_result.fonts_embedded),
+                )
 
-        if tounicode_result.fonts_failed:
-            raise ConversionError(
-                "Could not add ToUnicode mappings to: "
-                f"{', '.join(tounicode_result.fonts_failed)}. "
-                "ToUnicode is required for PDF/A compliance "
-                f"(ISO 19005-2/3, rule 6.2.11.7.2, level {level})."
-            )
+            if tounicode_result.fonts_failed:
+                raise ConversionError(
+                    "Could not add ToUnicode mappings to: "
+                    f"{', '.join(tounicode_result.fonts_failed)}. "
+                    "ToUnicode is required for PDF/A compliance "
+                    f"(ISO 19005-2/3, rule 6.2.11.7.2, level {level})."
+                )
 
-        warnings.extend(tounicode_result.warnings)
+            warnings.extend(tounicode_result.warnings)
 
-        with FontEmbedder(pdf) as embedder:
             original_subsetted_standard14_font_ids = (
                 embedder.collect_subsetted_standard14_font_ids()
             )
 
-        # 3.7. Subset embedded fonts to reduce file size
-        logger.debug("Subsetting embedded fonts")
-        with FontEmbedder(pdf) as embedder:
+            # 3.7. Subset embedded fonts to reduce file size.
+            # Font encoding fixes (ISO 19005-2, 6.2.11.6) happen later in
+            # sanitize_truetype_encoding(), which runs after subsetting so
+            # the cmaps it adds are not pruned by the subsetter.
+            logger.debug("Subsetting embedded fonts")
             subset_result = embedder.subset_embedded_fonts()
 
-        if subset_result.fonts_subsetted:
-            logger.debug(
-                "Fonts subsetted: %s (saved %d bytes)",
-                ", ".join(subset_result.fonts_subsetted),
-                subset_result.bytes_saved,
-            )
+            if subset_result.fonts_subsetted:
+                logger.debug(
+                    "Fonts subsetted: %s (saved %d bytes)",
+                    ", ".join(subset_result.fonts_subsetted),
+                    subset_result.bytes_saved,
+                )
 
-        if subset_result.warnings:
-            warnings.extend(subset_result.warnings)
+            if subset_result.warnings:
+                warnings.extend(subset_result.warnings)
 
-        # 3.8. Fix font encoding issues (ISO 19005-2, 6.2.11.6)
-        # Must run AFTER subsetting: symbolic TrueType fonts need their
-        # /Encoding during subsetting for glyph selection; the (3,0) cmap
-        # added here would otherwise be pruned by the subsetter.
-        logger.debug("Fixing font encodings for PDF/A compliance")
-        with FontEmbedder(pdf) as embedder:
-            encoding_fixes = embedder.fix_font_encodings()
-
-        if encoding_fixes:
-            logger.debug(
-                "Fixed encoding on %d font(s) (rule 6.2.11.6)",
-                encoding_fixes,
-            )
-
-        # Replace embedded subsetted Standard-14 fonts with full bundled
-        # replacements after subsetting so incomplete original subsets are not
-        # carried forward into the final PDF/A output.
-        logger.debug("Refreshing subsetted Standard-14 fonts")
-        with FontEmbedder(pdf) as embedder:
+            # Replace embedded subsetted Standard-14 fonts with full bundled
+            # replacements after subsetting so incomplete original subsets are
+            # not carried forward into the final PDF/A output.
+            logger.debug("Refreshing subsetted Standard-14 fonts")
             refresh_result = embedder.replace_subsetted_standard14_fonts(
                 original_subsetted_standard14_font_ids
             )
 
-        warnings.extend(refresh_result.warnings)
+            warnings.extend(refresh_result.warnings)
 
-        with FontEmbedder(pdf) as embedder:
             dedupe_result = embedder.deduplicate_embedded_font_programs()
-        if dedupe_result.programs_deduplicated:
-            logger.debug(
-                "Deduplicated %d embedded font program(s) (saved ~%d bytes)",
-                dedupe_result.programs_deduplicated,
-                dedupe_result.bytes_saved_estimate,
-            )
+            if dedupe_result.programs_deduplicated:
+                logger.debug(
+                    "Deduplicated %d embedded font program(s) (saved ~%d bytes)",
+                    dedupe_result.programs_deduplicated,
+                    dedupe_result.bytes_saved_estimate,
+                )
 
         # 4. Sanitize PDF for PDF/A
         logger.debug("Sanitizing PDF for PDF/A-%s", level)

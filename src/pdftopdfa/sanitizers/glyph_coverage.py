@@ -21,7 +21,7 @@ import struct
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
-from ..fonts.glyph_usage import collect_font_usage
+from ..fonts.glyph_usage import FontUsageCache, collect_font_usage
 from ..fonts.tounicode import parse_cidtogidmap_stream
 from ..fonts.traversal import iter_all_page_fonts
 from ..fonts.utils import safe_str as _safe_str
@@ -30,7 +30,10 @@ from ..utils import resolve_indirect as _resolve
 logger = logging.getLogger(__name__)
 
 
-def sanitize_glyph_coverage(pdf: Pdf) -> dict[str, int]:
+def sanitize_glyph_coverage(
+    pdf: Pdf,
+    usage_cache: FontUsageCache | None = None,
+) -> dict[str, int]:
     """Adds empty glyph outlines for referenced but missing glyphs.
 
     Iterates all embedded fonts and checks whether every glyph
@@ -39,6 +42,8 @@ def sanitize_glyph_coverage(pdf: Pdf) -> dict[str, int]:
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
+        usage_cache: Optional shared font usage cache; when absent, the
+            usage is collected locally.
 
     Returns:
         Dictionary with ``{"glyphs_added": N}``.
@@ -46,7 +51,7 @@ def sanitize_glyph_coverage(pdf: Pdf) -> dict[str, int]:
     result: dict[str, int] = {"glyphs_added": 0}
 
     # Collect character codes used with each font across the PDF
-    usage = collect_font_usage(pdf)
+    usage = usage_cache.get() if usage_cache is not None else collect_font_usage(pdf)
     if not usage:
         return result
 
