@@ -1335,6 +1335,72 @@ class TestConvertDirectory:
         assert len(results) == 3
         assert all(r.success for r in results)
 
+    @pytest.mark.parametrize("recursive", [False, True])
+    @patch("pdftopdfa.converter.convert_files")
+    def test_convert_directory_matches_pdf_suffix_case_insensitively(
+        self,
+        mock_convert_files: MagicMock,
+        recursive: bool,
+        tmp_dir: Path,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """PDF suffix matching is case-insensitive in both search modes."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        nested_dir = input_dir / "nested"
+        nested_dir.mkdir()
+
+        top_level_pdfs = {
+            input_dir / "lower.pdf",
+            input_dir / "upper.PDF",
+            input_dir / "mixed.PdF",
+        }
+        nested_pdfs = {
+            nested_dir / "nested_lower.pdf",
+            nested_dir / "nested_upper.PDF",
+            nested_dir / "nested_mixed.pDf",
+        }
+        for path in top_level_pdfs | nested_pdfs:
+            path.write_bytes(sample_pdf_bytes)
+
+        mock_convert_files.return_value = []
+
+        convert_directory(input_dir, recursive=recursive, show_progress=False)
+
+        file_pairs = mock_convert_files.call_args.kwargs["file_pairs"]
+        actual_inputs = {input_path for input_path, _ in file_pairs}
+        expected_inputs = top_level_pdfs | nested_pdfs if recursive else top_level_pdfs
+        assert actual_inputs == expected_inputs
+
+    @pytest.mark.parametrize("recursive", [False, True])
+    @patch("pdftopdfa.converter.convert_files")
+    def test_convert_directory_excludes_non_pdf_candidates(
+        self,
+        mock_convert_files: MagicMock,
+        recursive: bool,
+        tmp_dir: Path,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """Directories and files with similar suffixes are not processed."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        nested_dir = input_dir / "nested"
+        nested_dir.mkdir()
+
+        expected_pdf = input_dir / "document.PDF"
+        expected_pdf.write_bytes(sample_pdf_bytes)
+        (input_dir / "directory.pdf").mkdir()
+        for name in ("document.pdfx", "document.pdf.backup", "document.pd", "pdf"):
+            (input_dir / name).write_bytes(sample_pdf_bytes)
+        (nested_dir / "nested.txt").write_bytes(sample_pdf_bytes)
+
+        mock_convert_files.return_value = []
+
+        convert_directory(input_dir, recursive=recursive, show_progress=False)
+
+        file_pairs = mock_convert_files.call_args.kwargs["file_pairs"]
+        assert [input_path for input_path, _ in file_pairs] == [expected_pdf]
+
     def test_convert_directory_recursive(
         self, tmp_dir: Path, sample_pdf_bytes: bytes
     ) -> None:

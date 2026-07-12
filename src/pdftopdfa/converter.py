@@ -1473,9 +1473,11 @@ def convert_directory(
     if not input_dir.is_dir():
         raise ConversionError(f"Directory does not exist: {input_dir}")
 
-    # Find all PDFs
-    pattern = "**/*.pdf" if recursive else "*.pdf"
-    pdf_files = sorted(input_dir.glob(pattern))
+    # Find all PDFs with a case-insensitive suffix check on every platform.
+    candidates = input_dir.rglob("*") if recursive else input_dir.glob("*")
+    pdf_files = sorted(
+        path for path in candidates if path.is_file() and path.suffix.lower() == ".pdf"
+    )
 
     # A recursive search must not process files from a nested output tree.
     if (
