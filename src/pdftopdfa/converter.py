@@ -1467,6 +1467,9 @@ def convert_directory(
     Raises:
         ConversionError: If the input directory does not exist.
     """
+    input_dir = input_dir.resolve()
+    output_dir = output_dir.resolve() if output_dir is not None else None
+
     if not input_dir.is_dir():
         raise ConversionError(f"Directory does not exist: {input_dir}")
 
@@ -1474,8 +1477,16 @@ def convert_directory(
     pattern = "**/*.pdf" if recursive else "*.pdf"
     pdf_files = sorted(input_dir.glob(pattern))
 
+    # A recursive search must not process files from a nested output tree.
+    if (
+        output_dir is not None
+        and output_dir != input_dir
+        and output_dir.is_relative_to(input_dir)
+    ):
+        pdf_files = [p for p in pdf_files if not p.is_relative_to(output_dir)]
+
     # When output goes to the same directory, exclude previous conversion outputs
-    if output_dir is None or output_dir.resolve() == input_dir.resolve():
+    if output_dir is None or output_dir == input_dir:
         pdf_files = [p for p in pdf_files if not p.stem.endswith("_pdfa")]
 
     if not pdf_files:

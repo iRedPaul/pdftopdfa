@@ -1373,6 +1373,115 @@ class TestConvertDirectory:
         )
         assert len(results_recursive) == 2
 
+    @patch("pdftopdfa.converter.convert_files")
+    def test_recursive_nested_empty_output_directory(
+        self, mock_convert_files: MagicMock, tmp_dir: Path, sample_pdf_bytes: bytes
+    ) -> None:
+        """An empty nested output directory works on the first run."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        output_dir = input_dir / "output"
+        output_dir.mkdir()
+        source = input_dir / "document.pdf"
+        source.write_bytes(sample_pdf_bytes)
+        mock_convert_files.return_value = []
+
+        convert_directory(
+            input_dir,
+            output_dir=output_dir,
+            recursive=True,
+            show_progress=False,
+        )
+
+        assert mock_convert_files.call_args.kwargs["file_pairs"] == [
+            (source, output_dir / "document_pdfa.pdf")
+        ]
+
+    @patch("pdftopdfa.converter.convert_files")
+    def test_recursive_excludes_nested_output_tree(
+        self, mock_convert_files: MagicMock, tmp_dir: Path, sample_pdf_bytes: bytes
+    ) -> None:
+        """PDFs anywhere below a nested output directory are not inputs."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        output_dir = input_dir / "export"
+        nested_output_dir = output_dir / "archive"
+        nested_output_dir.mkdir(parents=True)
+        source = input_dir / "document.pdf"
+        source.write_bytes(sample_pdf_bytes)
+        (output_dir / "old.pdf").write_bytes(sample_pdf_bytes)
+        (nested_output_dir / "old_pdfa.pdf").write_bytes(sample_pdf_bytes)
+        mock_convert_files.return_value = []
+
+        convert_directory(
+            input_dir,
+            output_dir=output_dir,
+            recursive=True,
+            show_progress=False,
+        )
+
+        assert mock_convert_files.call_args.kwargs["file_pairs"] == [
+            (source, output_dir / "document_pdfa.pdf")
+        ]
+
+    def test_recursive_nested_output_is_stable_across_runs(
+        self, tmp_dir: Path, sample_pdf_bytes: bytes
+    ) -> None:
+        """Repeated runs do not create output/output paths."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        output_dir = input_dir / "output"
+        (input_dir / "document.pdf").write_bytes(sample_pdf_bytes)
+
+        first_results = convert_directory(
+            input_dir,
+            output_dir=output_dir,
+            recursive=True,
+            show_progress=False,
+        )
+        second_results = convert_directory(
+            input_dir,
+            output_dir=output_dir,
+            recursive=True,
+            show_progress=False,
+        )
+
+        assert len(first_results) == 1
+        assert len(second_results) == 1
+        assert not (output_dir / "output").exists()
+
+    @pytest.mark.parametrize("output_location", ["same", "outside"])
+    @patch("pdftopdfa.converter.convert_files")
+    def test_recursive_non_nested_output_behavior_is_unchanged(
+        self,
+        mock_convert_files: MagicMock,
+        output_location: str,
+        tmp_dir: Path,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """Same-directory and external output locations retain their behavior."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        source = input_dir / "document.pdf"
+        previous_output = input_dir / "previous_pdfa.pdf"
+        source.write_bytes(sample_pdf_bytes)
+        previous_output.write_bytes(sample_pdf_bytes)
+        output_dir = input_dir if output_location == "same" else tmp_dir / "output"
+        mock_convert_files.return_value = []
+
+        convert_directory(
+            input_dir,
+            output_dir=output_dir,
+            recursive=True,
+            show_progress=False,
+        )
+
+        file_pairs = mock_convert_files.call_args.kwargs["file_pairs"]
+        expected_inputs = (
+            [source] if output_location == "same" else [source, previous_output]
+        )
+        assert [input_path for input_path, _ in file_pairs] == expected_inputs
+
     def test_convert_directory_skips_pdfa_files(
         self, tmp_dir: Path, sample_pdf_bytes: bytes
     ) -> None:
