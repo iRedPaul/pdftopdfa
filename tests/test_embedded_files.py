@@ -5,12 +5,14 @@
 """Tests for selective embedded file removal (PDF/A-2 compliance)."""
 
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import patch
 
 import pikepdf
 from conftest import new_pdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
+from pdftopdfa.converter import ConversionResult, convert_to_pdfa
 from pdftopdfa.sanitizers import sanitize_for_pdfa
 from pdftopdfa.sanitizers.files import (
     _is_pdfa_compliant_embedded,
@@ -64,6 +66,46 @@ def _create_pdfa_pdf_bytes(level: str) -> bytes:
     xmp_stream["/Subtype"] = Name("/XML")
     pdf.Root["/Metadata"] = xmp_stream
 
+    buf = BytesIO()
+    pdf.save(buf)
+    return buf.getvalue()
+
+
+def _create_encrypted_pdf_bytes() -> bytes:
+    """Create an encrypted PDF that can be opened with an empty user password."""
+    pdf = new_pdf()
+    pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
+    buf = BytesIO()
+    pdf.save(buf, encryption=pikepdf.Encryption(owner="owner-password"))
+    return buf.getvalue()
+
+
+def _create_signed_pdf_bytes() -> bytes:
+    """Create a non-conformant PDF containing a live signature field."""
+    pdf = new_pdf()
+    pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
+    signature = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Sig,
+            Filter=Name("/Adobe.PPKLite"),
+            SubFilter=Name("/adbe.pkcs7.detached"),
+            ByteRange=Array([0, 100, 200, 300]),
+            Contents=pdf.make_stream(b"\x00" * 64),
+        )
+    )
+    field = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Annot,
+            Subtype=Name.Widget,
+            FT=Name.Sig,
+            Rect=Array([0, 0, 200, 50]),
+            V=signature,
+        )
+    )
+    pdf.pages[0]["/Annots"] = Array([field])
+    pdf.Root["/AcroForm"] = pdf.make_indirect(
+        Dictionary(Fields=Array([field]), SigFlags=1)
+    )
     buf = BytesIO()
     pdf.save(buf)
     return buf.getvalue()
@@ -271,7 +313,12 @@ class TestRemoveNonCompliantEmbeddedFiles:
 
         result = remove_non_compliant_embedded_files(pdf)
 
-        assert result == {"removed": 0, "kept": 1, "converted": 0}
+        assert result == {
+            "removed": 0,
+            "kept": 1,
+            "converted": 0,
+            "conversion_failed": 0,
+        }
         assert "/EmbeddedFiles" in pdf.Root.Names
 
     def test_removes_non_compliant_file(self) -> None:
@@ -280,7 +327,12 @@ class TestRemoveNonCompliantEmbeddedFiles:
 
         result = remove_non_compliant_embedded_files(pdf)
 
-        assert result == {"removed": 1, "kept": 0, "converted": 0}
+        assert result == {
+            "removed": 1,
+            "kept": 0,
+            "converted": 0,
+            "conversion_failed": 0,
+        }
         # EmbeddedFiles should be deleted since all files were removed
         names = pdf.Root.Names
         names = _resolve_indirect(names)
@@ -311,7 +363,12 @@ class TestRemoveNonCompliantEmbeddedFiles:
 
         result = remove_non_compliant_embedded_files(pdf)
 
-        assert result == {"removed": 1, "kept": 1, "converted": 0}
+        assert result == {
+            "removed": 1,
+            "kept": 1,
+            "converted": 0,
+            "conversion_failed": 0,
+        }
         # EmbeddedFiles should still exist with one entry
         remaining = pdf.Root.Names.EmbeddedFiles.Names
         assert len(remaining) == 2  # [name, filespec]
@@ -324,7 +381,12 @@ class TestRemoveNonCompliantEmbeddedFiles:
 
         result = remove_non_compliant_embedded_files(pdf)
 
-        assert result == {"removed": 0, "kept": 0, "converted": 0}
+        assert result == {
+            "removed": 0,
+            "kept": 0,
+            "converted": 0,
+            "conversion_failed": 0,
+        }
 
     def test_removes_non_compliant_file_attachment(self) -> None:
         """Non-compliant FileAttachment annotation is removed."""
@@ -386,18 +448,20 @@ class TestConvertNonCompliantEmbeddedFiles:
         assert result["removed"] == 1
         assert result["converted"] == 0
 
-    def test_falls_back_to_removal_when_conversion_fails(self) -> None:
-        """When conversion returns None, the file is removed and /EF is stripped."""
+    def test_preserves_pdf_when_conversion_fails(self) -> None:
+        """When conversion returns None, the original PDF attachment is kept."""
         pdf = _make_pdf_with_embedded(b"%PDF-1.4 unconvertible", "bad.pdf")
 
         with patch(_TRY_CONVERT, return_value=None):
             result = remove_non_compliant_embedded_files(pdf)
 
-        assert result["removed"] == 1
+        assert result["removed"] == 0
         assert result["converted"] == 0
-        # EmbeddedFiles should be gone
-        names = _resolve_indirect(pdf.Root.Names)
-        assert "/EmbeddedFiles" not in names
+        assert result["conversion_failed"] == 1
+        names_array = pdf.Root.Names.EmbeddedFiles.Names
+        filespec = _resolve_indirect(names_array[1])
+        stream = _resolve_indirect(_resolve_indirect(filespec.EF).F)
+        assert bytes(stream.read_bytes()) == b"%PDF-1.4 unconvertible"
 
     def test_return_dict_has_converted_key(self) -> None:
         """Return dict always contains 'converted' key."""
@@ -435,6 +499,134 @@ class TestConvertNonCompliantEmbeddedFiles:
 
         assert "embedded_files_converted" in result
         assert isinstance(result["embedded_files_converted"], int)
+
+    def test_encrypted_embedded_pdf_is_not_returned_as_converted(self) -> None:
+        """An encrypted input copied unchanged is not a successful conversion."""
+        from pdftopdfa.sanitizers.files import (
+            _try_convert_embedded_pdf_to_pdfa2,
+        )
+
+        with patch(
+            "pdftopdfa.sanitizers.files.is_verapdf_available",
+            return_value=False,
+        ):
+            converted = _try_convert_embedded_pdf_to_pdfa2(
+                _create_encrypted_pdf_bytes()
+            )
+
+        assert converted is None
+
+    def test_signed_non_compliant_embedded_pdf_is_preserved(self) -> None:
+        """A signed input skipped by conversion is retained and reported."""
+        pdf = _make_pdf_with_embedded(_create_signed_pdf_bytes(), "signed.pdf")
+
+        with patch(
+            "pdftopdfa.sanitizers.files.is_verapdf_available",
+            return_value=False,
+        ):
+            result = remove_non_compliant_embedded_files(pdf)
+
+        assert result["converted"] == 0
+        assert result["removed"] == 0
+        assert result["conversion_failed"] == 1
+        assert "/EmbeddedFiles" in _resolve_indirect(pdf.Root.Names)
+
+    def test_failed_attachment_conversion_marks_outer_result_invalid(
+        self, tmp_path: Path
+    ) -> None:
+        """The outer conversion reports failure while preserving the attachment."""
+        input_path = tmp_path / "input.pdf"
+        output_path = tmp_path / "output.pdf"
+        pdf = _make_pdf_with_embedded(b"%PDF-1.4 unconvertible", "bad.pdf")
+        pdf.save(input_path)
+
+        with patch(_TRY_CONVERT, return_value=None):
+            result = convert_to_pdfa(input_path, output_path, level="2b")
+
+        assert result.success is True
+        assert result.validation_failed is True
+        assert any("attachment" in warning for warning in result.warnings)
+        with pikepdf.open(output_path) as output_pdf:
+            names_array = output_pdf.Root.Names.EmbeddedFiles.Names
+            filespec = _resolve_indirect(names_array[1])
+            stream = _resolve_indirect(_resolve_indirect(filespec.EF).F)
+            assert bytes(stream.read_bytes()) == b"%PDF-1.4 unconvertible"
+
+    def test_successful_skipped_result_is_rejected(self) -> None:
+        """success=True does not accept an unchanged skipped output."""
+        from pdftopdfa.sanitizers.files import (
+            _try_convert_embedded_pdf_to_pdfa2,
+        )
+
+        def fake_convert(input_path: Path, output_path: Path, **kwargs: object):
+            output_path.write_bytes(input_path.read_bytes())
+            return ConversionResult(
+                success=True,
+                input_path=input_path,
+                output_path=output_path,
+                level="2b",
+                skipped=True,
+            )
+
+        with patch("pdftopdfa.converter.convert_to_pdfa", side_effect=fake_convert):
+            converted = _try_convert_embedded_pdf_to_pdfa2(b"%PDF-1.4 unchanged")
+
+        assert converted is None
+
+    def test_validation_failed_result_is_rejected(self) -> None:
+        """A conversion result reporting failed validation is rejected."""
+        from pdftopdfa.sanitizers.files import (
+            _try_convert_embedded_pdf_to_pdfa2,
+        )
+
+        def fake_convert(input_path: Path, output_path: Path, **kwargs: object):
+            output_path.write_bytes(b"%PDF-1.7 invalid PDF/A")
+            return ConversionResult(
+                success=True,
+                input_path=input_path,
+                output_path=output_path,
+                level="2b",
+                validation_failed=True,
+            )
+
+        with patch("pdftopdfa.converter.convert_to_pdfa", side_effect=fake_convert):
+            converted = _try_convert_embedded_pdf_to_pdfa2(b"%PDF-1.4 input")
+
+        assert converted is None
+
+    def test_successful_validated_embedded_pdf_is_retained(self) -> None:
+        """A converted attachment is returned after PDF/A-2b validation."""
+        from pdftopdfa.sanitizers.files import (
+            _try_convert_embedded_pdf_to_pdfa2,
+        )
+
+        converted_data = b"%PDF-1.7 converted PDF/A-2b"
+
+        def fake_convert(input_path: Path, output_path: Path, **kwargs: object):
+            output_path.write_bytes(converted_data)
+            return ConversionResult(
+                success=True,
+                input_path=input_path,
+                output_path=output_path,
+                level="2b",
+            )
+
+        validation = VeraPDFResult(compliant=True, flavour="2b")
+        with (
+            patch("pdftopdfa.converter.convert_to_pdfa", side_effect=fake_convert),
+            patch(
+                "pdftopdfa.sanitizers.files.is_verapdf_available",
+                return_value=True,
+            ),
+            patch(
+                "pdftopdfa.sanitizers.files.validate_with_verapdf",
+                return_value=validation,
+            ) as mock_validate,
+        ):
+            converted = _try_convert_embedded_pdf_to_pdfa2(b"%PDF-1.4 input")
+
+        assert converted == converted_data
+        assert mock_validate.call_args.kwargs["flavour"] == "2b"
 
 
 class TestEmbeddedPdfConversionDepthLimit:
@@ -1439,7 +1631,12 @@ class TestRemoveNonCompliantCleanup:
 
         result = remove_non_compliant_embedded_files(pdf)
 
-        assert result == {"removed": 1, "kept": 0, "converted": 0}
+        assert result == {
+            "removed": 1,
+            "kept": 0,
+            "converted": 0,
+            "conversion_failed": 0,
+        }
         assert "/AF" not in pdf.Root
 
     def test_preserves_root_af_when_some_kept(self) -> None:
@@ -1467,7 +1664,12 @@ class TestRemoveNonCompliantCleanup:
 
         result = remove_non_compliant_embedded_files(pdf)
 
-        assert result == {"removed": 1, "kept": 1, "converted": 0}
+        assert result == {
+            "removed": 1,
+            "kept": 1,
+            "converted": 0,
+            "conversion_failed": 0,
+        }
         assert "/AF" in pdf.Root
 
 

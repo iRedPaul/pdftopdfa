@@ -76,6 +76,11 @@ _SANITIZE_WARNINGS: list[tuple[str, str]] = [
     ("actions_removed", "non-compliant action(s) removed"),
     ("files_removed", "embedded file(s) removed"),
     ("embedded_files_kept", "conformant embedded file(s) kept"),
+    (
+        "embedded_pdf_conversions_failed",
+        "embedded PDF attachment(s) could not be converted; output is not "
+        "PDF/A compliant",
+    ),
     ("af_relationships_fixed", "AFRelationship(s) added to embedded file(s)"),
     ("xfa_removed", "XFA form element(s) removed"),
     ("btn_ap_subdicts_fixed", "Btn widget /AP/N stream(s) wrapped in state dict"),
@@ -225,7 +230,9 @@ class ConversionResult:
         warnings: List of warnings during conversion.
         processing_time: Processing time in seconds.
         error: Error message if success=False.
-        validation_failed: True if veraPDF validation failed.
+        validation_failed: True if the output is known not to conform to the
+            requested PDF/A level, including a failed veraPDF validation or a
+            preserved embedded PDF that could not be converted.
         skipped: True if the original PDF was copied through unchanged.
     """
 
@@ -1139,7 +1146,9 @@ def convert_to_pdfa(
         processing_time = time.perf_counter() - start_time
 
         # 9. Optional: Validate
-        validation_failed = False
+        validation_failed = (
+            sanitize_result.get("embedded_pdf_conversions_failed", 0) > 0
+        )
         if validate:
             logger.debug("Validating output with veraPDF")
             try:

@@ -145,6 +145,7 @@ def sanitize_for_pdfa(
         "files_removed": 0,
         "embedded_files_kept": 0,
         "embedded_files_converted": 0,
+        "embedded_pdf_conversions_failed": 0,
         "proprietary_stamps_normalized": 0,
         "tounicode_gaps_filled": 0,
         "pua_actualtext_added": 0,
@@ -434,6 +435,9 @@ def sanitize_for_pdfa(
         result["files_removed"] = embed_result["removed"]
         result["embedded_files_kept"] = embed_result["kept"]
         result["embedded_files_converted"] = embed_result.get("converted", 0)
+        result["embedded_pdf_conversions_failed"] = embed_result.get(
+            "conversion_failed", 0
+        )
 
     # Ensure AF relationships and embedded file metadata (2b/2u and 3b/3u)
     # PDF/A-2 (ISO 19005-2) and PDF/A-3 (ISO 19005-3) both require:

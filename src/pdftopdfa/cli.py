@@ -481,6 +481,9 @@ def _convert_single_file(
     if result.skipped:
         return EXIT_SUCCESS
 
+    if result.validation_failed:
+        return EXIT_VALIDATION_FAILED
+
     # Optional: Validation
     if do_validate:
         if not quiet:

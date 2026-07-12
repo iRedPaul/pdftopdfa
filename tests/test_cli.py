@@ -203,6 +203,37 @@ class TestCliConvert:
         assert result == EXIT_SUCCESS
         mock_validate.assert_not_called()
 
+    @patch("pdftopdfa.cli.validate_with_verapdf")
+    @patch("pdftopdfa.cli.convert_to_pdfa")
+    def test_cli_single_file_known_validation_failure_returns_exit_code(
+        self,
+        mock_convert_to_pdfa,
+        mock_validate,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """A known compliance failure returns the validation failure exit code."""
+        output_path = tmp_dir / "output.pdf"
+        mock_convert_to_pdfa.return_value = ConversionResult(
+            success=True,
+            input_path=sample_pdf,
+            output_path=output_path,
+            level="2b",
+            validation_failed=True,
+        )
+
+        result = cli_module._convert_single_file(
+            sample_pdf,
+            str(output_path),
+            "2b",
+            do_validate=True,
+            force=False,
+            quiet=True,
+        )
+
+        assert result == EXIT_VALIDATION_FAILED
+        mock_validate.assert_not_called()
+
     def test_cli_convert_simple(
         self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
     ) -> None:
