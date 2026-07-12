@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.5.1] - 2026-07-12
+
+### Changes
+
+- Refactor the PDF/A conversion pipeline and improve font, metadata, and sanitizer handling
+
+### Bug Fixes
+
+- Count only live digital signatures when sanitizing PDFs
+- Preserve validation failures for embedded PDFs and avoid duplicate attachment validation
+- Abort OCR conversion when annotations cannot be restored safely
+- Handle Tesseract OSD timeouts and apply OCR fallback thresholds per page
+- Exclude nested output directories from recursive conversion
+
+### Documentation
+
+- Clarify validation, OCR fallback, CIDFont replacement, and `needs_ocr()` behavior
+
 ## [0.5.0] - 2026-07-07
 
 ### Changes
