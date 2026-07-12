@@ -6,6 +6,7 @@
 
 import logging
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -19,6 +20,7 @@ from PIL import Image
 from pdftopdfa.exceptions import OCRError
 from pdftopdfa.ocr import (
     _ROTATION_FIX_QUALITIES,
+    _TESSERACT_OSD_TIMEOUT_SECONDS,
     OCR_SETTINGS,
     OcrQuality,
     _detect_consistent_text_skew,
@@ -29,6 +31,7 @@ from pdftopdfa.ocr import (
     _page_has_images,
     _page_has_text,
     _parse_tesseract_osd,
+    _run_tesseract_orientation,
     _should_clear_page_rotate,
     apply_ocr,
     is_ocr_available,
@@ -1129,6 +1132,42 @@ class TestBestQualityTextRotationNormalization:
         )
 
         assert result == _OrientationResult(rotate=180, confidence=12.5)
+
+    @patch("pdftopdfa.ocr.subprocess.run")
+    def test_run_tesseract_orientation_uses_timeout_and_parses_output(
+        self, mock_run: MagicMock, tmp_dir: Path
+    ) -> None:
+        """OSD uses a bounded subprocess and parses successful output."""
+        image_path = tmp_dir / "preview.png"
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout="Rotate: 270\nOrientation confidence: 11.25\n",
+            stderr="",
+        )
+
+        result = _run_tesseract_orientation(image_path)
+
+        assert result == _OrientationResult(rotate=270, confidence=11.25)
+        assert mock_run.call_args.kwargs["timeout"] == _TESSERACT_OSD_TIMEOUT_SECONDS
+
+    @patch("pdftopdfa.ocr.subprocess.run")
+    def test_run_tesseract_orientation_returns_none_on_timeout(
+        self,
+        mock_run: MagicMock,
+        tmp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An OSD timeout is logged and treated as unavailable orientation."""
+        image_path = tmp_dir / "preview.png"
+        mock_run.side_effect = subprocess.TimeoutExpired(
+            "tesseract", _TESSERACT_OSD_TIMEOUT_SECONDS
+        )
+
+        with caplog.at_level(logging.WARNING, logger="pdftopdfa.ocr"):
+            result = _run_tesseract_orientation(image_path)
+
+        assert result is None
+        assert "Tesseract OSD timed out" in caplog.text
 
     def test_should_clear_page_rotate_when_cleared_preview_is_better(self) -> None:
         """Clearing /Rotate is preferred when it removes the needed correction."""

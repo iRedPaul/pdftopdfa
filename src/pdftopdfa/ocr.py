@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 
 _path_lock = threading.Lock()
 _ROTATION_FIX_PLUGIN = "pdftopdfa.ocr_rotation_fix"
+_TESSERACT_OSD_TIMEOUT_SECONDS = 30
 
 
 @contextlib.contextmanager
@@ -278,7 +279,15 @@ def _run_tesseract_orientation(image_path: Path) -> _OrientationResult | None:
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
+                timeout=_TESSERACT_OSD_TIMEOUT_SECONDS,
             )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "Tesseract OSD timed out after %s seconds for %s",
+            _TESSERACT_OSD_TIMEOUT_SECONDS,
+            image_path,
+        )
+        return None
     except FileNotFoundError:
         logger.debug("Tesseract not available for OCR rotation normalization")
         return None
