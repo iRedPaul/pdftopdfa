@@ -709,6 +709,8 @@ def remove_non_compliant_embedded_files(pdf: Pdf) -> dict[str, int]:
                 og = (0, 0)
             if og != (0, 0) and og in processed_filespecs:
                 continue
+            if og != (0, 0):
+                processed_filespecs.add(og)
             ef = resolved.get("/EF")
             if ef is None:
                 continue

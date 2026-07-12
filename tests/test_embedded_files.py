@@ -437,6 +437,56 @@ class TestConvertNonCompliantEmbeddedFiles:
         # EmbeddedFiles must still exist (file was converted, not removed)
         assert "/EmbeddedFiles" in pdf.Root.Names
 
+    def test_converts_reopened_indirect_name_tree_filespec_once(self) -> None:
+        """An indirect Name Tree FileSpec is not converted again by the scan."""
+        pdf = _make_pdf_with_embedded(b"%PDF-1.4 non-compliant", "doc.pdf")
+        names_array = pdf.Root.Names.EmbeddedFiles.Names
+        names_array[1] = pdf.make_indirect(names_array[1])
+        buffer = BytesIO()
+        pdf.save(buffer)
+        pdf.close()
+        buffer.seek(0)
+
+        with pikepdf.open(buffer) as reopened:
+            with patch(
+                _TRY_CONVERT, return_value=b"%PDF-1.4 converted"
+            ) as mock_convert:
+                result = remove_non_compliant_embedded_files(reopened)
+
+        mock_convert.assert_called_once()
+        assert result == {
+            "removed": 0,
+            "kept": 0,
+            "converted": 1,
+            "conversion_failed": 0,
+        }
+
+    def test_shared_indirect_name_tree_and_annotation_checked_once(self) -> None:
+        """One indirect FileSpec in two locations is validated only once."""
+        pdf = _make_pdf_with_embedded(b"%PDF-1.4 attachment", "doc.pdf")
+        names_array = pdf.Root.Names.EmbeddedFiles.Names
+        filespec = pdf.make_indirect(names_array[1])
+        names_array[1] = filespec
+        pdf.pages[0]["/Annots"] = Array(
+            [
+                Dictionary(
+                    Type=Name.Annot,
+                    Subtype=Name.FileAttachment,
+                    Rect=Array([0, 0, 100, 100]),
+                    FS=filespec,
+                )
+            ]
+        )
+
+        with patch(
+            "pdftopdfa.sanitizers.files._is_pdfa_compliant_embedded",
+            return_value=True,
+        ) as mock_check:
+            result = remove_non_compliant_embedded_files(pdf)
+
+        mock_check.assert_called_once()
+        assert result["kept"] == 1
+
     def test_removes_non_pdf_embedded_file(self) -> None:
         """Non-PDF embedded file (no %PDF- prefix) is removed without conversion."""
         pdf = _make_pdf_with_embedded(b"Not a PDF at all", "bad.txt")
@@ -1886,7 +1936,12 @@ class TestRemoveNonCompliantOrphanFilespecs:
 
         result = remove_non_compliant_embedded_files(pdf)
 
-        assert result["removed"] >= 1
+        assert result == {
+            "removed": 1,
+            "kept": 0,
+            "converted": 0,
+            "conversion_failed": 0,
+        }
         # The FileSpec should no longer have /EF
         page_af = pdf.pages[0].get("/AF")
         if page_af is not None:
