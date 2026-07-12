@@ -9,14 +9,17 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pikepdf
+import pytest
 from conftest import make_pdf_with_page, new_pdf, resolve
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from pdftopdfa.converter import (
+    _AnnotationRestoreStatus,
     _has_annotations,
     _restore_annotations_after_ocr,
     _strip_annotations_for_ocr,
 )
+from pdftopdfa.exceptions import OCRError
 
 # -- Helpers --
 
@@ -249,9 +252,10 @@ class TestRestoreAnnotationsAfterOcr:
         ocr_pdf.save(str(ocr_path))
 
         output = tmp_dir / "merged.pdf"
-        count = _restore_annotations_after_ocr(original, ocr_path, output)
+        result = _restore_annotations_after_ocr(original, ocr_path, output)
 
-        assert count == 1
+        assert result.status is _AnnotationRestoreStatus.SUCCESS
+        assert result.count == 1
         with pikepdf.open(output) as merged:
             annots = merged.pages[0].get("/Annots")
             assert annots is not None
@@ -290,9 +294,10 @@ class TestRestoreAnnotationsAfterOcr:
         ocr_pdf.save(str(ocr_path))
 
         output = tmp_dir / "popup_merged.pdf"
-        count = _restore_annotations_after_ocr(original, ocr_path, output)
+        result = _restore_annotations_after_ocr(original, ocr_path, output)
 
-        assert count == 2
+        assert result.status is _AnnotationRestoreStatus.SUCCESS
+        assert result.count == 2
         with pikepdf.open(output) as merged:
             annots = merged.pages[0]["/Annots"]
             markup_out = resolve(annots[0])
@@ -329,9 +334,10 @@ class TestRestoreAnnotationsAfterOcr:
         ocr_pdf.save(str(ocr_path))
 
         output = tmp_dir / "irt_merged.pdf"
-        count = _restore_annotations_after_ocr(original, ocr_path, output)
+        result = _restore_annotations_after_ocr(original, ocr_path, output)
 
-        assert count == 2
+        assert result.status is _AnnotationRestoreStatus.SUCCESS
+        assert result.count == 2
         with pikepdf.open(output) as merged:
             annots = merged.pages[0]["/Annots"]
             reply = resolve(annots[1])
@@ -396,9 +402,12 @@ class TestRestoreAnnotationsAfterOcr:
             assert "/Fields" in af
             assert "/DA" in af
             assert "/DR" in af
+            page_widget = resolve(merged.pages[0]["/Annots"][0])
+            form_widget = resolve(af["/Fields"][0])
+            assert page_widget.objgen == form_widget.objgen
 
-    def test_page_count_mismatch_returns_zero(self, tmp_dir: Path) -> None:
-        """Page count mismatch returns 0 and OCR file is unchanged."""
+    def test_page_count_mismatch_returns_failure(self, tmp_dir: Path) -> None:
+        """Page count mismatch is distinguishable from no annotations."""
         original = _make_pdf_with_stamp(tmp_dir, "mismatch_orig.pdf")
 
         # OCR output with 2 pages
@@ -412,9 +421,11 @@ class TestRestoreAnnotationsAfterOcr:
         ocr_pdf.save(str(ocr_path))
 
         output = tmp_dir / "mismatch_merged.pdf"
-        count = _restore_annotations_after_ocr(original, ocr_path, output)
+        result = _restore_annotations_after_ocr(original, ocr_path, output)
 
-        assert count == 0
+        assert result.status is _AnnotationRestoreStatus.FAILED
+        assert result.count == 0
+        assert "Page count mismatch" in result.error
 
     def test_no_annotations_returns_zero(self, tmp_dir: Path) -> None:
         """PDF without annotations returns 0."""
@@ -427,9 +438,10 @@ class TestRestoreAnnotationsAfterOcr:
         ocr_pdf.save(str(ocr_path))
 
         output = tmp_dir / "no_annots_merged.pdf"
-        count = _restore_annotations_after_ocr(original, ocr_path, output)
+        result = _restore_annotations_after_ocr(original, ocr_path, output)
 
-        assert count == 0
+        assert result.status is _AnnotationRestoreStatus.NO_ANNOTATIONS
+        assert result.count == 0
 
     def test_multipage_selective_annotations(self, tmp_dir: Path) -> None:
         """Annotations on pages 1 and 3 only; page 2 has no /Annots."""
@@ -458,9 +470,10 @@ class TestRestoreAnnotationsAfterOcr:
         ocr_pdf.save(str(ocr_path))
 
         output = tmp_dir / "multi_merged.pdf"
-        count = _restore_annotations_after_ocr(original, ocr_path, output)
+        result = _restore_annotations_after_ocr(original, ocr_path, output)
 
-        assert count == 2
+        assert result.status is _AnnotationRestoreStatus.SUCCESS
+        assert result.count == 2
         with pikepdf.open(output) as merged:
             assert merged.pages[0].get("/Annots") is not None
             assert merged.pages[1].get("/Annots") is None
@@ -484,6 +497,42 @@ class TestRestoreAnnotationsAfterOcr:
             assert "/BBox" in ap_n
             # Verify stream data is non-empty
             assert len(ap_n.read_bytes()) > 0
+
+    def test_copy_foreign_failure_is_reported(self, tmp_dir: Path) -> None:
+        """A copy_foreign failure returns an explicit failure result."""
+        original = _make_pdf_with_stamp(tmp_dir, "copy_error_orig.pdf")
+        ocr_pdf = make_pdf_with_page()
+        ocr_path = tmp_dir / "copy_error_ocr.pdf"
+        ocr_pdf.save(str(ocr_path))
+
+        output = tmp_dir / "copy_error_merged.pdf"
+        with patch.object(
+            pikepdf.Pdf,
+            "copy_foreign",
+            side_effect=RuntimeError("copy failed"),
+        ):
+            result = _restore_annotations_after_ocr(original, ocr_path, output)
+
+        assert result.status is _AnnotationRestoreStatus.FAILED
+        assert "copy failed" in result.error
+
+    def test_save_failure_is_reported(self, tmp_dir: Path) -> None:
+        """A merge save failure returns an explicit failure result."""
+        original = _make_pdf_with_stamp(tmp_dir, "save_error_orig.pdf")
+        ocr_pdf = make_pdf_with_page()
+        ocr_path = tmp_dir / "save_error_ocr.pdf"
+        ocr_pdf.save(str(ocr_path))
+
+        output = tmp_dir / "save_error_merged.pdf"
+        with patch.object(
+            pikepdf.Pdf,
+            "save",
+            side_effect=RuntimeError("save failed"),
+        ):
+            result = _restore_annotations_after_ocr(original, ocr_path, output)
+
+        assert result.status is _AnnotationRestoreStatus.FAILED
+        assert "save failed" in result.error
 
 
 # -- TestOcrAnnotationIntegration --
@@ -522,6 +571,40 @@ class TestOcrAnnotationIntegration:
             annots = merged.pages[0].get("/Annots")
             assert annots is not None
             assert len(annots) >= 1
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_page_count_mismatch_aborts_conversion(
+        self,
+        mock_is_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        tmp_dir: Path,
+    ) -> None:
+        """OCR output with a changed page count cannot silently lose annotations."""
+        from pdftopdfa.converter import convert_to_pdfa
+
+        original = _make_pdf_with_stamp(tmp_dir, "mismatch_integration.pdf")
+
+        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> None:
+            pdf = new_pdf()
+            for _ in range(2):
+                pdf.pages.append(
+                    pikepdf.Page(
+                        Dictionary(
+                            Type=Name.Page,
+                            MediaBox=Array([0, 0, 612, 792]),
+                        )
+                    )
+                )
+            pdf.save(dst)
+
+        mock_apply_ocr.side_effect = fake_apply_ocr
+
+        output = tmp_dir / "mismatch_output.pdf"
+        with pytest.raises(OCRError, match="prevent annotation loss"):
+            convert_to_pdfa(original, output, level="2b", ocr_languages=["eng"])
+
+        assert not output.exists()
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)

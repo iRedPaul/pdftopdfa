@@ -13,6 +13,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -53,6 +54,24 @@ if TYPE_CHECKING:
     from .ocr import OcrQuality
 
 logger = logging.getLogger(__name__)
+
+
+class _AnnotationRestoreStatus(Enum):
+    """Outcome of restoring annotations after OCR."""
+
+    NO_ANNOTATIONS = "no_annotations"
+    SUCCESS = "success"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class _AnnotationRestoreResult:
+    """Detailed result of an annotation restoration attempt."""
+
+    status: _AnnotationRestoreStatus
+    count: int = 0
+    error: str | None = None
+
 
 # Conformance level ranking: a > u > b
 _CONFORMANCE_RANK = {"b": 0, "u": 1, "a": 2}
@@ -593,7 +612,7 @@ def _prepare_signed_pdf_for_ocr(input_path: Path, prepared_path: Path) -> dict:
 
 def _restore_annotations_after_ocr(
     original_path: Path, ocr_path: Path, output_path: Path
-) -> int:
+) -> _AnnotationRestoreResult:
     """Re-inject original annotations into an OCR-processed PDF.
 
     Copies entire ``/Annots`` arrays (preserving internal cross-references
@@ -606,7 +625,7 @@ def _restore_annotations_after_ocr(
         output_path: Path where the merged result will be saved.
 
     Returns:
-        Total number of annotations restored (0 on failure or mismatch).
+        A result that distinguishes no annotations, success, and failure.
     """
     original_pdf = None
     ocr_pdf = None
@@ -615,18 +634,32 @@ def _restore_annotations_after_ocr(
         ocr_pdf = pikepdf.open(ocr_path)
 
         if len(original_pdf.pages) != len(ocr_pdf.pages):
-            logger.warning(
-                "Page count mismatch after OCR (%d vs %d), "
-                "skipping annotation restoration",
-                len(original_pdf.pages),
-                len(ocr_pdf.pages),
+            error = (
+                "Page count mismatch after OCR "
+                f"({len(original_pdf.pages)} vs {len(ocr_pdf.pages)})"
             )
-            return 0
+            logger.warning("%s; annotation restoration failed", error)
+            return _AnnotationRestoreResult(
+                status=_AnnotationRestoreStatus.FAILED,
+                error=error,
+            )
+
+        annotation_count = 0
+        for page in original_pdf.pages:
+            try:
+                annots = page.get("/Annots")
+                if annots is not None:
+                    annotation_count += len(annots)
+            except Exception:
+                continue
+
+        if annotation_count == 0:
+            return _AnnotationRestoreResult(
+                status=_AnnotationRestoreStatus.NO_ANNOTATIONS
+            )
 
         total_restored = 0
-        for i, (orig_page, ocr_page) in enumerate(
-            zip(original_pdf.pages, ocr_pdf.pages)
-        ):
+        for orig_page, ocr_page in zip(original_pdf.pages, ocr_pdf.pages):
             try:
                 annots = orig_page.get("/Annots")
                 if annots is None or len(annots) == 0:
@@ -638,29 +671,49 @@ def _restore_annotations_after_ocr(
             annots_ref = original_pdf.make_indirect(annots)
             copied_annots = ocr_pdf.copy_foreign(annots_ref)
 
-            # Remap /P (parent page) references to the target page
+            # Remap /P (parent page) references to the target page.
             for annot in copied_annots:
                 try:
                     resolved = annot.get_object()
-                    if "/P" in resolved:
-                        resolved["/P"] = ocr_page.obj
-                except Exception:
-                    continue
+                except (AttributeError, TypeError, ValueError):
+                    resolved = annot
+                if "/P" in resolved:
+                    resolved["/P"] = ocr_page.obj
 
             ocr_page.obj["/Annots"] = copied_annots
             total_restored += len(copied_annots)
 
-        # Restore /AcroForm if present in original
+        if total_restored != annotation_count:
+            error = (
+                "Annotation count mismatch while restoring after OCR "
+                f"({total_restored} of {annotation_count} restored)"
+            )
+            logger.warning("%s", error)
+            return _AnnotationRestoreResult(
+                status=_AnnotationRestoreStatus.FAILED,
+                count=total_restored,
+                error=error,
+            )
+
+        # Restore /AcroForm if present in original. copy_foreign preserves
+        # shared indirect objects, including relationships to copied widgets.
         if "/AcroForm" in original_pdf.Root:
             acroform = original_pdf.Root["/AcroForm"]
             acroform_ref = original_pdf.make_indirect(acroform)
             ocr_pdf.Root["/AcroForm"] = ocr_pdf.copy_foreign(acroform_ref)
 
         ocr_pdf.save(output_path)
-        return total_restored
+        return _AnnotationRestoreResult(
+            status=_AnnotationRestoreStatus.SUCCESS,
+            count=total_restored,
+        )
     except Exception as exc:
-        logger.warning("Could not restore annotations after OCR: %s", exc)
-        return 0
+        error = f"Could not restore annotations after OCR: {exc}"
+        logger.warning("%s", error)
+        return _AnnotationRestoreResult(
+            status=_AnnotationRestoreStatus.FAILED,
+            error=error,
+        )
     finally:
         if original_pdf is not None:
             try:
@@ -915,18 +968,30 @@ def convert_to_pdfa(
                     )
                     os.close(fd3)
                     ocr_merged_temp_file = Path(merged_tmp)
-                    count = _restore_annotations_after_ocr(
+                    restore_result = _restore_annotations_after_ocr(
                         ocr_source_base, ocr_temp_file, ocr_merged_temp_file
                     )
-                    if count > 0:
+                    if restore_result.status is not _AnnotationRestoreStatus.SUCCESS:
+                        reason = restore_result.error or (
+                            "No annotations were available for restoration"
+                        )
+                        raise OCRError(
+                            "OCR annotation restoration failed; conversion aborted "
+                            f"to prevent annotation loss: {reason}"
+                        )
+                    try:
                         os.replace(str(ocr_merged_temp_file), str(ocr_temp_file))
-                        logger.debug("%d annotation(s) preserved through OCR", count)
-                        warnings.append(f"{count} annotation(s) preserved through OCR")
-                    else:
-                        try:
-                            ocr_merged_temp_file.unlink()
-                        except Exception:
-                            pass
+                    except OSError as exc:
+                        raise OCRError(
+                            "OCR annotation restoration could not be finalized; "
+                            f"conversion aborted to prevent annotation loss: {exc}"
+                        ) from exc
+                    logger.debug(
+                        "%d annotation(s) preserved through OCR", restore_result.count
+                    )
+                    warnings.append(
+                        f"{restore_result.count} annotation(s) preserved through OCR"
+                    )
                     ocr_merged_temp_file = None
 
                 # Clean up the stripped copy.
