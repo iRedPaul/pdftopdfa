@@ -1,0 +1,6 @@
+# Keep bundled model artifacts byte-identical across platform checkouts.
+src/pdftopdfa/resources/models/**/*.onnx binary
+src/pdftopdfa/resources/models/**/*.yml text eol=lf
+src/pdftopdfa/resources/models/**/*.json text eol=lf
+src/pdftopdfa/resources/models/**/*.md text eol=lf
+src/pdftopdfa/resources/models/**/LICENSE text eol=lf
