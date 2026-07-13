@@ -10,7 +10,11 @@
 
 - Replace Tesseract OSD page rotation with CPU-only ONNX Runtime inference
 - Analyze every page before best-quality OCR and keep low-confidence pages unchanged
-- Add PaddleOCR, ONNX Runtime, and NumPy as fixed dependencies
+- Add PaddleOCR, ONNX Runtime, and NumPy as required dependencies
+
+### Bug Fixes
+
+- Match PDF filename extensions case-insensitively during directory conversion
 
 ### Documentation
 
