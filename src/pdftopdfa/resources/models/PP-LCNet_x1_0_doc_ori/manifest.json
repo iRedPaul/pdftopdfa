@@ -1,0 +1,18 @@
+{
+  "engine": "onnxruntime",
+  "files": {
+    "inference.onnx": "af9a0a4f317ff0709ce752067807f819cb15d883f8ecad89f28df1c6ee2d9c92",
+    "inference.yml": "9e195eb729a8173588cd0e8a852c8b373aa606e79e77b4ac7d8346f5426caf26"
+  },
+  "model_name": "PP-LCNet_x1_0_doc_ori",
+  "source": {
+    "repository": "https://huggingface.co/PaddlePaddle/PP-LCNet_x1_0_doc_ori",
+    "revision": "d3b95a6dff5fe8a94f2748e12b61cb26818a0df8"
+  },
+  "conversion": {
+    "opset": 7,
+    "paddle2onnx": "2.0.2rc3",
+    "paddlepaddle": "3.0.0.dev20250426",
+    "paddlex": "3.7.2"
+  }
+}

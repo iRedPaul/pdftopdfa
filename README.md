@@ -18,7 +18,7 @@ Instead of re-rendering via Ghostscript, it modifies the PDF structure directly 
 - **ICC color profiles** -- automatically embeds sRGB, CMYK, and grayscale profiles
 - **Batch processing** -- converts entire directories, optionally recursive
 - **Integrated validation** -- checks conformance via [veraPDF](https://verapdf.org/)
-- **OCR support** -- optional text recognition for scanned PDFs via Tesseract
+- **OCR support** -- optional text recognition via Tesseract with offline PaddleOCR page orientation
 - **Simple API** -- usable as CLI tool or Python library
 
 ## How It Works
@@ -26,7 +26,7 @@ Instead of re-rendering via Ghostscript, it modifies the PDF structure directly 
 pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with the PDF/A standard:
 
 1. **Pre-check** -- skips encrypted and digitally signed PDFs, then detects if the PDF is already a valid PDF/A file (skips conversion if the existing level meets or exceeds the target; optionally skips any veraPDF-compliant PDF/A via `--skip-any-pdfa`; see [Usage Guide](docs/usage.md#already-compliant-pdfs) for details)
-2. **OCR** (optional) -- runs Tesseract via ocrmypdf on scanned pages without a text layer
+2. **OCR** (optional) -- uses the bundled PaddleOCR model to orient every page in `best` mode, then runs Tesseract via ocrmypdf on pages without a text layer
 3. **Font compliance** -- analyzes all fonts, embeds missing ones, adds ToUnicode mappings, subsets embedded fonts, and fixes encoding issues
 4. **Sanitization** -- removes or fixes non-compliant elements (JavaScript, non-standard actions, transparency groups, annotations, optional content, etc.)
 5. **Metadata** -- synchronizes XMP metadata with the document info dictionary and sets the PDF/A conformance level
@@ -38,7 +38,10 @@ pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with 
 ### Prerequisites
 
 - Python 3.12, 3.13, or 3.14
-- macOS, Linux, or Windows
+- macOS 14 or later on Apple Silicon, Linux, or Windows
+
+Intel-based Macs are not supported. Installation on macOS requires the ARM64
+wheels provided by ONNX Runtime for Apple Silicon.
 
 ```bash
 pip install pdftopdfa
@@ -50,7 +53,7 @@ pip install pdftopdfa
 pip install "pdftopdfa[ocr]"
 ```
 
-OCR requires a [Tesseract](https://github.com/tesseract-ocr/tesseract) installation on the system. See [docs/ocr.md](docs/ocr.md) for details on OCR usage and quality presets.
+OCR requires a [Tesseract](https://github.com/tesseract-ocr/tesseract) installation on the system. The `best` preset uses a bundled PaddleOCR ONNX model and never downloads model files at runtime. See [docs/ocr.md](docs/ocr.md) for details on OCR usage and quality presets.
 
 ## Quick Start
 
@@ -152,6 +155,8 @@ Contributions are welcome! Please open an [issue](https://github.com/iredpaul/pd
 - [click](https://click.palletsprojects.com/) -- CLI framework
 - [colorama](https://pypi.org/project/colorama/) -- Colored terminal output
 - [tqdm](https://tqdm.github.io/) -- Progress bars
+- [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) -- document orientation classification
+- [ONNX Runtime](https://onnxruntime.ai/) -- CPU inference for the bundled orientation model
 
 **Optional:**
 
@@ -164,6 +169,7 @@ Contributions are welcome! Please open an [issue](https://github.com/iredpaul/pd
 This project bundles the following resources:
 
 - **[Liberation Fonts](https://github.com/liberationfonts/liberation-fonts)** -- metrically compatible replacements for the PDF Standard 14 fonts (SIL OFL 1.1)
+- **[PP-LCNet_x1_0_doc_ori](https://huggingface.co/PaddlePaddle/PP-LCNet_x1_0_doc_ori)** -- bundled document-orientation model (Apache-2.0)
 - **[Noto Sans CJK](https://github.com/notofonts/noto-cjk)** -- CJK font coverage (SIL OFL 1.1)
 - **[Noto Sans Symbols 2](https://github.com/notofonts/symbols)** -- symbol font replacement (SIL OFL 1.1)
 - **[STIX Two Math](https://github.com/stipub/stixfonts)** -- math font replacement (SIL OFL 1.1)

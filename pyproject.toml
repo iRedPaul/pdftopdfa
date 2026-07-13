@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdftopdfa"
-version = "0.5.1"
+version = "0.6.0"
 description = "Convert PDF files to the archival PDF/A format"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -33,6 +33,9 @@ dependencies = [
     "colorama>=0.4.6",
     "tqdm>=4.68.3",
     "fonttools>=4.63.0",
+    "numpy>=1.24,<2.4",
+    "onnxruntime>=1.27,<2",
+    "paddleocr>=3.7.0,<3.8",
 ]
 
 [project.urls]
@@ -67,6 +70,7 @@ pdftopdfa = [
     "resources/fonts/LICENSES.txt",
     "resources/cid_unicode/*.bin.gz",
     "resources/cid_unicode/LICENSES.txt",
+    "resources/models/PP-LCNet_x1_0_doc_ori/*",
 ]
 
 [tool.pytest.ini_options]

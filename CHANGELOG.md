@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.6.0] - 2026-07-13
+
+### Features
+
+- Add bundled offline PaddleOCR document-orientation classification for best-quality OCR
+
+### Changes
+
+- Replace Tesseract OSD page rotation with CPU-only ONNX Runtime inference
+- Analyze every page before best-quality OCR and keep low-confidence pages unchanged
+- Add PaddleOCR, ONNX Runtime, and NumPy as fixed dependencies
+
+### Documentation
+
+- Document offline model packaging, confidence handling, and frozen application requirements
+- Document macOS 14 and Apple Silicon as the supported macOS platform
+
+### CI / Build
+
+- Bundle the pinned PP-LCNet orientation model, manifest, source notice, and license
+- Test macOS exclusively on an explicit Apple Silicon runner
+
 ## [0.5.1] - 2026-07-12
 
 ### Changes

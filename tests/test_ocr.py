@@ -6,7 +6,7 @@
 
 import logging
 import os
-import subprocess
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -20,29 +20,33 @@ from PIL import Image
 from pdftopdfa.exceptions import OCRError
 from pdftopdfa.ocr import (
     _ROTATION_FIX_QUALITIES,
-    _TESSERACT_OSD_TIMEOUT_SECONDS,
     OCR_SETTINGS,
     OcrQuality,
     _detect_consistent_text_skew,
-    _normalize_best_quality_skipped_text_pages,
-    _normalize_best_quality_text_page_rotations,
     _normalize_best_quality_text_page_skew,
-    _OrientationResult,
     _page_has_images,
     _page_has_text,
-    _parse_tesseract_osd,
-    _run_tesseract_orientation,
-    _should_clear_page_rotate,
     apply_ocr,
     is_ocr_available,
     needs_ocr,
 )
 from pdftopdfa.ocr_rotation_fix import (
-    _compose_page_rotation,
     _should_swap_visible_page_axis,
     filter_pdf_page,
-    rasterize_pdf_page,
 )
+
+
+@pytest.fixture(autouse=True)
+def _mock_paddle_orientation():
+    """Keep OCR unit tests independent from the real orientation model."""
+    with patch("pdftopdfa.ocr.normalize_pdf_orientation") as mock_normalize:
+
+        def copy_input(input_path: Path, output_path: Path):
+            shutil.copy2(input_path, output_path)
+            return []
+
+        mock_normalize.side_effect = copy_input
+        yield mock_normalize
 
 
 class TestIsOcrAvailable:
@@ -434,6 +438,24 @@ class TestApplyOcr:
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_best_orientation_error_aborts_before_ocr(
+        self,
+        mock_ocrmypdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        _mock_paddle_orientation: MagicMock,
+    ) -> None:
+        """A model or inference failure stops conversion before OCRmyPDF."""
+        output_path = tmp_dir / "output.pdf"
+        _mock_paddle_orientation.side_effect = OCRError("model is corrupt")
+
+        with pytest.raises(OCRError, match="model is corrupt"):
+            apply_ocr(sample_pdf, output_path, quality=OcrQuality.BEST)
+
+        mock_ocrmypdf.ocr.assert_not_called()
+
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
     def test_apply_ocr_calls_ocrmypdf(
         self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
     ) -> None:
@@ -521,10 +543,11 @@ class TestApplyOcr:
         mock_ocrmypdf: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
+        _mock_paddle_orientation: MagicMock,
     ) -> None:
         """A faster fallback runs when OCR exceeds the time threshold."""
         output_path = tmp_dir / "output.pdf"
-        mock_perf_counter.side_effect = [0.0, 61.0, 61.0, 62.0]
+        mock_perf_counter.side_effect = [0.0, 1.0, 1.0, 61.0, 61.0, 62.0]
 
         def create_output(input_path: Path, output: Path, **kwargs: object) -> None:
             import shutil
@@ -545,6 +568,7 @@ class TestApplyOcr:
         )
         assert "oversample" not in retry_kwargs
         assert "plugins" not in retry_kwargs
+        _mock_paddle_orientation.assert_called_once()
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
@@ -558,7 +582,7 @@ class TestApplyOcr:
     ) -> None:
         """fallback_quality=None disables automatic retry."""
         output_path = tmp_dir / "output.pdf"
-        mock_perf_counter.side_effect = [0.0, 61.0]
+        mock_perf_counter.side_effect = [0.0, 1.0, 1.0, 61.0]
 
         def create_output(input_path: Path, output: Path, **kwargs: object) -> None:
             import shutil
@@ -602,7 +626,7 @@ class TestApplyOcr:
         self._write_multipage_pdf(input_pdf, page_count=3)
         output_path = tmp_dir / "output.pdf"
         # 61s for 3 pages stays within the 3 * 60s budget -> no fallback
-        mock_perf_counter.side_effect = [0.0, 61.0]
+        mock_perf_counter.side_effect = [0.0, 1.0, 1.0, 61.0]
 
         def create_output(input_path: Path, output: Path, **kwargs: object) -> None:
             import shutil
@@ -629,7 +653,7 @@ class TestApplyOcr:
         self._write_multipage_pdf(input_pdf, page_count=3)
         output_path = tmp_dir / "output.pdf"
         # 181s for 3 pages exceeds the 3 * 60s budget -> fallback
-        mock_perf_counter.side_effect = [0.0, 181.0, 181.0, 182.0]
+        mock_perf_counter.side_effect = [0.0, 1.0, 1.0, 181.0, 181.0, 182.0]
 
         def create_output(input_path: Path, output: Path, **kwargs: object) -> None:
             import shutil
@@ -847,8 +871,8 @@ class TestOcrQuality:
         settings = OCR_SETTINGS[OcrQuality.BEST]
         assert settings["skip_text"] is True
         assert settings["deskew"] is True
-        assert settings["rotate_pages"] is True
-        assert settings["rotate_pages_threshold"] == 5.0
+        assert settings["rotate_pages"] is False
+        assert "rotate_pages_threshold" not in settings
         assert settings["oversample"] == 600
         assert settings["tesseract_pagesegmode"] == 11
         assert settings["tesseract_thresholding"] == 1
@@ -856,6 +880,22 @@ class TestOcrQuality:
         assert settings["optimize"] == 0
         assert settings["progress_bar"] is False
         assert "clean" not in settings
+
+    @pytest.mark.parametrize("quality", [OcrQuality.FAST, OcrQuality.DEFAULT])
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_non_best_quality_never_runs_paddle_orientation(
+        self,
+        mock_ocrmypdf: MagicMock,
+        quality: OcrQuality,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        _mock_paddle_orientation: MagicMock,
+    ) -> None:
+        """Only an originally requested BEST run initializes PaddleOCR."""
+        apply_ocr(sample_pdf, tmp_dir / "output.pdf", quality=quality)
+
+        _mock_paddle_orientation.assert_not_called()
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
@@ -902,13 +942,14 @@ class TestOcrQuality:
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
-    @patch("pdftopdfa.ocr._normalize_best_quality_skipped_text_pages")
+    @patch("pdftopdfa.ocr._normalize_best_quality_text_page_skew")
     def test_apply_ocr_best_quality(
         self,
-        mock_normalize_pages: MagicMock,
+        mock_normalize_skew: MagicMock,
         mock_ocrmypdf: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
+        _mock_paddle_orientation: MagicMock,
     ) -> None:
         """apply_ocr with BEST quality passes correct parameters."""
         output_path = tmp_dir / "output.pdf"
@@ -920,16 +961,18 @@ class TestOcrQuality:
             **OCR_SETTINGS[OcrQuality.BEST],
             "tesseract_timeout": 60,
         }
-        mock_ocrmypdf.ocr.assert_called_once_with(
-            sample_pdf,
-            output_path,
-            language=["eng"],
-            output_type="pdf",
-            rasterizer="pypdfium",
-            plugins=["pdftopdfa.ocr_rotation_fix"],
+        _mock_paddle_orientation.assert_called_once()
+        oriented_input = mock_ocrmypdf.ocr.call_args.args[0]
+        assert oriented_input.name == f"{sample_pdf.stem}_oriented.pdf"
+        assert mock_ocrmypdf.ocr.call_args.args[1] == output_path
+        assert mock_ocrmypdf.ocr.call_args.kwargs == {
+            "language": ["eng"],
+            "output_type": "pdf",
+            "rasterizer": "pypdfium",
+            "plugins": ["pdftopdfa.ocr_rotation_fix"],
             **expected_settings,
-        )
-        mock_normalize_pages.assert_called_once_with(output_path)
+        }
+        mock_normalize_skew.assert_called_once_with(output_path)
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
@@ -1007,7 +1050,7 @@ class TestApplyOcrForce:
         assert call_kwargs["redo_ocr"] is True
         assert "skip_text" not in call_kwargs
         assert "deskew" not in call_kwargs
-        assert call_kwargs["rotate_pages"] is True
+        assert call_kwargs["rotate_pages"] is False
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
@@ -1035,7 +1078,7 @@ class TestApplyOcrForce:
         assert "deskew" not in call_kwargs
         assert "clean_final" not in call_kwargs
         assert "remove_background" not in call_kwargs
-        assert call_kwargs["rotate_pages"] is True
+        assert call_kwargs["rotate_pages"] is False
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
@@ -1122,206 +1165,8 @@ class TestOcrPlugins:
         assert "plugins" not in call_kwargs
 
 
-class TestBestQualityTextRotationNormalization:
-    """Tests for post-OCR normalization of skipped text-page rotations."""
-
-    def test_parse_tesseract_osd(self) -> None:
-        """OSD output is parsed into rotation and confidence."""
-        result = _parse_tesseract_osd(
-            "Rotate: 180\nOrientation confidence: 12.5\nScript: Latin\n"
-        )
-
-        assert result == _OrientationResult(rotate=180, confidence=12.5)
-
-    @patch("pdftopdfa.ocr.subprocess.run")
-    def test_run_tesseract_orientation_uses_timeout_and_parses_output(
-        self, mock_run: MagicMock, tmp_dir: Path
-    ) -> None:
-        """OSD uses a bounded subprocess and parses successful output."""
-        image_path = tmp_dir / "preview.png"
-        mock_run.return_value = SimpleNamespace(
-            returncode=0,
-            stdout="Rotate: 270\nOrientation confidence: 11.25\n",
-            stderr="",
-        )
-
-        result = _run_tesseract_orientation(image_path)
-
-        assert result == _OrientationResult(rotate=270, confidence=11.25)
-        assert mock_run.call_args.kwargs["timeout"] == _TESSERACT_OSD_TIMEOUT_SECONDS
-
-    @patch("pdftopdfa.ocr.subprocess.run")
-    def test_run_tesseract_orientation_returns_none_on_timeout(
-        self,
-        mock_run: MagicMock,
-        tmp_dir: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """An OSD timeout is logged and treated as unavailable orientation."""
-        image_path = tmp_dir / "preview.png"
-        mock_run.side_effect = subprocess.TimeoutExpired(
-            "tesseract", _TESSERACT_OSD_TIMEOUT_SECONDS
-        )
-
-        with caplog.at_level(logging.WARNING, logger="pdftopdfa.ocr"):
-            result = _run_tesseract_orientation(image_path)
-
-        assert result is None
-        assert "Tesseract OSD timed out" in caplog.text
-
-    def test_should_clear_page_rotate_when_cleared_preview_is_better(self) -> None:
-        """Clearing /Rotate is preferred when it removes the needed correction."""
-        current = _OrientationResult(rotate=180, confidence=8.0)
-        cleared = _OrientationResult(rotate=0, confidence=9.5)
-
-        assert _should_clear_page_rotate(180, current, cleared) is True
-
-    def test_should_not_clear_page_rotate_without_improvement(self) -> None:
-        """Pages stay untouched when the cleared preview is not better."""
-        current = _OrientationResult(rotate=0, confidence=9.0)
-        cleared = _OrientationResult(rotate=180, confidence=10.0)
-
-        assert _should_clear_page_rotate(180, current, cleared) is False
-
-    @patch("pdftopdfa.ocr._run_tesseract_orientation")
-    @patch("pdftopdfa.ocr._render_pdf_page_preview")
-    @patch("pdftopdfa.ocr._write_single_page_with_rotate")
-    def test_normalize_best_quality_text_page_rotations_clears_rotate(
-        self,
-        mock_write_single_page: MagicMock,
-        mock_render_preview: MagicMock,
-        mock_run_orientation: MagicMock,
-        tmp_dir: Path,
-    ) -> None:
-        """A text-only page with better orientation after clearing is normalized."""
-        pdf_path = tmp_dir / "rotated.pdf"
-
-        with Pdf.new() as pdf:
-            page = pdf.add_blank_page(page_size=(595.0, 842.0))
-            page.Rotate = 180
-            font = Dictionary(
-                Type=Name.Font,
-                Subtype=Name.Type1,
-                BaseFont=Name("/Helvetica"),
-            )
-            page.obj[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
-            page.obj[Name.Contents] = pdf.make_stream(
-                b"BT /F1 12 Tf 100 700 Td (Rotated text) Tj ET"
-            )
-            pdf.save(pdf_path)
-
-        mock_write_single_page.side_effect = lambda *args, **kwargs: kwargs[
-            "output_path"
-        ]
-        mock_run_orientation.side_effect = [
-            _OrientationResult(rotate=180, confidence=8.0),
-            _OrientationResult(rotate=0, confidence=9.0),
-        ]
-
-        changed_pages = _normalize_best_quality_text_page_rotations(pdf_path)
-
-        assert changed_pages == [1]
-        with Pdf.open(pdf_path) as pdf:
-            page = pdf.pages[0]
-            assert int(page.obj.get("/Rotate", 0)) == 0
-            assert [float(value) for value in page.obj["/MediaBox"]] == pytest.approx(
-                [0.0, 0.0, 595.0, 842.0]
-            )
-
-    @patch("pdftopdfa.ocr._run_tesseract_orientation")
-    @patch("pdftopdfa.ocr._render_pdf_page_preview")
-    @patch("pdftopdfa.ocr._write_single_page_with_rotate")
-    def test_normalize_best_quality_text_page_rotations_preserves_visible_a4(
-        self,
-        mock_write_single_page: MagicMock,
-        mock_render_preview: MagicMock,
-        mock_run_orientation: MagicMock,
-        tmp_dir: Path,
-    ) -> None:
-        """Clearing /Rotate keeps the original page box geometry unchanged."""
-        pdf_path = tmp_dir / "rotated_visible_a4.pdf"
-        original_box = [0.0, 0.0, 842.0, 595.0]
-
-        with Pdf.new() as pdf:
-            page = pdf.add_blank_page(page_size=(842.0, 595.0))
-            page.Rotate = 270
-            font = Dictionary(
-                Type=Name.Font,
-                Subtype=Name.Type1,
-                BaseFont=Name("/Helvetica"),
-            )
-            page.obj[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
-            page.obj[Name.CropBox] = Array(original_box)
-            page.obj[Name.TrimBox] = Array(original_box)
-            page.obj[Name.Contents] = pdf.make_stream(
-                b"BT /F1 12 Tf 100 450 Td (Portrait A4) Tj ET"
-            )
-            pdf.save(pdf_path)
-
-        mock_write_single_page.side_effect = lambda *args, **kwargs: kwargs[
-            "output_path"
-        ]
-        mock_run_orientation.side_effect = [
-            _OrientationResult(rotate=270, confidence=8.0),
-            _OrientationResult(rotate=0, confidence=9.0),
-        ]
-
-        changed_pages = _normalize_best_quality_text_page_rotations(pdf_path)
-
-        assert changed_pages == [1]
-        with Pdf.open(pdf_path) as pdf:
-            page = pdf.pages[0]
-            assert int(page.obj.get("/Rotate", 0)) == 0
-            assert [float(value) for value in page.obj["/MediaBox"]] == pytest.approx(
-                original_box
-            )
-            assert [float(value) for value in page.obj["/CropBox"]] == pytest.approx(
-                original_box
-            )
-            assert [float(value) for value in page.obj["/TrimBox"]] == pytest.approx(
-                original_box
-            )
-
-    @patch("pdftopdfa.ocr._run_tesseract_orientation")
-    @patch("pdftopdfa.ocr._render_pdf_page_preview")
-    @patch("pdftopdfa.ocr._write_single_page_with_rotate")
-    def test_normalize_best_quality_text_page_rotations_keeps_rotate_when_needed(
-        self,
-        mock_write_single_page: MagicMock,
-        mock_render_preview: MagicMock,
-        mock_run_orientation: MagicMock,
-        tmp_dir: Path,
-    ) -> None:
-        """Rotation is preserved when clearing it would not improve orientation."""
-        pdf_path = tmp_dir / "rotated_keep.pdf"
-
-        with Pdf.new() as pdf:
-            page = pdf.add_blank_page(page_size=(595.0, 842.0))
-            page.Rotate = 90
-            font = Dictionary(
-                Type=Name.Font,
-                Subtype=Name.Type1,
-                BaseFont=Name("/Helvetica"),
-            )
-            page.obj[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
-            page.obj[Name.Contents] = pdf.make_stream(
-                b"BT /F1 12 Tf 100 700 Td (Keep rotate) Tj ET"
-            )
-            pdf.save(pdf_path)
-
-        mock_write_single_page.side_effect = lambda *args, **kwargs: kwargs[
-            "output_path"
-        ]
-        mock_run_orientation.side_effect = [
-            _OrientationResult(rotate=0, confidence=9.0),
-            _OrientationResult(rotate=90, confidence=9.5),
-        ]
-
-        changed_pages = _normalize_best_quality_text_page_rotations(pdf_path)
-
-        assert changed_pages == []
-        with Pdf.open(pdf_path) as pdf:
-            assert int(pdf.pages[0].obj.get("/Rotate", 0)) == 90
+class TestBestQualityTextSkewNormalization:
+    """Tests for post-OCR normalization of skipped text-page skew."""
 
     def test_detect_consistent_text_skew(self, tmp_dir: Path) -> None:
         """Consistent small text-matrix skew is detected."""
@@ -1387,23 +1232,6 @@ class TestBestQualityTextRotationNormalization:
             assert [float(value) for value in page.obj["/TrimBox"]] == pytest.approx(
                 original_box
             )
-
-    @patch("pdftopdfa.ocr._normalize_best_quality_text_page_rotations")
-    @patch("pdftopdfa.ocr._normalize_best_quality_text_page_skew")
-    def test_normalize_best_quality_skipped_text_pages_runs_both_steps(
-        self,
-        mock_normalize_skew: MagicMock,
-        mock_normalize_rotations: MagicMock,
-        tmp_dir: Path,
-    ) -> None:
-        """Best-quality skipped text normalization runs rotation then skew."""
-        pdf_path = tmp_dir / "combined.pdf"
-        pdf_path.write_bytes(b"%PDF-1.4\n")
-
-        _normalize_best_quality_skipped_text_pages(pdf_path)
-
-        mock_normalize_rotations.assert_called_once_with(pdf_path)
-        mock_normalize_skew.assert_called_once_with(pdf_path)
 
 
 class TestVisiblePageRotationFix:
@@ -1516,128 +1344,3 @@ class TestVisiblePageRotationFix:
             mediabox = [float(value) for value in pdf.pages[0].mediabox]
 
         assert mediabox == expected_mediabox
-
-
-class TestPypdfiumRotationFix:
-    """Tests for pypdfium raster rotation composition."""
-
-    def test_compose_page_rotation_preserves_existing_rotate(self) -> None:
-        """The requested OCR correction is composed with the existing /Rotate."""
-        assert _compose_page_rotation(270, 90) == 180
-        assert _compose_page_rotation(270, 180) == 90
-        assert _compose_page_rotation(270, 270) == 0
-        assert _compose_page_rotation(270, 0) == 270
-        assert _compose_page_rotation(0, 90) == 270
-
-    @patch("ocrmypdf.builtin_plugins.pypdfium.rasterize_pdf_page")
-    def test_rasterize_pdf_page_composes_existing_rotate_for_pypdfium(
-        self, mock_rasterize: MagicMock, tmp_dir: Path
-    ) -> None:
-        """A /Rotate=270 page plus 180° OCR correction is rendered as /Rotate=90."""
-        input_pdf = tmp_dir / "input.pdf"
-        output_png = tmp_dir / "output.png"
-
-        with Pdf.new() as pdf:
-            page = pdf.add_blank_page(page_size=(595.0, 842.0))
-            page.Rotate = 270
-            pdf.save(input_pdf)
-
-        captured: dict[str, Path] = {}
-
-        def capture_temp_pdf(*args, **kwargs):
-            captured["temp_pdf"] = Path(args[0])
-            return output_png
-
-        mock_rasterize.side_effect = capture_temp_pdf
-        options = SimpleNamespace(rasterizer="pypdfium", keep_temporary_files=True)
-
-        result = rasterize_pdf_page(
-            input_pdf,
-            output_png,
-            "png16m",
-            SimpleNamespace(),
-            1,
-            None,
-            180,
-            False,
-            True,
-            options,
-            False,
-        )
-
-        assert result == output_png
-        assert mock_rasterize.call_args.args[6] == 0
-        with Pdf.open(captured["temp_pdf"]) as pdf:
-            assert int(pdf.pages[0].obj.get("/Rotate", 0)) == 90
-
-    @patch("ocrmypdf.builtin_plugins.pypdfium.rasterize_pdf_page")
-    def test_rasterize_pdf_page_applies_90_degree_correction_against_rotate(
-        self, mock_rasterize: MagicMock, tmp_dir: Path
-    ) -> None:
-        """A /Rotate=270 page plus 90° OCR correction is rendered as /Rotate=180."""
-        input_pdf = tmp_dir / "input_90.pdf"
-        output_png = tmp_dir / "output_90.png"
-
-        with Pdf.new() as pdf:
-            page = pdf.add_blank_page(page_size=(595.0, 842.0))
-            page.Rotate = 270
-            pdf.save(input_pdf)
-
-        captured: dict[str, Path] = {}
-
-        def capture_temp_pdf(*args, **kwargs):
-            captured["temp_pdf"] = Path(args[0])
-            return output_png
-
-        mock_rasterize.side_effect = capture_temp_pdf
-        options = SimpleNamespace(rasterizer="pypdfium", keep_temporary_files=True)
-
-        result = rasterize_pdf_page(
-            input_pdf,
-            output_png,
-            "png16m",
-            SimpleNamespace(),
-            1,
-            None,
-            90,
-            False,
-            True,
-            options,
-            False,
-        )
-
-        assert result == output_png
-        assert mock_rasterize.call_args.args[6] == 0
-        with Pdf.open(captured["temp_pdf"]) as pdf:
-            assert int(pdf.pages[0].obj.get("/Rotate", 0)) == 180
-
-    @patch("ocrmypdf.builtin_plugins.pypdfium.rasterize_pdf_page")
-    def test_rasterize_pdf_page_skips_when_no_existing_rotate(
-        self, mock_rasterize: MagicMock, tmp_dir: Path
-    ) -> None:
-        """Pages without /Rotate fall back to OCRmyPDF's default pypdfium hook."""
-        input_pdf = tmp_dir / "input.pdf"
-        output_png = tmp_dir / "output.png"
-
-        with Pdf.new() as pdf:
-            pdf.add_blank_page(page_size=(595.0, 842.0))
-            pdf.save(input_pdf)
-
-        options = SimpleNamespace(rasterizer="pypdfium", keep_temporary_files=False)
-
-        result = rasterize_pdf_page(
-            input_pdf,
-            output_png,
-            "png16m",
-            SimpleNamespace(),
-            1,
-            None,
-            180,
-            False,
-            True,
-            options,
-            False,
-        )
-
-        assert result is None
-        mock_rasterize.assert_not_called()

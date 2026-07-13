@@ -14,7 +14,11 @@ pip install "pdftopdfa[ocr]"
 
 System dependency:
 
-- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) must be installed and available in `PATH`.
+- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) must be installed and available in `PATH` for text recognition and deskew.
+
+The PaddleOCR document-orientation classifier and its ONNX model are installed
+with `pdftopdfa`. The model is read exclusively from the package and does not
+require an internet connection or a pre-populated user cache.
 
 Optional environment variable:
 
@@ -117,18 +121,32 @@ Internal OCR settings:
 | Parameter | `fast` | `default` | `best` |
 |---|---|---|---|
 | `deskew` | False | False | True |
-| `rotate_pages` | False | False | True |
-| `rotate_pages_threshold` | - | - | 5.0 |
+| OCRmyPDF `rotate_pages` | False | False | False |
+| Paddle page orientation | No | No | All pages |
+| Paddle confidence threshold | - | - | 0.80 |
 | `oversample` | - | 600 | 600 |
 | `tesseract_pagesegmode` | - | 11 (`sparse_text`) | 11 (`sparse_text`) |
 | `tesseract_thresholding` | - | `adaptive-otsu` | `adaptive-otsu` |
 
 `default` and `best` rely on Tesseract's built-in adaptive thresholding.
 This is generally more robust for mixed scans with small text regions on large pages.
-`best` now includes the same OCR detection baseline as `default` and adds
-deskew/rotation on top.
+Before OCR starts, `best` renders and classifies every page with the bundled
+`PP-LCNet_x1_0_doc_ori` model, including pages that OCRmyPDF later skips because
+they already contain text. Predictions below 0.80 leave the page unchanged and
+produce a warning. Missing, corrupt, or unusable model files abort the conversion.
+Tesseract OSD is not used.
 When OCR is forced, redo-ocr-incompatible options such as `deskew`
 are disabled automatically.
+
+## Offline Deployment
+
+The ONNX model, its inference configuration, integrity manifest, source notice,
+and Apache-2.0 license are package data. Wheel builds contain these files under
+`pdftopdfa/resources/models/PP-LCNet_x1_0_doc_ori/`.
+
+Applications frozen with tools such as PyInstaller must collect the `pdftopdfa`
+package data as well as PaddleOCR, PaddleX, ONNX Runtime, OpenCV, NumPy, and the
+ONNX Runtime native libraries. No writable model cache is required at runtime.
 
 ## Automatic Fallback
 
@@ -170,6 +188,12 @@ pip install "pdftopdfa[ocr]"
 - Install Tesseract on your system.
 - Ensure `tesseract --version` works.
 - Or set `TESSERACT_PATH` to the executable or parent directory.
+
+### Bundled Paddle model is missing or corrupt
+
+Reinstall `pdftopdfa` from an intact wheel. The orientation preflight validates
+the packaged files against SHA-256 hashes and intentionally does not attempt a
+network download or external-cache fallback.
 
 ### OCR did not run
 

@@ -15,10 +15,8 @@ import logging
 import math
 import os
 import shutil
-import subprocess
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
@@ -59,13 +57,13 @@ if TYPE_CHECKING:
 
 # Local
 from .exceptions import OCRError
+from .orientation import normalize_pdf_orientation
 from .utils import log_suppressed_error
 
 logger = logging.getLogger(__name__)
 
 _path_lock = threading.Lock()
 _ROTATION_FIX_PLUGIN = "pdftopdfa.ocr_rotation_fix"
-_TESSERACT_OSD_TIMEOUT_SECONDS = 30
 
 
 @contextlib.contextmanager
@@ -131,9 +129,8 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
     OcrQuality.BEST: {
         "skip_text": True,
         "deskew": True,
-        "rotate_pages": True,
-        # Lower threshold so sideways scanned pages are rotated more reliably.
-        "rotate_pages_threshold": 5.0,
+        # Page orientation is normalized by the bundled Paddle ONNX model.
+        "rotate_pages": False,
         # Match DEFAULT's OCR-friendly sampling so BEST truly builds on it.
         "oversample": 600,
         "tesseract_pagesegmode": 11,
@@ -158,14 +155,6 @@ _REDO_OCR_INCOMPATIBLE_OPTIONS = frozenset(
 )
 
 _ROTATION_FIX_QUALITIES = frozenset({OcrQuality.DEFAULT, OcrQuality.BEST})
-
-
-@dataclass(frozen=True)
-class _OrientationResult:
-    """Orientation analysis result returned by Tesseract OSD."""
-
-    rotate: int
-    confidence: float
 
 
 def _get_ocr_plugins(quality: OcrQuality) -> list[str]:
@@ -241,124 +230,6 @@ def _count_pdf_pages(pdf_path: Path) -> int:
             logger, exc, "Could not count pages of %s: %s", pdf_path, exc
         )
         return 1
-
-
-def _parse_tesseract_osd(output: str) -> _OrientationResult | None:
-    """Parse Tesseract OSD output into a structured result."""
-    rotate = None
-    confidence = None
-
-    for line in output.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("Rotate:"):
-            try:
-                rotate = int(stripped.split(":", 1)[1].strip()) % 360
-            except ValueError:
-                return None
-        elif stripped.startswith("Orientation confidence:"):
-            try:
-                confidence = float(stripped.split(":", 1)[1].strip())
-            except ValueError:
-                return None
-
-    if rotate is None or confidence is None:
-        return None
-
-    return _OrientationResult(rotate=rotate, confidence=confidence)
-
-
-def _run_tesseract_orientation(image_path: Path) -> _OrientationResult | None:
-    """Run Tesseract OSD on an image and return the orientation result."""
-    command = ["tesseract", os.fspath(image_path), "stdout", "--psm", "0"]
-
-    try:
-        with _temporary_tesseract_path():
-            completed = subprocess.run(
-                command,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=_TESSERACT_OSD_TIMEOUT_SECONDS,
-            )
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            "Tesseract OSD timed out after %s seconds for %s",
-            _TESSERACT_OSD_TIMEOUT_SECONDS,
-            image_path,
-        )
-        return None
-    except FileNotFoundError:
-        logger.debug("Tesseract not available for OCR rotation normalization")
-        return None
-    except Exception as exc:
-        log_suppressed_error(
-            logger, exc, "Tesseract OSD failed for %s: %s", image_path, exc
-        )
-        return None
-
-    if completed.returncode != 0:
-        logger.debug(
-            "Tesseract OSD returned %s for %s: %s",
-            completed.returncode,
-            image_path,
-            completed.stderr.strip(),
-        )
-
-    return _parse_tesseract_osd(completed.stdout)
-
-
-def _render_pdf_page_preview(
-    pdf_path: Path, *, page_index: int, output_path: Path
-) -> None:
-    """Render a PDF page to an image using pypdfium2."""
-    import pypdfium2 as pdfium
-
-    pdf = pdfium.PdfDocument(os.fspath(pdf_path))
-    try:
-        page = pdf[page_index]
-        image = page.render(scale=1.5).to_pil()
-        image.save(output_path)
-    finally:
-        close = getattr(pdf, "close", None)
-        if callable(close):
-            close()
-
-
-def _write_single_page_with_rotate(
-    input_path: Path,
-    *,
-    page_index: int,
-    rotate: int,
-    output_path: Path,
-) -> Path:
-    """Write a one-page PDF copy with an overridden /Rotate value."""
-    import pikepdf
-
-    with pikepdf.open(input_path) as source_pdf:
-        with pikepdf.Pdf.new() as temp_pdf:
-            copied_page = temp_pdf.copy_foreign(source_pdf.pages[page_index].obj)
-            temp_pdf.pages.append(pikepdf.Page(copied_page))
-            temp_pdf.pages[0].Rotate = rotate
-            temp_pdf.save(output_path)
-    return output_path
-
-
-def _should_clear_page_rotate(
-    existing_rotate: int,
-    current_orientation: _OrientationResult | None,
-    cleared_orientation: _OrientationResult | None,
-) -> bool:
-    """Decide whether clearing /Rotate improves the page orientation."""
-    if existing_rotate % 360 == 0:
-        return False
-    if current_orientation is None or cleared_orientation is None:
-        return False
-    if current_orientation.rotate == 0:
-        return False
-    if cleared_orientation.rotate != 0:
-        return False
-    return cleared_orientation.confidence >= current_orientation.confidence
 
 
 def _extract_text_matrix_angles(page) -> list[float]:
@@ -491,98 +362,6 @@ def _normalize_best_quality_text_page_skew(pdf_path: Path) -> list[tuple[int, fl
         ", ".join(f"{page_no} ({angle:.2f}deg)" for page_no, angle in normalized),
     )
     return normalized
-
-
-def _normalize_best_quality_text_page_rotations(pdf_path: Path) -> list[int]:
-    """Clear suspicious /Rotate flags on text-only pages skipped by OCR."""
-    try:
-        import pikepdf
-    except ImportError:
-        return []
-
-    changed_pages: list[int] = []
-
-    with pikepdf.open(pdf_path) as pdf:
-        candidates: list[tuple[int, int]] = []
-        for page_index, page in enumerate(pdf.pages):
-            rotate = int(page.obj.get("/Rotate", 0) or 0) % 360
-            if rotate == 0:
-                continue
-            if not _page_has_text(page) or _page_has_images(page):
-                continue
-            candidates.append((page_index, rotate))
-
-    if not candidates:
-        return changed_pages
-
-    try:
-        with TemporaryDirectory(prefix="pdftopdfa_rotfix_") as tmpdir:
-            temp_dir = Path(tmpdir)
-            for page_index, rotate in candidates:
-                current_preview = temp_dir / f"page_{page_index + 1}_current.png"
-                cleared_pdf = temp_dir / f"page_{page_index + 1}_cleared.pdf"
-                cleared_preview = temp_dir / f"page_{page_index + 1}_cleared.png"
-
-                _render_pdf_page_preview(
-                    pdf_path,
-                    page_index=page_index,
-                    output_path=current_preview,
-                )
-                _write_single_page_with_rotate(
-                    pdf_path,
-                    page_index=page_index,
-                    rotate=0,
-                    output_path=cleared_pdf,
-                )
-                _render_pdf_page_preview(
-                    cleared_pdf,
-                    page_index=0,
-                    output_path=cleared_preview,
-                )
-
-                current_orientation = _run_tesseract_orientation(current_preview)
-                cleared_orientation = _run_tesseract_orientation(cleared_preview)
-
-                if not _should_clear_page_rotate(
-                    rotate,
-                    current_orientation,
-                    cleared_orientation,
-                ):
-                    continue
-
-                changed_pages.append(page_index)
-    except ImportError:
-        logger.debug("pypdfium2 not available for OCR rotation normalization")
-        return []
-    except Exception as exc:
-        log_suppressed_error(
-            logger, exc, "OCR rotation normalization skipped for %s: %s", pdf_path, exc
-        )
-        return []
-
-    if not changed_pages:
-        return []
-
-    output_tmp = pdf_path.with_name(f"{pdf_path.stem}_rotfix.pdf")
-    with pikepdf.open(pdf_path) as pdf:
-        for page_index in changed_pages:
-            pdf.pages[page_index].Rotate = 0
-        pdf.save(output_tmp)
-
-    output_tmp.replace(pdf_path)
-
-    normalized_pages = [page_index + 1 for page_index in changed_pages]
-    logger.info(
-        "Cleared suspicious /Rotate on OCR-skipped text page(s): %s",
-        ", ".join(str(page_no) for page_no in normalized_pages),
-    )
-    return normalized_pages
-
-
-def _normalize_best_quality_skipped_text_pages(pdf_path: Path) -> None:
-    """Normalize skipped text pages for best-quality OCR output."""
-    _normalize_best_quality_text_page_rotations(pdf_path)
-    _normalize_best_quality_text_page_skew(pdf_path)
 
 
 def is_ocr_available() -> bool:
@@ -848,6 +627,10 @@ def apply_ocr(
     if per_page_limit is not None:
         total_limit = per_page_limit * max(1, _count_pdf_pages(input_path))
 
+    ocr_input_path = input_path
+    orientation_elapsed = 0.0
+    orientation_temp: TemporaryDirectory[str] | None = None
+
     def run_ocr_with_quality(
         run_quality: OcrQuality,
         *,
@@ -873,7 +656,7 @@ def apply_ocr(
         started = time.perf_counter()
         with _temporary_tesseract_path():
             ocrmypdf.ocr(
-                input_path,
+                ocr_input_path,
                 output_path,
                 language=languages,
                 output_type="pdf",
@@ -883,7 +666,25 @@ def apply_ocr(
         return time.perf_counter() - started
 
     try:
-        elapsed = run_ocr_with_quality(quality, timeout_limit=per_page_limit)
+        if quality == OcrQuality.BEST:
+            orientation_temp = TemporaryDirectory(
+                prefix="pdftopdfa_paddle_orientation_"
+            )
+            ocr_input_path = (
+                Path(orientation_temp.name) / f"{input_path.stem}_oriented.pdf"
+            )
+            orientation_started = time.perf_counter()
+            normalize_pdf_orientation(input_path, ocr_input_path)
+            orientation_elapsed = time.perf_counter() - orientation_started
+            logger.info(
+                "Paddle orientation preflight completed in %.2fs",
+                orientation_elapsed,
+            )
+
+        elapsed = orientation_elapsed + run_ocr_with_quality(
+            quality,
+            timeout_limit=per_page_limit,
+        )
 
         if fallback is not None and total_limit is not None and elapsed > total_limit:
             logger.warning(
@@ -901,7 +702,7 @@ def apply_ocr(
             run_ocr_with_quality(fallback)
 
         if quality == OcrQuality.BEST and output_path.exists():
-            _normalize_best_quality_skipped_text_pages(output_path)
+            _normalize_best_quality_text_page_skew(output_path)
         logger.info("OCR completed successfully: %s", output_path)
         return output_path
 
@@ -911,11 +712,18 @@ def apply_ocr(
     except PriorOcrFoundError:
         # PDF already has OCR text, just copy it
         logger.info("PDF already contains OCR text, skipping OCR")
-        shutil.copy2(input_path, output_path)
+        shutil.copy2(ocr_input_path, output_path)
         return output_path
 
     except MissingDependencyError as e:
         raise OCRError(f"OCR failed: {_format_ocr_exception(e)}") from e
 
+    except OCRError:
+        raise
+
     except Exception as e:
         raise OCRError(f"OCR failed: {_format_ocr_exception(e)}") from e
+
+    finally:
+        if orientation_temp is not None:
+            orientation_temp.cleanup()

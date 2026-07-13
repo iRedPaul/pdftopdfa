@@ -26,6 +26,9 @@ jobs:
       - name: Build package
         run: python -m build
 
+      - name: Verify bundled offline model
+        run: python scripts/verify_distribution.py
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
