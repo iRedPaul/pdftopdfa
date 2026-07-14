@@ -997,6 +997,15 @@ def convert_to_pdfa(
                 # Strip annotations before OCR so they are not
                 # rasterized into page images.
                 preserve_annots = _has_annotations(ocr_source_base)
+                effective_ocr_deskew = ocr_deskew
+                if preserve_annots and effective_ocr_deskew:
+                    effective_ocr_deskew = False
+                    warning = (
+                        "Deskew skipped because the PDF contains annotations whose "
+                        "geometry cannot be transformed safely"
+                    )
+                    logger.warning("%s: %s", warning, input_path)
+                    warnings.append(warning)
                 ocr_source = ocr_source_base
                 if preserve_annots:
                     fd2, clean_tmp = tempfile.mkstemp(
@@ -1018,7 +1027,7 @@ def convert_to_pdfa(
                     fallback_quality=ocr_fallback_quality,
                     fallback_after_seconds=ocr_fallback_after_seconds,
                     force=ocr_force,
-                    deskew=ocr_deskew,
+                    deskew=effective_ocr_deskew,
                     rotate_pages=ocr_rotate_pages,
                 )
 

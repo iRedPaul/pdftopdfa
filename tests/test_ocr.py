@@ -480,6 +480,34 @@ class TestApplyOcr:
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_disables_deskew_for_annotated_pdf(
+        self,
+        mock_ocrmypdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Direct OCR calls do not misalign annotations by deskewing content."""
+        annotated_pdf = tmp_dir / "annotated.pdf"
+        with Pdf.open(sample_pdf) as pdf:
+            annot = pdf.make_indirect(
+                Dictionary(
+                    Type=Name.Annot,
+                    Subtype=Name.Link,
+                    Rect=Array([10, 10, 30, 30]),
+                )
+            )
+            pdf.pages[0].obj[Name.Annots] = Array([annot])
+            pdf.save(annotated_pdf)
+
+        with caplog.at_level(logging.WARNING, logger="pdftopdfa.ocr"):
+            apply_ocr(annotated_pdf, tmp_dir / "output.pdf", deskew=True)
+
+        assert mock_ocrmypdf.ocr.call_args.kwargs["deskew"] is False
+        assert "Deskew disabled because the PDF contains annotations" in caplog.text
+
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
     @patch("pdftopdfa.ocr.EncryptedPdfError", Exception)
     def test_apply_ocr_handles_encrypted_pdf(
         self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
@@ -1287,6 +1315,42 @@ class TestTextSkewNormalization:
             assert [float(value) for value in page.obj["/TrimBox"]] == pytest.approx(
                 original_box
             )
+
+    def test_normalize_text_page_skew_skips_annotated_page(self, tmp_dir: Path) -> None:
+        """Text-page deskew leaves annotated page geometry and content unchanged."""
+        pdf_path = tmp_dir / "annotated_skew_page.pdf"
+
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(595.0, 842.0))
+            font = Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type1,
+                BaseFont=Name("/Helvetica"),
+            )
+            page.obj[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+            page.obj[Name.Contents] = pdf.make_stream(
+                b"BT /F1 12 Tf "
+                b"12.133 1.0125 -1.0125 12.133 100 700 Tm (A) Tj "
+                b"12.133 1.0125 -1.0125 12.133 100 680 Tm (B) Tj ET"
+            )
+            annot = pdf.make_indirect(
+                Dictionary(
+                    Type=Name.Annot,
+                    Subtype=Name.Link,
+                    Rect=Array([95, 675, 145, 715]),
+                )
+            )
+            page.obj[Name.Annots] = Array([annot])
+            pdf.save(pdf_path)
+
+        normalized = _normalize_text_page_skew(pdf_path)
+
+        assert normalized == []
+        with Pdf.open(pdf_path) as pdf:
+            assert not isinstance(pdf.pages[0].obj["/Contents"], Array)
+            assert [
+                float(value) for value in pdf.pages[0].obj["/Annots"][0]["/Rect"]
+            ] == [95.0, 675.0, 145.0, 715.0]
 
 
 class TestVisiblePageRotationFix:

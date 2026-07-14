@@ -574,6 +574,38 @@ class TestOcrAnnotationIntegration:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_deskew_is_skipped_when_annotations_are_preserved(
+        self,
+        mock_is_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        tmp_dir: Path,
+    ) -> None:
+        """Conversion keeps annotation geometry aligned by disabling deskew."""
+        import shutil
+
+        from pdftopdfa.converter import convert_to_pdfa
+
+        original = _make_pdf_with_stamp(tmp_dir, "deskew_annotations.pdf")
+        mock_apply_ocr.side_effect = lambda src, dst, *args, **kwargs: shutil.copy2(
+            src, dst
+        )
+
+        result = convert_to_pdfa(
+            original,
+            tmp_dir / "deskew_annotations_pdfa.pdf",
+            level="2b",
+            ocr_deskew=True,
+        )
+
+        assert result.success
+        assert mock_apply_ocr.call_args.kwargs["deskew"] is False
+        assert any(
+            "Deskew skipped because the PDF contains annotations" in warning
+            for warning in result.warnings
+        )
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
     def test_page_count_mismatch_aborts_conversion(
         self,
         mock_is_available: MagicMock,

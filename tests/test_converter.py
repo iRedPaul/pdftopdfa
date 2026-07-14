@@ -792,14 +792,14 @@ class TestConvertToPdfa:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_convert_ocr_force_calls_apply_ocr_with_force(
+    def test_convert_ocr_force_implies_ocr_with_default_language(
         self,
         mock_is_ocr_available: MagicMock,
         mock_apply_ocr: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """ocr_force=True calls apply_ocr(force=True)."""
+        """ocr_force=True enables OCR with English when no language is configured."""
         mock_is_ocr_available.return_value = True
 
         def create_ocr_output(
@@ -814,12 +814,11 @@ class TestConvertToPdfa:
 
         output_path = tmp_dir / "output.pdf"
 
-        result = convert_to_pdfa(
-            sample_pdf, output_path, ocr_languages=["eng"], ocr_force=True
-        )
+        result = convert_to_pdfa(sample_pdf, output_path, ocr_force=True)
 
         assert result.success is True
         mock_apply_ocr.assert_called_once()
+        assert mock_apply_ocr.call_args.args[2] == ["eng"]
         call_kwargs = mock_apply_ocr.call_args[1]
         assert call_kwargs["force"] is True
 

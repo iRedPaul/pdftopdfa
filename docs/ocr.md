@@ -156,6 +156,12 @@ continuing through the PDF/A conversion pipeline.
 text-only pages that OCRmyPDF skips. Deskewing may alter page appearance and
 increase file size.
 
+PDFs containing annotations are OCRed without deskewing, and a warning is
+emitted. Annotation rectangles, markup quadrilaterals, form widgets, and
+appearance streams cannot be mapped reliably through OCRmyPDF's raster deskew
+transformation, so skipping deskew prevents links and interactive content from
+becoming misaligned.
+
 Before OCR starts, `--rotate-pages` renders and classifies every page with the
 bundled `PP-LCNet_x1_0_doc_ori` model, including pages that OCRmyPDF later skips
 because they already contain text. Predictions below 0.80 leave the page

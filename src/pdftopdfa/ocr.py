@@ -220,6 +220,31 @@ def _count_pdf_pages(pdf_path: Path) -> int:
         return 1
 
 
+def _pdf_has_annotations(pdf_path: Path) -> bool:
+    """Return whether a PDF has page annotations.
+
+    Inspection failures conservatively disable deskewing so annotation geometry
+    cannot be corrupted by a page transformation.
+    """
+    import pikepdf
+
+    try:
+        with pikepdf.open(pdf_path) as pdf:
+            return any(
+                (annots := page.obj.get("/Annots")) is not None and len(annots) > 0
+                for page in pdf.pages
+            )
+    except Exception as exc:
+        log_suppressed_error(
+            logger,
+            exc,
+            "Could not inspect annotations before deskewing %s: %s",
+            pdf_path,
+            exc,
+        )
+        return True
+
+
 def _extract_text_matrix_angles(page) -> list[float]:
     """Collect text-matrix rotation angles from a page's content stream."""
     angles: list[float] = []
@@ -322,6 +347,9 @@ def _normalize_text_page_skew(pdf_path: Path) -> list[tuple[int, float]]:
         for page_index, page in enumerate(pdf.pages):
             rotate = int(page.obj.get("/Rotate", 0) or 0) % 360
             if rotate != 0:
+                continue
+            annots = page.obj.get("/Annots")
+            if annots is not None and len(annots) > 0:
                 continue
             if not _page_has_text(page) or _page_has_images(page):
                 continue
@@ -606,6 +634,12 @@ def apply_ocr(
         raise OCRError(
             "OCR not available. Install the OCR dependency: pip install pdftopdfa[ocr]"
         )
+    if deskew and _pdf_has_annotations(input_path):
+        logger.warning(
+            "Deskew disabled because the PDF contains annotations whose geometry "
+            "cannot be transformed safely"
+        )
+        deskew = False
 
     logger.info(
         "Starting OCR for %s (languages: %s, quality: %s, force: %s, "
