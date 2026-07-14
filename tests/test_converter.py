@@ -183,6 +183,14 @@ class TestGenerateOutputPath:
         assert output_path.parent == output_dir
         assert output_path.name == "document_pdfa.pdf"
 
+    def test_processing_only_output_name(self, tmp_dir: Path) -> None:
+        """Processing-only outputs use a neutral suffix."""
+        input_path = tmp_dir / "document.pdf"
+
+        output_path = generate_output_path(input_path, pdfa=False)
+
+        assert output_path == tmp_dir / "document_processed.pdf"
+
 
 class TestPdfaSaveSettings:
     """Tests for centralized PDF/A save settings."""
@@ -242,6 +250,160 @@ class TestConvertToPdfa:
         assert result.level == "2b"
         assert output_path.exists()
 
+    def test_no_pdfa_without_processing_copies_input_unchanged(
+        self, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """pdfa=False without OCR options creates an unchanged copy."""
+        output_path = tmp_dir / "processed.pdf"
+
+        result = convert_to_pdfa(sample_pdf, output_path, pdfa=False)
+
+        assert result.success is True
+        assert result.skipped is True
+        assert result.level is None
+        assert output_path.read_bytes() == sample_pdf.read_bytes()
+        assert any("copied unchanged" in warning for warning in result.warnings)
+
+    def test_no_pdfa_rejects_validation(self, sample_pdf: Path, tmp_dir: Path) -> None:
+        """The public API rejects PDF/A validation in processing-only mode."""
+        with pytest.raises(ConversionError, match="validation cannot be used"):
+            convert_to_pdfa(
+                sample_pdf,
+                tmp_dir / "processed.pdf",
+                pdfa=False,
+                validate=True,
+            )
+
+    @pytest.mark.parametrize("api", [convert_files, convert_directory])
+    def test_no_pdfa_batch_apis_reject_validation(
+        self, api, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """Batch APIs reject validation before processing any inputs."""
+        args = (
+            [(sample_pdf, tmp_dir / "processed.pdf")]
+            if api is convert_files
+            else [tmp_dir]
+        )
+
+        with pytest.raises(ConversionError, match="validation cannot be used"):
+            api(*args, pdfa=False, validate=True)
+
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=False)
+    def test_no_pdfa_fails_when_requested_ocr_is_unavailable(
+        self,
+        mock_is_ocr_available: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Processing-only mode does not silently ignore unavailable OCR."""
+        with pytest.raises(OCRError, match="OCR not available"):
+            convert_to_pdfa(
+                sample_pdf,
+                tmp_dir / "processed.pdf",
+                pdfa=False,
+                ocr_deskew=True,
+            )
+
+        mock_is_ocr_available.assert_called_once()
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_no_pdfa_force_ocr_implies_ocr(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Forced OCR activates processing without configured languages."""
+        processed_bytes = b"%PDF-force-ocr"
+
+        def create_ocr_output(
+            input_path: Path,
+            output_path: Path,
+            languages: list[str],
+            **kwargs: object,
+        ) -> Path:
+            output_path.write_bytes(processed_bytes)
+            return output_path
+
+        mock_apply_ocr.side_effect = create_ocr_output
+        output_path = tmp_dir / "processed.pdf"
+
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            pdfa=False,
+            ocr_force=True,
+        )
+
+        assert result.success is True
+        assert result.skipped is False
+        assert output_path.read_bytes() == processed_bytes
+        assert mock_apply_ocr.call_args.args[2] == ["eng"]
+        assert mock_apply_ocr.call_args.kwargs["force"] is True
+        mock_is_ocr_available.assert_called_once()
+
+    @patch("pdftopdfa.converter.save_pdfa")
+    @patch("pdftopdfa.converter.embed_color_profiles")
+    @patch("pdftopdfa.converter.sync_metadata")
+    @patch("pdftopdfa.converter.sanitize_for_pdfa")
+    @patch("pdftopdfa.converter.check_font_compliance")
+    @patch("pdftopdfa.converter.detect_pdfa_level")
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_no_pdfa_saves_ocr_result_without_pdfa_processing(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        mock_detect_pdfa: MagicMock,
+        mock_check_fonts: MagicMock,
+        mock_sanitize: MagicMock,
+        mock_sync_metadata: MagicMock,
+        mock_embed_profiles: MagicMock,
+        mock_save_pdfa: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """OCR output is copied directly and all PDF/A stages are bypassed."""
+        processed_bytes = b"%PDF-processed-by-ocr"
+
+        def create_ocr_output(
+            input_path: Path,
+            output_path: Path,
+            languages: list[str],
+            **kwargs: object,
+        ) -> Path:
+            output_path.write_bytes(processed_bytes)
+            return output_path
+
+        mock_apply_ocr.side_effect = create_ocr_output
+        output_path = tmp_dir / "processed.pdf"
+
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            pdfa=False,
+            ocr_rotate_pages=True,
+        )
+
+        assert result.success is True
+        assert result.skipped is False
+        assert result.level is None
+        assert output_path.read_bytes() == processed_bytes
+        assert mock_apply_ocr.call_args.args[2] == ["eng"]
+        assert mock_apply_ocr.call_args.kwargs["rotate_pages"] is True
+        mock_is_ocr_available.assert_called_once()
+        for pdfa_stage in (
+            mock_detect_pdfa,
+            mock_check_fonts,
+            mock_sanitize,
+            mock_sync_metadata,
+            mock_embed_profiles,
+            mock_save_pdfa,
+        ):
+            pdfa_stage.assert_not_called()
+
     def test_convert_uses_central_pdfa_save(
         self, sample_pdf: Path, tmp_dir: Path
     ) -> None:
@@ -284,6 +446,20 @@ class TestConvertToPdfa:
         assert any("encrypted" in w for w in result.warnings)
         assert output_path.exists()
         assert output_path.read_bytes() == encrypted_pdf.read_bytes()
+
+    def test_no_pdfa_encrypted_pdf_is_copied_unchanged(
+        self, encrypted_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """Encrypted inputs retain the existing protection without a level."""
+        output_path = tmp_dir / "processed.pdf"
+
+        result = convert_to_pdfa(encrypted_pdf, output_path, pdfa=False)
+
+        assert result.success is True
+        assert result.skipped is True
+        assert result.level is None
+        assert output_path.read_bytes() == encrypted_pdf.read_bytes()
+        assert any("encrypted" in warning for warning in result.warnings)
 
     @pytest.mark.parametrize("level", ["2b", "2u", "3b", "3u"])
     def test_convert_all_levels(
@@ -871,6 +1047,69 @@ class TestConvertToPdfa:
         assert output_path.read_bytes() == signed_input.read_bytes()
         mock_detect.assert_not_called()
         mock_verapdf.assert_not_called()
+
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_no_pdfa_processing_keeps_signed_pdf_protection(
+        self,
+        mock_is_ocr_available: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Signed inputs are copied unchanged before processing-only OCR."""
+        signed_input = tmp_dir / "signed_input.pdf"
+        _write_signed_pdf(sample_pdf, signed_input)
+        output_path = tmp_dir / "processed.pdf"
+
+        result = convert_to_pdfa(
+            signed_input,
+            output_path,
+            pdfa=False,
+            ocr_rotate_pages=True,
+        )
+
+        assert result.success is True
+        assert result.skipped is True
+        assert result.level is None
+        assert output_path.read_bytes() == signed_input.read_bytes()
+        assert any("digital signatures" in warning for warning in result.warnings)
+        mock_is_ocr_available.assert_not_called()
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_no_pdfa_allows_explicit_signature_invalidation(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Processing-only OCR can explicitly remove live signatures."""
+        import shutil
+
+        signed_input = tmp_dir / "signed_input.pdf"
+        _write_signed_pdf(sample_pdf, signed_input)
+        output_path = tmp_dir / "processed.pdf"
+        mock_apply_ocr.side_effect = lambda inp, out, *args, **kwargs: (
+            shutil.copy(inp, out) or out
+        )
+
+        result = convert_to_pdfa(
+            signed_input,
+            output_path,
+            pdfa=False,
+            ocr_rotate_pages=True,
+            allow_signature_invalidation=True,
+        )
+
+        assert result.success is True
+        assert result.skipped is False
+        assert result.level is None
+        assert any("PDF processing" in warning for warning in result.warnings)
+        with Pdf.open(output_path) as output_pdf:
+            if "/AcroForm" in output_pdf.Root:
+                assert output_pdf.Root.AcroForm.Fields[0].get("/V") is None
+        mock_is_ocr_available.assert_called_once()
+        mock_apply_ocr.assert_called_once()
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
@@ -1649,6 +1888,25 @@ class TestConvertDirectory:
         assert len(results) == 1
         assert results[0].input_path == input_dir / "doc.pdf"
 
+    @patch("pdftopdfa.converter.convert_files")
+    def test_processing_directory_uses_suffix_and_skips_previous_outputs(
+        self, mock_convert_files: MagicMock, tmp_dir: Path, sample_pdf_bytes: bytes
+    ) -> None:
+        """Processing-only directory mode uses and excludes _processed outputs."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        source = input_dir / "doc.pdf"
+        source.write_bytes(sample_pdf_bytes)
+        (input_dir / "old_processed.pdf").write_bytes(sample_pdf_bytes)
+        mock_convert_files.return_value = []
+
+        convert_directory(input_dir, pdfa=False, show_progress=False)
+
+        assert mock_convert_files.call_args.kwargs["file_pairs"] == [
+            (source, input_dir / "doc_processed.pdf")
+        ]
+        assert mock_convert_files.call_args.kwargs["pdfa"] is False
+
     @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_directory_with_ocr_languages(
         self,
@@ -1731,6 +1989,25 @@ class TestConvertDirectory:
 
 class TestConvertFiles:
     """Tests for convert_files."""
+
+    @patch("pdftopdfa.converter.convert_to_pdfa")
+    def test_convert_files_passes_no_pdfa(
+        self, mock_convert_to_pdfa: MagicMock, tmp_dir: Path
+    ) -> None:
+        """File-list processing forwards processing-only mode."""
+        input_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "output.pdf"
+        mock_convert_to_pdfa.return_value = ConversionResult(
+            success=True,
+            input_path=input_path,
+            output_path=output_path,
+            level=None,
+        )
+
+        results = convert_files([(input_path, output_path)], pdfa=False)
+
+        assert results[0].level is None
+        assert mock_convert_to_pdfa.call_args.kwargs["pdfa"] is False
 
     def test_convert_files_basic(self, tmp_dir: Path, sample_pdf_bytes: bytes) -> None:
         """Successful conversion of a file list."""

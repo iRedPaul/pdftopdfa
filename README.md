@@ -85,6 +85,10 @@ pdftopdfa --rotate-pages document.pdf
 # Deskew pages without changing their 90-degree orientation
 pdftopdfa --deskew document.pdf
 
+# Deskew and orient pages without converting the result to PDF/A
+# (creates document_processed.pdf)
+pdftopdfa --no-pdfa --deskew --rotate-pages document.pdf
+
 # Preserve known proprietary stamps as PDF Stamp annotations
 pdftopdfa --preserve-stamps document.pdf
 ```
@@ -99,6 +103,11 @@ result = convert_to_pdfa(
     level="2b",
 )
 ```
+
+Set `pdfa=False` to apply only the requested OCR processing. This skips font
+embedding, PDF/A sanitization, metadata synchronization, color-profile
+embedding, and PDF/A validation. The result is not validated or guaranteed to
+remain PDF/A compliant.
 
 See [docs/usage.md](docs/usage.md) for the full CLI reference, Python API documentation, and examples.
 

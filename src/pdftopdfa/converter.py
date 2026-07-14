@@ -193,11 +193,10 @@ _SIGNATURE_SKIP_WARNING = (
 )
 
 
-def _signature_invalidation_warning(count: int) -> str:
+def _signature_invalidation_warning(count: int, *, pdfa: bool = True) -> str:
     """Build the warning emitted when signature invalidation is explicit."""
-    return (
-        f"{count} digital signature(s) will be removed/invalidated for PDF/A conversion"
-    )
+    operation = "PDF/A conversion" if pdfa else "PDF processing"
+    return f"{count} digital signature(s) will be removed/invalidated for {operation}"
 
 
 def _compare_pdfa_levels(detected: str, target: str) -> int:
@@ -244,8 +243,9 @@ class ConversionResult:
     Attributes:
         success: True if the conversion was successful.
         input_path: Path to the input PDF.
-        output_path: Path to the output PDF/A.
-        level: PDF/A conformance level used.
+        output_path: Path to the output PDF.
+        level: PDF/A conformance level used, or None when PDF/A conversion
+            was disabled.
         warnings: List of warnings during conversion.
         processing_time: Processing time in seconds.
         error: Error message if success=False.
@@ -258,7 +258,7 @@ class ConversionResult:
     success: bool
     input_path: Path
     output_path: Path
-    level: str
+    level: str | None
     warnings: list[str] = field(default_factory=list)
     processing_time: float = 0.0
     error: str | None = None
@@ -269,17 +269,22 @@ class ConversionResult:
 def generate_output_path(
     input_path: Path,
     output_dir: Path | None = None,
+    *,
+    pdfa: bool = True,
 ) -> Path:
     """Generates the output path for a converted PDF.
 
     Args:
         input_path: Path to the input PDF.
         output_dir: Optional output directory.
+        pdfa: If True, generate a PDF/A output name. Otherwise, generate a
+            processing-only output name.
 
     Returns:
-        Path for the output PDF/A.
+        Path for the output PDF.
     """
-    output_name = f"{input_path.stem}_pdfa.pdf"
+    suffix = "pdfa" if pdfa else "processed"
+    output_name = f"{input_path.stem}_{suffix}.pdf"
     if output_dir is not None:
         return output_dir / output_name
     return input_path.parent / output_name
@@ -732,6 +737,7 @@ def convert_to_pdfa(
     output_path: Path,
     level: str = "3b",
     *,
+    pdfa: bool = True,
     validate: bool = False,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
@@ -745,12 +751,15 @@ def convert_to_pdfa(
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
 ) -> ConversionResult:
-    """Converts a PDF file to the PDF/A format.
+    """Converts a PDF file to PDF/A or applies only requested OCR processing.
 
     Args:
         input_path: Path to the input PDF.
-        output_path: Path for the output PDF/A.
+        output_path: Path for the output PDF.
         level: PDF/A conformance level ('2b' or '3b').
+        pdfa: If False, skip all PDF/A-specific processing and save only the
+            requested OCR processing result. PDF/A-specific options are
+            ignored in this mode.
         validate: If True, the result is validated.
         skip_any_pdfa: If True, skip conversion for any input that veraPDF
             validates as compliant PDF/A, regardless of target level.
@@ -783,7 +792,11 @@ def convert_to_pdfa(
         UnsupportedPDFError: If the PDF is not supported.
         FontEmbeddingError: If fonts cannot be embedded.
     """
-    level = validate_pdfa_level(level)
+    if not pdfa and validate:
+        raise ConversionError("PDF/A validation cannot be used when pdfa=False")
+    if pdfa:
+        level = validate_pdfa_level(level)
+    result_level = level if pdfa else None
     start_time = time.perf_counter()
     warnings: list[str] = []
     ocr_temp_file: Path | None = None
@@ -794,7 +807,9 @@ def convert_to_pdfa(
     source_info: dict | None = None
     source_xmp_tree = None
 
-    ocr_requested = ocr_languages is not None or ocr_deskew or ocr_rotate_pages
+    ocr_requested = (
+        ocr_force or ocr_languages is not None or ocr_deskew or ocr_rotate_pages
+    )
     if ocr_force and ocr_deskew:
         raise OCRError("Deskew cannot be combined with forced OCR")
     effective_ocr_languages = ocr_languages if ocr_languages is not None else ["eng"]
@@ -803,49 +818,79 @@ def convert_to_pdfa(
         force_ocr_requested or ocr_deskew or ocr_rotate_pages
     )
 
-    logger.info(
-        "Starting conversion: %s -> %s (PDF/A-%s)",
-        input_path,
-        output_path,
-        level,
-    )
+    if pdfa:
+        logger.info(
+            "Starting conversion: %s -> %s (PDF/A-%s)",
+            input_path,
+            output_path,
+            level,
+        )
+    else:
+        logger.info("Starting PDF processing: %s -> %s", input_path, output_path)
 
     try:
         # 0. Check if PDF is already PDF/A compliant (before OCR)
         with pikepdf.open(input_path) as check_pdf:
             if is_pdf_encrypted(check_pdf):
                 processing_time = time.perf_counter() - start_time
-                warning = "Conversion skipped: PDF is encrypted and cannot be converted"
+                warning = (
+                    "Conversion skipped: PDF is encrypted and cannot be converted"
+                    if pdfa
+                    else "Processing skipped: PDF is encrypted and cannot be processed"
+                )
                 logger.warning("%s: %s", warning, input_path)
                 _copy_input_to_output(input_path, output_path)
                 return ConversionResult(
                     success=True,
                     input_path=input_path,
                     output_path=output_path,
-                    level=level,
+                    level=result_level,
                     warnings=[warning],
                     processing_time=processing_time,
                     skipped=True,
                 )
-            source_info = extract_pdf_info(check_pdf)
-            source_xmp_tree = _extract_existing_xmp(check_pdf)
-            signature_count = count_digital_signatures(check_pdf)
-            if signature_count > 0 and not allow_signature_invalidation:
+            if not pdfa and not ocr_requested:
                 processing_time = time.perf_counter() - start_time
-                logger.warning("%s: %s", _SIGNATURE_SKIP_WARNING, input_path)
+                warning = "No processing options requested; input copied unchanged"
                 _copy_input_to_output(input_path, output_path)
                 return ConversionResult(
                     success=True,
                     input_path=input_path,
                     output_path=output_path,
-                    level=level,
-                    warnings=[_SIGNATURE_SKIP_WARNING],
+                    level=None,
+                    warnings=[warning],
+                    processing_time=processing_time,
+                    skipped=True,
+                )
+            source_info = extract_pdf_info(check_pdf) if pdfa else None
+            source_xmp_tree = _extract_existing_xmp(check_pdf) if pdfa else None
+            signature_count = count_digital_signatures(check_pdf)
+            if signature_count > 0 and not allow_signature_invalidation:
+                processing_time = time.perf_counter() - start_time
+                signature_skip_warning = (
+                    _SIGNATURE_SKIP_WARNING
+                    if pdfa
+                    else (
+                        "Processing skipped: PDF contains digital signatures; "
+                        "processing would invalidate them"
+                    )
+                )
+                logger.warning("%s: %s", signature_skip_warning, input_path)
+                _copy_input_to_output(input_path, output_path)
+                return ConversionResult(
+                    success=True,
+                    input_path=input_path,
+                    output_path=output_path,
+                    level=result_level,
+                    warnings=[signature_skip_warning],
                     processing_time=processing_time,
                     skipped=True,
                 )
             if signature_count > 0:
-                warnings.append(_signature_invalidation_warning(signature_count))
-            detected_level = detect_pdfa_level(check_pdf)
+                warnings.append(
+                    _signature_invalidation_warning(signature_count, pdfa=pdfa)
+                )
+            detected_level = detect_pdfa_level(check_pdf) if pdfa else None
 
         if detected_level is not None and explicit_ocr_processing_requested:
             logger.debug(
@@ -910,7 +955,10 @@ def convert_to_pdfa(
             from .ocr import OcrQuality, apply_ocr, is_ocr_available
 
             if not is_ocr_available():
-                warnings.append("OCR not available - pip install pdftopdfa[ocr]")
+                unavailable_message = "OCR not available - pip install pdftopdfa[ocr]"
+                if not pdfa:
+                    raise OCRError(unavailable_message)
+                warnings.append(unavailable_message)
             else:
                 fd, tmp_path = tempfile.mkstemp(
                     suffix=".pdf", prefix=f".{input_path.stem}_ocr_"
@@ -936,7 +984,7 @@ def convert_to_pdfa(
                     if not any("digital signature" in w for w in warnings):
                         warnings.append(
                             _signature_invalidation_warning(
-                                sig_result["signatures_found"]
+                                sig_result["signatures_found"], pdfa=pdfa
                             )
                         )
                 else:
@@ -1019,6 +1067,23 @@ def convert_to_pdfa(
                 actual_input = ocr_temp_file
                 lang_str = "+".join(effective_ocr_languages)
                 warnings.append(f"OCR performed (languages: {lang_str})")
+
+        if not pdfa:
+            _copy_input_to_output(actual_input, output_path)
+            processing_time = time.perf_counter() - start_time
+            logger.info(
+                "PDF processing successful: %s (%.2f seconds)",
+                output_path,
+                processing_time,
+            )
+            return ConversionResult(
+                success=True,
+                input_path=input_path,
+                output_path=output_path,
+                level=None,
+                warnings=warnings,
+                processing_time=processing_time,
+            )
 
         # Validate that input and output are not the same file
         if actual_input.resolve() == output_path.resolve():
@@ -1310,6 +1375,7 @@ def convert_files(
     file_pairs: list[tuple[Path, Path]],
     level: str = "3b",
     *,
+    pdfa: bool = True,
     validate: bool = False,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
@@ -1333,6 +1399,7 @@ def convert_files(
     Args:
         file_pairs: List of (input_path, output_path) tuples.
         level: PDF/A conformance level (e.g. '2b', '3b').
+        pdfa: If False, apply only requested OCR processing.
         validate: If True, results are validated.
         skip_any_pdfa: If True, skip conversion for any input that veraPDF
             validates as compliant PDF/A, regardless of target level.
@@ -1361,6 +1428,9 @@ def convert_files(
     Returns:
         List of ConversionResult for all processed files.
     """
+    if not pdfa and validate:
+        raise ConversionError("PDF/A validation cannot be used when pdfa=False")
+
     results: list[ConversionResult] = []
     total = len(file_pairs)
 
@@ -1384,7 +1454,7 @@ def convert_files(
                     success=False,
                     input_path=input_path,
                     output_path=output_path,
-                    level=level,
+                    level=level if pdfa else None,
                     error="Output file already exists",
                 )
             )
@@ -1395,6 +1465,7 @@ def convert_files(
                 input_path=input_path,
                 output_path=output_path,
                 level=level,
+                pdfa=pdfa,
                 validate=validate,
                 skip_any_pdfa=skip_any_pdfa,
                 ocr_languages=ocr_languages,
@@ -1422,7 +1493,7 @@ def convert_files(
                     success=False,
                     input_path=input_path,
                     output_path=output_path,
-                    level=level,
+                    level=level if pdfa else None,
                     error=str(e),
                     processing_time=0.0,
                 )
@@ -1436,6 +1507,7 @@ def convert_directory(
     output_dir: Path | None = None,
     level: str = "3b",
     *,
+    pdfa: bool = True,
     recursive: bool = False,
     validate: bool = False,
     skip_any_pdfa: bool = False,
@@ -1459,6 +1531,7 @@ def convert_directory(
         output_dir: Optional output directory. If None, files are saved
             in the same directory as the input.
         level: PDF/A conformance level ('2b' or '3b').
+        pdfa: If False, apply only requested OCR processing.
         recursive: If True, subdirectories are included.
         validate: If True, results are validated.
         skip_any_pdfa: If True, skip conversion for any input that veraPDF
@@ -1489,6 +1562,9 @@ def convert_directory(
     Raises:
         ConversionError: If the input directory does not exist.
     """
+    if not pdfa and validate:
+        raise ConversionError("PDF/A validation cannot be used when pdfa=False")
+
     input_dir = input_dir.resolve()
     output_dir = output_dir.resolve() if output_dir is not None else None
 
@@ -1509,9 +1585,10 @@ def convert_directory(
     ):
         pdf_files = [p for p in pdf_files if not p.is_relative_to(output_dir)]
 
-    # When output goes to the same directory, exclude previous conversion outputs
+    # When output goes to the same directory, exclude previous outputs for this mode.
     if output_dir is None or output_dir == input_dir:
-        pdf_files = [p for p in pdf_files if not p.stem.endswith("_pdfa")]
+        output_suffix = "_pdfa" if pdfa else "_processed"
+        pdf_files = [p for p in pdf_files if not p.stem.endswith(output_suffix)]
 
     if not pdf_files:
         logger.warning("No PDF files found in: %s", input_dir)
@@ -1536,11 +1613,11 @@ def convert_directory(
                 rel_path = pdf_file.relative_to(input_dir)
                 out_subdir = output_dir / rel_path.parent
                 out_subdir.mkdir(parents=True, exist_ok=True)
-                out_path = out_subdir / f"{pdf_file.stem}_pdfa.pdf"
+                out_path = generate_output_path(pdf_file, out_subdir, pdfa=pdfa)
             else:
-                out_path = generate_output_path(pdf_file, output_dir)
+                out_path = generate_output_path(pdf_file, output_dir, pdfa=pdfa)
         else:
-            out_path = generate_output_path(pdf_file)
+            out_path = generate_output_path(pdf_file, pdfa=pdfa)
         file_pairs.append((pdf_file, out_path))
 
     # tqdm progress wrapper
@@ -1548,7 +1625,7 @@ def convert_directory(
     if show_progress:
         progress_bar = tqdm(
             total=len(file_pairs),
-            desc="Converting",
+            desc="Converting" if pdfa else "Processing",
             unit="file",
             ncols=80,
         )
@@ -1564,6 +1641,7 @@ def convert_directory(
     results = convert_files(
         file_pairs=file_pairs,
         level=level,
+        pdfa=pdfa,
         validate=validate,
         skip_any_pdfa=skip_any_pdfa,
         ocr_languages=ocr_languages,

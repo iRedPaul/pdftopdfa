@@ -106,11 +106,15 @@ def _print_result(result: ConversionResult, quiet: bool) -> None:
     """
     if result.success:
         if not quiet:
-            action = "Skipped" if result.skipped else "Converted"
+            if result.level is None:
+                action = "Copied unchanged" if result.skipped else "Processed"
+                details = f"{result.processing_time:.2f}s"
+            else:
+                action = "Skipped" if result.skipped else "Converted to PDF/A"
+                details = f"PDF/A-{result.level}, {result.processing_time:.2f}s"
             print_success(
                 f"{action}: {result.input_path.name} -> "
-                f"{result.output_path.name} (PDF/A-{result.level}, "
-                f"{result.processing_time:.2f}s)"
+                f"{result.output_path.name} ({details})"
             )
             for warning in result.warnings:
                 print_warning(warning)
@@ -159,6 +163,14 @@ def _print_validation_result(
     "do_validate",
     is_flag=True,
     help="Validate after conversion (note: -v is not verbose; use --verbose)",
+)
+@click.option(
+    "--no-pdfa",
+    "pdfa",
+    is_flag=True,
+    flag_value=False,
+    default=True,
+    help="Apply requested OCR processing without converting to PDF/A.",
 )
 @click.option(
     "-r",
@@ -278,6 +290,7 @@ def main(
     output: str | None,
     level: str,
     do_validate: bool,
+    pdfa: bool,
     recursive: bool,
     force: bool,
     quiet: bool,
@@ -295,10 +308,10 @@ def main(
     skip_any_pdfa: bool,
     allow_signature_invalidation: bool,
 ) -> None:
-    """Converts PDF files to the archival PDF/A format.
+    """Converts PDFs to PDF/A or applies OCR processing with --no-pdfa.
 
     INPUT is the path to the input PDF or a directory.
-    OUTPUT is optionally the path for the output PDF/A.
+    OUTPUT is optionally the path for the output PDF.
     """
     # Initialize colorama for Windows compatibility
     init()
@@ -311,6 +324,9 @@ def main(
     setup_logging(verbose=verbose, quiet=quiet)
 
     input_path_obj = Path(input_path)
+
+    if not pdfa and do_validate:
+        raise click.UsageError("--validate cannot be combined with --no-pdfa")
 
     # Check veraPDF availability if validation is requested
     if do_validate:
@@ -355,6 +371,7 @@ def main(
                 do_validate,
                 force,
                 quiet,
+                pdfa=pdfa,
                 ocr_languages=ocr_languages,
                 ocr_quality=ocr_quality_enum,
                 ocr_fallback_quality=ocr_fallback_quality_enum,
@@ -377,6 +394,7 @@ def main(
                 force,
                 recursive,
                 quiet,
+                pdfa=pdfa,
                 ocr_languages=ocr_languages,
                 ocr_quality=ocr_quality_enum,
                 ocr_fallback_quality=ocr_fallback_quality_enum,
@@ -424,6 +442,7 @@ def _convert_single_file(
     force: bool,
     quiet: bool,
     *,
+    pdfa: bool = True,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
     ocr_fallback_quality: "OcrQuality | None" = None,
@@ -445,6 +464,7 @@ def _convert_single_file(
         do_validate: Whether to validate after conversion.
         force: Whether to overwrite existing files.
         quiet: Whether to only output errors.
+        pdfa: Whether to perform PDF/A conversion after OCR processing.
         ocr_languages: Optional list of Tesseract language codes
             (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
@@ -469,7 +489,7 @@ def _convert_single_file(
     if output:
         output_path = Path(output)
     else:
-        output_path = generate_output_path(input_path)
+        output_path = generate_output_path(input_path, pdfa=pdfa)
 
     # Check if output exists
     if output_path.exists() and not force:
@@ -479,13 +499,17 @@ def _convert_single_file(
         return EXIT_GENERAL_ERROR
 
     if not quiet:
-        click.echo(f"Converting {input_path.name} -> PDF/A-{level}...")
+        if pdfa:
+            click.echo(f"Converting {input_path.name} -> PDF/A-{level}...")
+        else:
+            click.echo(f"Processing {input_path.name} without PDF/A conversion...")
 
     # Perform conversion
     result = convert_to_pdfa(
         input_path=input_path,
         output_path=output_path,
         level=level,
+        pdfa=pdfa,
         validate=False,  # Validate manually later
         skip_any_pdfa=skip_any_pdfa,
         ocr_languages=ocr_languages,
@@ -552,6 +576,7 @@ def _convert_directory(
     recursive: bool,
     quiet: bool,
     *,
+    pdfa: bool = True,
     ocr_languages: list[str] | None = None,
     ocr_quality: "OcrQuality | None" = None,
     ocr_fallback_quality: "OcrQuality | None" = None,
@@ -574,6 +599,7 @@ def _convert_directory(
         force: Whether to overwrite existing output files.
         recursive: Whether to process recursively.
         quiet: Whether to only output errors.
+        pdfa: Whether to perform PDF/A conversion after OCR processing.
         ocr_languages: Optional list of Tesseract language codes
             (e.g., ``["deu", "eng"]``).
         ocr_quality: OCR quality preset.
@@ -598,12 +624,18 @@ def _convert_directory(
 
     if not quiet:
         mode = "recursive" if recursive else "non-recursive"
-        click.echo(f"Converting directory {input_dir} ({mode}) -> PDF/A-{level}...")
+        if pdfa:
+            click.echo(f"Converting directory {input_dir} ({mode}) -> PDF/A-{level}...")
+        else:
+            click.echo(
+                f"Processing directory {input_dir} ({mode}) without PDF/A conversion..."
+            )
 
     results = convert_directory(
         input_dir=input_dir,
         output_dir=output_dir,
         level=level,
+        pdfa=pdfa,
         recursive=recursive,
         validate=do_validate,
         skip_any_pdfa=skip_any_pdfa,
@@ -630,7 +662,8 @@ def _convert_directory(
     if not quiet:
         click.echo()
         click.echo("Summary:")
-        print_success(f"{len(successful)} file(s) successfully converted")
+        action = "converted" if pdfa else "processed"
+        print_success(f"{len(successful)} file(s) successfully {action}")
         if skipped:
             print_warning(f"{len(skipped)} file(s) skipped and copied unchanged")
             for result in skipped:

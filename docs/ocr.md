@@ -46,6 +46,9 @@ pdftopdfa --deskew scan.pdf
 
 # Enable both independent page-processing steps
 pdftopdfa --deskew --rotate-pages scan.pdf
+
+# Apply both steps without the PDF/A conversion pipeline
+pdftopdfa --no-pdfa --deskew --rotate-pages scan.pdf
 ```
 
 ### Python API
@@ -66,6 +69,12 @@ result = convert_to_pdfa(
     ocr_rotate_pages=True,
 )
 ```
+
+Use `pdfa=False` and a neutral output name such as `scan_processed.pdf` to
+write the OCR result directly without font embedding, PDF/A sanitization,
+metadata synchronization, color-profile embedding, or PDF/A validation. The
+OCR behavior itself is unchanged, so image-only pages can still receive a text
+layer. The output is not guaranteed to be PDF/A compliant.
 
 ## When OCR Runs
 
@@ -140,6 +149,8 @@ Quality presets never enable deskewing or page rotation.
 `--deskew` and `--rotate-pages` are independent, opt-in operations. Both imply
 `--ocr`, remain active if OCR retries with the faster fallback preset, and
 bypass the already-compliant PDF/A skip check so the requested processing runs.
+With `--no-pdfa`, the processed OCR result is written directly instead of
+continuing through the PDF/A conversion pipeline.
 
 `--deskew` enables OCRmyPDF's skew correction and also straightens eligible
 text-only pages that OCRmyPDF skips. Deskewing may alter page appearance and

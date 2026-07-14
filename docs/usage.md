@@ -25,6 +25,9 @@ pdftopdfa -v input.pdf
 
 # Overwrite an existing output
 pdftopdfa -f input.pdf output.pdf
+
+# Apply OCR page processing without PDF/A conversion
+pdftopdfa --no-pdfa --deskew --rotate-pages input.pdf
 ```
 
 ### Batch Processing
@@ -42,11 +45,14 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 
 ## Output Paths and Overwrite Rules
 
-- Default output filename is `<input_stem>_pdfa.pdf`.
+- Default output filename is `<input_stem>_pdfa.pdf`, or
+  `<input_stem>_processed.pdf` with `--no-pdfa`.
 - Single-file conversion without explicit output writes next to the input file.
 - Directory conversion without explicit output writes into the same directory.
 - Recursive directory conversion with an explicit output directory preserves subdirectory structure.
 - When converting in-place (`output_dir=None`), files already ending in `_pdfa.pdf` are skipped to avoid reconversion loops.
+- In processing-only mode, files already ending in `_processed.pdf` are skipped
+  instead.
 - Existing output files are not overwritten unless `-f/--force` (CLI) or `force_overwrite=True` (API) is used.
 
 ## Font Policy
@@ -73,6 +79,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 |---|---|
 | `-l, --level [2b\|2u\|3b\|3u]` | Target PDF/A level (default: `3b`) |
 | `-v, --validate` | Validate output with veraPDF. Note: unlike the common CLI convention, `-v` does **not** mean verbose — use `--verbose` for detailed logs |
+| `--no-pdfa` | Apply requested OCR processing without running the PDF/A conversion pipeline |
 | `-r, --recursive` | Process directories recursively |
 | `-f, --force` | Overwrite existing output files |
 | `-q, --quiet` | Show only errors |
@@ -132,6 +139,7 @@ def convert_to_pdfa(
     output_path: Path,
     level: str = "3b",
     *,
+    pdfa: bool = True,
     validate: bool = False,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
@@ -146,6 +154,14 @@ def convert_to_pdfa(
     allow_signature_invalidation: bool = False,
 ) -> ConversionResult
 ```
+
+Pass `pdfa=False` to keep the existing OCR behavior while skipping all
+PDF/A-specific processing. If no OCR option is selected, the input is copied
+unchanged. In this mode `ConversionResult.level` is `None`, `validate=True` is
+rejected, and PDF/A-specific settings such as `level`, `skip_any_pdfa`,
+`convert_calibrated`, and `preserve_stamps` are not applied. Existing PDF/A
+identification metadata is not deliberately removed, but the output is not
+validated or guaranteed to conform to PDF/A.
 
 By default, non-standard visible annotations are flattened into page content for
 maximum archival robustness. Set `preserve_stamps=True` or pass
@@ -177,6 +193,7 @@ def convert_directory(
     output_dir: Path | None = None,
     level: str = "3b",
     *,
+    pdfa: bool = True,
     recursive: bool = False,
     validate: bool = False,
     skip_any_pdfa: bool = False,
@@ -216,6 +233,7 @@ def convert_files(
     file_pairs: list[tuple[Path, Path]],
     level: str = "3b",
     *,
+    pdfa: bool = True,
     validate: bool = False,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
