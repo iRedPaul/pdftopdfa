@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.7.0] - 2026-07-14
+
+### Features
+
+- Add independent `--deskew` and `--rotate-pages` OCR processing options
+- Add `--no-pdfa` mode for OCR processing without PDF/A conversion
+
+### Changes
+
+- Remove the `best` OCR preset and keep page processing enabled across fallback retries
+- Bypass compliant PDF/A skip checks when explicit OCR processing is requested
+
+### Bug Fixes
+
+- Skip deskew for annotated PDFs to prevent annotation geometry misalignment
+
+### Documentation
+
+- Document OCR-only output, page processing, fallback, and Python API options
+
 ## [0.6.0] - 2026-07-13
 
 ### Features
