@@ -80,8 +80,10 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `--ocr` | Enable OCR for scanned/image-based PDFs |
 | `--ocr-force` | Force OCR even if text is present (implies `--ocr` and disables compliant-PDF/A skip optimization) |
 | `--ocr-lang LANG` | OCR language code (default: `eng`), for example `deu` or `deu+eng` |
-| `--ocr-quality [fast\|default\|best]` | OCR quality preset (default: `default`) |
-| `--ocr-fallback-quality [none\|fast\|default\|best]` | Faster OCR preset to retry with if OCR takes too long (default: `fast`) |
+| `--deskew` | Straighten skewed pages (implies `--ocr`) |
+| `--rotate-pages` | Automatically orient pages with the bundled Paddle model (implies `--ocr`) |
+| `--ocr-quality [fast\|default]` | OCR quality preset (default: `default`) |
+| `--ocr-fallback-quality [none\|fast\|default]` | Faster OCR preset to retry with if OCR takes too long (default: `fast`) |
 | `--ocr-fallback-after SECONDS` | Retry threshold for OCR fallback (default: `60`) |
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
 | `--preserve-stamps` | Convert known proprietary stamp annotations to standard PDF Stamp annotations instead of flattening them |
@@ -137,6 +139,8 @@ def convert_to_pdfa(
     ocr_fallback_quality: OcrQuality | None = OcrQuality.FAST,
     ocr_fallback_after_seconds: float | None = 60.0,
     ocr_force: bool = False,
+    ocr_deskew: bool = False,
+    ocr_rotate_pages: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
@@ -182,6 +186,8 @@ def convert_directory(
     ocr_fallback_quality: OcrQuality | None = OcrQuality.FAST,
     ocr_fallback_after_seconds: float | None = 60.0,
     ocr_force: bool = False,
+    ocr_deskew: bool = False,
+    ocr_rotate_pages: bool = False,
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
@@ -217,6 +223,8 @@ def convert_files(
     ocr_fallback_quality: OcrQuality | None = OcrQuality.FAST,
     ocr_fallback_after_seconds: float | None = 60.0,
     ocr_force: bool = False,
+    ocr_deskew: bool = False,
+    ocr_rotate_pages: bool = False,
     force_overwrite: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -229,8 +237,9 @@ def convert_files(
 ### `needs_ocr()`
 
 Library helper to analyze whether a PDF would benefit from OCR. It is not
-called by the conversion pipeline itself (OCR is opt-in via `ocr_languages`
-or `--ocr`); use it to decide programmatically whether to enable OCR.
+called by the conversion pipeline itself (OCR is opt-in via `ocr_languages`,
+`ocr_deskew`, `ocr_rotate_pages`, or the corresponding CLI options); use it to
+decide programmatically whether to enable OCR.
 
 ```python
 import pikepdf

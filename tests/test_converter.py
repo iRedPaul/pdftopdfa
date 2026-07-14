@@ -27,7 +27,7 @@ from pdftopdfa.converter import (
     get_pdfa_save_settings,
     save_pdfa,
 )
-from pdftopdfa.exceptions import ConversionError, VeraPDFError
+from pdftopdfa.exceptions import ConversionError, OCRError, VeraPDFError
 from pdftopdfa.verapdf import VeraPDFResult
 
 
@@ -374,6 +374,54 @@ class TestConvertToPdfa:
         call_args = mock_apply_ocr.call_args
         assert call_args[0][2] == ["eng"]  # Languages parameter
 
+    @pytest.mark.parametrize(
+        ("api_option", "apply_option"),
+        [("ocr_deskew", "deskew"), ("ocr_rotate_pages", "rotate_pages")],
+    )
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_processing_option_enables_ocr_with_default_language(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        api_option: str,
+        apply_option: str,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Each public processing option enables OCR with English."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
+        output_path = tmp_dir / f"{api_option}.pdf"
+
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            **{api_option: True},
+        )
+
+        assert result.success is True
+        assert mock_apply_ocr.call_args.args[2] == ["eng"]
+        assert mock_apply_ocr.call_args.kwargs[apply_option] is True
+
+    def test_convert_rejects_deskew_with_forced_ocr(
+        self, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """The public API rejects deskew combined with forced OCR."""
+        output_path = tmp_dir / "output.pdf"
+
+        with pytest.raises(OCRError, match="Deskew cannot be combined"):
+            convert_to_pdfa(
+                sample_pdf,
+                output_path,
+                ocr_deskew=True,
+                ocr_force=True,
+            )
+
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_with_ocr_fallback_quality_parameter(
@@ -634,6 +682,44 @@ class TestConvertToPdfa:
         assert result.success is True
         assert result.skipped is False
         assert output_path.exists()
+        mock_apply_ocr.assert_called_once()
+        mock_verapdf.assert_not_called()
+
+    @pytest.mark.parametrize("processing_option", ["ocr_deskew", "ocr_rotate_pages"])
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    @patch("pdftopdfa.converter.detect_pdfa_level")
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_processing_option_bypasses_same_level_skip(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        mock_detect: MagicMock,
+        mock_verapdf: MagicMock,
+        processing_option: str,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Explicit page processing runs for already compliant inputs."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_detect.return_value = "2b"
+        mock_verapdf.return_value = VeraPDFResult(compliant=True, flavour="2b")
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
+        output_path = tmp_dir / f"{processing_option}.pdf"
+
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            level="2b",
+            **{processing_option: True},
+        )
+
+        assert result.success is True
+        assert result.skipped is False
         mock_apply_ocr.assert_called_once()
         mock_verapdf.assert_not_called()
 
@@ -1602,6 +1688,27 @@ class TestConvertDirectory:
         assert mock_convert_files.call_args.kwargs["skip_any_pdfa"] is True
 
     @patch("pdftopdfa.converter.convert_files")
+    def test_convert_directory_passes_processing_options(
+        self, mock_convert_files: MagicMock, tmp_dir: Path, sample_pdf_bytes: bytes
+    ) -> None:
+        """convert_directory forwards both independent processing options."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        (input_dir / "test.pdf").write_bytes(sample_pdf_bytes)
+        mock_convert_files.return_value = []
+
+        convert_directory(
+            input_dir,
+            show_progress=False,
+            ocr_deskew=True,
+            ocr_rotate_pages=True,
+        )
+
+        kwargs = mock_convert_files.call_args.kwargs
+        assert kwargs["ocr_deskew"] is True
+        assert kwargs["ocr_rotate_pages"] is True
+
+    @patch("pdftopdfa.converter.convert_files")
     def test_convert_directory_passes_allow_signature_invalidation(
         self, mock_convert_files: MagicMock, tmp_dir: Path, sample_pdf_bytes: bytes
     ) -> None:
@@ -1726,6 +1833,31 @@ class TestConvertFiles:
             mock_convert_to_pdfa.call_args.kwargs["allow_signature_invalidation"]
             is True
         )
+
+    @patch("pdftopdfa.converter.convert_to_pdfa")
+    def test_convert_files_passes_processing_options(
+        self, mock_convert_to_pdfa: MagicMock, tmp_dir: Path
+    ) -> None:
+        """convert_files forwards both independent processing options."""
+        in_path = tmp_dir / "test.pdf"
+        out_path = tmp_dir / "test_pdfa.pdf"
+        in_path.write_bytes(b"%PDF-1.4 dummy")
+        mock_convert_to_pdfa.return_value = ConversionResult(
+            success=True,
+            input_path=in_path,
+            output_path=out_path,
+            level="3b",
+        )
+
+        convert_files(
+            [(in_path, out_path)],
+            ocr_deskew=True,
+            ocr_rotate_pages=True,
+        )
+
+        kwargs = mock_convert_to_pdfa.call_args.kwargs
+        assert kwargs["ocr_deskew"] is True
+        assert kwargs["ocr_rotate_pages"] is True
 
     def test_convert_files_cancellation(
         self, tmp_dir: Path, sample_pdf_bytes: bytes

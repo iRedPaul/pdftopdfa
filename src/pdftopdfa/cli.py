@@ -207,18 +207,29 @@ def _print_validation_result(
     "bypasses compliant-PDF/A skip checks.",
 )
 @click.option(
+    "--deskew",
+    is_flag=True,
+    default=False,
+    help="Straighten skewed pages. Implies --ocr.",
+)
+@click.option(
+    "--rotate-pages",
+    is_flag=True,
+    default=False,
+    help="Automatically orient pages with the bundled Paddle model. Implies --ocr.",
+)
+@click.option(
     "--ocr-quality",
     "ocr_quality",
-    type=click.Choice(["fast", "default", "best"]),
+    type=click.Choice(["fast", "default"]),
     default="default",
     help="OCR quality preset (default: default). "
-    "fast=minimal processing, default=best quality without visual changes, "
-    "best=best quality (may alter document visually and increase file size).",
+    "fast=minimal processing, default=best recognition quality.",
 )
 @click.option(
     "--ocr-fallback-quality",
     "ocr_fallback_quality",
-    type=click.Choice(["none", "fast", "default", "best"]),
+    type=click.Choice(["none", "fast", "default"]),
     default="fast",
     help="Faster OCR preset to retry with when OCR takes too long "
     "(default: fast; use none to disable).",
@@ -273,6 +284,8 @@ def main(
     verbose: bool,
     ocr_enabled: bool,
     ocr_force: bool,
+    deskew: bool,
+    rotate_pages: bool,
     ocr_lang: str,
     ocr_quality: str,
     ocr_fallback_quality: str,
@@ -311,9 +324,12 @@ def main(
             )
             sys.exit(EXIT_GENERAL_ERROR)
 
+    if deskew and ocr_force:
+        raise click.UsageError("--deskew cannot be combined with --ocr-force")
+
     try:
-        # --ocr-force implies --ocr
-        if ocr_force:
+        # Explicit OCR processing options imply --ocr.
+        if ocr_force or deskew or rotate_pages:
             ocr_enabled = True
 
         # Determine OCR languages (None if OCR not enabled)
@@ -344,6 +360,8 @@ def main(
                 ocr_fallback_quality=ocr_fallback_quality_enum,
                 ocr_fallback_after_seconds=ocr_fallback_after_seconds,
                 ocr_force=ocr_force,
+                ocr_deskew=deskew,
+                ocr_rotate_pages=rotate_pages,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 skip_any_pdfa=skip_any_pdfa,
@@ -364,6 +382,8 @@ def main(
                 ocr_fallback_quality=ocr_fallback_quality_enum,
                 ocr_fallback_after_seconds=ocr_fallback_after_seconds,
                 ocr_force=ocr_force,
+                ocr_deskew=deskew,
+                ocr_rotate_pages=rotate_pages,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 skip_any_pdfa=skip_any_pdfa,
@@ -409,6 +429,8 @@ def _convert_single_file(
     ocr_fallback_quality: "OcrQuality | None" = None,
     ocr_fallback_after_seconds: float | None = None,
     ocr_force: bool = False,
+    ocr_deskew: bool = False,
+    ocr_rotate_pages: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     skip_any_pdfa: bool = False,
@@ -430,6 +452,8 @@ def _convert_single_file(
         ocr_fallback_after_seconds: Per-page runtime budget for OCR fallback
             (total threshold is this value times the page count).
         ocr_force: If True, force OCR even on pages with existing text.
+        ocr_deskew: If True, straighten skewed pages during OCR.
+        ocr_rotate_pages: If True, normalize page orientation before OCR.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations
             to standard PDF Stamp annotations instead of flattening them.
@@ -469,6 +493,8 @@ def _convert_single_file(
         ocr_fallback_quality=ocr_fallback_quality,
         ocr_fallback_after_seconds=ocr_fallback_after_seconds,
         ocr_force=ocr_force,
+        ocr_deskew=ocr_deskew,
+        ocr_rotate_pages=ocr_rotate_pages,
         convert_calibrated=convert_calibrated,
         preserve_stamps=preserve_stamps,
         allow_signature_invalidation=allow_signature_invalidation,
@@ -531,6 +557,8 @@ def _convert_directory(
     ocr_fallback_quality: "OcrQuality | None" = None,
     ocr_fallback_after_seconds: float | None = None,
     ocr_force: bool = False,
+    ocr_deskew: bool = False,
+    ocr_rotate_pages: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     skip_any_pdfa: bool = False,
@@ -553,6 +581,8 @@ def _convert_directory(
         ocr_fallback_after_seconds: Per-page runtime budget for OCR fallback
             (total threshold is this value times the page count).
         ocr_force: If True, force OCR even on pages with existing text.
+        ocr_deskew: If True, straighten skewed pages during OCR.
+        ocr_rotate_pages: If True, normalize page orientation before OCR.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations
             to standard PDF Stamp annotations instead of flattening them.
@@ -583,6 +613,8 @@ def _convert_directory(
         ocr_fallback_quality=ocr_fallback_quality,
         ocr_fallback_after_seconds=ocr_fallback_after_seconds,
         ocr_force=ocr_force,
+        ocr_deskew=ocr_deskew,
+        ocr_rotate_pages=ocr_rotate_pages,
         force_overwrite=force,
         convert_calibrated=convert_calibrated,
         preserve_stamps=preserve_stamps,

@@ -95,12 +95,10 @@ class OcrQuality(enum.Enum):
     Attributes:
         FAST: Minimal processing, fastest. Does not alter the document visually.
         DEFAULT: Best quality without visual changes to the document.
-        BEST: Best quality, may alter the document visually (deskew, rotate, etc.).
     """
 
     FAST = "fast"
     DEFAULT = "default"
-    BEST = "best"
 
 
 OCR_SETTINGS: dict[OcrQuality, dict] = {
@@ -126,19 +124,6 @@ OCR_SETTINGS: dict[OcrQuality, dict] = {
         "tesseract_timeout": 300,
         "progress_bar": False,
     },
-    OcrQuality.BEST: {
-        "skip_text": True,
-        "deskew": True,
-        # Page orientation is normalized by the bundled Paddle ONNX model.
-        "rotate_pages": False,
-        # Match DEFAULT's OCR-friendly sampling so BEST truly builds on it.
-        "oversample": 600,
-        "tesseract_pagesegmode": 11,
-        "tesseract_thresholding": int(ThresholdingMethod.ADAPTIVE_OTSU),
-        "optimize": 0,
-        "tesseract_timeout": 300,
-        "progress_bar": False,
-    },
 }
 
 DEFAULT_OCR_FALLBACK_QUALITY = OcrQuality.FAST
@@ -146,7 +131,6 @@ DEFAULT_OCR_FALLBACK_AFTER_SECONDS = 60.0
 _OCR_QUALITY_RANK = {
     OcrQuality.FAST: 0,
     OcrQuality.DEFAULT: 1,
-    OcrQuality.BEST: 2,
 }
 
 # ocrmypdf rejects these options when redo_ocr is enabled.
@@ -154,13 +138,17 @@ _REDO_OCR_INCOMPATIBLE_OPTIONS = frozenset(
     {"deskew", "clean_final", "remove_background"}
 )
 
-_ROTATION_FIX_QUALITIES = frozenset({OcrQuality.DEFAULT, OcrQuality.BEST})
+_ROTATION_FIX_QUALITIES = frozenset({OcrQuality.DEFAULT})
 
 
-def _get_ocr_plugins(quality: OcrQuality) -> list[str]:
+def _get_ocr_plugins(
+    quality: OcrQuality,
+    *,
+    rotate_pages: bool = False,
+) -> list[str]:
     """Build the plugin list for the current OCR run."""
     plugins: list[str] = []
-    if quality in _ROTATION_FIX_QUALITIES:
+    if rotate_pages or quality in _ROTATION_FIX_QUALITIES:
         plugins.append(_ROTATION_FIX_PLUGIN)
     return plugins
 
@@ -319,7 +307,7 @@ def _apply_page_content_transform(pdf, page, *, angle_degrees: float) -> None:
     page.obj[pikepdf.Name.Contents] = wrapped_contents
 
 
-def _normalize_best_quality_text_page_skew(pdf_path: Path) -> list[tuple[int, float]]:
+def _normalize_text_page_skew(pdf_path: Path) -> list[tuple[int, float]]:
     """Deskew text-only pages whose text matrices are consistently slanted."""
     try:
         import pikepdf
@@ -574,6 +562,8 @@ def apply_ocr(
     fallback_quality: OcrQuality | None = DEFAULT_OCR_FALLBACK_QUALITY,
     fallback_after_seconds: float | None = DEFAULT_OCR_FALLBACK_AFTER_SECONDS,
     force: bool = False,
+    deskew: bool = False,
+    rotate_pages: bool = False,
 ) -> Path:
     """Performs OCR on a PDF.
 
@@ -595,8 +585,12 @@ def apply_ocr(
             is capped to this value so fallback can happen promptly. Use
             ``None`` to disable time-based retry.
         force: If True, use ocrmypdf's ``redo_ocr`` mode to remove the
-            existing OCR layer and re-apply OCR. Options incompatible with
-            ``redo_ocr`` are disabled automatically (default: False).
+            existing OCR layer and re-apply OCR. This cannot be combined
+            with ``deskew`` (default: False).
+        deskew: If True, straighten skewed pages independently of the quality
+            preset (default: False).
+        rotate_pages: If True, normalize page orientation with the bundled
+            Paddle model independently of the quality preset (default: False).
 
     Returns:
         Path to the OCR-processed PDF.
@@ -606,17 +600,22 @@ def apply_ocr(
     """
     if languages is None:
         languages = ["eng"]
+    if force and deskew:
+        raise OCRError("Deskew cannot be combined with forced OCR")
     if not HAS_OCR:
         raise OCRError(
             "OCR not available. Install the OCR dependency: pip install pdftopdfa[ocr]"
         )
 
     logger.info(
-        "Starting OCR for %s (languages: %s, quality: %s, force: %s)",
+        "Starting OCR for %s (languages: %s, quality: %s, force: %s, "
+        "deskew: %s, rotate pages: %s)",
         input_path,
         "+".join(languages),
         quality.value,
         force,
+        deskew,
+        rotate_pages,
     )
 
     fallback = _effective_fallback_quality(quality, fallback_quality)
@@ -637,8 +636,9 @@ def apply_ocr(
         timeout_limit: float | None = None,
     ) -> float:
         ocr_kwargs = dict(OCR_SETTINGS[run_quality])
+        ocr_kwargs["deskew"] = deskew
         _cap_tesseract_timeout(ocr_kwargs, timeout_limit)
-        plugins = _get_ocr_plugins(run_quality)
+        plugins = _get_ocr_plugins(run_quality, rotate_pages=rotate_pages)
 
         if force:
             ocr_kwargs.pop("skip_text", None)
@@ -666,7 +666,7 @@ def apply_ocr(
         return time.perf_counter() - started
 
     try:
-        if quality == OcrQuality.BEST:
+        if rotate_pages:
             orientation_temp = TemporaryDirectory(
                 prefix="pdftopdfa_paddle_orientation_"
             )
@@ -701,8 +701,8 @@ def apply_ocr(
                 pass
             run_ocr_with_quality(fallback)
 
-        if quality == OcrQuality.BEST and output_path.exists():
-            _normalize_best_quality_text_page_skew(output_path)
+        if deskew and output_path.exists():
+            _normalize_text_page_skew(output_path)
         logger.info("OCR completed successfully: %s", output_path)
         return output_path
 

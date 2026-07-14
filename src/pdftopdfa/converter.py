@@ -739,6 +739,8 @@ def convert_to_pdfa(
     ocr_fallback_quality: "OcrQuality | None" = DEFAULT_OCR_FALLBACK_QUALITY,
     ocr_fallback_after_seconds: float | None = DEFAULT_OCR_FALLBACK_AFTER_SECONDS,
     ocr_force: bool = False,
+    ocr_deskew: bool = False,
+    ocr_rotate_pages: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
@@ -762,8 +764,10 @@ def convert_to_pdfa(
             (total threshold is this value times the page count).
             Use None to disable time-based retry.
         ocr_force: If True, force OCR even on pages that already contain
-            text by using ocrmypdf's ``redo_ocr`` mode. Options
-            incompatible with ``redo_ocr`` are disabled automatically.
+            text by using ocrmypdf's ``redo_ocr`` mode. This cannot be
+            combined with ``ocr_deskew``.
+        ocr_deskew: If True, enable OCR and straighten skewed pages.
+        ocr_rotate_pages: If True, enable OCR and normalize page orientation.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
@@ -790,7 +794,14 @@ def convert_to_pdfa(
     source_info: dict | None = None
     source_xmp_tree = None
 
-    force_ocr_requested = ocr_force and ocr_languages is not None
+    ocr_requested = ocr_languages is not None or ocr_deskew or ocr_rotate_pages
+    if ocr_force and ocr_deskew:
+        raise OCRError("Deskew cannot be combined with forced OCR")
+    effective_ocr_languages = ocr_languages if ocr_languages is not None else ["eng"]
+    force_ocr_requested = ocr_force and ocr_requested
+    explicit_ocr_processing_requested = (
+        force_ocr_requested or ocr_deskew or ocr_rotate_pages
+    )
 
     logger.info(
         "Starting conversion: %s -> %s (PDF/A-%s)",
@@ -836,12 +847,13 @@ def convert_to_pdfa(
                 warnings.append(_signature_invalidation_warning(signature_count))
             detected_level = detect_pdfa_level(check_pdf)
 
-        if detected_level is not None and force_ocr_requested:
+        if detected_level is not None and explicit_ocr_processing_requested:
             logger.debug(
-                "Bypassing PDF/A pre-check skip because forced OCR was requested"
+                "Bypassing PDF/A pre-check skip because explicit OCR processing "
+                "was requested"
             )
 
-        if detected_level is not None and not force_ocr_requested:
+        if detected_level is not None and not explicit_ocr_processing_requested:
             should_validate_for_skip = skip_any_pdfa
             if not should_validate_for_skip:
                 level_cmp = _compare_pdfa_levels(detected_level, level)
@@ -894,7 +906,7 @@ def convert_to_pdfa(
 
         # 1. Optional: Perform OCR
         actual_input = input_path
-        if ocr_languages is not None:
+        if ocr_requested:
             from .ocr import OcrQuality, apply_ocr, is_ocr_available
 
             if not is_ocr_available():
@@ -953,11 +965,13 @@ def convert_to_pdfa(
                 apply_ocr(
                     ocr_source,
                     ocr_temp_file,
-                    ocr_languages,
+                    effective_ocr_languages,
                     quality=effective_quality,
                     fallback_quality=ocr_fallback_quality,
                     fallback_after_seconds=ocr_fallback_after_seconds,
                     force=ocr_force,
+                    deskew=ocr_deskew,
+                    rotate_pages=ocr_rotate_pages,
                 )
 
                 # Re-inject original annotations into OCR output.
@@ -1003,7 +1017,7 @@ def convert_to_pdfa(
                     ocr_clean_temp_file = None
 
                 actual_input = ocr_temp_file
-                lang_str = "+".join(ocr_languages)
+                lang_str = "+".join(effective_ocr_languages)
                 warnings.append(f"OCR performed (languages: {lang_str})")
 
         # Validate that input and output are not the same file
@@ -1303,6 +1317,8 @@ def convert_files(
     ocr_fallback_quality: "OcrQuality | None" = DEFAULT_OCR_FALLBACK_QUALITY,
     ocr_fallback_after_seconds: float | None = DEFAULT_OCR_FALLBACK_AFTER_SECONDS,
     ocr_force: bool = False,
+    ocr_deskew: bool = False,
+    ocr_rotate_pages: bool = False,
     force_overwrite: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -1328,8 +1344,9 @@ def convert_files(
         ocr_fallback_after_seconds: Per-page runtime budget for OCR fallback
             (total threshold is this value times the page count).
         ocr_force: If True, force OCR even on pages that already contain
-            text. Options incompatible with ocrmypdf's ``redo_ocr``
-            mode are disabled automatically.
+            text. This cannot be combined with ``ocr_deskew``.
+        ocr_deskew: If True, enable OCR and straighten skewed pages.
+        ocr_rotate_pages: If True, enable OCR and normalize page orientation.
         force_overwrite: If True, existing output files are overwritten.
             If False, existing outputs are skipped with an error result.
         preserve_stamps: If True, known proprietary stamp annotations are
@@ -1385,6 +1402,8 @@ def convert_files(
                 ocr_fallback_quality=ocr_fallback_quality,
                 ocr_fallback_after_seconds=ocr_fallback_after_seconds,
                 ocr_force=ocr_force,
+                ocr_deskew=ocr_deskew,
+                ocr_rotate_pages=ocr_rotate_pages,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 allow_signature_invalidation=allow_signature_invalidation,
@@ -1426,6 +1445,8 @@ def convert_directory(
     ocr_fallback_quality: "OcrQuality | None" = DEFAULT_OCR_FALLBACK_QUALITY,
     ocr_fallback_after_seconds: float | None = DEFAULT_OCR_FALLBACK_AFTER_SECONDS,
     ocr_force: bool = False,
+    ocr_deskew: bool = False,
+    ocr_rotate_pages: bool = False,
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
@@ -1452,8 +1473,9 @@ def convert_directory(
         ocr_fallback_after_seconds: Per-page runtime budget for OCR fallback
             (total threshold is this value times the page count).
         ocr_force: If True, force OCR even on pages that already contain
-            text. Options incompatible with ocrmypdf's ``redo_ocr``
-            mode are disabled automatically.
+            text. This cannot be combined with ``ocr_deskew``.
+        ocr_deskew: If True, enable OCR and straighten skewed pages.
+        ocr_rotate_pages: If True, enable OCR and normalize page orientation.
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
             flattened into page content.
@@ -1549,6 +1571,8 @@ def convert_directory(
         ocr_fallback_quality=ocr_fallback_quality,
         ocr_fallback_after_seconds=ocr_fallback_after_seconds,
         ocr_force=ocr_force,
+        ocr_deskew=ocr_deskew,
+        ocr_rotate_pages=ocr_rotate_pages,
         force_overwrite=force_overwrite,
         on_progress=_on_progress if show_progress else None,
         convert_calibrated=convert_calibrated,

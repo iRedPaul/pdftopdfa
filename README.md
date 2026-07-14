@@ -26,7 +26,7 @@ Instead of re-rendering via Ghostscript, it modifies the PDF structure directly 
 pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with the PDF/A standard:
 
 1. **Pre-check** -- skips encrypted and digitally signed PDFs, then detects if the PDF is already a valid PDF/A file (skips conversion if the existing level meets or exceeds the target; optionally skips any veraPDF-compliant PDF/A via `--skip-any-pdfa`; see [Usage Guide](docs/usage.md#already-compliant-pdfs) for details)
-2. **OCR** (optional) -- uses the bundled PaddleOCR model to orient every page in `best` mode, then runs Tesseract via ocrmypdf on pages without a text layer
+2. **OCR** (optional) -- optionally orients pages with the bundled PaddleOCR model and straightens skewed scans, then runs Tesseract via ocrmypdf on pages without a text layer
 3. **Font compliance** -- analyzes all fonts, embeds missing ones, adds ToUnicode mappings, subsets embedded fonts, and fixes encoding issues
 4. **Sanitization** -- removes or fixes non-compliant elements (JavaScript, non-standard actions, transparency groups, annotations, optional content, etc.)
 5. **Metadata** -- synchronizes XMP metadata with the document info dictionary and sets the PDF/A conformance level
@@ -53,7 +53,7 @@ pip install pdftopdfa
 pip install "pdftopdfa[ocr]"
 ```
 
-OCR requires a [Tesseract](https://github.com/tesseract-ocr/tesseract) installation on the system. The `best` preset uses a bundled PaddleOCR ONNX model and never downloads model files at runtime. See [docs/ocr.md](docs/ocr.md) for details on OCR usage and quality presets.
+OCR requires a [Tesseract](https://github.com/tesseract-ocr/tesseract) installation on the system. The `--rotate-pages` option uses a bundled PaddleOCR ONNX model and never downloads model files at runtime. See [docs/ocr.md](docs/ocr.md) for details on OCR usage, page processing, and quality presets.
 
 ## Quick Start
 
@@ -78,6 +78,12 @@ pdftopdfa -r ./documents/ ./output/
 
 # OCR for scanned PDFs
 pdftopdfa --ocr document.pdf
+
+# Automatically orient pages without deskewing them
+pdftopdfa --rotate-pages document.pdf
+
+# Deskew pages without changing their 90-degree orientation
+pdftopdfa --deskew document.pdf
 
 # Preserve known proprietary stamps as PDF Stamp annotations
 pdftopdfa --preserve-stamps document.pdf

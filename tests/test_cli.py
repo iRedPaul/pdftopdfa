@@ -52,6 +52,8 @@ class TestCliHelp:
 
         assert result.exit_code == 0
         assert "--ocr" in result.output
+        assert "--deskew" in result.output
+        assert "--rotate-pages" in result.output
 
     def test_cli_help_shows_ocr_force_option(self, runner: CliRunner) -> None:
         """--ocr-force option appears in help."""
@@ -377,6 +379,25 @@ class TestCliDirectory:
             is True
         )
 
+    @patch("pdftopdfa.cli._convert_directory")
+    def test_cli_convert_directory_passes_processing_flags(
+        self, mock_convert_directory, runner: CliRunner, tmp_dir: Path
+    ) -> None:
+        """Directory CLI forwards both independent processing flags."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        mock_convert_directory.return_value = EXIT_SUCCESS
+
+        result = runner.invoke(
+            main,
+            [str(input_dir), "--deskew", "--rotate-pages"],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        kwargs = mock_convert_directory.call_args.kwargs
+        assert kwargs["ocr_deskew"] is True
+        assert kwargs["ocr_rotate_pages"] is True
+
     def test_cli_convert_directory(
         self, runner: CliRunner, tmp_dir: Path, sample_pdf_bytes: bytes
     ) -> None:
@@ -656,23 +677,10 @@ class TestCliOcr:
 
         assert result.exit_code == EXIT_SUCCESS
 
-    @patch("pdftopdfa.ocr.apply_ocr")
-    @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_cli_ocr_quality_best(
-        self,
-        mock_is_ocr_available,
-        mock_apply_ocr,
-        runner: CliRunner,
-        sample_pdf: Path,
-        tmp_dir: Path,
+    def test_cli_ocr_quality_best_is_rejected(
+        self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
     ) -> None:
-        """--ocr-quality best is accepted."""
-        import shutil
-
-        mock_is_ocr_available.return_value = True
-        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
-            shutil.copy(inp, out) or out
-        )
+        """The removed --ocr-quality best value is rejected."""
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
@@ -680,7 +688,7 @@ class TestCliOcr:
             [str(sample_pdf), str(output_path), "--ocr", "--ocr-quality", "best"],
         )
 
-        assert result.exit_code == EXIT_SUCCESS
+        assert result.exit_code == 2
 
     def test_cli_ocr_quality_invalid(
         self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
@@ -757,7 +765,7 @@ class TestCliOcr:
                 str(output_path),
                 "--ocr",
                 "--ocr-quality",
-                "best",
+                "default",
                 "--ocr-fallback-quality",
                 "default",
                 "--ocr-fallback-after",
@@ -768,6 +776,79 @@ class TestCliOcr:
         assert result.exit_code == EXIT_SUCCESS
         assert mock_apply_ocr.call_args[1]["fallback_quality"] == OcrQuality.DEFAULT
         assert mock_apply_ocr.call_args[1]["fallback_after_seconds"] == 120.0
+
+    @pytest.mark.parametrize(
+        ("flag", "expected_kwarg"),
+        [("--deskew", "deskew"), ("--rotate-pages", "rotate_pages")],
+    )
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_cli_processing_flag_implies_ocr(
+        self,
+        mock_is_ocr_available,
+        mock_apply_ocr,
+        flag: str,
+        expected_kwarg: str,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Each standalone processing flag enables OCR with English."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
+        output_path = tmp_dir / f"{expected_kwarg}.pdf"
+
+        result = runner.invoke(main, [str(sample_pdf), str(output_path), flag])
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert mock_apply_ocr.call_args.args[2] == ["eng"]
+        assert mock_apply_ocr.call_args.kwargs[expected_kwarg] is True
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_cli_processing_flags_can_be_combined(
+        self,
+        mock_is_ocr_available,
+        mock_apply_ocr,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Deskew and rotation are forwarded independently when combined."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
+        output_path = tmp_dir / "combined.pdf"
+
+        result = runner.invoke(
+            main,
+            [str(sample_pdf), str(output_path), "--deskew", "--rotate-pages"],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert mock_apply_ocr.call_args.kwargs["deskew"] is True
+        assert mock_apply_ocr.call_args.kwargs["rotate_pages"] is True
+
+    def test_cli_deskew_rejects_forced_ocr(
+        self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """Deskew and forced OCR fail before conversion starts."""
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [str(sample_pdf), str(output_path), "--deskew", "--ocr-force"],
+        )
+
+        assert result.exit_code == 2
+        assert "--deskew cannot be combined with --ocr-force" in result.output
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")

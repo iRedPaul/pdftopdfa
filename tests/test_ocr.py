@@ -23,7 +23,7 @@ from pdftopdfa.ocr import (
     OCR_SETTINGS,
     OcrQuality,
     _detect_consistent_text_skew,
-    _normalize_best_quality_text_page_skew,
+    _normalize_text_page_skew,
     _page_has_images,
     _page_has_text,
     apply_ocr,
@@ -438,7 +438,7 @@ class TestApplyOcr:
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_best_orientation_error_aborts_before_ocr(
+    def test_rotation_error_aborts_before_ocr(
         self,
         mock_ocrmypdf: MagicMock,
         sample_pdf: Path,
@@ -450,7 +450,7 @@ class TestApplyOcr:
         _mock_paddle_orientation.side_effect = OCRError("model is corrupt")
 
         with pytest.raises(OCRError, match="model is corrupt"):
-            apply_ocr(sample_pdf, output_path, quality=OcrQuality.BEST)
+            apply_ocr(sample_pdf, output_path, rotate_pages=True)
 
         mock_ocrmypdf.ocr.assert_not_called()
 
@@ -556,7 +556,14 @@ class TestApplyOcr:
 
         mock_ocrmypdf.ocr.side_effect = create_output
 
-        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
+        apply_ocr(
+            sample_pdf,
+            output_path,
+            ["eng"],
+            quality=OcrQuality.DEFAULT,
+            deskew=True,
+            rotate_pages=True,
+        )
 
         assert mock_ocrmypdf.ocr.call_count == 2
         first_kwargs = mock_ocrmypdf.ocr.call_args_list[0].kwargs
@@ -567,7 +574,9 @@ class TestApplyOcr:
             == OCR_SETTINGS[OcrQuality.FAST]["tesseract_timeout"]
         )
         assert "oversample" not in retry_kwargs
-        assert "plugins" not in retry_kwargs
+        assert retry_kwargs["plugins"] == ["pdftopdfa.ocr_rotation_fix"]
+        assert first_kwargs["deskew"] is True
+        assert retry_kwargs["deskew"] is True
         _mock_paddle_orientation.assert_called_once()
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
@@ -595,7 +604,7 @@ class TestApplyOcr:
             sample_pdf,
             output_path,
             ["eng"],
-            quality=OcrQuality.BEST,
+            quality=OcrQuality.DEFAULT,
             fallback_quality=None,
         )
 
@@ -635,7 +644,13 @@ class TestApplyOcr:
 
         mock_ocrmypdf.ocr.side_effect = create_output
 
-        apply_ocr(input_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
+        apply_ocr(
+            input_pdf,
+            output_path,
+            ["eng"],
+            quality=OcrQuality.DEFAULT,
+            rotate_pages=True,
+        )
 
         mock_ocrmypdf.ocr.assert_called_once()
 
@@ -662,7 +677,13 @@ class TestApplyOcr:
 
         mock_ocrmypdf.ocr.side_effect = create_output
 
-        apply_ocr(input_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
+        apply_ocr(
+            input_pdf,
+            output_path,
+            ["eng"],
+            quality=OcrQuality.DEFAULT,
+            rotate_pages=True,
+        )
 
         assert mock_ocrmypdf.ocr.call_count == 2
 
@@ -828,13 +849,13 @@ class TestOcrQuality:
         """OcrQuality enum has the expected values."""
         assert OcrQuality.FAST.value == "fast"
         assert OcrQuality.DEFAULT.value == "default"
-        assert OcrQuality.BEST.value == "best"
 
     def test_ocr_quality_enum_from_string(self) -> None:
         """OcrQuality can be created from string values."""
         assert OcrQuality("fast") is OcrQuality.FAST
         assert OcrQuality("default") is OcrQuality.DEFAULT
-        assert OcrQuality("best") is OcrQuality.BEST
+        with pytest.raises(ValueError):
+            OcrQuality("best")
 
     def test_ocr_settings_has_all_presets(self) -> None:
         """OCR_SETTINGS contains entries for all quality presets."""
@@ -866,25 +887,10 @@ class TestOcrQuality:
         assert settings["progress_bar"] is False
         assert "clean" not in settings
 
-    def test_ocr_settings_best_preset(self) -> None:
-        """Best preset uses all quality parameters including visual changes."""
-        settings = OCR_SETTINGS[OcrQuality.BEST]
-        assert settings["skip_text"] is True
-        assert settings["deskew"] is True
-        assert settings["rotate_pages"] is False
-        assert "rotate_pages_threshold" not in settings
-        assert settings["oversample"] == 600
-        assert settings["tesseract_pagesegmode"] == 11
-        assert settings["tesseract_thresholding"] == 1
-        assert settings["tesseract_timeout"] == 300
-        assert settings["optimize"] == 0
-        assert settings["progress_bar"] is False
-        assert "clean" not in settings
-
     @pytest.mark.parametrize("quality", [OcrQuality.FAST, OcrQuality.DEFAULT])
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_non_best_quality_never_runs_paddle_orientation(
+    def test_quality_alone_never_runs_paddle_orientation(
         self,
         mock_ocrmypdf: MagicMock,
         quality: OcrQuality,
@@ -892,7 +898,7 @@ class TestOcrQuality:
         tmp_dir: Path,
         _mock_paddle_orientation: MagicMock,
     ) -> None:
-        """Only an originally requested BEST run initializes PaddleOCR."""
+        """Quality presets alone never initialize PaddleOCR."""
         apply_ocr(sample_pdf, tmp_dir / "output.pdf", quality=quality)
 
         _mock_paddle_orientation.assert_not_called()
@@ -942,8 +948,8 @@ class TestOcrQuality:
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
-    @patch("pdftopdfa.ocr._normalize_best_quality_text_page_skew")
-    def test_apply_ocr_best_quality(
+    @patch("pdftopdfa.ocr._normalize_text_page_skew")
+    def test_apply_ocr_independent_processing_options(
         self,
         mock_normalize_skew: MagicMock,
         mock_ocrmypdf: MagicMock,
@@ -951,14 +957,22 @@ class TestOcrQuality:
         tmp_dir: Path,
         _mock_paddle_orientation: MagicMock,
     ) -> None:
-        """apply_ocr with BEST quality passes correct parameters."""
+        """Deskew and page rotation work independently of OCR quality."""
         output_path = tmp_dir / "output.pdf"
         mock_ocrmypdf.ocr.side_effect = lambda *args, **kwargs: output_path.touch()
 
-        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
+        apply_ocr(
+            sample_pdf,
+            output_path,
+            ["eng"],
+            quality=OcrQuality.DEFAULT,
+            deskew=True,
+            rotate_pages=True,
+        )
 
         expected_settings = {
-            **OCR_SETTINGS[OcrQuality.BEST],
+            **OCR_SETTINGS[OcrQuality.DEFAULT],
+            "deskew": True,
             "tesseract_timeout": 60,
         }
         _mock_paddle_orientation.assert_called_once()
@@ -995,6 +1009,19 @@ class TestOcrQuality:
 
 class TestApplyOcrForce:
     """Tests for apply_ocr(force=True) behaviour."""
+
+    @patch("pdftopdfa.ocr.HAS_OCR", True)
+    @patch("pdftopdfa.ocr.ocrmypdf")
+    def test_apply_ocr_force_rejects_deskew(
+        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """Forced OCR rejects the explicitly incompatible deskew option."""
+        output_path = tmp_dir / "output.pdf"
+
+        with pytest.raises(OCRError, match="Deskew cannot be combined"):
+            apply_ocr(sample_pdf, output_path, ["eng"], force=True, deskew=True)
+
+        mock_ocrmypdf.ocr.assert_not_called()
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
@@ -1038,13 +1065,19 @@ class TestApplyOcrForce:
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_force_with_best_quality(
+    def test_apply_ocr_force_with_default_quality(
         self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
     ) -> None:
-        """force=True with BEST quality removes redo_ocr conflicts only."""
+        """force=True with DEFAULT quality removes redo_ocr conflicts only."""
         output_path = tmp_dir / "output.pdf"
 
-        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST, force=True)
+        apply_ocr(
+            sample_pdf,
+            output_path,
+            ["eng"],
+            quality=OcrQuality.DEFAULT,
+            force=True,
+        )
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
         assert call_kwargs["redo_ocr"] is True
@@ -1059,19 +1092,23 @@ class TestApplyOcrForce:
     ) -> None:
         """force=True strips all ocrmypdf options incompatible with redo_ocr."""
         output_path = tmp_dir / "output.pdf"
-        forced_best_settings = {
-            **OCR_SETTINGS[OcrQuality.BEST],
+        forced_default_settings = {
+            **OCR_SETTINGS[OcrQuality.DEFAULT],
             "clean_final": True,
             "remove_background": True,
         }
 
         with patch.dict(
             "pdftopdfa.ocr.OCR_SETTINGS",
-            {OcrQuality.BEST: forced_best_settings},
+            {OcrQuality.DEFAULT: forced_default_settings},
             clear=False,
         ):
             apply_ocr(
-                sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST, force=True
+                sample_pdf,
+                output_path,
+                ["eng"],
+                quality=OcrQuality.DEFAULT,
+                force=True,
             )
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
@@ -1091,14 +1128,27 @@ class TestApplyOcrForce:
     ) -> None:
         """force=True logs when redo_ocr-incompatible options are disabled."""
         output_path = tmp_dir / "output.pdf"
+        settings = {
+            **OCR_SETTINGS[OcrQuality.DEFAULT],
+            "clean_final": True,
+        }
 
-        with caplog.at_level(logging.INFO, logger="pdftopdfa.ocr"):
-            apply_ocr(
-                sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST, force=True
-            )
+        with patch.dict(
+            "pdftopdfa.ocr.OCR_SETTINGS",
+            {OcrQuality.DEFAULT: settings},
+            clear=False,
+        ):
+            with caplog.at_level(logging.INFO, logger="pdftopdfa.ocr"):
+                apply_ocr(
+                    sample_pdf,
+                    output_path,
+                    ["eng"],
+                    quality=OcrQuality.DEFAULT,
+                    force=True,
+                )
 
         assert (
-            "force=True disables redo_ocr-incompatible OCR options: deskew"
+            "force=True disables redo_ocr-incompatible OCR options: clean_final"
             in caplog.text
         )
 
@@ -1106,10 +1156,9 @@ class TestApplyOcrForce:
 class TestOcrPlugins:
     """Tests for active OCR plugin integration."""
 
-    def test_rotation_fix_qualities_contains_default_and_best(self) -> None:
-        """Rotation fix stays enabled for the non-fast OCR presets."""
+    def test_rotation_fix_qualities_contains_default(self) -> None:
+        """Rotation fix stays enabled for the default OCR preset."""
         assert OcrQuality.DEFAULT in _ROTATION_FIX_QUALITIES
-        assert OcrQuality.BEST in _ROTATION_FIX_QUALITIES
         assert OcrQuality.FAST not in _ROTATION_FIX_QUALITIES
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
@@ -1127,13 +1176,19 @@ class TestOcrPlugins:
 
     @patch("pdftopdfa.ocr.HAS_OCR", True)
     @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_best_uses_rotation_plugin(
+    def test_apply_ocr_fast_rotation_uses_rotation_plugin(
         self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
     ) -> None:
-        """BEST quality also keeps only the rotation plugin."""
+        """Explicit rotation enables the rotation plugin for FAST quality."""
         output_path = tmp_dir / "output.pdf"
 
-        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.BEST)
+        apply_ocr(
+            sample_pdf,
+            output_path,
+            ["eng"],
+            quality=OcrQuality.FAST,
+            rotate_pages=True,
+        )
 
         call_kwargs = mock_ocrmypdf.ocr.call_args[1]
         assert call_kwargs["plugins"] == ["pdftopdfa.ocr_rotation_fix"]
@@ -1165,7 +1220,7 @@ class TestOcrPlugins:
         assert "plugins" not in call_kwargs
 
 
-class TestBestQualityTextSkewNormalization:
+class TestTextSkewNormalization:
     """Tests for post-OCR normalization of skipped text-page skew."""
 
     def test_detect_consistent_text_skew(self, tmp_dir: Path) -> None:
@@ -1192,7 +1247,7 @@ class TestBestQualityTextSkewNormalization:
         assert angle is not None
         assert angle == pytest.approx(4.77, abs=0.1)
 
-    def test_normalize_best_quality_text_page_skew(self, tmp_dir: Path) -> None:
+    def test_normalize_text_page_skew(self, tmp_dir: Path) -> None:
         """Text-only pages with dominant skew keep their original page size."""
         pdf_path = tmp_dir / "skew_page.pdf"
         original_box = [0.0, 0.0, 595.0, 842.0]
@@ -1214,7 +1269,7 @@ class TestBestQualityTextSkewNormalization:
             )
             pdf.save(pdf_path)
 
-        normalized = _normalize_best_quality_text_page_skew(pdf_path)
+        normalized = _normalize_text_page_skew(pdf_path)
 
         assert normalized
         with Pdf.open(pdf_path) as pdf:

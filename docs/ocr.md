@@ -38,11 +38,14 @@ pdftopdfa --ocr --ocr-lang deu scan.pdf
 # Multilingual
 pdftopdfa --ocr --ocr-lang deu+eng scan.pdf
 
-# Highest OCR quality
-pdftopdfa --ocr --ocr-quality best scan.pdf
+# Automatically orient pages without deskewing
+pdftopdfa --rotate-pages scan.pdf
 
-# Highest OCR quality, but retry with fast OCR if it takes over 60 seconds
-pdftopdfa --ocr --ocr-quality best --ocr-fallback-quality fast scan.pdf
+# Deskew pages without automatic orientation
+pdftopdfa --deskew scan.pdf
+
+# Enable both independent page-processing steps
+pdftopdfa --deskew --rotate-pages scan.pdf
 ```
 
 ### Python API
@@ -59,12 +62,17 @@ result = convert_to_pdfa(
     ocr_quality=OcrQuality.DEFAULT,
     ocr_fallback_quality=OcrQuality.FAST,
     ocr_fallback_after_seconds=60.0,
+    ocr_deskew=False,
+    ocr_rotate_pages=True,
 )
 ```
 
 ## When OCR Runs
 
-If OCR is enabled (`--ocr` or `ocr_languages` is set), `pdftopdfa` always invokes OCR processing for the document:
+If OCR is enabled (`--ocr`, `--deskew`, or `--rotate-pages`, or a corresponding
+Python option is set), `pdftopdfa` always invokes OCR processing for the
+document. The two page-processing options use English when no OCR language is
+provided.
 
 - Pages that already contain text are skipped automatically.
 - Pages without a text layer are OCRed.
@@ -92,7 +100,7 @@ result = convert_to_pdfa(
     output_path=Path("scan_pdfa.pdf"),
     ocr_languages=["deu"],
     ocr_force=True,
-    ocr_quality=OcrQuality.BEST,
+    ocr_quality=OcrQuality.DEFAULT,
 )
 ```
 
@@ -104,8 +112,8 @@ Behavior notes:
 - Forced OCR does not bypass the signed-PDF protection. Use
   `--allow-signature-invalidation` only when an unsigned OCR/PDF/A copy is
   intentional.
-- With forced OCR, options incompatible with ocrmypdf's `redo_ocr`
-  mode are disabled automatically.
+- `--deskew` cannot be combined with `--ocr-force`, because OCRmyPDF's
+  `redo_ocr` mode does not support deskewing.
 - Original annotations are preserved when possible.
 
 ## Quality Presets
@@ -113,30 +121,36 @@ Behavior notes:
 | Preset | Goal | Visual changes |
 |---|---|---|
 | `fast` | Fastest processing | No |
-| `default` | Better recognition without changing page appearance | No |
-| `best` | Highest recognition quality | Possible (deskew/rotation) |
+| `default` | Better recognition | No |
 
 Internal OCR settings:
 
-| Parameter | `fast` | `default` | `best` |
-|---|---|---|---|
-| `deskew` | False | False | True |
-| OCRmyPDF `rotate_pages` | False | False | False |
-| Paddle page orientation | No | No | All pages |
-| Paddle confidence threshold | - | - | 0.80 |
-| `oversample` | - | 600 | 600 |
-| `tesseract_pagesegmode` | - | 11 (`sparse_text`) | 11 (`sparse_text`) |
-| `tesseract_thresholding` | - | `adaptive-otsu` | `adaptive-otsu` |
+| Parameter | `fast` | `default` |
+|---|---|---|
+| `oversample` | - | 600 |
+| `tesseract_pagesegmode` | - | 11 (`sparse_text`) |
+| `tesseract_thresholding` | - | `adaptive-otsu` |
 
-`default` and `best` rely on Tesseract's built-in adaptive thresholding.
-This is generally more robust for mixed scans with small text regions on large pages.
-Before OCR starts, `best` renders and classifies every page with the bundled
-`PP-LCNet_x1_0_doc_ori` model, including pages that OCRmyPDF later skips because
-they already contain text. Predictions below 0.80 leave the page unchanged and
-produce a warning. Missing, corrupt, or unusable model files abort the conversion.
-Tesseract OSD is not used.
-When OCR is forced, redo-ocr-incompatible options such as `deskew`
-are disabled automatically.
+`default` relies on Tesseract's built-in adaptive thresholding. This is
+generally more robust for mixed scans with small text regions on large pages.
+Quality presets never enable deskewing or page rotation.
+
+## Page Processing
+
+`--deskew` and `--rotate-pages` are independent, opt-in operations. Both imply
+`--ocr`, remain active if OCR retries with the faster fallback preset, and
+bypass the already-compliant PDF/A skip check so the requested processing runs.
+
+`--deskew` enables OCRmyPDF's skew correction and also straightens eligible
+text-only pages that OCRmyPDF skips. Deskewing may alter page appearance and
+increase file size.
+
+Before OCR starts, `--rotate-pages` renders and classifies every page with the
+bundled `PP-LCNet_x1_0_doc_ori` model, including pages that OCRmyPDF later skips
+because they already contain text. Predictions below 0.80 leave the page
+unchanged and produce a warning. Missing, corrupt, or unusable model files abort
+the conversion. Tesseract OSD and OCRmyPDF's own `rotate_pages` option are not
+used.
 
 ## Offline Deployment
 
@@ -156,17 +170,14 @@ threshold so fallback can happen promptly instead of waiting for the longer
 quality-preset timeout.
 
 ```bash
-# Default behavior: best first, fast fallback after 60 seconds
-pdftopdfa --ocr --ocr-quality best scan.pdf
-
-# Use default as fallback from best
-pdftopdfa --ocr --ocr-quality best --ocr-fallback-quality default scan.pdf
+# Default behavior: default first, fast fallback after 60 seconds
+pdftopdfa --ocr scan.pdf
 
 # Change the fallback threshold
-pdftopdfa --ocr --ocr-quality best --ocr-fallback-after 120 scan.pdf
+pdftopdfa --rotate-pages --ocr-fallback-after 120 scan.pdf
 
 # Disable automatic retry
-pdftopdfa --ocr --ocr-quality best --ocr-fallback-quality none scan.pdf
+pdftopdfa --deskew --ocr-fallback-quality none scan.pdf
 ```
 
 Fallback presets only run when they are faster than the selected preset. For
@@ -199,7 +210,7 @@ network download or external-cache fallback.
 
 Possible reasons:
 
-- OCR was not enabled (`--ocr` missing).
+- OCR was not enabled (`--ocr`, `--deskew`, or `--rotate-pages` missing).
 - The document already had sufficient text coverage.
 - The file had fewer than 50% OCR-relevant pages.
 - The input PDF was digitally signed and was skipped to avoid invalidating the
