@@ -8,14 +8,8 @@ This module provides functions for optical character recognition (OCR)
 in image-based PDFs (scanned documents).
 """
 
-# Standard Library
-import contextlib
-import enum
 import logging
-import math
-import os
 import shutil
-import threading
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -24,7 +18,6 @@ from typing import TYPE_CHECKING
 # Optional import of ocrmypdf
 try:
     import ocrmypdf
-    from ocrmypdf._exec.tesseract import ThresholdingMethod
     from ocrmypdf.exceptions import (
         EncryptedPdfError,
         MissingDependencyError,
@@ -35,12 +28,6 @@ try:
 except ImportError:
     HAS_OCR = False
     ocrmypdf = None  # type: ignore[assignment]
-
-    class ThresholdingMethod(enum.IntEnum):  # type: ignore[no-redef]
-        AUTO = 0
-        OTSU = 0
-        ADAPTIVE_OTSU = 1
-        SAUVOLA = 2
 
     class EncryptedPdfError(Exception):  # type: ignore[no-redef]
         pass
@@ -57,132 +44,92 @@ if TYPE_CHECKING:
 
 # Local
 from .exceptions import OCRError
-from .orientation import normalize_pdf_orientation
+from .orientation import _effective_page_rotate, normalize_pdf_orientation
 from .utils import log_suppressed_error
 
 logger = logging.getLogger(__name__)
 
-_path_lock = threading.Lock()
+_PADDLE_OCR_PLUGIN = "pdftopdfa.ocr_paddle"
 _ROTATION_FIX_PLUGIN = "pdftopdfa.ocr_rotation_fix"
-
-
-@contextlib.contextmanager
-def _temporary_tesseract_path():
-    """Temporarily add TESSERACT_PATH parent to PATH (thread-safe).
-
-    ocrmypdf does not support a custom env parameter for subprocess calls,
-    so we must modify os.environ temporarily. A lock serializes access to
-    prevent concurrent PATH mutations from different threads.
-    """
-    tesseract_path = os.environ.get("TESSERACT_PATH")
-    if not tesseract_path:
-        yield
-        return
-    p = Path(tesseract_path)
-    tesseract_dir = str(p) if p.is_dir() else str(p.parent)
-    with _path_lock:
-        saved = os.environ.get("PATH", "")
-        os.environ["PATH"] = tesseract_dir + os.pathsep + saved
-        try:
-            yield
-        finally:
-            os.environ["PATH"] = saved
-
-
-class OcrQuality(enum.Enum):
-    """OCR quality presets controlling the speed/quality trade-off.
-
-    Attributes:
-        FAST: Minimal processing, fastest. Does not alter the document visually.
-        DEFAULT: Best quality without visual changes to the document.
-    """
-
-    FAST = "fast"
-    DEFAULT = "default"
-
-
-OCR_SETTINGS: dict[OcrQuality, dict] = {
-    OcrQuality.FAST: {
-        "skip_text": True,
-        "deskew": False,
-        "rotate_pages": False,
-        "optimize": 0,
-        "tesseract_timeout": 120,
-        "progress_bar": False,
-    },
-    OcrQuality.DEFAULT: {
-        "skip_text": True,
-        "deskew": False,
-        "rotate_pages": False,
-        # Higher oversampling helps small text blocks on large pages.
-        "oversample": 600,
-        # Sparse-text mode is more robust when text covers only part of a page.
-        "tesseract_pagesegmode": 11,
-        # Let modern Tesseract handle local thresholding directly.
-        "tesseract_thresholding": int(ThresholdingMethod.ADAPTIVE_OTSU),
-        "optimize": 0,
-        "tesseract_timeout": 300,
-        "progress_bar": False,
-    },
+_PADDLE_LANGUAGE_TAGS = {
+    "ch": "zh-Hans",
+    "chinese_cht": "zh-Hant",
+    "french": "fr",
+    "german": "de",
+    "japan": "ja",
+    "rs_latin": "sr-Latn",
 }
-
-DEFAULT_OCR_FALLBACK_QUALITY = OcrQuality.FAST
-DEFAULT_OCR_FALLBACK_AFTER_SECONDS = 60.0
-_OCR_QUALITY_RANK = {
-    OcrQuality.FAST: 0,
-    OcrQuality.DEFAULT: 1,
-}
-
-# ocrmypdf rejects these options when redo_ocr is enabled.
-_REDO_OCR_INCOMPATIBLE_OPTIONS = frozenset(
-    {"deskew", "clean_final", "remove_background"}
+PADDLE_OCR_LANGUAGES = frozenset(
+    {
+        "af",
+        "az",
+        "bs",
+        "ca",
+        "ch",
+        "chinese_cht",
+        "cs",
+        "cy",
+        "da",
+        "de",
+        "en",
+        "es",
+        "et",
+        "eu",
+        "fi",
+        "fr",
+        "french",
+        "ga",
+        "german",
+        "gl",
+        "hr",
+        "hu",
+        "id",
+        "is",
+        "it",
+        "japan",
+        "ku",
+        "la",
+        "lb",
+        "lt",
+        "lv",
+        "mi",
+        "ms",
+        "mt",
+        "nl",
+        "no",
+        "oc",
+        "pl",
+        "pt",
+        "qu",
+        "rm",
+        "ro",
+        "rs_latin",
+        "sk",
+        "sl",
+        "sq",
+        "sv",
+        "sw",
+        "tl",
+        "tr",
+        "uz",
+        "vi",
+    }
 )
 
-_ROTATION_FIX_QUALITIES = frozenset({OcrQuality.DEFAULT})
 
+def validate_ocr_languages(languages: list[str]) -> list[str]:
+    """Validate and return PaddleOCR 3.7 PP-OCRv6 language codes."""
+    if not languages or any(not language for language in languages):
+        raise ValueError("At least one OCR language must be specified")
 
-def _get_ocr_plugins(
-    quality: OcrQuality,
-    *,
-    rotate_pages: bool = False,
-) -> list[str]:
-    """Build the plugin list for the current OCR run."""
-    plugins: list[str] = []
-    if rotate_pages or quality in _ROTATION_FIX_QUALITIES:
-        plugins.append(_ROTATION_FIX_PLUGIN)
-    return plugins
-
-
-def _is_faster_ocr_quality(candidate: OcrQuality, quality: OcrQuality) -> bool:
-    """Return True if candidate is a faster OCR quality than quality."""
-    return _OCR_QUALITY_RANK[candidate] < _OCR_QUALITY_RANK[quality]
-
-
-def _effective_fallback_quality(
-    quality: OcrQuality,
-    fallback_quality: OcrQuality | None,
-) -> OcrQuality | None:
-    """Return the fallback quality to use for quality, if any."""
-    if fallback_quality is None:
-        return None
-    if not _is_faster_ocr_quality(fallback_quality, quality):
-        return None
-    return fallback_quality
-
-
-def _remove_redo_ocr_incompatible_options(ocr_kwargs: dict[str, object]) -> list[str]:
-    """Remove options that ocrmypdf rejects together with redo_ocr."""
-    removed_options: list[str] = []
-
-    for option in sorted(_REDO_OCR_INCOMPATIBLE_OPTIONS):
-        if option not in ocr_kwargs:
-            continue
-
-        value = ocr_kwargs.pop(option)
-        if value:
-            removed_options.append(option)
-
-    return removed_options
+    unsupported = sorted(set(languages) - PADDLE_OCR_LANGUAGES)
+    if unsupported:
+        supported = ", ".join(sorted(PADDLE_OCR_LANGUAGES))
+        raise ValueError(
+            f"Unsupported PaddleOCR language code(s): {', '.join(unsupported)}. "
+            f"Supported codes: {supported}"
+        )
+    return languages
 
 
 def _format_ocr_exception(exc: BaseException) -> str:
@@ -191,33 +138,6 @@ def _format_ocr_exception(exc: BaseException) -> str:
     if message:
         return message
     return exc.__class__.__name__
-
-
-def _cap_tesseract_timeout(
-    ocr_kwargs: dict[str, object],
-    fallback_after_seconds: float | None,
-) -> None:
-    """Cap Tesseract OCR timeout so fallback can happen promptly."""
-    if fallback_after_seconds is None:
-        return
-    timeout = max(1, math.ceil(fallback_after_seconds))
-    existing_timeout = ocr_kwargs.get("tesseract_timeout")
-    if existing_timeout is None or float(existing_timeout) > timeout:
-        ocr_kwargs["tesseract_timeout"] = timeout
-
-
-def _count_pdf_pages(pdf_path: Path) -> int:
-    """Return the page count of a PDF, or 1 if it cannot be determined."""
-    import pikepdf
-
-    try:
-        with pikepdf.open(pdf_path) as pdf:
-            return len(pdf.pages)
-    except Exception as exc:
-        log_suppressed_error(
-            logger, exc, "Could not count pages of %s: %s", pdf_path, exc
-        )
-        return 1
 
 
 def _pdf_has_annotations(pdf_path: Path) -> bool:
@@ -245,139 +165,168 @@ def _pdf_has_annotations(pdf_path: Path) -> bool:
         return True
 
 
-def _extract_text_matrix_angles(page) -> list[float]:
-    """Collect text-matrix rotation angles from a page's content stream."""
-    angles: list[float] = []
-
-    try:
-        import pikepdf
-
-        for operands, operator in pikepdf.parse_content_stream(page):
-            if str(operator) != "Tm" or len(operands) != 6:
-                continue
-            a, b, c, d, _e, _f = [float(value) for value in operands]
-            if abs(a) < 1e-6 and abs(b) < 1e-6:
-                continue
-            angle = math.degrees(math.atan2(b, a))
-            if abs(d) > 1e-6 or abs(c) > 1e-6:
-                shear = math.degrees(math.atan2(c, d))
-            else:
-                shear = 0.0
-            if abs(angle - (-shear)) > 0.25:
-                continue
-            angles.append(angle)
-    except Exception as exc:
-        log_suppressed_error(logger, exc, "Failed to inspect text matrix skew: %s", exc)
-
-    return angles
-
-
-def _detect_consistent_text_skew(page) -> float | None:
-    """Detect a dominant small skew angle on a text-only page."""
-    angles = _extract_text_matrix_angles(page)
-    if len(angles) < 2:
-        return None
-
-    median_angle = sorted(angles)[len(angles) // 2]
-    abs_median = abs(median_angle)
-    if abs_median < 0.5 or abs_median > 10.0:
-        return None
-
-    consistent = [angle for angle in angles if abs(angle - median_angle) <= 0.5]
-    if len(consistent) / len(angles) < 0.8:
-        return None
-
-    return sum(consistent) / len(consistent)
-
-
-def _apply_page_content_transform(pdf, page, *, angle_degrees: float) -> None:
-    """Apply a global counter-rotation while preserving the page format."""
+def _ocr_form_names(pdf_path: Path) -> list[frozenset[str]]:
+    """Return resource names that must not be treated as newly grafted OCR."""
     import pikepdf
 
-    media_box = [float(value) for value in page.mediabox]
-    page_width = media_box[2] - media_box[0]
-    page_height = media_box[3] - media_box[1]
-    radians = math.radians(angle_degrees)
-    cos_theta = math.cos(radians)
-    sin_theta = math.sin(radians)
-
-    rotated_width = abs(page_width * cos_theta) + abs(page_height * sin_theta)
-    rotated_height = abs(page_width * sin_theta) + abs(page_height * cos_theta)
-    scale = min(page_width / rotated_width, page_height / rotated_height, 1.0)
-
-    a = scale * cos_theta
-    b = scale * sin_theta
-    c = -scale * sin_theta
-    d = scale * cos_theta
-    center_x = media_box[0] + page_width / 2.0
-    center_y = media_box[1] + page_height / 2.0
-    translate_x = center_x - (a * center_x + c * center_y)
-    translate_y = center_y - (b * center_x + d * center_y)
-
-    prefix = pdf.make_stream(
-        (
-            "q\n"
-            f"{a:.12f} {b:.12f} "
-            f"{c:.12f} {d:.12f} "
-            f"{translate_x:.12f} {translate_y:.12f} cm\n"
-        ).encode("ascii")
-    )
-    suffix = pdf.make_stream(b"\nQ\n")
-
-    contents = page.obj.get("/Contents")
-    if isinstance(contents, pikepdf.Array):
-        wrapped_contents = pikepdf.Array([prefix, *contents, suffix])
-    else:
-        wrapped_contents = pikepdf.Array([prefix, contents, suffix])
-    page.obj[pikepdf.Name.Contents] = wrapped_contents
-
-
-def _normalize_text_page_skew(pdf_path: Path) -> list[tuple[int, float]]:
-    """Deskew text-only pages whose text matrices are consistently slanted."""
-    try:
-        import pikepdf
-    except ImportError:
-        return []
-
-    normalized: list[tuple[int, float]] = []
-    output_tmp = pdf_path.with_name(f"{pdf_path.stem}_deskew.pdf")
-
     with pikepdf.open(pdf_path) as pdf:
-        changed = False
-        for page_index, page in enumerate(pdf.pages):
-            rotate = int(page.obj.get("/Rotate", 0) or 0) % 360
-            if rotate != 0:
-                continue
-            annots = page.obj.get("/Annots")
-            if annots is not None and len(annots) > 0:
-                continue
-            if not _page_has_text(page) or _page_has_images(page):
-                continue
-
-            skew_angle = _detect_consistent_text_skew(page)
-            if skew_angle is None:
-                continue
-
-            _apply_page_content_transform(
-                pdf,
-                page,
-                angle_degrees=-skew_angle,
+        names = []
+        for page in pdf.pages:
+            xobjects = page.resources.get("/XObject")
+            names.append(
+                frozenset(
+                    str(name)
+                    for name in xobjects.keys()
+                    if str(name).startswith("/OCR-")
+                )
+                if xobjects is not None
+                else frozenset()
             )
-            normalized.append((page_index + 1, skew_angle))
+        return names
+
+
+def _strip_invisible_text_from_form(form: "pikepdf.Stream") -> bool:
+    """Remove invisible text objects from a Form XObject."""
+    import pikepdf
+
+    try:
+        instructions = list(pikepdf.parse_content_stream(form))
+    except (pikepdf.PdfError, TypeError, ValueError) as exc:
+        raise OCRError("Could not remove the existing OCR text layer") from exc
+
+    output = []
+    text_object = []
+    text_show_modes: list[tuple[int, int]] = []
+    in_text_object = False
+    render_mode = 0
+    render_mode_stack: list[int] = []
+    changed = False
+    text_show_operators = frozenset({"Tj", "TJ", "'", '"'})
+
+    for instruction in instructions:
+        operands, operator = instruction
+        operator_name = str(operator)
+
+        if operator_name == "Tr":
+            try:
+                render_mode = int(operands[0])
+            except (IndexError, TypeError, ValueError) as exc:
+                raise OCRError("Could not remove the existing OCR text layer") from exc
+        elif operator_name == "q":
+            render_mode_stack.append(render_mode)
+        elif operator_name == "Q" and render_mode_stack:
+            render_mode = render_mode_stack.pop()
+
+        if not in_text_object:
+            if operator_name == "BT":
+                in_text_object = True
+                text_object.append(instruction)
+                text_show_modes.clear()
+            else:
+                output.append(instruction)
+            continue
+
+        text_object.append(instruction)
+        if operator_name in text_show_operators:
+            text_show_modes.append((len(text_object) - 1, render_mode))
+        if operator_name != "ET":
+            continue
+
+        in_text_object = False
+        if text_show_modes and all(mode == 3 for _, mode in text_show_modes):
+            for index, _mode in text_show_modes:
+                show_operands, show_operator = text_object[index]
+                show_operands = list(show_operands)
+                show_name = str(show_operator)
+                try:
+                    if show_name == "TJ":
+                        show_operands[0] = pikepdf.Array(
+                            pikepdf.String("")
+                            if isinstance(value, pikepdf.String)
+                            else value
+                            for value in show_operands[0]
+                        )
+                    else:
+                        show_operands[-1] = pikepdf.String("")
+                except (IndexError, TypeError, ValueError) as exc:
+                    raise OCRError(
+                        "Could not remove the existing OCR text layer"
+                    ) from exc
+                text_object[index] = (show_operands, show_operator)
+            changed = True
+        output.extend(text_object)
+        text_object.clear()
+        text_show_modes.clear()
+
+    if text_object:
+        output.extend(text_object)
+
+    if changed:
+        form.write(pikepdf.unparse_content_stream(output))
+    return changed
+
+
+def _finalize_ocr_output(
+    pdf_path: Path,
+    languages: list[str],
+    existing_ocr_form_names: list[frozenset[str]],
+    *,
+    strip_existing_ocr_text: bool = False,
+) -> None:
+    """Set OCR metadata and finalize OCR Form XObjects."""
+    import pikepdf
+
+    changed = False
+    with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+        if "/Lang" not in pdf.Root:
+            language = _PADDLE_LANGUAGE_TAGS.get(languages[0], languages[0])
+            pdf.Root[pikepdf.Name.Lang] = pikepdf.String(language)
             changed = True
 
-        if not changed:
-            return []
+        for page_index, page in enumerate(pdf.pages):
+            if page_index >= len(existing_ocr_form_names):
+                continue
 
-        pdf.save(output_tmp)
+            xobjects = page.resources.get("/XObject")
+            if xobjects is None:
+                continue
 
-    output_tmp.replace(pdf_path)
+            for name, xobject in xobjects.items():
+                if not str(name).startswith("/OCR-"):
+                    continue
+                is_existing = str(name) in existing_ocr_form_names[page_index]
+                if (
+                    strip_existing_ocr_text
+                    and is_existing
+                    and xobject.get("/Subtype") == pikepdf.Name.Form
+                ):
+                    changed = _strip_invisible_text_from_form(xobject) or changed
 
-    logger.info(
-        "Deskewed OCR-skipped text page(s): %s",
-        ", ".join(f"{page_no} ({angle:.2f}deg)" for page_no, angle in normalized),
-    )
-    return normalized
+                if is_existing:
+                    continue
+                if xobject.get("/Subtype") != pikepdf.Name.Form:
+                    continue
+                rotation = _effective_page_rotate(page)
+                if rotation not in {90, 270}:
+                    continue
+
+                box = xobject.get("/BBox")
+                if box is None or len(box) != 4:
+                    continue
+                media_box = [float(value) for value in page.MediaBox]
+                width = media_box[2] - media_box[0]
+                height = media_box[3] - media_box[1]
+                values = [float(value) for value in box]
+                box_width = values[2] - values[0]
+                box_height = values[3] - values[1]
+                if abs(box_width - width) > 0.01 or abs(box_height - height) > 0.01:
+                    continue
+
+                xobject[pikepdf.Name.BBox] = pikepdf.Array([0, 0, height, width])
+                changed = True
+
+        if changed:
+            pdf.save(pdf_path)
 
 
 def is_ocr_available() -> bool:
@@ -393,8 +342,9 @@ def needs_ocr(pdf: "pikepdf.Pdf", *, threshold: float = 0.5) -> bool:
     """Analyzes whether a PDF needs OCR.
 
     Public library helper; not called by the conversion pipeline itself
-    (OCR is opt-in via ``ocr_languages``/``--ocr``). Use it to decide
-    programmatically whether to enable OCR for a document.
+    (OCR is opt-in via an explicit model-directory pair and
+    ``ocr_languages``/``--ocr``). Use it to decide programmatically whether
+    to enable OCR for a document.
 
     Checks each page for the presence of images without recognizable text.
     A page is considered to need OCR if it contains images but has no
@@ -586,39 +536,31 @@ def apply_ocr(
     output_path: Path,
     languages: list[str] | None = None,
     *,
-    quality: OcrQuality = OcrQuality.DEFAULT,
-    fallback_quality: OcrQuality | None = DEFAULT_OCR_FALLBACK_QUALITY,
-    fallback_after_seconds: float | None = DEFAULT_OCR_FALLBACK_AFTER_SECONDS,
+    detection_model_dir: Path,
+    recognition_model_dir: Path,
     force: bool = False,
     deskew: bool = False,
     rotate_pages: bool = False,
 ) -> Path:
     """Performs OCR on a PDF.
 
-    Uses ocrmypdf for text recognition. Pages that already contain text
-    are skipped unless ``force=True``.
+    Uses PaddleOCR for recognition and OCRmyPDF for rasterization, text-layer
+    rendering, and PDF merging. Pages that already contain text are skipped
+    unless ``force=True``.
 
     Args:
         input_path: Path to the input PDF.
         output_path: Path for the OCR-processed PDF.
-        languages: List of Tesseract language codes (default: ``["eng"]``).
-            Example: ``["deu", "eng"]`` for German + English.
-        quality: OCR quality preset (default: OcrQuality.DEFAULT).
-        fallback_quality: Faster OCR quality to retry with if the initial OCR
-            run exceeds the fallback threshold. Use ``None`` to disable.
-        fallback_after_seconds: Per-page runtime budget for OCR fallback. The
-            retry triggers when the whole run takes longer than this value
-            multiplied by the page count, so large documents are not penalized
-            for their size. The per-page Tesseract timeout of the initial run
-            is capped to this value so fallback can happen promptly. Use
-            ``None`` to disable time-based retry.
+        languages: PaddleOCR 3.7 PP-OCRv6 language codes (default: ``["en"]``).
+            Example: ``["de", "en"]`` for German + English metadata.
+        detection_model_dir: Verified PP-OCRv6 Medium detection model directory.
+        recognition_model_dir: Verified PP-OCRv6 Medium recognition model directory.
         force: If True, use ocrmypdf's ``redo_ocr`` mode to remove the
             existing OCR layer and re-apply OCR. This cannot be combined
             with ``deskew`` (default: False).
-        deskew: If True, straighten skewed pages independently of the quality
-            preset (default: False).
+        deskew: If True, straighten skewed pages with PaddleOCR (default: False).
         rotate_pages: If True, normalize page orientation with the bundled
-            Paddle model independently of the quality preset (default: False).
+            Paddle model (default: False).
 
     Returns:
         Path to the OCR-processed PDF.
@@ -627,13 +569,26 @@ def apply_ocr(
         OCRError: If OCR is not available or fails.
     """
     if languages is None:
-        languages = ["eng"]
+        languages = ["en"]
     if force and deskew:
         raise OCRError("Deskew cannot be combined with forced OCR")
     if not HAS_OCR:
         raise OCRError(
             "OCR not available. Install the OCR dependency: pip install pdftopdfa[ocr]"
         )
+
+    from .ocr_paddle import validate_model_directories
+
+    try:
+        validate_ocr_languages(languages)
+    except ValueError as exc:
+        raise OCRError(str(exc)) from exc
+
+    detection_model_dir, recognition_model_dir = validate_model_directories(
+        detection_model_dir,
+        recognition_model_dir,
+    )
+
     if deskew and _pdf_has_annotations(input_path):
         logger.warning(
             "Deskew disabled because the PDF contains annotations whose geometry "
@@ -642,62 +597,46 @@ def apply_ocr(
         deskew = False
 
     logger.info(
-        "Starting OCR for %s (languages: %s, quality: %s, force: %s, "
-        "deskew: %s, rotate pages: %s)",
+        "Starting PaddleOCR for %s (languages: %s, force: %s, deskew: %s, "
+        "rotate pages: %s)",
         input_path,
         "+".join(languages),
-        quality.value,
         force,
         deskew,
         rotate_pages,
     )
 
-    fallback = _effective_fallback_quality(quality, fallback_quality)
-    per_page_limit = fallback_after_seconds if fallback is not None else None
-    # The threshold is a per-page budget: scale it by the page count so a
-    # large document that OCRs each page quickly does not trigger fallback.
-    total_limit: float | None = None
-    if per_page_limit is not None:
-        total_limit = per_page_limit * max(1, _count_pdf_pages(input_path))
-
     ocr_input_path = input_path
-    orientation_elapsed = 0.0
     orientation_temp: TemporaryDirectory[str] | None = None
+    existing_ocr_form_names: list[frozenset[str]] = []
 
-    def run_ocr_with_quality(
-        run_quality: OcrQuality,
-        *,
-        timeout_limit: float | None = None,
-    ) -> float:
-        ocr_kwargs = dict(OCR_SETTINGS[run_quality])
-        ocr_kwargs["deskew"] = deskew
-        _cap_tesseract_timeout(ocr_kwargs, timeout_limit)
-        plugins = _get_ocr_plugins(run_quality, rotate_pages=rotate_pages)
-
+    def run_ocr() -> None:
+        ocr_kwargs: dict[str, object] = {
+            "ocr_engine": "paddle",
+            "pdf_renderer": "fpdf2",
+            "rasterizer": "pypdfium",
+            "output_type": "pdf",
+            "oversample": 600,
+            "optimize": 0,
+            "jobs": 1,
+            "skip_text": True,
+            "deskew": deskew,
+            "rotate_pages": False,
+            "progress_bar": False,
+            "plugins": [_PADDLE_OCR_PLUGIN, _ROTATION_FIX_PLUGIN],
+            "paddle_detection_model_dir": detection_model_dir,
+            "paddle_recognition_model_dir": recognition_model_dir,
+        }
         if force:
             ocr_kwargs.pop("skip_text", None)
-            removed_options = _remove_redo_ocr_incompatible_options(ocr_kwargs)
-            if removed_options:
-                logger.info(
-                    "force=True disables redo_ocr-incompatible OCR options: %s",
-                    ", ".join(removed_options),
-                )
             ocr_kwargs["redo_ocr"] = True
 
-        if plugins:
-            ocr_kwargs["plugins"] = plugins
-
-        started = time.perf_counter()
-        with _temporary_tesseract_path():
-            ocrmypdf.ocr(
-                ocr_input_path,
-                output_path,
-                language=languages,
-                output_type="pdf",
-                rasterizer="pypdfium",
-                **ocr_kwargs,
-            )
-        return time.perf_counter() - started
+        ocrmypdf.ocr(
+            ocr_input_path,
+            output_path,
+            language=languages,
+            **ocr_kwargs,
+        )
 
     try:
         if rotate_pages:
@@ -709,34 +648,20 @@ def apply_ocr(
             )
             orientation_started = time.perf_counter()
             normalize_pdf_orientation(input_path, ocr_input_path)
-            orientation_elapsed = time.perf_counter() - orientation_started
             logger.info(
                 "Paddle orientation preflight completed in %.2fs",
-                orientation_elapsed,
+                time.perf_counter() - orientation_started,
             )
 
-        elapsed = orientation_elapsed + run_ocr_with_quality(
-            quality,
-            timeout_limit=per_page_limit,
+        existing_ocr_form_names = _ocr_form_names(ocr_input_path)
+        run_ocr()
+
+        _finalize_ocr_output(
+            output_path,
+            languages,
+            existing_ocr_form_names,
+            strip_existing_ocr_text=force,
         )
-
-        if fallback is not None and total_limit is not None and elapsed > total_limit:
-            logger.warning(
-                "Retrying OCR with fallback quality '%s' after '%s' took %.2fs "
-                "(limit: %.2fs)",
-                fallback.value,
-                quality.value,
-                elapsed,
-                total_limit,
-            )
-            try:
-                output_path.unlink()
-            except FileNotFoundError:
-                pass
-            run_ocr_with_quality(fallback)
-
-        if deskew and output_path.exists():
-            _normalize_text_page_skew(output_path)
         logger.info("OCR completed successfully: %s", output_path)
         return output_path
 
@@ -747,6 +672,12 @@ def apply_ocr(
         # PDF already has OCR text, just copy it
         logger.info("PDF already contains OCR text, skipping OCR")
         shutil.copy2(ocr_input_path, output_path)
+        _finalize_ocr_output(
+            output_path,
+            languages,
+            existing_ocr_form_names,
+            strip_existing_ocr_text=force,
+        )
         return output_path
 
     except MissingDependencyError as e:

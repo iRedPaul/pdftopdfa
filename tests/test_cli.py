@@ -24,6 +24,13 @@ from pdftopdfa.cli import (
 from pdftopdfa.converter import ConversionResult
 from pdftopdfa.verapdf import is_verapdf_available
 
+OCR_MODEL_ARGS = [
+    "--ocr-detection-model-dir",
+    "detection-model",
+    "--ocr-recognition-model-dir",
+    "recognition-model",
+]
+
 
 @pytest.fixture
 def runner() -> CliRunner:
@@ -453,7 +460,7 @@ class TestCliDirectory:
 
         result = runner.invoke(
             main,
-            [str(input_dir), "--deskew", "--rotate-pages"],
+            [str(input_dir), "--deskew", "--rotate-pages", *OCR_MODEL_ARGS],
         )
 
         assert result.exit_code == EXIT_SUCCESS
@@ -586,7 +593,7 @@ class TestCliOcr:
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """--ocr without --ocr-lang uses 'eng' as default language."""
+        """--ocr without --ocr-lang uses 'en' as default language."""
         import shutil
 
         mock_is_ocr_available.return_value = True
@@ -595,11 +602,20 @@ class TestCliOcr:
         )
         output_path = tmp_dir / "output.pdf"
 
-        result = runner.invoke(main, [str(sample_pdf), str(output_path), "--ocr"])
+        result = runner.invoke(
+            main,
+            [str(sample_pdf), str(output_path), "--ocr", *OCR_MODEL_ARGS],
+        )
 
         assert result.exit_code == EXIT_SUCCESS
         assert output_path.exists()
-        assert mock_apply_ocr.call_args[0][2] == ["eng"]
+        assert mock_apply_ocr.call_args[0][2] == ["en"]
+        assert mock_apply_ocr.call_args.kwargs["detection_model_dir"] == Path(
+            "detection-model"
+        )
+        assert mock_apply_ocr.call_args.kwargs["recognition_model_dir"] == Path(
+            "recognition-model"
+        )
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
@@ -611,7 +627,7 @@ class TestCliOcr:
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """--ocr --ocr-lang eng uses 'eng' as language."""
+        """--ocr --ocr-lang de uses 'de' as language."""
         import shutil
 
         mock_is_ocr_available.return_value = True
@@ -621,12 +637,20 @@ class TestCliOcr:
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
-            main, [str(sample_pdf), str(output_path), "--ocr", "--ocr-lang", "eng"]
+            main,
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--ocr",
+                "--ocr-lang",
+                "de",
+                *OCR_MODEL_ARGS,
+            ],
         )
 
         assert result.exit_code == EXIT_SUCCESS
         assert output_path.exists()
-        assert mock_apply_ocr.call_args[0][2] == ["eng"]
+        assert mock_apply_ocr.call_args[0][2] == ["de"]
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
@@ -638,7 +662,7 @@ class TestCliOcr:
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """--ocr --ocr-lang deu+eng uses multiple languages."""
+        """--ocr --ocr-lang de+en uses multiple languages."""
         import shutil
 
         mock_is_ocr_available.return_value = True
@@ -648,12 +672,20 @@ class TestCliOcr:
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
-            main, [str(sample_pdf), str(output_path), "--ocr", "--ocr-lang", "deu+eng"]
+            main,
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--ocr",
+                "--ocr-lang",
+                "de+en",
+                *OCR_MODEL_ARGS,
+            ],
         )
 
         assert result.exit_code == EXIT_SUCCESS
         assert output_path.exists()
-        assert mock_apply_ocr.call_args[0][2] == ["deu", "eng"]
+        assert mock_apply_ocr.call_args[0][2] == ["de", "en"]
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
@@ -678,45 +710,39 @@ class TestCliOcr:
         # Create test PDF
         (input_dir / "test.pdf").write_bytes(sample_pdf_bytes)
 
-        result = runner.invoke(main, [str(input_dir), "--ocr"])
+        result = runner.invoke(main, [str(input_dir), "--ocr", *OCR_MODEL_ARGS])
 
         assert result.exit_code == EXIT_SUCCESS
 
-    def test_cli_ocr_quality_option_in_help(self, runner: CliRunner) -> None:
-        """--ocr-quality option appears in help."""
+    def test_cli_help_shows_only_paddle_model_options(self, runner: CliRunner) -> None:
+        """Help exposes model paths and no removed preset/fallback controls."""
         result = runner.invoke(main, ["--help"])
 
         assert result.exit_code == 0
-        assert "--ocr-quality" in result.output
-        assert "--ocr-fallback-quality" in result.output
-        assert "--ocr-fallback-after" in result.output
+        assert "--ocr-detection-model-dir" in result.output
+        assert "--ocr-recognition-model-dir" in result.output
+        assert "--ocr-quality" not in result.output
+        assert "--ocr-fallback-quality" not in result.output
+        assert "--ocr-fallback-after" not in result.output
 
-    @patch("pdftopdfa.ocr.apply_ocr")
-    @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_cli_ocr_quality_default(
+    def test_cli_ocr_requires_model_pair(
         self,
-        mock_is_ocr_available,
-        mock_apply_ocr,
         runner: CliRunner,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """--ocr-quality defaults to 'default'."""
-        import shutil
-
-        mock_is_ocr_available.return_value = True
-        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
-            shutil.copy(inp, out) or out
-        )
+        """--ocr fails before conversion when the model pair is absent."""
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(main, [str(sample_pdf), str(output_path), "--ocr"])
 
-        assert result.exit_code == EXIT_SUCCESS
+        assert result.exit_code == 2
+        assert "OCR requires --ocr-detection-model-dir" in result.output
+        assert not output_path.exists()
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_cli_ocr_quality_fast(
+    def test_cli_model_pair_implies_ocr(
         self,
         mock_is_ocr_available,
         mock_apply_ocr,
@@ -724,7 +750,7 @@ class TestCliOcr:
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """--ocr-quality fast is accepted."""
+        """A complete model pair enables OCR without a separate flag."""
         import shutil
 
         mock_is_ocr_available.return_value = True
@@ -735,54 +761,59 @@ class TestCliOcr:
 
         result = runner.invoke(
             main,
-            [str(sample_pdf), str(output_path), "--ocr", "--ocr-quality", "fast"],
+            [str(sample_pdf), str(output_path), *OCR_MODEL_ARGS],
         )
 
         assert result.exit_code == EXIT_SUCCESS
+        assert mock_apply_ocr.call_args.args[2] == ["en"]
 
-    def test_cli_ocr_quality_best_is_rejected(
+    def test_cli_rejects_detection_model_without_recognition(
         self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
     ) -> None:
-        """The removed --ocr-quality best value is rejected."""
+        """One model directory is rejected before conversion."""
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
             main,
-            [str(sample_pdf), str(output_path), "--ocr", "--ocr-quality", "best"],
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--ocr-detection-model-dir",
+                "detection-model",
+            ],
         )
 
         assert result.exit_code == 2
+        assert "must be provided together" in result.output
 
-    def test_cli_ocr_quality_invalid(
+    def test_cli_rejects_recognition_model_without_detection(
         self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
     ) -> None:
-        """--ocr-quality with invalid value is rejected."""
+        """The inverse incomplete pair is rejected before conversion."""
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
             main,
-            [str(sample_pdf), str(output_path), "--ocr", "--ocr-quality", "ultra"],
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--ocr-recognition-model-dir",
+                "recognition-model",
+            ],
         )
 
-        assert result.exit_code == 2  # Click rejects invalid choice
+        assert result.exit_code == 2
+        assert "must be provided together" in result.output
 
-    @patch("pdftopdfa.ocr.apply_ocr")
-    @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_cli_ocr_fallback_quality_none(
+    @pytest.mark.parametrize("language", ["eng", "deu", "unknown"])
+    def test_cli_rejects_unsupported_language(
         self,
-        mock_is_ocr_available,
-        mock_apply_ocr,
+        language: str,
         runner: CliRunner,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """--ocr-fallback-quality none disables automatic OCR fallback."""
-        import shutil
-
-        mock_is_ocr_available.return_value = True
-        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
-            shutil.copy(inp, out) or out
-        )
+        """Legacy and unknown language codes are rejected without aliases."""
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
@@ -791,54 +822,14 @@ class TestCliOcr:
                 str(sample_pdf),
                 str(output_path),
                 "--ocr",
-                "--ocr-fallback-quality",
-                "none",
+                "--ocr-lang",
+                language,
+                *OCR_MODEL_ARGS,
             ],
         )
 
-        assert result.exit_code == EXIT_SUCCESS
-        assert mock_apply_ocr.call_args[1]["fallback_quality"] is None
-        assert mock_apply_ocr.call_args[1]["fallback_after_seconds"] == 60.0
-
-    @patch("pdftopdfa.ocr.apply_ocr")
-    @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_cli_ocr_fallback_quality_default_with_custom_threshold(
-        self,
-        mock_is_ocr_available,
-        mock_apply_ocr,
-        runner: CliRunner,
-        sample_pdf: Path,
-        tmp_dir: Path,
-    ) -> None:
-        """--ocr-fallback-quality default is passed through."""
-        import shutil
-
-        from pdftopdfa.ocr import OcrQuality
-
-        mock_is_ocr_available.return_value = True
-        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
-            shutil.copy(inp, out) or out
-        )
-        output_path = tmp_dir / "output.pdf"
-
-        result = runner.invoke(
-            main,
-            [
-                str(sample_pdf),
-                str(output_path),
-                "--ocr",
-                "--ocr-quality",
-                "default",
-                "--ocr-fallback-quality",
-                "default",
-                "--ocr-fallback-after",
-                "120",
-            ],
-        )
-
-        assert result.exit_code == EXIT_SUCCESS
-        assert mock_apply_ocr.call_args[1]["fallback_quality"] == OcrQuality.DEFAULT
-        assert mock_apply_ocr.call_args[1]["fallback_after_seconds"] == 120.0
+        assert result.exit_code == 2
+        assert "Unsupported PaddleOCR language code" in result.output
 
     @pytest.mark.parametrize(
         ("flag", "expected_kwarg"),
@@ -865,10 +856,13 @@ class TestCliOcr:
         )
         output_path = tmp_dir / f"{expected_kwarg}.pdf"
 
-        result = runner.invoke(main, [str(sample_pdf), str(output_path), flag])
+        result = runner.invoke(
+            main,
+            [str(sample_pdf), str(output_path), flag, *OCR_MODEL_ARGS],
+        )
 
         assert result.exit_code == EXIT_SUCCESS
-        assert mock_apply_ocr.call_args.args[2] == ["eng"]
+        assert mock_apply_ocr.call_args.args[2] == ["en"]
         assert mock_apply_ocr.call_args.kwargs[expected_kwarg] is True
 
     @patch("pdftopdfa.ocr.apply_ocr")
@@ -892,7 +886,13 @@ class TestCliOcr:
 
         result = runner.invoke(
             main,
-            [str(sample_pdf), str(output_path), "--deskew", "--rotate-pages"],
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--deskew",
+                "--rotate-pages",
+                *OCR_MODEL_ARGS,
+            ],
         )
 
         assert result.exit_code == EXIT_SUCCESS
@@ -907,7 +907,13 @@ class TestCliOcr:
 
         result = runner.invoke(
             main,
-            [str(sample_pdf), str(output_path), "--deskew", "--ocr-force"],
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--deskew",
+                "--ocr-force",
+                *OCR_MODEL_ARGS,
+            ],
         )
 
         assert result.exit_code == 2
@@ -932,7 +938,10 @@ class TestCliOcr:
         )
         output_path = tmp_dir / "output.pdf"
 
-        result = runner.invoke(main, [str(sample_pdf), str(output_path), "--ocr-force"])
+        result = runner.invoke(
+            main,
+            [str(sample_pdf), str(output_path), "--ocr-force", *OCR_MODEL_ARGS],
+        )
 
         assert result.exit_code == EXIT_SUCCESS
         assert output_path.exists()
@@ -960,31 +969,26 @@ class TestCliOcr:
 
         result = runner.invoke(
             main,
-            [str(sample_pdf), str(output_path), "--ocr-force", "--ocr-lang", "deu"],
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--ocr-force",
+                "--ocr-lang",
+                "de",
+                *OCR_MODEL_ARGS,
+            ],
         )
 
         assert result.exit_code == EXIT_SUCCESS
-        assert mock_apply_ocr.call_args[0][2] == ["deu"]
+        assert mock_apply_ocr.call_args[0][2] == ["de"]
 
-    @patch("pdftopdfa.ocr.apply_ocr")
-    @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_cli_ocr_force_with_quality(
+    def test_removed_quality_option_is_rejected(
         self,
-        mock_is_ocr_available,
-        mock_apply_ocr,
         runner: CliRunner,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """--ocr-force works with --ocr-quality."""
-        import shutil
-
-        from pdftopdfa.ocr import OcrQuality
-
-        mock_is_ocr_available.return_value = True
-        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
-            shutil.copy(inp, out) or out
-        )
+        """Removed quality controls are not accepted by Click."""
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
@@ -995,11 +999,12 @@ class TestCliOcr:
                 "--ocr-force",
                 "--ocr-quality",
                 "fast",
+                *OCR_MODEL_ARGS,
             ],
         )
 
-        assert result.exit_code == EXIT_SUCCESS
-        assert mock_apply_ocr.call_args[1]["quality"] == OcrQuality.FAST
+        assert result.exit_code == 2
+        assert "No such option '--ocr-quality'" in result.output
 
 
 class TestDirectoryValidationFailures:

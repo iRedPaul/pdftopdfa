@@ -21,6 +21,9 @@ from pdftopdfa.converter import (
 )
 from pdftopdfa.exceptions import OCRError
 
+_DETECTION_MODEL_DIR = Path("paddle-detection")
+_RECOGNITION_MODEL_DIR = Path("paddle-recognition")
+
 # -- Helpers --
 
 
@@ -563,7 +566,14 @@ class TestOcrAnnotationIntegration:
         mock_apply_ocr.side_effect = fake_apply_ocr
 
         output = tmp_dir / "output_pdfa.pdf"
-        result = convert_to_pdfa(original, output, level="2b", ocr_languages=["eng"])
+        result = convert_to_pdfa(
+            original,
+            output,
+            level="2b",
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        )
 
         assert result.success
         # Check annotations survived
@@ -594,6 +604,8 @@ class TestOcrAnnotationIntegration:
             original,
             tmp_dir / "deskew_annotations_pdfa.pdf",
             level="2b",
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_deskew=True,
         )
 
@@ -634,7 +646,14 @@ class TestOcrAnnotationIntegration:
 
         output = tmp_dir / "mismatch_output.pdf"
         with pytest.raises(OCRError, match="prevent annotation loss"):
-            convert_to_pdfa(original, output, level="2b", ocr_languages=["eng"])
+            convert_to_pdfa(
+                original,
+                output,
+                level="2b",
+                ocr_languages=["en"],
+                ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            )
 
         assert not output.exists()
 
@@ -662,7 +681,14 @@ class TestOcrAnnotationIntegration:
 
         output = tmp_dir / "plain_pdfa.pdf"
         with patch("pdftopdfa.converter._strip_annotations_for_ocr") as mock_strip:
-            convert_to_pdfa(original, output, level="2b", ocr_languages=["eng"])
+            convert_to_pdfa(
+                original,
+                output,
+                level="2b",
+                ocr_languages=["en"],
+                ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            )
             mock_strip.assert_not_called()
 
     @patch("pdftopdfa.ocr.apply_ocr")
@@ -686,7 +712,14 @@ class TestOcrAnnotationIntegration:
         mock_apply_ocr.side_effect = fake_apply_ocr
 
         output = tmp_dir / "warn_pdfa.pdf"
-        result = convert_to_pdfa(original, output, level="2b", ocr_languages=["eng"])
+        result = convert_to_pdfa(
+            original,
+            output,
+            level="2b",
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        )
 
         matching = [
             w for w in result.warnings if "annotation(s) preserved through OCR" in w
@@ -714,7 +747,14 @@ class TestOcrAnnotationIntegration:
         mock_apply_ocr.side_effect = fake_apply_ocr
 
         output = tmp_dir / "cleanup_pdfa.pdf"
-        convert_to_pdfa(original, output, level="2b", ocr_languages=["eng"])
+        convert_to_pdfa(
+            original,
+            output,
+            level="2b",
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        )
 
         # Check no temp files remain (hidden files starting with .)
         temp_files = [

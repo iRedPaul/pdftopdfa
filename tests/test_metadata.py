@@ -574,7 +574,7 @@ class TestSyncMetadata:
 
         with Pdf.open(pdf_with_metadata) as pdf:
             pdf.docinfo["/Creator"] = (
-                "OCRmyPDF 17.3.0 / OCRmyPDF fpdf2 + Tesseract OCR 5.5.0.20241111"
+                "OCRmyPDF 17.8.1 / PaddleOCR 3.7.0 (PP-OCRv6 Medium)"
             )
             pdf.docinfo["/Producer"] = "pikepdf 10.3.0"
 
@@ -606,7 +606,7 @@ class TestSyncMetadata:
 
         with Pdf.open(pdf_with_metadata) as pdf:
             pdf.docinfo["/Creator"] = (
-                "OCRmyPDF 17.3.0 / OCRmyPDF fpdf2 + Tesseract OCR 5.5.0.20241111"
+                "OCRmyPDF 17.8.1 / PaddleOCR 3.7.0 (PP-OCRv6 Medium)"
             )
             pdf.docinfo["/Producer"] = "pikepdf 10.3.0"
 
@@ -642,7 +642,7 @@ class TestSyncMetadata:
 
         pdf = open_pdf(BytesIO(sample_pdf_bytes))
         pdf.docinfo["/Author"] = "Unknown"
-        pdf.docinfo["/Creator"] = "OCRmyPDF 17.3.0 / Tesseract OCR"
+        pdf.docinfo["/Creator"] = "OCRmyPDF 17.8.1 / PaddleOCR 3.7.0"
         pdf.docinfo["/Producer"] = "OCRmyPDF"
         source_info = {
             "title": None,

@@ -2,17 +2,17 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-"""Verify bundled orientation artifacts in built distributions."""
+"""Verify model contents and OCR configuration in built distributions."""
 
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
-import io
 import json
 import tarfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 MODEL_ROOT = "pdftopdfa/resources/models/PP-LCNet_x1_0_doc_ori"
 REQUIRED_FILES = {
@@ -22,9 +22,111 @@ REQUIRED_FILES = {
     "inference.yml",
     "manifest.json",
 }
+EXTERNAL_OCR_MODEL_MARKERS = {
+    "pp-ocrv6_medium_det",
+    "pp-ocrv6_medium_rec",
+}
+EXTERNAL_OCR_MODEL_HASHES = {
+    "eb13b44b25bb36f89528b68720af8a61d9cf381176107f465db1757b65d086e1",
+    "7298d5ead546584af2504d03355f881ac7a7bc0eb1e282d3e159277c1d0af871",
+    "9c09abf0957f7968c7586464b7397b84ad2387a0497a351af40e9acc71b673ba",
+    "991b700facf5b50a7de193468207d5f4255b538dde0d312ae3b7c7a9b6873129",
+}
+ALLOWED_TESSERACT_IDENTIFIERS = {
+    "_TESSERACT_PLUGIN",
+    "_TesseractCompatibilityOptions",
+}
+
+
+def _is_package_python_source(name: str) -> bool:
+    path = PurePosixPath(name)
+    return path.suffix == ".py" and "pdftopdfa" in path.parts
+
+
+def _verify_no_active_tesseract(name: str, content: bytes) -> None:
+    try:
+        tree = ast.parse(content, filename=name)
+    except (SyntaxError, ValueError) as exc:
+        raise RuntimeError(f"Could not inspect package Python source: {name}") from exc
+
+    allowed_literals = {
+        id(key)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        for key, value in zip(node.keys, node.values, strict=True)
+        if (
+            isinstance(key, ast.Constant)
+            and key.value == "tesseract"
+            and isinstance(value, ast.Name)
+            and value.id == "_TesseractCompatibilityOptions"
+        )
+    }
+
+    for node in ast.walk(tree):
+        identifiers: list[str] = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            identifiers.append(node.name)
+        elif isinstance(node, ast.Name):
+            identifiers.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            identifiers.append(node.attr)
+        elif isinstance(node, ast.keyword) and node.arg is not None:
+            identifiers.append(node.arg)
+        elif isinstance(node, ast.Import):
+            identifiers.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module is not None:
+                identifiers.append(node.module)
+            identifiers.extend(alias.name for alias in node.names)
+
+        forbidden_identifier = next(
+            (
+                identifier
+                for identifier in identifiers
+                if "tesseract" in identifier.casefold()
+                and identifier not in ALLOWED_TESSERACT_IDENTIFIERS
+            ),
+            None,
+        )
+        if forbidden_identifier is not None:
+            raise RuntimeError(
+                "Active Tesseract configuration must not be distributed: "
+                f"{name}:{node.lineno} ({forbidden_identifier})"
+            )
+
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        value = node.value.casefold()
+        if (
+            value.startswith("tesseract_") or value in {"tesseract", "tesseract.exe"}
+        ) and id(node) not in allowed_literals:
+            raise RuntimeError(
+                "Active Tesseract configuration must not be distributed: "
+                f"{name}:{node.lineno} ({node.value})"
+            )
 
 
 def _verify_files(names: list[str], read_file) -> None:
+    external_model_entries = [
+        name
+        for name in names
+        if any(marker in name.lower() for marker in EXTERNAL_OCR_MODEL_MARKERS)
+    ]
+    if external_model_entries:
+        raise RuntimeError(
+            "External PP-OCRv6 model files must not be distributed: "
+            f"{sorted(external_model_entries)}"
+        )
+
+    for name in names:
+        content = read_file(name)
+        if hashlib.sha256(content).hexdigest() in EXTERNAL_OCR_MODEL_HASHES:
+            raise RuntimeError(
+                f"External PP-OCRv6 model artifact must not be distributed: {name}"
+            )
+        if _is_package_python_source(name):
+            _verify_no_active_tesseract(name, content)
+
     roots = {
         name[: -len("/manifest.json")]
         for name in names
@@ -47,18 +149,19 @@ def _verify_files(names: list[str], read_file) -> None:
 
 def _verify_wheel(path: Path) -> None:
     with zipfile.ZipFile(path) as archive:
-        _verify_files(archive.namelist(), archive.read)
+        names = [info.filename for info in archive.infolist() if not info.is_dir()]
+        _verify_files(names, archive.read)
 
 
 def _verify_sdist(path: Path) -> None:
     with tarfile.open(path, "r:gz") as archive:
-        names = archive.getnames()
+        names = [member.name for member in archive.getmembers() if member.isfile()]
 
         def read_file(name: str) -> bytes:
             member = archive.extractfile(name)
             if member is None:
                 raise RuntimeError(f"Could not read {name}")
-            return io.BytesIO(member.read()).getvalue()
+            return member.read()
 
         _verify_files(names, read_file)
 

@@ -30,6 +30,9 @@ from pdftopdfa.converter import (
 from pdftopdfa.exceptions import ConversionError, OCRError, VeraPDFError
 from pdftopdfa.verapdf import VeraPDFResult
 
+_DETECTION_MODEL_DIR = Path("paddle-detection")
+_RECOGNITION_MODEL_DIR = Path("paddle-recognition")
+
 
 def _write_signed_pdf(source_path: Path, signed_path: Path) -> None:
     """Write a copy of source_path with a live digital signature field."""
@@ -301,6 +304,8 @@ class TestConvertToPdfa:
                 sample_pdf,
                 tmp_dir / "processed.pdf",
                 pdfa=False,
+                ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
                 ocr_deskew=True,
             )
 
@@ -334,13 +339,23 @@ class TestConvertToPdfa:
             sample_pdf,
             output_path,
             pdfa=False,
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_force=True,
         )
 
         assert result.success is True
         assert result.skipped is False
         assert output_path.read_bytes() == processed_bytes
-        assert mock_apply_ocr.call_args.args[2] == ["eng"]
+        assert mock_apply_ocr.call_args.args[2] == ["en"]
+        assert (
+            mock_apply_ocr.call_args.kwargs["detection_model_dir"]
+            == _DETECTION_MODEL_DIR
+        )
+        assert (
+            mock_apply_ocr.call_args.kwargs["recognition_model_dir"]
+            == _RECOGNITION_MODEL_DIR
+        )
         assert mock_apply_ocr.call_args.kwargs["force"] is True
         mock_is_ocr_available.assert_called_once()
 
@@ -384,6 +399,8 @@ class TestConvertToPdfa:
             sample_pdf,
             output_path,
             pdfa=False,
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_rotate_pages=True,
         )
 
@@ -391,7 +408,7 @@ class TestConvertToPdfa:
         assert result.skipped is False
         assert result.level is None
         assert output_path.read_bytes() == processed_bytes
-        assert mock_apply_ocr.call_args.args[2] == ["eng"]
+        assert mock_apply_ocr.call_args.args[2] == ["en"]
         assert mock_apply_ocr.call_args.kwargs["rotate_pages"] is True
         mock_is_ocr_available.assert_called_once()
         for pdfa_stage in (
@@ -503,18 +520,23 @@ class TestConvertToPdfa:
         assert any("Validation: Rule 6.1.2 failed" in w for w in result.warnings)
 
     @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_convert_with_ocr_language_adds_warning_when_unavailable(
+    def test_convert_with_ocr_language_fails_when_unavailable(
         self, mock_is_ocr_available: MagicMock, sample_pdf: Path, tmp_dir: Path
     ) -> None:
-        """Warning when OCR requested but not available."""
+        """Explicit OCR requests fail closed when the dependency is unavailable."""
         mock_is_ocr_available.return_value = False
         output_path = tmp_dir / "output.pdf"
 
-        result = convert_to_pdfa(sample_pdf, output_path, ocr_languages=["deu"])
+        with pytest.raises(OCRError, match="OCR not available"):
+            convert_to_pdfa(
+                sample_pdf,
+                output_path,
+                ocr_languages=["de"],
+                ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            )
 
-        assert result.success is True
-        has_ocr_warning = any("OCR not available" in w for w in result.warnings)
-        assert has_ocr_warning
+        assert not output_path.exists()
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
@@ -542,13 +564,21 @@ class TestConvertToPdfa:
 
         output_path = tmp_dir / "output.pdf"
 
-        result = convert_to_pdfa(sample_pdf, output_path, ocr_languages=["eng"])
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        )
 
         assert result.success is True
         # Check if apply_ocr was called with the correct languages
         mock_apply_ocr.assert_called_once()
         call_args = mock_apply_ocr.call_args
-        assert call_args[0][2] == ["eng"]  # Languages parameter
+        assert call_args[0][2] == ["en"]  # Languages parameter
+        assert call_args.kwargs["detection_model_dir"] == _DETECTION_MODEL_DIR
+        assert call_args.kwargs["recognition_model_dir"] == _RECOGNITION_MODEL_DIR
 
     @pytest.mark.parametrize(
         ("api_option", "apply_option"),
@@ -577,11 +607,13 @@ class TestConvertToPdfa:
         result = convert_to_pdfa(
             sample_pdf,
             output_path,
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             **{api_option: True},
         )
 
         assert result.success is True
-        assert mock_apply_ocr.call_args.args[2] == ["eng"]
+        assert mock_apply_ocr.call_args.args[2] == ["en"]
         assert mock_apply_ocr.call_args.kwargs[apply_option] is True
 
     def test_convert_rejects_deskew_with_forced_ocr(
@@ -594,43 +626,40 @@ class TestConvertToPdfa:
             convert_to_pdfa(
                 sample_pdf,
                 output_path,
+                ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
                 ocr_deskew=True,
                 ocr_force=True,
             )
 
-    @patch("pdftopdfa.ocr.apply_ocr")
-    @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_convert_with_ocr_fallback_quality_parameter(
-        self,
-        mock_is_ocr_available: MagicMock,
-        mock_apply_ocr: MagicMock,
-        sample_pdf: Path,
-        tmp_dir: Path,
+    @pytest.mark.parametrize("api_name", ["single", "batch", "directory"])
+    def test_ocr_model_pair_is_required_before_processing(
+        self, api_name: str, tmp_dir: Path
     ) -> None:
-        """ocr_fallback_quality is passed through to apply_ocr."""
-        import shutil
-
-        from pdftopdfa.ocr import OcrQuality
-
-        mock_is_ocr_available.return_value = True
-        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
-            shutil.copy(inp, out) or out
-        )
-
+        """Every public converter rejects a partial model pair before I/O."""
+        input_path = tmp_dir / "missing.pdf"
         output_path = tmp_dir / "output.pdf"
 
-        result = convert_to_pdfa(
-            sample_pdf,
-            output_path,
-            ocr_languages=["eng"],
-            ocr_fallback_quality=OcrQuality.FAST,
-            ocr_fallback_after_seconds=45.0,
-        )
+        with pytest.raises(ValueError, match="must be provided together"):
+            if api_name == "single":
+                convert_to_pdfa(
+                    input_path,
+                    output_path,
+                    ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                )
+            elif api_name == "batch":
+                convert_files(
+                    [(input_path, output_path)],
+                    ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                )
+            else:
+                convert_directory(
+                    input_path,
+                    ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                    show_progress=False,
+                )
 
-        assert result.success is True
-        mock_apply_ocr.assert_called_once()
-        assert mock_apply_ocr.call_args[1]["fallback_quality"] == OcrQuality.FAST
-        assert mock_apply_ocr.call_args[1]["fallback_after_seconds"] == 45.0
+        assert not output_path.exists()
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
@@ -679,7 +708,13 @@ class TestConvertToPdfa:
             "pdftopdfa.converter.tempfile.mkstemp", side_effect=tracking_mkstemp
         ):
             with pytest.raises(OCRError):
-                convert_to_pdfa(annotated_pdf, output_path, ocr_languages=["eng"])
+                convert_to_pdfa(
+                    annotated_pdf,
+                    output_path,
+                    ocr_languages=["en"],
+                    ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                    ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+                )
 
         # OCR output temp + annotation-stripped copy were created ...
         assert len(created) >= 2
@@ -711,11 +746,17 @@ class TestConvertToPdfa:
 
         output_path = tmp_dir / "output.pdf"
 
-        result = convert_to_pdfa(sample_pdf, output_path, ocr_languages=["deu", "eng"])
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            ocr_languages=["de", "en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        )
 
         assert result.success is True
         has_ocr_done_warning = any(
-            "OCR performed" in w and "deu+eng" in w for w in result.warnings
+            "OCR performed" in w and "de+en" in w for w in result.warnings
         )
         assert has_ocr_done_warning
 
@@ -749,7 +790,9 @@ class TestConvertToPdfa:
             pdf_with_metadata,
             output_path,
             level="2b",
-            ocr_languages=["eng"],
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
         )
 
         assert result.success is True
@@ -784,7 +827,13 @@ class TestConvertToPdfa:
 
         output_path = tmp_dir / "output.pdf"
 
-        result = convert_to_pdfa(sample_pdf, output_path, ocr_languages=["deu"])
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            ocr_languages=["de"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        )
 
         assert result.success is True
         mock_apply_ocr.assert_called_once()
@@ -814,11 +863,17 @@ class TestConvertToPdfa:
 
         output_path = tmp_dir / "output.pdf"
 
-        result = convert_to_pdfa(sample_pdf, output_path, ocr_force=True)
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            ocr_force=True,
+        )
 
         assert result.success is True
         mock_apply_ocr.assert_called_once()
-        assert mock_apply_ocr.call_args.args[2] == ["eng"]
+        assert mock_apply_ocr.call_args.args[2] == ["en"]
         call_kwargs = mock_apply_ocr.call_args[1]
         assert call_kwargs["force"] is True
 
@@ -850,7 +905,9 @@ class TestConvertToPdfa:
             sample_pdf,
             output_path,
             level="2b",
-            ocr_languages=["eng"],
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_force=True,
         )
 
@@ -890,6 +947,8 @@ class TestConvertToPdfa:
             sample_pdf,
             output_path,
             level="2b",
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             **{processing_option: True},
         )
 
@@ -927,7 +986,9 @@ class TestConvertToPdfa:
             output_path,
             level="2b",
             skip_any_pdfa=True,
-            ocr_languages=["eng"],
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_force=True,
         )
 
@@ -962,7 +1023,12 @@ class TestConvertToPdfa:
         output_path = tmp_dir / "output.pdf"
 
         result = convert_to_pdfa(
-            sample_pdf, output_path, ocr_languages=["eng"], ocr_force=False
+            sample_pdf,
+            output_path,
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            ocr_force=False,
         )
 
         assert result.success is True
@@ -986,7 +1052,9 @@ class TestConvertToPdfa:
         result = convert_to_pdfa(
             signed_input,
             output_path,
-            ocr_languages=["eng"],
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_force=True,
         )
 
@@ -1063,6 +1131,8 @@ class TestConvertToPdfa:
             signed_input,
             output_path,
             pdfa=False,
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_rotate_pages=True,
         )
 
@@ -1096,6 +1166,8 @@ class TestConvertToPdfa:
             signed_input,
             output_path,
             pdfa=False,
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_rotate_pages=True,
             allow_signature_invalidation=True,
         )
@@ -1145,7 +1217,9 @@ class TestConvertToPdfa:
         result = convert_to_pdfa(
             signed_input,
             output_path,
-            ocr_languages=["eng"],
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             allow_signature_invalidation=True,
         )
 
@@ -1921,14 +1995,16 @@ class TestConvertDirectory:
         (input_dir / "test.pdf").write_bytes(sample_pdf_bytes)
 
         results = convert_directory(
-            input_dir, show_progress=False, ocr_languages=["deu"]
+            input_dir,
+            show_progress=False,
+            ocr_languages=["de"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
         )
 
         assert len(results) == 1
-        assert results[0].success is True
-        # Since OCR is not available, warning should be present
-        has_ocr_warning = any("OCR not available" in w for w in results[0].warnings)
-        assert has_ocr_warning
+        assert results[0].success is False
+        assert "OCR not available" in (results[0].error or "")
 
     @patch("pdftopdfa.converter.convert_files")
     def test_convert_directory_passes_skip_any_pdfa(
@@ -1957,11 +2033,15 @@ class TestConvertDirectory:
         convert_directory(
             input_dir,
             show_progress=False,
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_deskew=True,
             ocr_rotate_pages=True,
         )
 
         kwargs = mock_convert_files.call_args.kwargs
+        assert kwargs["ocr_detection_model_dir"] == _DETECTION_MODEL_DIR
+        assert kwargs["ocr_recognition_model_dir"] == _RECOGNITION_MODEL_DIR
         assert kwargs["ocr_deskew"] is True
         assert kwargs["ocr_rotate_pages"] is True
 
@@ -2127,11 +2207,15 @@ class TestConvertFiles:
 
         convert_files(
             [(in_path, out_path)],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_deskew=True,
             ocr_rotate_pages=True,
         )
 
         kwargs = mock_convert_to_pdfa.call_args.kwargs
+        assert kwargs["ocr_detection_model_dir"] == _DETECTION_MODEL_DIR
+        assert kwargs["ocr_recognition_model_dir"] == _RECOGNITION_MODEL_DIR
         assert kwargs["ocr_deskew"] is True
         assert kwargs["ocr_rotate_pages"] is True
 

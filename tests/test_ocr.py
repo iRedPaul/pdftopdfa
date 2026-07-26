@@ -2,10 +2,8 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-"""Unit tests for ocr.py."""
+"""Unit tests for the public OCR integration."""
 
-import logging
-import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,21 +12,20 @@ from unittest.mock import MagicMock, patch
 import pikepdf
 import pytest
 from conftest import new_pdf
-from pikepdf import Array, Dictionary, Name, Pdf
+from pikepdf import Dictionary, Name, Pdf
 from PIL import Image
 
 from pdftopdfa.exceptions import OCRError
 from pdftopdfa.ocr import (
-    _ROTATION_FIX_QUALITIES,
-    OCR_SETTINGS,
-    OcrQuality,
-    _detect_consistent_text_skew,
-    _normalize_text_page_skew,
+    _finalize_ocr_output,
+    _ocr_form_names,
     _page_has_images,
     _page_has_text,
+    _strip_invisible_text_from_form,
     apply_ocr,
     is_ocr_available,
     needs_ocr,
+    validate_ocr_languages,
 )
 from pdftopdfa.ocr_rotation_fix import (
     _should_swap_visible_page_axis,
@@ -38,10 +35,10 @@ from pdftopdfa.ocr_rotation_fix import (
 
 @pytest.fixture(autouse=True)
 def _mock_paddle_orientation():
-    """Keep OCR unit tests independent from the real orientation model."""
+    """Keep OCR unit tests independent from the orientation model."""
     with patch("pdftopdfa.ocr.normalize_pdf_orientation") as mock_normalize:
 
-        def copy_input(input_path: Path, output_path: Path):
+        def copy_input(input_path: Path, output_path: Path) -> list[object]:
             shutil.copy2(input_path, output_path)
             return []
 
@@ -49,1384 +46,591 @@ def _mock_paddle_orientation():
         yield mock_normalize
 
 
-class TestIsOcrAvailable:
-    """Tests for is_ocr_available."""
+@pytest.fixture
+def model_dirs(tmp_dir: Path) -> tuple[Path, Path]:
+    """Return explicit model paths for integration-boundary tests."""
+    return tmp_dir / "detection", tmp_dir / "recognition"
+
+
+@pytest.fixture
+def validate_models(model_dirs: tuple[Path, Path]):
+    """Bypass artifact hashing in tests that exercise only OCRmyPDF options."""
+    with patch(
+        "pdftopdfa.ocr_paddle.validate_model_directories",
+        return_value=model_dirs,
+    ) as mock_validate:
+        yield mock_validate
+
+
+def _copy_ocr_input(input_path: Path, output_path: Path, **_kwargs: object) -> None:
+    """Model OCRmyPDF's output contract in option-boundary tests."""
+    shutil.copy2(input_path, output_path)
+
+
+class TestOcrDetection:
+    """Tests for public OCR availability and page analysis helpers."""
 
     def test_is_ocr_available_returns_bool(self) -> None:
-        """Checks that is_ocr_available returns a boolean value."""
-        result = is_ocr_available()
+        assert isinstance(is_ocr_available(), bool)
 
-        assert isinstance(result, bool)
+    def test_empty_pdf_does_not_need_ocr(self, empty_pdf_obj: Pdf) -> None:
+        assert needs_ocr(empty_pdf_obj) is False
 
+    def test_text_pdf_does_not_need_ocr(self, pdf_with_text_obj: Pdf) -> None:
+        assert needs_ocr(pdf_with_text_obj) is False
 
-class TestNeedsOcr:
-    """Tests for needs_ocr."""
+    def test_image_pdf_needs_ocr(self, pdf_with_image_obj: Pdf) -> None:
+        assert needs_ocr(pdf_with_image_obj) is True
 
-    def test_empty_pdf_returns_false(self, empty_pdf_obj: Pdf) -> None:
-        """Empty PDF (without pages) doesn't need OCR."""
-        result = needs_ocr(empty_pdf_obj)
-
-        assert result is False
-
-    def test_pdf_with_text_returns_false(self, pdf_with_text_obj: Pdf) -> None:
-        """PDF with text doesn't need OCR."""
-        result = needs_ocr(pdf_with_text_obj)
-
-        assert result is False
-
-    def test_pdf_with_image_only_returns_true(self, pdf_with_image_obj: Pdf) -> None:
-        """PDF with image only (without text) needs OCR."""
-        result = needs_ocr(pdf_with_image_obj)
-
-        assert result is True
-
-    def test_threshold_parameter_low(self, pdf_with_image_obj: Pdf) -> None:
-        """Low threshold (0.0) detects OCR need."""
-        result = needs_ocr(pdf_with_image_obj, threshold=0.0)
-
-        assert result is True
-
-    def test_threshold_parameter_high(self, pdf_with_image_obj: Pdf) -> None:
-        """High threshold (1.0) with one page: 100% required."""
-        # With one page with image without text: ratio = 1.0, so >= 1.0
-        result = needs_ocr(pdf_with_image_obj, threshold=1.0)
-
-        assert result is True
-
-    def test_threshold_above_ratio_returns_false(self, tmp_dir: Path) -> None:
-        """Threshold above actual ratio returns False."""
-        # Create PDF with 2 pages: one with text, one with image
+    def test_threshold_applies_to_page_ratio(self, tmp_dir: Path) -> None:
         pdf = new_pdf()
-
-        # Page 1: With text
-        font_dict = Dictionary(
-            Type=Name.Font,
-            Subtype=Name.Type1,
-            BaseFont=Name("/Helvetica"),
-        )
-        page1_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(Font=Dictionary(F1=font_dict)),
-        )
-        content1 = pdf.make_stream(b"BT /F1 12 Tf 100 700 Td (Text) Tj ET")
-        page1_dict[Name.Contents] = content1
-        pdf.pages.append(pikepdf.Page(page1_dict))
-
-        # Page 2: With image without text
-        image_data = b"\x80"
-        image_stream = pdf.make_stream(image_data)
-        image_stream[Name.Type] = Name.XObject
-        image_stream[Name.Subtype] = Name.Image
-        image_stream[Name.Width] = 1
-        image_stream[Name.Height] = 1
-        image_stream[Name.ColorSpace] = Name.DeviceGray
-        image_stream[Name.BitsPerComponent] = 8
-
-        page2_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(XObject=Dictionary(Im0=image_stream)),
-        )
-        content2 = pdf.make_stream(b"q 100 0 0 100 100 600 cm /Im0 Do Q")
-        page2_dict[Name.Contents] = content2
-        pdf.pages.append(pikepdf.Page(page2_dict))
-
-        # ratio = 1/2 = 0.5, threshold = 0.6 -> False
-        result = needs_ocr(pdf, threshold=0.6)
-
-        assert result is False
-
-    def test_simple_pdf_without_images_returns_false(self, sample_pdf_obj: Pdf) -> None:
-        """Simple PDF without images doesn't need OCR."""
-        result = needs_ocr(sample_pdf_obj)
-
-        assert result is False
-
-
-class TestPageHasImages:
-    """Tests for _page_has_images."""
-
-    def test_page_without_resources(self, tmp_dir: Path) -> None:
-        """Page without Resources has no images."""
-        pdf = new_pdf()
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-        )
-        page = pikepdf.Page(page_dict)
-        pdf.pages.append(page)
-
-        result = _page_has_images(pdf.pages[0])
-
-        assert result is False
-
-    def test_page_with_empty_resources(self, tmp_dir: Path) -> None:
-        """Page with empty Resources has no images."""
-        pdf = new_pdf()
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(),
-        )
-        page = pikepdf.Page(page_dict)
-        pdf.pages.append(page)
-
-        result = _page_has_images(pdf.pages[0])
-
-        assert result is False
-
-    def test_page_with_image_xobject(self, pdf_with_image_obj: Pdf) -> None:
-        """Page with image XObject is detected."""
-        result = _page_has_images(pdf_with_image_obj.pages[0])
-
-        assert result is True
-
-    def test_page_with_form_xobject_no_image(self, tmp_dir: Path) -> None:
-        """Page with Form XObject (no image) has no images."""
-        pdf = new_pdf()
-
-        # Create Form XObject (not Image)
-        form_stream = pdf.make_stream(b"")
-        form_stream[Name.Type] = Name.XObject
-        form_stream[Name.Subtype] = Name.Form
-        form_stream[Name.BBox] = Array([0, 0, 100, 100])
-
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(XObject=Dictionary(Fm0=form_stream)),
-        )
-        page = pikepdf.Page(page_dict)
-        pdf.pages.append(page)
-
-        result = _page_has_images(pdf.pages[0])
-
-        assert result is False
-
-
-class TestPageHasText:
-    """Tests for _page_has_text."""
-
-    def test_page_without_contents(self, tmp_dir: Path) -> None:
-        """Page without content stream has no text."""
-        pdf = new_pdf()
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-        )
-        page = pikepdf.Page(page_dict)
-        pdf.pages.append(page)
-
-        result = _page_has_text(pdf.pages[0])
-
-        assert result is False
-
-    def test_page_with_text_operators_tj(self, pdf_with_text_obj: Pdf) -> None:
-        """Page with Tj operator is detected as text."""
-        result = _page_has_text(pdf_with_text_obj.pages[0])
-
-        assert result is True
-
-    def test_page_with_text_operators_tj_array(self, tmp_dir: Path) -> None:
-        """Page with TJ operator (array) is detected as text."""
-        pdf = new_pdf()
-
-        font_dict = Dictionary(
-            Type=Name.Font,
-            Subtype=Name.Type1,
-            BaseFont=Name("/Helvetica"),
+        text_page = pdf.add_blank_page(page_size=(100, 100))
+        text_page.obj[Name.Contents] = pdf.make_stream(b"BT (Text) Tj ET")
+        image_page = pdf.add_blank_page(page_size=(100, 100))
+        image = pdf.make_stream(b"\x80")
+        image[Name.Type] = Name.XObject
+        image[Name.Subtype] = Name.Image
+        image[Name.Width] = 1
+        image[Name.Height] = 1
+        image[Name.ColorSpace] = Name.DeviceGray
+        image[Name.BitsPerComponent] = 8
+        image_page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Im0=image))
+        image_page.obj[Name.Contents] = pdf.make_stream(
+            b"q 100 0 0 100 0 0 cm /Im0 Do Q"
         )
 
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(Font=Dictionary(F1=font_dict)),
-        )
+        assert needs_ocr(pdf, threshold=0.5) is True
+        assert needs_ocr(pdf, threshold=0.6) is False
 
-        # Content stream with TJ operator
-        content_data = b"BT /F1 12 Tf 100 700 Td [(He) 10 (llo)] TJ ET"
-        content_stream = pdf.make_stream(content_data)
-        page_dict[Name.Contents] = content_stream
+    def test_page_image_and_text_detection(
+        self,
+        pdf_with_image_obj: Pdf,
+        pdf_with_text_obj: Pdf,
+    ) -> None:
+        assert _page_has_images(pdf_with_image_obj.pages[0]) is True
+        assert _page_has_text(pdf_with_image_obj.pages[0]) is False
+        assert _page_has_images(pdf_with_text_obj.pages[0]) is False
+        assert _page_has_text(pdf_with_text_obj.pages[0]) is True
 
-        page = pikepdf.Page(page_dict)
-        pdf.pages.append(page)
 
-        result = _page_has_text(pdf.pages[0])
+class TestOcrLanguageMetadata:
+    """Tests for catalog language assignment after OCR."""
 
-        assert result is True
+    def test_sets_primary_language_when_missing(self, tmp_dir: Path) -> None:
+        path = tmp_dir / "language.pdf"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page()
+            pdf.save(path)
 
-    def test_page_with_graphics_only(self, pdf_with_image_obj: Pdf) -> None:
-        """Page with only graphics operators has no text."""
-        result = _page_has_text(pdf_with_image_obj.pages[0])
+        _finalize_ocr_output(path, ["de", "en"], _ocr_form_names(path))
 
-        assert result is False
+        with Pdf.open(path) as pdf:
+            assert str(pdf.Root[Name.Lang]) == "de"
 
-    def test_page_with_content_array(self, tmp_dir: Path) -> None:
-        """Page with content array (multiple streams) is checked correctly."""
-        pdf = new_pdf()
+    def test_preserves_existing_language(self, tmp_dir: Path) -> None:
+        path = tmp_dir / "language.pdf"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page()
+            pdf.Root[Name.Lang] = "fr-FR"
+            pdf.save(path)
 
-        font_dict = Dictionary(
-            Type=Name.Font,
-            Subtype=Name.Type1,
-            BaseFont=Name("/Helvetica"),
-        )
+        _finalize_ocr_output(path, ["de"], _ocr_form_names(path))
 
-        # Two content streams
-        stream1 = pdf.make_stream(b"q 1 0 0 1 0 0 cm Q")  # Only graphics
-        stream2 = pdf.make_stream(b"BT /F1 12 Tf (Text) Tj ET")  # With text
+        with Pdf.open(path) as pdf:
+            assert str(pdf.Root[Name.Lang]) == "fr-FR"
 
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(Font=Dictionary(F1=font_dict)),
-            Contents=Array([stream1, stream2]),
-        )
+    @pytest.mark.parametrize(
+        ("language", "expected"),
+        [
+            ("ch", "zh-Hans"),
+            ("chinese_cht", "zh-Hant"),
+            ("french", "fr"),
+            ("german", "de"),
+            ("japan", "ja"),
+            ("rs_latin", "sr-Latn"),
+        ],
+    )
+    def test_maps_paddle_alias_to_bcp47(
+        self,
+        tmp_dir: Path,
+        language: str,
+        expected: str,
+    ) -> None:
+        path = tmp_dir / f"{language}.pdf"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page()
+            pdf.save(path)
 
-        page = pikepdf.Page(page_dict)
-        pdf.pages.append(page)
+        _finalize_ocr_output(path, [language], _ocr_form_names(path))
 
-        result = _page_has_text(pdf.pages[0])
+        with Pdf.open(path) as pdf:
+            assert str(pdf.Root[Name.Lang]) == expected
 
-        assert result is True
 
-    def test_page_with_text_in_form_xobject(self, tmp_dir: Path) -> None:
-        """Text inside a Form XObject is detected."""
-        pdf = new_pdf()
+class TestRotatedOcrFormBoxes:
+    """Tests for rotated OCR text-layer clipping repair."""
 
-        font_dict = Dictionary(
-            Type=Name.Font,
-            Subtype=Name.Type1,
-            BaseFont=Name("/Helvetica"),
-        )
+    @pytest.mark.parametrize("rotation", [90, 270])
+    def test_swaps_ocr_form_box_axes(
+        self,
+        tmp_dir: Path,
+        rotation: int,
+    ) -> None:
+        path = tmp_dir / f"rotated-{rotation}.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(576, 432))
+            page.obj[Name.Rotate] = rotation
+            form = pdf.make_stream(b"")
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = pikepdf.Array([0, 0, 576, 432])
+            xobjects = Dictionary()
+            xobjects[Name("/OCR-pdf-0")] = form
+            page.obj[Name.Resources] = Dictionary(XObject=xobjects)
+            pdf.save(path)
 
-        # Create Form XObject containing text
-        form_stream = pdf.make_stream(b"BT /F1 12 Tf 100 700 Td (Text in Form) Tj ET")
-        form_stream[Name.Type] = Name.XObject
-        form_stream[Name.Subtype] = Name.Form
-        form_stream[Name.BBox] = Array([0, 0, 612, 792])
-        form_stream[Name.Resources] = Dictionary(Font=Dictionary(F1=font_dict))
+        _finalize_ocr_output(path, ["en"], [frozenset()])
 
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(XObject=Dictionary(Fm0=form_stream)),
-        )
-        # Page content only invokes the Form XObject, no direct text
-        content = pdf.make_stream(b"q /Fm0 Do Q")
-        page_dict[Name.Contents] = content
-        pdf.pages.append(pikepdf.Page(page_dict))
+        with Pdf.open(path) as pdf:
+            form = pdf.pages[0].Resources.XObject["/OCR-pdf-0"]
+            assert [float(value) for value in form.BBox] == [0, 0, 432, 576]
 
-        result = _page_has_text(pdf.pages[0])
+    @pytest.mark.parametrize("inherited", [False, True])
+    def test_leaves_preexisting_ocr_form_unchanged(
+        self,
+        tmp_dir: Path,
+        inherited: bool,
+    ) -> None:
+        path = tmp_dir / f"rotated-inherited-{inherited}.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(576, 432))
+            form = pdf.make_stream(b"")
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = pikepdf.Array([0, 0, 576, 432])
+            xobjects = Dictionary()
+            xobjects[Name("/OCR-existing")] = form
+            container = page.obj.Parent if inherited else page.obj
+            container[Name.Rotate] = 90
+            container[Name.Resources] = Dictionary(XObject=xobjects)
+            if inherited:
+                del page.obj[Name.Resources]
+            pdf.save(path)
 
-        assert result is True
+        existing_names = _ocr_form_names(path)
+        _finalize_ocr_output(path, ["en"], existing_names)
 
-    def test_page_with_nested_form_xobject_text(self, tmp_dir: Path) -> None:
-        """Text inside a nested Form XObject is detected."""
-        pdf = new_pdf()
+        with Pdf.open(path) as pdf:
+            form = pdf.pages[0].resources.XObject["/OCR-existing"]
+            assert [float(value) for value in form.BBox] == [0, 0, 576, 432]
 
-        font_dict = Dictionary(
-            Type=Name.Font,
-            Subtype=Name.Type1,
-            BaseFont=Name("/Helvetica"),
-        )
 
-        # Inner Form XObject with text
-        inner_form = pdf.make_stream(b"BT /F1 12 Tf 50 50 Td (Nested text) Tj ET")
-        inner_form[Name.Type] = Name.XObject
-        inner_form[Name.Subtype] = Name.Form
-        inner_form[Name.BBox] = Array([0, 0, 200, 200])
-        inner_form[Name.Resources] = Dictionary(Font=Dictionary(F1=font_dict))
+class TestLanguages:
+    """Tests for the PP-OCRv6 language contract."""
 
-        # Outer Form XObject that references inner
-        outer_form = pdf.make_stream(b"q /Fm1 Do Q")
-        outer_form[Name.Type] = Name.XObject
-        outer_form[Name.Subtype] = Name.Form
-        outer_form[Name.BBox] = Array([0, 0, 612, 792])
-        outer_form[Name.Resources] = Dictionary(XObject=Dictionary(Fm1=inner_form))
+    @pytest.mark.parametrize("languages", [["en"], ["de"], ["de", "en"]])
+    def test_supported_languages(self, languages: list[str]) -> None:
+        assert validate_ocr_languages(languages) == languages
 
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(XObject=Dictionary(Fm0=outer_form)),
-        )
-        content = pdf.make_stream(b"q /Fm0 Do Q")
-        page_dict[Name.Contents] = content
-        pdf.pages.append(pikepdf.Page(page_dict))
+    @pytest.mark.parametrize("languages", [[], ["eng"], ["deu"], ["unknown"]])
+    def test_unsupported_languages(self, languages: list[str]) -> None:
+        with pytest.raises(ValueError, match="OCR language|PaddleOCR"):
+            validate_ocr_languages(languages)
 
-        result = _page_has_text(pdf.pages[0])
 
-        assert result is True
+@pytest.mark.parametrize(
+    ("content", "operator"),
+    [
+        (b"BT 3 Tr (hidden) Tj ET", b"Tj"),
+        (b"BT 3 Tr [(hid) 20 (den)] TJ ET", b"TJ"),
+        (b"BT 3 Tr (hidden) ' ET", b"'"),
+        (b'BT 3 Tr 1 2 (hidden) " ET', b'"'),
+    ],
+)
+def test_invisible_form_cleanup_preserves_text_show_operator(
+    content: bytes,
+    operator: bytes,
+) -> None:
+    with Pdf.new() as pdf:
+        form = pdf.make_stream(content)
 
-    def test_page_with_form_xobject_no_text(self, tmp_dir: Path) -> None:
-        """Form XObject without text operators is not detected as text."""
-        pdf = new_pdf()
+        assert _strip_invisible_text_from_form(form) is True
 
-        # Form XObject with only graphics
-        form_stream = pdf.make_stream(b"q 1 0 0 1 0 0 cm 0 0 100 100 re f Q")
-        form_stream[Name.Type] = Name.XObject
-        form_stream[Name.Subtype] = Name.Form
-        form_stream[Name.BBox] = Array([0, 0, 100, 100])
-
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(XObject=Dictionary(Fm0=form_stream)),
-        )
-        content = pdf.make_stream(b"q /Fm0 Do Q")
-        page_dict[Name.Contents] = content
-        pdf.pages.append(pikepdf.Page(page_dict))
-
-        result = _page_has_text(pdf.pages[0])
-
-        assert result is False
-
-    def test_needs_ocr_detects_text_in_form_xobject(self, tmp_dir: Path) -> None:
-        """needs_ocr returns False when text exists inside Form XObjects."""
-        pdf = new_pdf()
-
-        font_dict = Dictionary(
-            Type=Name.Font,
-            Subtype=Name.Type1,
-            BaseFont=Name("/Helvetica"),
-        )
-
-        # Image XObject
-        image_data = b"\x80"
-        image_stream = pdf.make_stream(image_data)
-        image_stream[Name.Type] = Name.XObject
-        image_stream[Name.Subtype] = Name.Image
-        image_stream[Name.Width] = 1
-        image_stream[Name.Height] = 1
-        image_stream[Name.ColorSpace] = Name.DeviceGray
-        image_stream[Name.BitsPerComponent] = 8
-
-        # Form XObject with OCR text layer
-        form_stream = pdf.make_stream(b"BT /F1 12 Tf 100 700 Td (OCR text) Tj ET")
-        form_stream[Name.Type] = Name.XObject
-        form_stream[Name.Subtype] = Name.Form
-        form_stream[Name.BBox] = Array([0, 0, 612, 792])
-        form_stream[Name.Resources] = Dictionary(Font=Dictionary(F1=font_dict))
-
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(XObject=Dictionary(Im0=image_stream, Fm0=form_stream)),
-        )
-        content = pdf.make_stream(b"q 100 0 0 100 100 600 cm /Im0 Do Q /Fm0 Do")
-        page_dict[Name.Contents] = content
-        pdf.pages.append(pikepdf.Page(page_dict))
-
-        # Page has images AND text (in Form XObject), so should NOT need OCR
-        result = needs_ocr(pdf)
-
-        assert result is False
+        rewritten = form.read_bytes()
+        assert b"hid" not in rewritten
+        assert operator in rewritten
+        assert b"3 Tr" in rewritten
 
 
 class TestApplyOcr:
-    """Tests for apply_ocr."""
+    """Tests for the fixed PaddleOCR/OCRmyPDF boundary."""
 
-    def test_apply_ocr_raises_when_not_available(
-        self, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """OCRError when OCR is not installed."""
-        output_path = tmp_dir / "output.pdf"
-
-        with patch("pdftopdfa.ocr.HAS_OCR", False):
-            with pytest.raises(OCRError, match="OCR not available"):
-                apply_ocr(sample_pdf, output_path, ["deu"])
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_rotation_error_aborts_before_ocr(
+    def test_passes_fixed_offline_configuration(
         self,
-        mock_ocrmypdf: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
-        _mock_paddle_orientation: MagicMock,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
     ) -> None:
-        """A model or inference failure stops conversion before OCRmyPDF."""
-        output_path = tmp_dir / "output.pdf"
-        _mock_paddle_orientation.side_effect = OCRError("model is corrupt")
+        output = tmp_dir / "output.pdf"
+        detection, recognition = model_dirs
 
-        with pytest.raises(OCRError, match="model is corrupt"):
-            apply_ocr(sample_pdf, output_path, rotate_pages=True)
-
-        mock_ocrmypdf.ocr.assert_not_called()
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_calls_ocrmypdf(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """apply_ocr calls ocrmypdf.ocr with correct default parameters."""
-        output_path = tmp_dir / "output.pdf"
-
-        apply_ocr(sample_pdf, output_path, ["eng"])
-
-        expected_settings = {
-            **OCR_SETTINGS[OcrQuality.DEFAULT],
-            "tesseract_timeout": 60,
-        }
-        mock_ocrmypdf.ocr.assert_called_once_with(
-            sample_pdf,
-            output_path,
-            language=["eng"],
-            output_type="pdf",
-            rasterizer="pypdfium",
-            plugins=["pdftopdfa.ocr_rotation_fix"],
-            **expected_settings,
-        )
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_disables_deskew_for_annotated_pdf(
-        self,
-        mock_ocrmypdf: MagicMock,
-        sample_pdf: Path,
-        tmp_dir: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """Direct OCR calls do not misalign annotations by deskewing content."""
-        annotated_pdf = tmp_dir / "annotated.pdf"
-        with Pdf.open(sample_pdf) as pdf:
-            annot = pdf.make_indirect(
-                Dictionary(
-                    Type=Name.Annot,
-                    Subtype=Name.Link,
-                    Rect=Array([10, 10, 30, 30]),
-                )
-            )
-            pdf.pages[0].obj[Name.Annots] = Array([annot])
-            pdf.save(annotated_pdf)
-
-        with caplog.at_level(logging.WARNING, logger="pdftopdfa.ocr"):
-            apply_ocr(annotated_pdf, tmp_dir / "output.pdf", deskew=True)
-
-        assert mock_ocrmypdf.ocr.call_args.kwargs["deskew"] is False
-        assert "Deskew disabled because the PDF contains annotations" in caplog.text
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    @patch("pdftopdfa.ocr.EncryptedPdfError", Exception)
-    def test_apply_ocr_handles_encrypted_pdf(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """EncryptedPdfError is converted to OCRError."""
-        output_path = tmp_dir / "output.pdf"
-
-        # Simulate EncryptedPdfError
-        mock_ocrmypdf.ocr.side_effect = Exception("encrypted")
-
-        with patch("pdftopdfa.ocr.EncryptedPdfError", Exception):
-            # Since we patch Exception as EncryptedPdfError, it gets caught
-            # but handled as a general error
-            with pytest.raises(OCRError, match="OCR failed"):
-                apply_ocr(sample_pdf, output_path, ["deu"])
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    @patch("pdftopdfa.ocr.shutil.copy2")
-    def test_apply_ocr_handles_prior_ocr(
-        self,
-        mock_copy: MagicMock,
-        mock_ocrmypdf: MagicMock,
-        sample_pdf: Path,
-        tmp_dir: Path,
-    ) -> None:
-        """PriorOcrFoundError leads to copying the file."""
-        output_path = tmp_dir / "output.pdf"
-
-        # Create mock exception
-        class MockPriorOcrFoundError(Exception):
-            pass
-
-        # Patch the exception class
-        with patch("pdftopdfa.ocr.PriorOcrFoundError", MockPriorOcrFoundError):
-            mock_ocrmypdf.ocr.side_effect = MockPriorOcrFoundError()
-
-            result = apply_ocr(sample_pdf, output_path, ["deu"])
-
-            mock_copy.assert_called_once_with(sample_pdf, output_path)
-            assert result == output_path
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_returns_output_path(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """apply_ocr returns the output path."""
-        output_path = tmp_dir / "output.pdf"
-
-        result = apply_ocr(sample_pdf, output_path, ["deu"])
-
-        assert result == output_path
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    @patch("pdftopdfa.ocr.time.perf_counter")
-    def test_apply_ocr_retries_with_fallback_when_runtime_exceeds_limit(
-        self,
-        mock_perf_counter: MagicMock,
-        mock_ocrmypdf: MagicMock,
-        sample_pdf: Path,
-        tmp_dir: Path,
-        _mock_paddle_orientation: MagicMock,
-    ) -> None:
-        """A faster fallback runs when OCR exceeds the time threshold."""
-        output_path = tmp_dir / "output.pdf"
-        mock_perf_counter.side_effect = [0.0, 1.0, 1.0, 61.0, 61.0, 62.0]
-
-        def create_output(input_path: Path, output: Path, **kwargs: object) -> None:
-            import shutil
-
-            shutil.copy(input_path, output)
-
-        mock_ocrmypdf.ocr.side_effect = create_output
-
-        apply_ocr(
-            sample_pdf,
-            output_path,
-            ["eng"],
-            quality=OcrQuality.DEFAULT,
-            deskew=True,
-            rotate_pages=True,
-        )
-
-        assert mock_ocrmypdf.ocr.call_count == 2
-        first_kwargs = mock_ocrmypdf.ocr.call_args_list[0].kwargs
-        assert first_kwargs["tesseract_timeout"] == 60
-        retry_kwargs = mock_ocrmypdf.ocr.call_args_list[1].kwargs
-        assert (
-            retry_kwargs["tesseract_timeout"]
-            == OCR_SETTINGS[OcrQuality.FAST]["tesseract_timeout"]
-        )
-        assert "oversample" not in retry_kwargs
-        assert retry_kwargs["plugins"] == ["pdftopdfa.ocr_rotation_fix"]
-        assert first_kwargs["deskew"] is True
-        assert retry_kwargs["deskew"] is True
-        _mock_paddle_orientation.assert_called_once()
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    @patch("pdftopdfa.ocr.time.perf_counter")
-    def test_apply_ocr_fallback_can_be_disabled(
-        self,
-        mock_perf_counter: MagicMock,
-        mock_ocrmypdf: MagicMock,
-        sample_pdf: Path,
-        tmp_dir: Path,
-    ) -> None:
-        """fallback_quality=None disables automatic retry."""
-        output_path = tmp_dir / "output.pdf"
-        mock_perf_counter.side_effect = [0.0, 1.0, 1.0, 61.0]
-
-        def create_output(input_path: Path, output: Path, **kwargs: object) -> None:
-            import shutil
-
-            shutil.copy(input_path, output)
-
-        mock_ocrmypdf.ocr.side_effect = create_output
-
-        apply_ocr(
-            sample_pdf,
-            output_path,
-            ["eng"],
-            quality=OcrQuality.DEFAULT,
-            fallback_quality=None,
-        )
-
-        mock_ocrmypdf.ocr.assert_called_once()
-
-    @staticmethod
-    def _write_multipage_pdf(path: Path, page_count: int) -> None:
-        pdf = new_pdf()
-        for _ in range(page_count):
-            pdf.pages.append(
-                pikepdf.Page(
-                    Dictionary(Type=Name.Page, MediaBox=Array([0, 0, 612, 792]))
-                )
-            )
-        pdf.save(path)
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    @patch("pdftopdfa.ocr.time.perf_counter")
-    def test_apply_ocr_fallback_threshold_scales_with_page_count(
-        self,
-        mock_perf_counter: MagicMock,
-        mock_ocrmypdf: MagicMock,
-        tmp_dir: Path,
-    ) -> None:
-        """The fallback threshold is a per-page budget, not a total limit."""
-        input_pdf = tmp_dir / "multipage.pdf"
-        self._write_multipage_pdf(input_pdf, page_count=3)
-        output_path = tmp_dir / "output.pdf"
-        # 61s for 3 pages stays within the 3 * 60s budget -> no fallback
-        mock_perf_counter.side_effect = [0.0, 1.0, 1.0, 61.0]
-
-        def create_output(input_path: Path, output: Path, **kwargs: object) -> None:
-            import shutil
-
-            shutil.copy(input_path, output)
-
-        mock_ocrmypdf.ocr.side_effect = create_output
-
-        apply_ocr(
-            input_pdf,
-            output_path,
-            ["eng"],
-            quality=OcrQuality.DEFAULT,
-            rotate_pages=True,
-        )
-
-        mock_ocrmypdf.ocr.assert_called_once()
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    @patch("pdftopdfa.ocr.time.perf_counter")
-    def test_apply_ocr_fallback_triggers_above_scaled_threshold(
-        self,
-        mock_perf_counter: MagicMock,
-        mock_ocrmypdf: MagicMock,
-        tmp_dir: Path,
-    ) -> None:
-        """Fallback still triggers when the per-page budget is exceeded."""
-        input_pdf = tmp_dir / "multipage.pdf"
-        self._write_multipage_pdf(input_pdf, page_count=3)
-        output_path = tmp_dir / "output.pdf"
-        # 181s for 3 pages exceeds the 3 * 60s budget -> fallback
-        mock_perf_counter.side_effect = [0.0, 1.0, 1.0, 181.0, 181.0, 182.0]
-
-        def create_output(input_path: Path, output: Path, **kwargs: object) -> None:
-            import shutil
-
-            shutil.copy(input_path, output)
-
-        mock_ocrmypdf.ocr.side_effect = create_output
-
-        apply_ocr(
-            input_pdf,
-            output_path,
-            ["eng"],
-            quality=OcrQuality.DEFAULT,
-            rotate_pages=True,
-        )
-
-        assert mock_ocrmypdf.ocr.call_count == 2
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_default_language(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """apply_ocr uses English as default language."""
-        output_path = tmp_dir / "output.pdf"
-
-        apply_ocr(sample_pdf, output_path)
-
-        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert call_kwargs["language"] == ["eng"]
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_multi_language(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """apply_ocr supports multiple languages."""
-        output_path = tmp_dir / "output.pdf"
-
-        apply_ocr(sample_pdf, output_path, ["deu", "eng"])
-
-        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert call_kwargs["language"] == ["deu", "eng"]
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_blank_exception_uses_exception_type(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """Exceptions without a message still produce a useful OCRError."""
-        output_path = tmp_dir / "output.pdf"
-        mock_ocrmypdf.ocr.side_effect = RuntimeError()
-
-        with pytest.raises(OCRError, match=r"OCR failed: RuntimeError"):
-            apply_ocr(sample_pdf, output_path, ["deu"])
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    @patch("pdftopdfa.ocr.MissingDependencyError", Exception)
-    def test_apply_ocr_handles_missing_dependency(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """MissingDependencyError is converted to OCRError preserving the message."""
-        output_path = tmp_dir / "output.pdf"
-
-        # Simulate MissingDependencyError
-        class MockMissingDependencyError(Exception):
-            pass
-
-        with patch("pdftopdfa.ocr.MissingDependencyError", MockMissingDependencyError):
-            mock_ocrmypdf.ocr.side_effect = MockMissingDependencyError(
-                "tesseract is not installed"
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
+            result = apply_ocr(
+                sample_pdf,
+                output,
+                ["de", "en"],
+                detection_model_dir=detection,
+                recognition_model_dir=recognition,
             )
 
-            with pytest.raises(OCRError, match="tesseract is not installed"):
-                apply_ocr(sample_pdf, output_path, ["deu"])
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_tesseract_path_modifies_path(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """TESSERACT_PATH prepends its directory to PATH during OCR."""
-        output_path = tmp_dir / "output.pdf"
-        original_path = os.environ.get("PATH", "")
-
-        captured_path = {}
-
-        def capture_path(*args: object, **kwargs: object) -> None:
-            captured_path["during"] = os.environ.get("PATH", "")
-
-        mock_ocrmypdf.ocr.side_effect = capture_path
-
-        with patch.dict(
-            "os.environ",
-            {"TESSERACT_PATH": "/opt/tesseract/bin/tesseract"},
-        ):
-            apply_ocr(sample_pdf, output_path, ["eng"])
-
-        expected_dir = str(Path("/opt/tesseract/bin/tesseract").parent)
-        assert captured_path["during"].startswith(expected_dir + os.pathsep)
-        # PATH is restored after the call
-        assert os.environ.get("PATH", "") == original_path
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_tesseract_path_accepts_directory(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_path: Path
-    ) -> None:
-        """TESSERACT_PATH pointing to a directory uses it directly (not its parent)."""
-        output_path = tmp_path / "output.pdf"
-        tesseract_dir = tmp_path / "tesseract" / "bin"
-        tesseract_dir.mkdir(parents=True)
-
-        captured_path = {}
-
-        def capture_path(*args: object, **kwargs: object) -> None:
-            captured_path["during"] = os.environ.get("PATH", "")
-
-        mock_ocrmypdf.ocr.side_effect = capture_path
-
-        with patch.dict(
-            "os.environ",
-            {"TESSERACT_PATH": str(tesseract_dir)},
-        ):
-            apply_ocr(sample_pdf, output_path, ["eng"])
-
-        assert captured_path["during"].startswith(str(tesseract_dir) + os.pathsep)
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_tesseract_path_not_set_leaves_path_unchanged(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """PATH remains unchanged when TESSERACT_PATH is not set."""
-        output_path = tmp_dir / "output.pdf"
-        original_path = os.environ.get("PATH", "")
-
-        captured_path = {}
-
-        def capture_path(*args: object, **kwargs: object) -> None:
-            captured_path["during"] = os.environ.get("PATH", "")
-
-        mock_ocrmypdf.ocr.side_effect = capture_path
-
-        with patch.dict("os.environ", {}, clear=False):
-            # Ensure TESSERACT_PATH is not set
-            os.environ.pop("TESSERACT_PATH", None)
-            apply_ocr(sample_pdf, output_path, ["eng"])
-
-        assert captured_path["during"] == original_path
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_tesseract_path_restored_on_error(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """PATH is restored even when ocrmypdf raises an exception."""
-        output_path = tmp_dir / "output.pdf"
-        original_path = os.environ.get("PATH", "")
-
-        mock_ocrmypdf.ocr.side_effect = RuntimeError("OCR crash")
-
-        with patch.dict(
-            "os.environ",
-            {"TESSERACT_PATH": "/opt/tesseract/bin/tesseract"},
-        ):
-            with pytest.raises(OCRError):
-                apply_ocr(sample_pdf, output_path, ["eng"])
-
-        assert os.environ.get("PATH", "") == original_path
-
-
-class TestOcrQuality:
-    """Tests for OCR quality presets."""
-
-    def test_ocr_quality_enum_values(self) -> None:
-        """OcrQuality enum has the expected values."""
-        assert OcrQuality.FAST.value == "fast"
-        assert OcrQuality.DEFAULT.value == "default"
-
-    def test_ocr_quality_enum_from_string(self) -> None:
-        """OcrQuality can be created from string values."""
-        assert OcrQuality("fast") is OcrQuality.FAST
-        assert OcrQuality("default") is OcrQuality.DEFAULT
-        with pytest.raises(ValueError):
-            OcrQuality("best")
-
-    def test_ocr_settings_has_all_presets(self) -> None:
-        """OCR_SETTINGS contains entries for all quality presets."""
-        for quality in OcrQuality:
-            assert quality in OCR_SETTINGS
-
-    def test_ocr_settings_fast_preset(self) -> None:
-        """Fast preset uses minimal parameters."""
-        settings = OCR_SETTINGS[OcrQuality.FAST]
-        assert settings["skip_text"] is True
-        assert settings["deskew"] is False
-        assert settings["rotate_pages"] is False
-        assert settings["optimize"] == 0
-        assert settings["progress_bar"] is False
-        assert "oversample" not in settings
-        assert "clean" not in settings
-
-    def test_ocr_settings_default_preset(self) -> None:
-        """Default preset uses quality parameters without visual changes."""
-        settings = OCR_SETTINGS[OcrQuality.DEFAULT]
-        assert settings["skip_text"] is True
-        assert settings["deskew"] is False
-        assert settings["rotate_pages"] is False
-        assert settings["oversample"] == 600
-        assert settings["tesseract_pagesegmode"] == 11
-        assert settings["tesseract_thresholding"] == 1
-        assert settings["tesseract_timeout"] == 300
-        assert settings["optimize"] == 0
-        assert settings["progress_bar"] is False
-        assert "clean" not in settings
-
-    @pytest.mark.parametrize("quality", [OcrQuality.FAST, OcrQuality.DEFAULT])
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_quality_alone_never_runs_paddle_orientation(
-        self,
-        mock_ocrmypdf: MagicMock,
-        quality: OcrQuality,
-        sample_pdf: Path,
-        tmp_dir: Path,
-        _mock_paddle_orientation: MagicMock,
-    ) -> None:
-        """Quality presets alone never initialize PaddleOCR."""
-        apply_ocr(sample_pdf, tmp_dir / "output.pdf", quality=quality)
-
-        _mock_paddle_orientation.assert_not_called()
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_fast_quality(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """apply_ocr with FAST quality passes correct parameters."""
-        output_path = tmp_dir / "output.pdf"
-
-        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.FAST)
-
-        mock_ocrmypdf.ocr.assert_called_once_with(
-            sample_pdf,
-            output_path,
-            language=["eng"],
-            output_type="pdf",
-            rasterizer="pypdfium",
-            **OCR_SETTINGS[OcrQuality.FAST],
-        )
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_default_quality(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """apply_ocr with DEFAULT quality passes correct parameters."""
-        output_path = tmp_dir / "output.pdf"
-
-        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.DEFAULT)
-
-        expected_settings = {
-            **OCR_SETTINGS[OcrQuality.DEFAULT],
-            "tesseract_timeout": 60,
-        }
-        mock_ocrmypdf.ocr.assert_called_once_with(
-            sample_pdf,
-            output_path,
-            language=["eng"],
-            output_type="pdf",
-            rasterizer="pypdfium",
-            plugins=["pdftopdfa.ocr_rotation_fix"],
-            **expected_settings,
-        )
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    @patch("pdftopdfa.ocr._normalize_text_page_skew")
-    def test_apply_ocr_independent_processing_options(
-        self,
-        mock_normalize_skew: MagicMock,
-        mock_ocrmypdf: MagicMock,
-        sample_pdf: Path,
-        tmp_dir: Path,
-        _mock_paddle_orientation: MagicMock,
-    ) -> None:
-        """Deskew and page rotation work independently of OCR quality."""
-        output_path = tmp_dir / "output.pdf"
-        mock_ocrmypdf.ocr.side_effect = lambda *args, **kwargs: output_path.touch()
-
-        apply_ocr(
-            sample_pdf,
-            output_path,
-            ["eng"],
-            quality=OcrQuality.DEFAULT,
-            deskew=True,
-            rotate_pages=True,
-        )
-
-        expected_settings = {
-            **OCR_SETTINGS[OcrQuality.DEFAULT],
-            "deskew": True,
-            "tesseract_timeout": 60,
-        }
-        _mock_paddle_orientation.assert_called_once()
-        oriented_input = mock_ocrmypdf.ocr.call_args.args[0]
-        assert oriented_input.name == f"{sample_pdf.stem}_oriented.pdf"
-        assert mock_ocrmypdf.ocr.call_args.args[1] == output_path
-        assert mock_ocrmypdf.ocr.call_args.kwargs == {
-            "language": ["eng"],
-            "output_type": "pdf",
+        assert result == output
+        validate_models.assert_called_once_with(detection, recognition)
+        mock_ocr.assert_called_once()
+        args, kwargs = mock_ocr.call_args
+        assert args == (sample_pdf, output)
+        assert kwargs == {
+            "language": ["de", "en"],
+            "ocr_engine": "paddle",
+            "pdf_renderer": "fpdf2",
             "rasterizer": "pypdfium",
-            "plugins": ["pdftopdfa.ocr_rotation_fix"],
-            **expected_settings,
-        }
-        mock_normalize_skew.assert_called_once_with(output_path)
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_default_quality_when_omitted(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """apply_ocr uses DEFAULT quality when quality parameter is omitted."""
-        output_path = tmp_dir / "output.pdf"
-
-        apply_ocr(sample_pdf, output_path, ["eng"])
-
-        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        expected = OCR_SETTINGS[OcrQuality.DEFAULT]
-        for key, value in expected.items():
-            if key == "tesseract_timeout":
-                assert call_kwargs[key] == 60
-            else:
-                assert call_kwargs[key] == value
-
-
-class TestApplyOcrForce:
-    """Tests for apply_ocr(force=True) behaviour."""
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_force_rejects_deskew(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """Forced OCR rejects the explicitly incompatible deskew option."""
-        output_path = tmp_dir / "output.pdf"
-
-        with pytest.raises(OCRError, match="Deskew cannot be combined"):
-            apply_ocr(sample_pdf, output_path, ["eng"], force=True, deskew=True)
-
-        mock_ocrmypdf.ocr.assert_not_called()
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_force_sets_redo_ocr(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """force=True sets redo_ocr=True in ocrmypdf call."""
-        output_path = tmp_dir / "output.pdf"
-
-        apply_ocr(sample_pdf, output_path, ["eng"], force=True)
-
-        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert call_kwargs["redo_ocr"] is True
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_force_removes_skip_text(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """force=True removes skip_text from ocrmypdf call."""
-        output_path = tmp_dir / "output.pdf"
-
-        apply_ocr(sample_pdf, output_path, ["eng"], force=True)
-
-        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert "skip_text" not in call_kwargs
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_no_force_uses_skip_text(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """force=False (default) still uses skip_text=True."""
-        output_path = tmp_dir / "output.pdf"
-
-        apply_ocr(sample_pdf, output_path, ["eng"])
-
-        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert call_kwargs["skip_text"] is True
-        assert "redo_ocr" not in call_kwargs
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_force_with_default_quality(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """force=True with DEFAULT quality removes redo_ocr conflicts only."""
-        output_path = tmp_dir / "output.pdf"
-
-        apply_ocr(
-            sample_pdf,
-            output_path,
-            ["eng"],
-            quality=OcrQuality.DEFAULT,
-            force=True,
-        )
-
-        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert call_kwargs["redo_ocr"] is True
-        assert "skip_text" not in call_kwargs
-        assert "deskew" not in call_kwargs
-        assert call_kwargs["rotate_pages"] is False
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_force_removes_all_redo_ocr_incompatible_options(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """force=True strips all ocrmypdf options incompatible with redo_ocr."""
-        output_path = tmp_dir / "output.pdf"
-        forced_default_settings = {
-            **OCR_SETTINGS[OcrQuality.DEFAULT],
-            "clean_final": True,
-            "remove_background": True,
+            "output_type": "pdf",
+            "oversample": 600,
+            "optimize": 0,
+            "jobs": 1,
+            "skip_text": True,
+            "deskew": False,
+            "rotate_pages": False,
+            "progress_bar": False,
+            "plugins": [
+                "pdftopdfa.ocr_paddle",
+                "pdftopdfa.ocr_rotation_fix",
+            ],
+            "paddle_detection_model_dir": detection,
+            "paddle_recognition_model_dir": recognition,
         }
 
-        with patch.dict(
-            "pdftopdfa.ocr.OCR_SETTINGS",
-            {OcrQuality.DEFAULT: forced_default_settings},
-            clear=False,
-        ):
+    def test_defaults_to_english_metadata(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        output = tmp_dir / "output.pdf"
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
             apply_ocr(
                 sample_pdf,
-                output_path,
-                ["eng"],
-                quality=OcrQuality.DEFAULT,
+                output,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+            )
+
+        assert mock_ocr.call_args.kwargs["language"] == ["en"]
+        with Pdf.open(output) as pdf:
+            assert str(pdf.Root[Name.Lang]) == "en"
+
+    def test_force_uses_redo_without_skip_text(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
+            apply_ocr(
+                sample_pdf,
+                tmp_dir / "output.pdf",
+                ["en"],
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
                 force=True,
             )
 
-        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert "deskew" not in call_kwargs
-        assert "clean_final" not in call_kwargs
-        assert "remove_background" not in call_kwargs
-        assert call_kwargs["rotate_pages"] is False
+        kwargs = mock_ocr.call_args.kwargs
+        assert kwargs["redo_ocr"] is True
+        assert "skip_text" not in kwargs
 
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_force_logs_removed_incompatible_options(
+    def test_force_removes_only_invisible_text_from_existing_ocr_forms(
         self,
-        mock_ocrmypdf: MagicMock,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            hidden = pdf.make_stream(b"BT 3 Tr (old OCR) Tj ET")
+            hidden[Name.Type] = Name.XObject
+            hidden[Name.Subtype] = Name.Form
+            hidden[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            visible = pdf.make_stream(
+                b"1 0 0 rg 0 0 10 10 re f BT 0 Tr (visible text) Tj ET"
+            )
+            visible[Name.Type] = Name.XObject
+            visible[Name.Subtype] = Name.Form
+            visible[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            separate = pdf.make_stream(
+                b"BT 3 Tr (separate hidden) Tj ET BT 0 Tr (separate visible) Tj ET"
+            )
+            separate[Name.Type] = Name.XObject
+            separate[Name.Subtype] = Name.Form
+            separate[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            visible_first = pdf.make_stream(
+                b"BT 0 Tr (visible first) Tj 3 Tr (hidden last) Tj ET"
+            )
+            visible_first[Name.Type] = Name.XObject
+            visible_first[Name.Subtype] = Name.Form
+            visible_first[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            hidden_first = pdf.make_stream(
+                b"BT 3 Tr (hidden first) Tj 0 Tr (visible last) Tj ET"
+            )
+            hidden_first[Name.Type] = Name.XObject
+            hidden_first[Name.Subtype] = Name.Form
+            hidden_first[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            user_form = pdf.make_stream(b"BT 3 Tr (user hidden text) Tj ET")
+            user_form[Name.Type] = Name.XObject
+            user_form[Name.Subtype] = Name.Form
+            user_form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            page.obj[Name.Resources] = Dictionary(
+                XObject=Dictionary(
+                    {
+                        "/OCR-hidden": hidden,
+                        "/OCR-visible": visible,
+                        "/OCR-separate": separate,
+                        "/OCR-visible-first": visible_first,
+                        "/OCR-hidden-first": hidden_first,
+                        "/User-form": user_form,
+                    }
+                )
+            )
+            page.obj[Name.Contents] = pdf.make_stream(
+                b"/OCR-hidden Do /OCR-visible Do /OCR-separate Do "
+                b"/OCR-visible-first Do /OCR-hidden-first Do /User-form Do"
+            )
+            pdf.save(input_path)
+
+        def add_new_ocr_form(
+            source: Path,
+            destination: Path,
+            **_kwargs: object,
+        ) -> None:
+            shutil.copy2(source, destination)
+            with Pdf.open(destination, allow_overwriting_input=True) as pdf:
+                page = pdf.pages[0]
+                new = pdf.make_stream(b"BT 3 Tr (new OCR) Tj ET")
+                new[Name.Type] = Name.XObject
+                new[Name.Subtype] = Name.Form
+                new[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+                page.Resources.XObject["/OCR-new"] = new
+                page.Contents = pikepdf.Array(
+                    [page.Contents, pdf.make_stream(b"/OCR-new Do")]
+                )
+                pdf.save(destination)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=add_new_ocr_form,
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                ["en"],
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                force=True,
+            )
+
+        with Pdf.open(input_path) as pdf:
+            assert (
+                b"(old OCR)"
+                in pdf.pages[0].Resources.XObject["/OCR-hidden"].read_bytes()
+            )
+        with Pdf.open(output_path) as pdf:
+            xobjects = pdf.pages[0].Resources.XObject
+            hidden_bytes = xobjects["/OCR-hidden"].read_bytes()
+            assert b"(old OCR)" not in hidden_bytes
+            assert b"BT" in hidden_bytes
+            assert b"3 Tr" in hidden_bytes
+            assert b"(visible text)" in xobjects["/OCR-visible"].read_bytes()
+            assert b" re" in xobjects["/OCR-visible"].read_bytes()
+            separate_bytes = xobjects["/OCR-separate"].read_bytes()
+            assert b"(separate hidden)" not in separate_bytes
+            assert b"(separate visible)" in separate_bytes
+            visible_first_bytes = xobjects["/OCR-visible-first"].read_bytes()
+            assert b"(visible first)" in visible_first_bytes
+            assert b"(hidden last)" in visible_first_bytes
+            hidden_first_bytes = xobjects["/OCR-hidden-first"].read_bytes()
+            assert b"(hidden first)" in hidden_first_bytes
+            assert b"(visible last)" in hidden_first_bytes
+            assert b"(new OCR)" in xobjects["/OCR-new"].read_bytes()
+            assert b"(user hidden text)" in xobjects["/User-form"].read_bytes()
+
+    def test_force_and_deskew_are_incompatible(
+        self,
         sample_pdf: Path,
         tmp_dir: Path,
-        caplog: pytest.LogCaptureFixture,
+        model_dirs: tuple[Path, Path],
     ) -> None:
-        """force=True logs when redo_ocr-incompatible options are disabled."""
-        output_path = tmp_dir / "output.pdf"
-        settings = {
-            **OCR_SETTINGS[OcrQuality.DEFAULT],
-            "clean_final": True,
-        }
+        with pytest.raises(OCRError, match="Deskew cannot"):
+            apply_ocr(
+                sample_pdf,
+                tmp_dir / "output.pdf",
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                force=True,
+                deskew=True,
+            )
 
-        with patch.dict(
-            "pdftopdfa.ocr.OCR_SETTINGS",
-            {OcrQuality.DEFAULT: settings},
-            clear=False,
+    def test_annotations_disable_deskew(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        with (
+            patch("pdftopdfa.ocr._pdf_has_annotations", return_value=True),
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=_copy_ocr_input,
+            ) as mock_ocr,
         ):
-            with caplog.at_level(logging.INFO, logger="pdftopdfa.ocr"):
-                apply_ocr(
-                    sample_pdf,
-                    output_path,
-                    ["eng"],
-                    quality=OcrQuality.DEFAULT,
-                    force=True,
-                )
+            apply_ocr(
+                sample_pdf,
+                tmp_dir / "output.pdf",
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=True,
+            )
 
-        assert (
-            "force=True disables redo_ocr-incompatible OCR options: clean_final"
-            in caplog.text
-        )
+        assert mock_ocr.call_args.kwargs["deskew"] is False
 
-
-class TestOcrPlugins:
-    """Tests for active OCR plugin integration."""
-
-    def test_rotation_fix_qualities_contains_default(self) -> None:
-        """Rotation fix stays enabled for the default OCR preset."""
-        assert OcrQuality.DEFAULT in _ROTATION_FIX_QUALITIES
-        assert OcrQuality.FAST not in _ROTATION_FIX_QUALITIES
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_default_uses_rotation_plugin(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    def test_rotation_preflight_supplies_temporary_pdf(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        _mock_paddle_orientation: MagicMock,
     ) -> None:
-        """DEFAULT quality keeps the rotation plugin only."""
-        output_path = tmp_dir / "output.pdf"
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
+            apply_ocr(
+                sample_pdf,
+                tmp_dir / "output.pdf",
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                rotate_pages=True,
+            )
 
-        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.DEFAULT)
+        _mock_paddle_orientation.assert_called_once()
+        assert mock_ocr.call_args.args[0] != sample_pdf
 
-        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert call_kwargs["plugins"] == ["pdftopdfa.ocr_rotation_fix"]
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_fast_rotation_uses_rotation_plugin(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    def test_invalid_language_is_ocr_error(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
     ) -> None:
-        """Explicit rotation enables the rotation plugin for FAST quality."""
-        output_path = tmp_dir / "output.pdf"
+        with pytest.raises(OCRError, match="Unsupported PaddleOCR"):
+            apply_ocr(
+                sample_pdf,
+                tmp_dir / "output.pdf",
+                ["eng"],
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+            )
 
-        apply_ocr(
-            sample_pdf,
-            output_path,
-            ["eng"],
-            quality=OcrQuality.FAST,
-            rotate_pages=True,
-        )
-
-        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert call_kwargs["plugins"] == ["pdftopdfa.ocr_rotation_fix"]
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_default_uses_rotation_plugin_without_extra_dependencies(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    def test_unavailable_dependency_is_fail_closed(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
     ) -> None:
-        """Rotation fix stays enabled without optional preprocessing packages."""
-        output_path = tmp_dir / "output.pdf"
+        with (
+            patch("pdftopdfa.ocr.HAS_OCR", False),
+            pytest.raises(OCRError, match="OCR not available"),
+        ):
+            apply_ocr(
+                sample_pdf,
+                tmp_dir / "output.pdf",
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+            )
 
-        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.DEFAULT)
-
-        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert call_kwargs["plugins"] == ["pdftopdfa.ocr_rotation_fix"]
-
-    @patch("pdftopdfa.ocr.HAS_OCR", True)
-    @patch("pdftopdfa.ocr.ocrmypdf")
-    def test_apply_ocr_fast_no_plugin(
-        self, mock_ocrmypdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    def test_engine_error_is_wrapped(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
     ) -> None:
-        """FAST quality never uses OCR plugins."""
-        output_path = tmp_dir / "output.pdf"
-
-        apply_ocr(sample_pdf, output_path, ["eng"], quality=OcrQuality.FAST)
-
-        call_kwargs = mock_ocrmypdf.ocr.call_args[1]
-        assert "plugins" not in call_kwargs
-
-
-class TestTextSkewNormalization:
-    """Tests for post-OCR normalization of skipped text-page skew."""
-
-    def test_detect_consistent_text_skew(self, tmp_dir: Path) -> None:
-        """Consistent small text-matrix skew is detected."""
-        pdf_path = tmp_dir / "skew_detect.pdf"
-
-        with Pdf.new() as pdf:
-            page = pdf.add_blank_page(page_size=(595.0, 842.0))
-            font = Dictionary(
-                Type=Name.Font,
-                Subtype=Name.Type1,
-                BaseFont=Name("/Helvetica"),
+        with (
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=RuntimeError("inference failed"),
+            ),
+            pytest.raises(OCRError, match="inference failed"),
+        ):
+            apply_ocr(
+                sample_pdf,
+                tmp_dir / "output.pdf",
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
             )
-            page.obj[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
-            page.obj[Name.Contents] = pdf.make_stream(
-                b"BT /F1 12 Tf 12.133 1.0125 -1.0125 12.133 100 700 Tm (A) Tj "
-                b"12.133 1.0125 -1.0125 12.133 100 680 Tm (B) Tj ET"
-            )
-            pdf.save(pdf_path)
-
-        with Pdf.open(pdf_path) as pdf:
-            angle = _detect_consistent_text_skew(pdf.pages[0])
-
-        assert angle is not None
-        assert angle == pytest.approx(4.77, abs=0.1)
-
-    def test_normalize_text_page_skew(self, tmp_dir: Path) -> None:
-        """Text-only pages with dominant skew keep their original page size."""
-        pdf_path = tmp_dir / "skew_page.pdf"
-        original_box = [0.0, 0.0, 595.0, 842.0]
-
-        with Pdf.new() as pdf:
-            page = pdf.add_blank_page(page_size=(595.0, 842.0))
-            font = Dictionary(
-                Type=Name.Font,
-                Subtype=Name.Type1,
-                BaseFont=Name("/Helvetica"),
-            )
-            page.obj[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
-            page.obj[Name.CropBox] = Array(original_box)
-            page.obj[Name.TrimBox] = Array(original_box)
-            page.obj[Name.Contents] = pdf.make_stream(
-                b"BT /F1 12 Tf "
-                b"12.133 1.0125 -1.0125 12.133 100 700 Tm (A) Tj "
-                b"12.133 1.0125 -1.0125 12.133 100 680 Tm (B) Tj ET"
-            )
-            pdf.save(pdf_path)
-
-        normalized = _normalize_text_page_skew(pdf_path)
-
-        assert normalized
-        with Pdf.open(pdf_path) as pdf:
-            page = pdf.pages[0]
-            contents = page.obj["/Contents"]
-            assert isinstance(contents, Array)
-            prefix = bytes(contents[0].read_bytes()).decode("ascii")
-            assert " cm" in prefix
-            assert [float(value) for value in page.obj["/MediaBox"]] == pytest.approx(
-                original_box
-            )
-            assert [float(value) for value in page.obj["/CropBox"]] == pytest.approx(
-                original_box
-            )
-            assert [float(value) for value in page.obj["/TrimBox"]] == pytest.approx(
-                original_box
-            )
-
-    def test_normalize_text_page_skew_skips_annotated_page(self, tmp_dir: Path) -> None:
-        """Text-page deskew leaves annotated page geometry and content unchanged."""
-        pdf_path = tmp_dir / "annotated_skew_page.pdf"
-
-        with Pdf.new() as pdf:
-            page = pdf.add_blank_page(page_size=(595.0, 842.0))
-            font = Dictionary(
-                Type=Name.Font,
-                Subtype=Name.Type1,
-                BaseFont=Name("/Helvetica"),
-            )
-            page.obj[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
-            page.obj[Name.Contents] = pdf.make_stream(
-                b"BT /F1 12 Tf "
-                b"12.133 1.0125 -1.0125 12.133 100 700 Tm (A) Tj "
-                b"12.133 1.0125 -1.0125 12.133 100 680 Tm (B) Tj ET"
-            )
-            annot = pdf.make_indirect(
-                Dictionary(
-                    Type=Name.Annot,
-                    Subtype=Name.Link,
-                    Rect=Array([95, 675, 145, 715]),
-                )
-            )
-            page.obj[Name.Annots] = Array([annot])
-            pdf.save(pdf_path)
-
-        normalized = _normalize_text_page_skew(pdf_path)
-
-        assert normalized == []
-        with Pdf.open(pdf_path) as pdf:
-            assert not isinstance(pdf.pages[0].obj["/Contents"], Array)
-            assert [
-                float(value) for value in pdf.pages[0].obj["/Annots"][0]["/Rect"]
-            ] == [95.0, 675.0, 145.0, 715.0]
 
 
 class TestVisiblePageRotationFix:
     """Tests for visible-page rotation normalization during OCR."""
 
-    def _make_page_context(
-        self,
-        *,
+    @staticmethod
+    def _page_context(
         width_points: float,
         height_points: float,
-        rotation: int,
+        rotation: int = 0,
     ) -> SimpleNamespace:
         media_box = [0.0, 0.0, width_points, height_points]
-        pageinfo = SimpleNamespace(
-            width_inches=width_points / 72.0,
-            height_inches=height_points / 72.0,
-            rotation=rotation,
-            mediabox=media_box,
-            cropbox=media_box,
-            trimbox=media_box,
-            artbox=media_box,
-            bleedbox=media_box,
+        return SimpleNamespace(
+            pageinfo=SimpleNamespace(
+                width_inches=width_points / 72.0,
+                height_inches=height_points / 72.0,
+                rotation=rotation,
+                mediabox=media_box,
+                cropbox=media_box,
+                trimbox=media_box,
+                artbox=media_box,
+                bleedbox=media_box,
+            )
         )
-        return SimpleNamespace(pageinfo=pageinfo)
 
     @pytest.mark.parametrize(
-        ("page_size", "image_size", "expected_swap"),
+        ("page_size", "image_size", "expected"),
         [
             ((595.0, 842.0), (300, 200), True),
             ((842.0, 595.0), (200, 300), True),
             ((842.0, 595.0), (300, 200), False),
         ],
     )
-    def test_should_swap_visible_page_axis(
+    def test_axis_swap_detection(
         self,
         page_size: tuple[float, float],
         image_size: tuple[int, int],
-        expected_swap: bool,
+        expected: bool,
     ) -> None:
-        """Axis swapping follows the actual rendered image orientation."""
-        assert (
-            _should_swap_visible_page_axis(
-                page_size[0],
-                page_size[1],
-                image_size[0],
-                image_size[1],
-            )
-            is expected_swap
-        )
-
-    def test_filter_pdf_page_fixes_rotate_270_plus_180_regression(
-        self, tmp_dir: Path
-    ) -> None:
-        """A /Rotate=270 page stays in the rendered orientation after 180° OCR fix."""
-        image_path = tmp_dir / "rendered.png"
-        output_pdf = tmp_dir / "visible.pdf"
-
-        # Represents the rendered bitmap after OCRmyPDF applied /Rotate=270 and
-        # then an additional 180 degree autorotation correction.
-        Image.new("RGB", (300, 200), color="white").save(image_path)
-        with Pdf.new() as pdf:
-            pdf.add_blank_page(page_size=(595.0, 842.0))
-            pdf.save(output_pdf)
-
-        page_context = self._make_page_context(
-            width_points=842.0,
-            height_points=595.0,
-            rotation=270,
-        )
-
-        filter_pdf_page(page_context, image_path, output_pdf)
-
-        with Pdf.open(output_pdf) as pdf:
-            mediabox = [float(value) for value in pdf.pages[0].mediabox]
-
-        assert mediabox == [0.0, 0.0, 842.0, 595.0]
+        assert _should_swap_visible_page_axis(*page_size, *image_size) is expected
 
     @pytest.mark.parametrize(
         ("page_size", "image_size", "expected_mediabox"),
@@ -1435,31 +639,27 @@ class TestVisiblePageRotationFix:
             ((842.0, 595.0), (200, 300), [0.0, 0.0, 595.0, 842.0]),
         ],
     )
-    def test_filter_pdf_page_preserves_90_and_270_autorotate_cases(
+    def test_filter_preserves_visible_orientation(
         self,
         tmp_dir: Path,
         page_size: tuple[float, float],
         image_size: tuple[int, int],
         expected_mediabox: list[float],
     ) -> None:
-        """Regular 90°/270° autorotation still produces the correct page geometry."""
-        image_path = tmp_dir / f"rendered_{image_size[0]}x{image_size[1]}.png"
-        output_pdf = tmp_dir / f"visible_{page_size[0]}x{page_size[1]}.pdf"
-
+        image_path = tmp_dir / "page.png"
+        output_pdf = tmp_dir / "page.pdf"
         Image.new("RGB", image_size, color="white").save(image_path)
         with Pdf.new() as pdf:
             pdf.add_blank_page(page_size=page_size)
             pdf.save(output_pdf)
 
-        page_context = self._make_page_context(
-            width_points=page_size[0],
-            height_points=page_size[1],
-            rotation=0,
+        filter_pdf_page(
+            self._page_context(*page_size),
+            image_path,
+            output_pdf,
         )
 
-        filter_pdf_page(page_context, image_path, output_pdf)
-
-        with Pdf.open(output_pdf) as pdf:
-            mediabox = [float(value) for value in pdf.pages[0].mediabox]
-
-        assert mediabox == expected_mediabox
+        with pikepdf.open(output_pdf) as pdf:
+            assert [float(value) for value in pdf.pages[0].mediabox] == (
+                expected_mediabox
+            )

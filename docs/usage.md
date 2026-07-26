@@ -2,7 +2,7 @@
 
 This guide covers everyday usage of `pdftopdfa` from the command line and Python.
 
-For OCR-specific setup and tuning, see [OCR Guide](ocr.md).
+For OCR model setup and processing behavior, see [OCR Guide](ocr.md).
 
 For the full list of PDF/A-2/3 compliance rules, see the [veraPDF PDF/A-2 and PDF/A-3 rules reference](https://github.com/veraPDF/veraPDF-validation-profiles/wiki/PDFA-Parts-2-and-3-rules).
 
@@ -27,7 +27,10 @@ pdftopdfa -v input.pdf
 pdftopdfa -f input.pdf output.pdf
 
 # Apply OCR page processing without PDF/A conversion
-pdftopdfa --no-pdfa --deskew --rotate-pages input.pdf
+pdftopdfa --no-pdfa --deskew --rotate-pages \
+  --ocr-detection-model-dir /opt/pdftopdfa/models/PP-OCRv6_medium_det \
+  --ocr-recognition-model-dir /opt/pdftopdfa/models/PP-OCRv6_medium_rec \
+  input.pdf
 ```
 
 ### Batch Processing
@@ -84,14 +87,13 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `-f, --force` | Overwrite existing output files |
 | `-q, --quiet` | Show only errors |
 | `--verbose` | Enable detailed logs |
-| `--ocr` | Enable OCR for scanned/image-based PDFs |
-| `--ocr-force` | Force OCR even if text is present (implies `--ocr` and disables compliant-PDF/A skip optimization) |
-| `--ocr-lang LANG` | OCR language code (default: `eng`), for example `deu` or `deu+eng` |
-| `--deskew` | Straighten skewed pages (implies `--ocr`) |
-| `--rotate-pages` | Automatically orient pages with the bundled Paddle model (implies `--ocr`) |
-| `--ocr-quality [fast\|default]` | OCR quality preset (default: `default`) |
-| `--ocr-fallback-quality [none\|fast\|default]` | Faster OCR preset to retry with if OCR takes too long (default: `fast`) |
-| `--ocr-fallback-after SECONDS` | Retry threshold for OCR fallback (default: `60`) |
+| `--ocr` | Enable OCR for scanned/image-based PDFs; requires both model-directory options |
+| `--ocr-force` | Replace an existing OCR layer; requires both model-directory options, implies `--ocr`, and disables the compliant-PDF/A skip optimization |
+| `--ocr-lang LANG` | PaddleOCR language code (default: `en`), for example `de` or `de+en`; does not enable OCR by itself |
+| `--ocr-detection-model-dir DIR` | Directory containing the verified PP-OCRv6 Medium detection `inference.onnx` and `inference.yml` |
+| `--ocr-recognition-model-dir DIR` | Directory containing the verified PP-OCRv6 Medium recognition `inference.onnx` and `inference.yml` |
+| `--deskew` | Straighten skewed pages; requires both model-directory options and implies `--ocr` |
+| `--rotate-pages` | Automatically orient pages with the bundled Paddle model; requires both model-directory options and implies `--ocr` |
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
 | `--preserve-stamps` | Convert known proprietary stamp annotations to standard PDF Stamp annotations instead of flattening them |
 | `--skip-any-pdfa` | Skip inputs that veraPDF validates as any compliant PDF/A, regardless of target level |
@@ -143,9 +145,8 @@ def convert_to_pdfa(
     validate: bool = False,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
-    ocr_quality: OcrQuality | None = None,
-    ocr_fallback_quality: OcrQuality | None = OcrQuality.FAST,
-    ocr_fallback_after_seconds: float | None = 60.0,
+    ocr_detection_model_dir: Path | None = None,
+    ocr_recognition_model_dir: Path | None = None,
     ocr_force: bool = False,
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
@@ -153,6 +154,27 @@ def convert_to_pdfa(
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
 ) -> ConversionResult
+```
+
+To run OCR, provide both external model directories. The pair enables OCR;
+`ocr_languages` defaults to `["en"]`:
+
+```python
+from pathlib import Path
+
+from pdftopdfa import convert_to_pdfa
+
+result = convert_to_pdfa(
+    input_path=Path("scan.pdf"),
+    output_path=Path("scan_pdfa.pdf"),
+    ocr_languages=["de", "en"],
+    ocr_detection_model_dir=Path(
+        "/opt/pdftopdfa/models/PP-OCRv6_medium_det"
+    ),
+    ocr_recognition_model_dir=Path(
+        "/opt/pdftopdfa/models/PP-OCRv6_medium_rec"
+    ),
+)
 ```
 
 Pass `pdfa=False` to keep the existing OCR behavior while skipping all
@@ -199,9 +221,8 @@ def convert_directory(
     skip_any_pdfa: bool = False,
     show_progress: bool = True,
     ocr_languages: list[str] | None = None,
-    ocr_quality: OcrQuality | None = None,
-    ocr_fallback_quality: OcrQuality | None = OcrQuality.FAST,
-    ocr_fallback_after_seconds: float | None = 60.0,
+    ocr_detection_model_dir: Path | None = None,
+    ocr_recognition_model_dir: Path | None = None,
     ocr_force: bool = False,
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
@@ -237,9 +258,8 @@ def convert_files(
     validate: bool = False,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
-    ocr_quality: OcrQuality | None = None,
-    ocr_fallback_quality: OcrQuality | None = OcrQuality.FAST,
-    ocr_fallback_after_seconds: float | None = 60.0,
+    ocr_detection_model_dir: Path | None = None,
+    ocr_recognition_model_dir: Path | None = None,
     ocr_force: bool = False,
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
@@ -255,9 +275,10 @@ def convert_files(
 ### `needs_ocr()`
 
 Library helper to analyze whether a PDF would benefit from OCR. It is not
-called by the conversion pipeline itself (OCR is opt-in via `ocr_languages`,
-`ocr_deskew`, `ocr_rotate_pages`, or the corresponding CLI options); use it to
-decide programmatically whether to enable OCR.
+called by the conversion pipeline itself. OCR is opt-in through a complete
+detection/recognition model-directory pair, with optional language and
+page-processing settings; use this helper to decide programmatically whether
+to provide that pair.
 
 ```python
 import pikepdf
@@ -265,7 +286,7 @@ from pdftopdfa.ocr import needs_ocr
 
 with pikepdf.open("scan.pdf") as pdf:
     if needs_ocr(pdf, threshold=0.5):
-        ...  # convert with ocr_languages=["eng"]
+        ...  # convert with both model directories and ocr_languages=["en"]
 ```
 
 Signature:
@@ -304,6 +325,18 @@ All custom exceptions inherit from `PDFToPDFAError`:
 - `UnsupportedPDFError`
 - `OCRError`
 - `VeraPDFError`
+
+OCR configuration is validated before input processing:
+
+- CLI use of `--ocr`, `--ocr-force`, `--deskew`, or `--rotate-pages` without
+  both model-directory options raises a Click `UsageError`.
+- Providing only one model-directory option also raises `UsageError`.
+- The high-level Python APIs raise `ValueError` when only one model directory
+  is supplied, or when languages or OCR processing options are supplied
+  without the complete pair.
+- Invalid language codes such as `eng` and `deu` are rejected. Use `en`, `de`,
+  or `["de", "en"]` for mixed German/English metadata.
+- Missing, altered, or structurally invalid model artifacts raise `OCRError`.
 
 Example:
 
@@ -367,7 +400,8 @@ Notes:
 - If the metadata claim fails veraPDF validation, conversion is not skipped.
 - If veraPDF is unavailable, conversion is not skipped based only on metadata.
 - Skipped files return warning: `Conversion skipped: PDF already valid PDF/A (veraPDF compliant)`.
-- Forced OCR (`--ocr-force` or `ocr_force=True` with OCR languages configured) always runs and bypasses this skip logic.
+- Forced OCR (`--ocr-force` or `ocr_force=True` with both model directories)
+  always runs and bypasses this skip logic.
 - Forced OCR does not bypass the signed-PDF protection; use `--allow-signature-invalidation` explicitly to convert signed inputs.
 
 ## Validation
@@ -384,7 +418,6 @@ If veraPDF is missing, conversion still runs, and validation is reported as skip
 | Variable | Description |
 |---|---|
 | `VERAPDF_PATH` | Path to `verapdf` executable or its parent directory |
-| `TESSERACT_PATH` | Path to `tesseract` executable or its parent directory |
 
 ## Related Docs
 

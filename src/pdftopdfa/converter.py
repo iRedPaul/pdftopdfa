@@ -15,7 +15,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 # Third Party
 import pikepdf
@@ -38,7 +37,7 @@ from .metadata import (
     remove_pdfx_identification,
     sync_metadata,
 )
-from .ocr import DEFAULT_OCR_FALLBACK_AFTER_SECONDS, DEFAULT_OCR_FALLBACK_QUALITY
+from .ocr import validate_ocr_languages
 from .sanitizers import (
     count_digital_signatures,
     sanitize_for_pdfa,
@@ -49,9 +48,6 @@ from .sanitizers import (
 from .utils import get_required_pdf_version, is_pdf_encrypted, validate_pdfa_level
 from .validator import detect_iso_standards, detect_pdfa_level
 from .verapdf import validate_with_verapdf
-
-if TYPE_CHECKING:
-    from .ocr import OcrQuality
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +71,40 @@ class _AnnotationRestoreResult:
 
 # Conformance level ranking: a > u > b
 _CONFORMANCE_RANK = {"b": 0, "u": 1, "a": 2}
+
+
+def _validate_ocr_configuration(
+    *,
+    ocr_languages: list[str] | None,
+    ocr_detection_model_dir: Path | None,
+    ocr_recognition_model_dir: Path | None,
+    ocr_force: bool,
+    ocr_deskew: bool,
+    ocr_rotate_pages: bool,
+) -> tuple[bool, list[str]]:
+    """Validate OCR activation and return its effective language list."""
+    if (ocr_detection_model_dir is None) != (ocr_recognition_model_dir is None):
+        raise ValueError(
+            "OCR detection and recognition model directories must be provided together"
+        )
+
+    ocr_requested = (
+        ocr_languages is not None
+        or ocr_detection_model_dir is not None
+        or ocr_force
+        or ocr_deskew
+        or ocr_rotate_pages
+    )
+    if ocr_requested and ocr_detection_model_dir is None:
+        raise ValueError(
+            "OCR requires both detection and recognition model directories"
+        )
+
+    effective_languages = ocr_languages if ocr_languages is not None else ["en"]
+    if ocr_requested:
+        validate_ocr_languages(effective_languages)
+    return ocr_requested, effective_languages
+
 
 # Sanitization result key -> warning message mappings for convert_to_pdfa().
 _SANITIZE_WARNINGS: list[tuple[str, str]] = [
@@ -741,9 +771,8 @@ def convert_to_pdfa(
     validate: bool = False,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
-    ocr_quality: "OcrQuality | None" = None,
-    ocr_fallback_quality: "OcrQuality | None" = DEFAULT_OCR_FALLBACK_QUALITY,
-    ocr_fallback_after_seconds: float | None = DEFAULT_OCR_FALLBACK_AFTER_SECONDS,
+    ocr_detection_model_dir: Path | None = None,
+    ocr_recognition_model_dir: Path | None = None,
     ocr_force: bool = False,
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
@@ -763,15 +792,12 @@ def convert_to_pdfa(
         validate: If True, the result is validated.
         skip_any_pdfa: If True, skip conversion for any input that veraPDF
             validates as compliant PDF/A, regardless of target level.
-        ocr_languages: Optional list of Tesseract language codes
-            (e.g., ``["deu", "eng"]``).  If specified, OCR is applied to
-            image-based pages.
-        ocr_quality: OCR quality preset. If None, uses OcrQuality.DEFAULT.
-        ocr_fallback_quality: Faster OCR quality to retry with if OCR leaves
-            the selected preset takes too long. Use None to disable.
-        ocr_fallback_after_seconds: Per-page runtime budget for OCR fallback
-            (total threshold is this value times the page count).
-            Use None to disable time-based retry.
+        ocr_languages: Optional list of PaddleOCR language codes
+            (e.g., ``["de", "en"]``). Requires both model directories.
+        ocr_detection_model_dir: PP-OCRv6 Medium detection model directory.
+            Must be provided with ``ocr_recognition_model_dir``.
+        ocr_recognition_model_dir: PP-OCRv6 Medium recognition model directory.
+            Must be provided with ``ocr_detection_model_dir``.
         ocr_force: If True, force OCR even on pages that already contain
             text by using ocrmypdf's ``redo_ocr`` mode. This cannot be
             combined with ``ocr_deskew``.
@@ -792,6 +818,14 @@ def convert_to_pdfa(
         UnsupportedPDFError: If the PDF is not supported.
         FontEmbeddingError: If fonts cannot be embedded.
     """
+    ocr_requested, effective_ocr_languages = _validate_ocr_configuration(
+        ocr_languages=ocr_languages,
+        ocr_detection_model_dir=ocr_detection_model_dir,
+        ocr_recognition_model_dir=ocr_recognition_model_dir,
+        ocr_force=ocr_force,
+        ocr_deskew=ocr_deskew,
+        ocr_rotate_pages=ocr_rotate_pages,
+    )
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
     if pdfa:
@@ -807,12 +841,8 @@ def convert_to_pdfa(
     source_info: dict | None = None
     source_xmp_tree = None
 
-    ocr_requested = (
-        ocr_force or ocr_languages is not None or ocr_deskew or ocr_rotate_pages
-    )
     if ocr_force and ocr_deskew:
         raise OCRError("Deskew cannot be combined with forced OCR")
-    effective_ocr_languages = ocr_languages if ocr_languages is not None else ["eng"]
     force_ocr_requested = ocr_force and ocr_requested
     explicit_ocr_processing_requested = (
         force_ocr_requested or ocr_deskew or ocr_rotate_pages
@@ -952,22 +982,16 @@ def convert_to_pdfa(
         # 1. Optional: Perform OCR
         actual_input = input_path
         if ocr_requested:
-            from .ocr import OcrQuality, apply_ocr, is_ocr_available
+            from .ocr import apply_ocr, is_ocr_available
 
             if not is_ocr_available():
-                unavailable_message = "OCR not available - pip install pdftopdfa[ocr]"
-                if not pdfa:
-                    raise OCRError(unavailable_message)
-                warnings.append(unavailable_message)
+                raise OCRError("OCR not available - pip install pdftopdfa[ocr]")
             else:
                 fd, tmp_path = tempfile.mkstemp(
                     suffix=".pdf", prefix=f".{input_path.stem}_ocr_"
                 )
                 os.close(fd)
                 ocr_temp_file = Path(tmp_path)
-                effective_quality = (
-                    ocr_quality if ocr_quality is not None else OcrQuality.DEFAULT
-                )
                 ocr_source_base = input_path
 
                 fd_sig, sig_tmp = tempfile.mkstemp(
@@ -1023,9 +1047,8 @@ def convert_to_pdfa(
                     ocr_source,
                     ocr_temp_file,
                     effective_ocr_languages,
-                    quality=effective_quality,
-                    fallback_quality=ocr_fallback_quality,
-                    fallback_after_seconds=ocr_fallback_after_seconds,
+                    detection_model_dir=ocr_detection_model_dir,
+                    recognition_model_dir=ocr_recognition_model_dir,
                     force=ocr_force,
                     deskew=effective_ocr_deskew,
                     rotate_pages=ocr_rotate_pages,
@@ -1388,9 +1411,8 @@ def convert_files(
     validate: bool = False,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
-    ocr_quality: "OcrQuality | None" = None,
-    ocr_fallback_quality: "OcrQuality | None" = DEFAULT_OCR_FALLBACK_QUALITY,
-    ocr_fallback_after_seconds: float | None = DEFAULT_OCR_FALLBACK_AFTER_SECONDS,
+    ocr_detection_model_dir: Path | None = None,
+    ocr_recognition_model_dir: Path | None = None,
     ocr_force: bool = False,
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
@@ -1412,13 +1434,12 @@ def convert_files(
         validate: If True, results are validated.
         skip_any_pdfa: If True, skip conversion for any input that veraPDF
             validates as compliant PDF/A, regardless of target level.
-        ocr_languages: Optional list of Tesseract language codes
-            (e.g., ``["deu", "eng"]``).
-        ocr_quality: OCR quality preset.
-        ocr_fallback_quality: Faster OCR quality to retry with if OCR leaves
-            the selected preset takes too long.
-        ocr_fallback_after_seconds: Per-page runtime budget for OCR fallback
-            (total threshold is this value times the page count).
+        ocr_languages: Optional list of PaddleOCR language codes
+            (e.g., ``["de", "en"]``). Requires both model directories.
+        ocr_detection_model_dir: PP-OCRv6 Medium detection model directory.
+            Must be provided with ``ocr_recognition_model_dir``.
+        ocr_recognition_model_dir: PP-OCRv6 Medium recognition model directory.
+            Must be provided with ``ocr_detection_model_dir``.
         ocr_force: If True, force OCR even on pages that already contain
             text. This cannot be combined with ``ocr_deskew``.
         ocr_deskew: If True, enable OCR and straighten skewed pages.
@@ -1437,6 +1458,14 @@ def convert_files(
     Returns:
         List of ConversionResult for all processed files.
     """
+    _validate_ocr_configuration(
+        ocr_languages=ocr_languages,
+        ocr_detection_model_dir=ocr_detection_model_dir,
+        ocr_recognition_model_dir=ocr_recognition_model_dir,
+        ocr_force=ocr_force,
+        ocr_deskew=ocr_deskew,
+        ocr_rotate_pages=ocr_rotate_pages,
+    )
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
 
@@ -1478,9 +1507,8 @@ def convert_files(
                 validate=validate,
                 skip_any_pdfa=skip_any_pdfa,
                 ocr_languages=ocr_languages,
-                ocr_quality=ocr_quality,
-                ocr_fallback_quality=ocr_fallback_quality,
-                ocr_fallback_after_seconds=ocr_fallback_after_seconds,
+                ocr_detection_model_dir=ocr_detection_model_dir,
+                ocr_recognition_model_dir=ocr_recognition_model_dir,
                 ocr_force=ocr_force,
                 ocr_deskew=ocr_deskew,
                 ocr_rotate_pages=ocr_rotate_pages,
@@ -1522,9 +1550,8 @@ def convert_directory(
     skip_any_pdfa: bool = False,
     show_progress: bool = True,
     ocr_languages: list[str] | None = None,
-    ocr_quality: "OcrQuality | None" = None,
-    ocr_fallback_quality: "OcrQuality | None" = DEFAULT_OCR_FALLBACK_QUALITY,
-    ocr_fallback_after_seconds: float | None = DEFAULT_OCR_FALLBACK_AFTER_SECONDS,
+    ocr_detection_model_dir: Path | None = None,
+    ocr_recognition_model_dir: Path | None = None,
     ocr_force: bool = False,
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
@@ -1546,14 +1573,12 @@ def convert_directory(
         skip_any_pdfa: If True, skip conversion for any input that veraPDF
             validates as compliant PDF/A, regardless of target level.
         show_progress: If True, a progress bar is shown.
-        ocr_languages: Optional list of Tesseract language codes
-            (e.g., ``["deu", "eng"]``).
-            If specified, OCR is applied to image-based pages.
-        ocr_quality: OCR quality preset.
-        ocr_fallback_quality: Faster OCR quality to retry with if OCR leaves
-            the selected preset takes too long.
-        ocr_fallback_after_seconds: Per-page runtime budget for OCR fallback
-            (total threshold is this value times the page count).
+        ocr_languages: Optional list of PaddleOCR language codes
+            (e.g., ``["de", "en"]``). Requires both model directories.
+        ocr_detection_model_dir: PP-OCRv6 Medium detection model directory.
+            Must be provided with ``ocr_recognition_model_dir``.
+        ocr_recognition_model_dir: PP-OCRv6 Medium recognition model directory.
+            Must be provided with ``ocr_detection_model_dir``.
         ocr_force: If True, force OCR even on pages that already contain
             text. This cannot be combined with ``ocr_deskew``.
         ocr_deskew: If True, enable OCR and straighten skewed pages.
@@ -1571,6 +1596,14 @@ def convert_directory(
     Raises:
         ConversionError: If the input directory does not exist.
     """
+    _validate_ocr_configuration(
+        ocr_languages=ocr_languages,
+        ocr_detection_model_dir=ocr_detection_model_dir,
+        ocr_recognition_model_dir=ocr_recognition_model_dir,
+        ocr_force=ocr_force,
+        ocr_deskew=ocr_deskew,
+        ocr_rotate_pages=ocr_rotate_pages,
+    )
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
 
@@ -1654,9 +1687,8 @@ def convert_directory(
         validate=validate,
         skip_any_pdfa=skip_any_pdfa,
         ocr_languages=ocr_languages,
-        ocr_quality=ocr_quality,
-        ocr_fallback_quality=ocr_fallback_quality,
-        ocr_fallback_after_seconds=ocr_fallback_after_seconds,
+        ocr_detection_model_dir=ocr_detection_model_dir,
+        ocr_recognition_model_dir=ocr_recognition_model_dir,
         ocr_force=ocr_force,
         ocr_deskew=ocr_deskew,
         ocr_rotate_pages=ocr_rotate_pages,

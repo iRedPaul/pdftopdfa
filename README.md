@@ -18,7 +18,8 @@ Instead of re-rendering via Ghostscript, it modifies the PDF structure directly 
 - **ICC color profiles** -- automatically embeds sRGB, CMYK, and grayscale profiles
 - **Batch processing** -- converts entire directories, optionally recursive
 - **Integrated validation** -- checks conformance via [veraPDF](https://verapdf.org/)
-- **OCR support** -- optional text recognition via Tesseract with offline PaddleOCR page orientation
+- **OCR support** -- optional PP-OCRv6 Medium text recognition on the CPU,
+  with explicit offline model directories and no runtime model downloads
 - **Simple API** -- usable as CLI tool or Python library
 
 ## How It Works
@@ -26,7 +27,10 @@ Instead of re-rendering via Ghostscript, it modifies the PDF structure directly 
 pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with the PDF/A standard:
 
 1. **Pre-check** -- skips encrypted and digitally signed PDFs, then detects if the PDF is already a valid PDF/A file (skips conversion if the existing level meets or exceeds the target; optionally skips any veraPDF-compliant PDF/A via `--skip-any-pdfa`; see [Usage Guide](docs/usage.md#already-compliant-pdfs) for details)
-2. **OCR** (optional) -- optionally orients pages with the bundled PaddleOCR model and straightens skewed scans, then runs Tesseract via ocrmypdf on pages without a text layer
+2. **OCR** (optional) -- optionally orients pages with the bundled PaddleOCR
+   orientation model, straightens skewed scans, and recognizes text with
+   externally supplied PP-OCRv6 Medium models; OCRmyPDF rasterizes pages and
+   creates the searchable text layer
 3. **Font compliance** -- analyzes all fonts, embeds missing ones, adds ToUnicode mappings, subsets embedded fonts, and fixes encoding issues
 4. **Sanitization** -- removes or fixes non-compliant elements (JavaScript, non-standard actions, transparency groups, annotations, optional content, etc.)
 5. **Metadata** -- synchronizes XMP metadata with the document info dictionary and sets the PDF/A conformance level
@@ -53,7 +57,49 @@ pip install pdftopdfa
 pip install "pdftopdfa[ocr]"
 ```
 
-OCR requires a [Tesseract](https://github.com/tesseract-ocr/tesseract) installation on the system. The `--rotate-pages` option uses a bundled PaddleOCR ONNX model and never downloads model files at runtime. See [docs/ocr.md](docs/ocr.md) for details on OCR usage, page processing, and quality presets.
+OCR uses PaddleOCR 3.7 with ONNX Runtime on the CPU. It does not download
+models at runtime. Detection and recognition models must be obtained separately
+and passed explicitly on every OCR invocation.
+
+#### PP-OCRv6 model setup
+
+Download the files from these exact model revisions:
+
+- Detection:
+  [`PP-OCRv6_medium_det_onnx` at `6132380`](https://huggingface.co/PaddlePaddle/PP-OCRv6_medium_det_onnx/tree/61323801669c338b7891481ec7bac61ce31b576a)
+- Recognition:
+  [`PP-OCRv6_medium_rec_onnx` at `50c7eac`](https://huggingface.co/PaddlePaddle/PP-OCRv6_medium_rec_onnx/tree/50c7eacafc52fa7bcf4194e8cd08e46f8558504b)
+
+Each model directory must contain exactly `inference.onnx` and
+`inference.yml`. Missing files, extra files, symbolic links, unexpected sizes,
+or hash mismatches are rejected before PaddleOCR is initialized.
+
+| Model | File | Size (bytes) | SHA-256 |
+| --- | --- | ---: | --- |
+| Detection | `inference.onnx` | 62,032,837 | `eb13b44b25bb36f89528b68720af8a61d9cf381176107f465db1757b65d086e1` |
+| Detection | `inference.yml` | 886 | `7298d5ead546584af2504d03355f881ac7a7bc0eb1e282d3e159277c1d0af871` |
+| Recognition | `inference.onnx` | 76,554,979 | `9c09abf0957f7968c7586464b7397b84ad2387a0497a351af40e9acc71b673ba` |
+| Recognition | `inference.yml` | 150,580 | `991b700facf5b50a7de193468207d5f4255b538dde0d312ae3b7c7a9b6873129` |
+
+The models are not included in the source distribution or wheel. Keep them in
+deployment-managed, read-only directories. Both
+`--ocr-detection-model-dir` and `--ocr-recognition-model-dir` are required
+together; supplying the pair enables OCR without an additional `--ocr` flag.
+Conversely, `--ocr`, `--ocr-force`, `--deskew`, and `--rotate-pages` are
+rejected unless both model options are present.
+
+`--ocr-lang` defaults to `en`. Use `de` for German and `de+en` for mixed
+German/English metadata. The accepted PaddleOCR 3.7 codes are:
+
+`af`, `az`, `bs`, `ca`, `ch`, `chinese_cht`, `cs`, `cy`, `da`, `de`, `en`,
+`es`, `et`, `eu`, `fi`, `fr`, `french`, `ga`, `german`, `gl`, `hr`, `hu`,
+`id`, `is`, `it`, `japan`, `ku`, `la`, `lb`, `lt`, `lv`, `mi`, `ms`, `mt`,
+`nl`, `no`, `oc`, `pl`, `pt`, `qu`, `rm`, `ro`, `rs_latin`, `sk`, `sl`,
+`sq`, `sv`, `sw`, `tl`, `tr`, `uz`, `vi`.
+
+Legacy codes such as `eng` and `deu` are not accepted. See the
+[PaddleOCR language documentation](https://github.com/PaddlePaddle/PaddleOCR/blob/main/docs/version3.x/pipeline_usage/OCR.en.md)
+for the language families represented by these codes.
 
 ## Quick Start
 
@@ -76,18 +122,34 @@ pdftopdfa --allow-signature-invalidation document.pdf
 # Convert an entire directory
 pdftopdfa -r ./documents/ ./output/
 
-# OCR for scanned PDFs
-pdftopdfa --ocr document.pdf
+# The OCR examples below use the externally managed model directories
+DET_MODEL=/opt/pdftopdfa/models/PP-OCRv6_medium_det_onnx
+REC_MODEL=/opt/pdftopdfa/models/PP-OCRv6_medium_rec_onnx
+
+# OCR a German/English scanned PDF
+pdftopdfa --ocr-lang de+en \
+  --ocr-detection-model-dir "$DET_MODEL" \
+  --ocr-recognition-model-dir "$REC_MODEL" \
+  document.pdf
 
 # Automatically orient pages without deskewing them
-pdftopdfa --rotate-pages document.pdf
+pdftopdfa --rotate-pages \
+  --ocr-detection-model-dir "$DET_MODEL" \
+  --ocr-recognition-model-dir "$REC_MODEL" \
+  document.pdf
 
 # Deskew pages without changing their 90-degree orientation
-pdftopdfa --deskew document.pdf
+pdftopdfa --deskew \
+  --ocr-detection-model-dir "$DET_MODEL" \
+  --ocr-recognition-model-dir "$REC_MODEL" \
+  document.pdf
 
 # Deskew and orient pages without converting the result to PDF/A
 # (creates document_processed.pdf)
-pdftopdfa --no-pdfa --deskew --rotate-pages document.pdf
+pdftopdfa --no-pdfa --deskew --rotate-pages \
+  --ocr-detection-model-dir "$DET_MODEL" \
+  --ocr-recognition-model-dir "$REC_MODEL" \
+  document.pdf
 
 # Preserve known proprietary stamps as PDF Stamp annotations
 pdftopdfa --preserve-stamps document.pdf
@@ -102,7 +164,25 @@ result = convert_to_pdfa(
     output_path=Path("output.pdf"),
     level="2b",
 )
+
+ocr_result = convert_to_pdfa(
+    input_path=Path("scan.pdf"),
+    output_path=Path("scan_pdfa.pdf"),
+    level="2b",
+    ocr_languages=["de", "en"],
+    ocr_detection_model_dir=Path(
+        "/opt/pdftopdfa/models/PP-OCRv6_medium_det_onnx"
+    ),
+    ocr_recognition_model_dir=Path(
+        "/opt/pdftopdfa/models/PP-OCRv6_medium_rec_onnx"
+    ),
+)
 ```
+
+Supplying both model directories enables OCR in `convert_to_pdfa()`,
+`convert_files()`, and `convert_directory()`. Supplying only one directory, or
+requesting an OCR option without both directories, raises `ValueError` before
+processing starts.
 
 Set `pdfa=False` to apply only the requested OCR processing. This skips font
 embedding, PDF/A sanitization, metadata synchronization, color-profile
@@ -130,7 +210,7 @@ See [docs/usage.md](docs/usage.md) for the full CLI reference, Python API docume
 ## Development
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,ocr]"
 ```
 
 ### Running Tests
@@ -170,12 +250,14 @@ Contributions are welcome! Please open an [issue](https://github.com/iredpaul/pd
 - [click](https://click.palletsprojects.com/) -- CLI framework
 - [colorama](https://pypi.org/project/colorama/) -- Colored terminal output
 - [tqdm](https://tqdm.github.io/) -- Progress bars
-- [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) -- document orientation classification
-- [ONNX Runtime](https://onnxruntime.ai/) -- CPU inference for the bundled orientation model
+- [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) -- document
+  orientation and PP-OCRv6 text recognition
+- [ONNX Runtime](https://onnxruntime.ai/) -- CPU inference for Paddle models
 
 **Optional:**
 
-- [ocrmypdf](https://ocrmypdf.readthedocs.io/) -- OCR support (requires [Tesseract](https://github.com/tesseract-ocr/tesseract))
+- [OCRmyPDF](https://ocrmypdf.readthedocs.io/) -- PDF rasterization, text-layer
+  generation, and page merging for optional OCR
 - [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) -- PDF page rasterizer for OCR
 - [veraPDF](https://verapdf.org/) -- ISO-compliant PDF/A validation
 
