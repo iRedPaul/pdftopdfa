@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.8.0] - 2026-07-26
+
+### Features
+
+- Replace Tesseract text recognition with a CPU-only PP-OCRv6 Medium OCR engine
+- Add explicit SHA-256-verified PaddleOCR detection and recognition model directory options
+- Generate word-level text geometry and deskew angles from PaddleOCR results
+
+### Changes
+
+- Require both external model directories for every OCR workflow
+- Switch OCR language codes from Tesseract aliases such as `eng` and `deu` to PaddleOCR codes such as `en` and `de`
+- Remove OCR quality presets, timeout fallback controls, and active Tesseract integration
+- Disable automatic recognition-model resolution and downloads
+
+### Bug Fixes
+
+- Fix OCR text-layer clipping on pages rotated by 90 or 270 degrees
+- Fix zero-DPI failures during forced OCR of vector-only pages
+- Remove existing invisible OCR text safely during forced OCR
+
+### Documentation
+
+- Document PP-OCRv6 model setup, supported languages, CLI and Python usage, and offline deployment
+
+### CI / Build
+
+- Pin OCRmyPDF 17.8.1, ONNX Runtime 1.27.0, and PaddleOCR 3.7.0 for OCR installations
+- Reject external PP-OCRv6 weights and active Tesseract configuration in built distributions
+
 ## [0.7.0] - 2026-07-14
 
 ### Features
