@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import math
 import re
-import stat
 import statistics
 import threading
 from argparse import SUPPRESS
@@ -29,7 +28,10 @@ from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
 from PIL import Image
 from pydantic import BaseModel
 
+from ._ocr_runtime import _MODEL_FILENAMES as _MODEL_FILENAMES
 from ._ocr_runtime import (
+    _ModelSpec,
+    _validate_model_directory,
     onnxruntime_engine_config,
     require_execution_provider,
     validate_ocr_execution_provider,
@@ -45,15 +47,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _TESSERACT_PLUGIN = "ocrmypdf.builtin_plugins.tesseract_ocr"
-_MODEL_FILENAMES = frozenset({"inference.onnx", "inference.yml"})
 _MIN_DESKEW_ANGLE = 0.05
 _MAX_DESKEW_ANGLE = 10.0
 _TEXT_DETECTION_LIMIT_SIDE_LEN = 1600
-
-
-@dataclass(frozen=True)
-class _ModelSpec:
-    name: str
 
 
 @dataclass(frozen=True)
@@ -93,55 +89,6 @@ _pending_deskew_results: dict[tuple[Path, int], _CachedPrediction] = {}
 _prediction_result_by_image: dict[Path, _CachedPrediction] = {}
 _coordinate_dpi_lock = threading.Lock()
 _coordinate_dpi_by_image: dict[Path, float] = {}
-
-
-def _validate_model_directory(
-    model_dir: Path,
-    spec: _ModelSpec,
-) -> tuple[tuple[int, int, int, int, int, int], ...]:
-    if model_dir.is_symlink() or not model_dir.is_dir():
-        raise OCRError(f"{spec.name} model directory does not exist: {model_dir}")
-
-    try:
-        entries = {entry.name for entry in model_dir.iterdir()}
-    except OSError as exc:
-        raise OCRError(f"Could not inspect {spec.name} model directory: {exc}") from exc
-
-    if entries != _MODEL_FILENAMES:
-        missing = sorted(_MODEL_FILENAMES - entries)
-        unexpected = sorted(entries - _MODEL_FILENAMES)
-        details = []
-        if missing:
-            details.append(f"missing: {', '.join(missing)}")
-        if unexpected:
-            details.append(f"unexpected: {', '.join(unexpected)}")
-        raise OCRError(
-            f"{spec.name} model directory must contain exactly inference.onnx "
-            f"and inference.yml ({'; '.join(details)})"
-        )
-
-    fingerprint = []
-    for filename in sorted(_MODEL_FILENAMES):
-        path = model_dir / filename
-        try:
-            artifact_stat = path.lstat()
-        except OSError as exc:
-            raise OCRError(
-                f"Could not inspect {spec.name} model artifact: {exc}"
-            ) from exc
-        if path.is_symlink() or not stat.S_ISREG(artifact_stat.st_mode):
-            raise OCRError(f"{spec.name} model artifact is not a regular file: {path}")
-        fingerprint.append(
-            (
-                artifact_stat.st_dev,
-                artifact_stat.st_ino,
-                artifact_stat.st_mode,
-                artifact_stat.st_size,
-                artifact_stat.st_mtime_ns,
-                artifact_stat.st_ctime_ns,
-            )
-        )
-    return tuple(fingerprint)
 
 
 def _resolve_and_validate_model_directories(

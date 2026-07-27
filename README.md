@@ -21,6 +21,9 @@ Instead of re-rendering via Ghostscript, it modifies the PDF structure directly 
 - **OCR support** -- optional PP-OCRv6 Medium text recognition on the CPU or
   through DirectML on Windows 11, with explicit offline model directories and
   no runtime model downloads
+- **Table recognition** -- recognizes already-cropped wired and wireless
+  tables as typed cells and HTML using only explicitly supplied local ONNX
+  models
 - **Simple API** -- usable as CLI tool or Python library
 
 ## How It Works
@@ -78,9 +81,11 @@ DirectML extra does not select it automatically; use
 requested but unavailable, processing stops with an error instead of falling
 back to the CPU.
 
-OCR does not download models at runtime. Detection and recognition models must
-be obtained separately and passed explicitly on every OCR invocation. CPU and
-DirectML use the same FP32 ONNX model files.
+OCR and table recognition do not download models at runtime. Every model must
+be obtained separately and passed through an explicit local directory on each
+public API invocation. CPU and DirectML use the same FP32 ONNX model files.
+See the [OCR guide](docs/ocr.md) for the `recognize_table()` model contract and
+typed result.
 
 #### PP-OCRv6 model setup
 

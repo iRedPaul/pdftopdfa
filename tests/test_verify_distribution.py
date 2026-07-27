@@ -52,6 +52,14 @@ def test_cpu_and_directml_runtimes_are_separate_extras() -> None:
     assert not any(
         dependency.startswith("onnxruntime==") for dependency in directml_dependencies
     )
+    assert "paddlex[ocr]==3.7.2" in cpu_dependencies
+    assert "paddlex[ocr]==3.7.2" in directml_dependencies
+
+    forbidden_engines = ("paddlepaddle", "torch", "transformers")
+    assert not any(
+        dependency.partition("[")[0].partition("=")[0] in forbidden_engines
+        for dependency in base_dependencies + cpu_dependencies + directml_dependencies
+    )
 
 
 def _valid_archive_files() -> dict[str, bytes]:

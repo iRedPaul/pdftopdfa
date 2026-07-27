@@ -22,6 +22,13 @@ from .exceptions import (
     VeraPDFError,
 )
 from .ocr import recognize_image
+from .table import (
+    TableBoundingBox,
+    TableCell,
+    TableRecognitionResult,
+    TableType,
+    recognize_table,
+)
 
 try:
     __version__ = version("pdftopdfa")
@@ -34,7 +41,12 @@ __all__ = [
     "convert_files",
     "convert_directory",
     "recognize_image",
+    "recognize_table",
     "ConversionResult",
+    "TableType",
+    "TableBoundingBox",
+    "TableCell",
+    "TableRecognitionResult",
     "PDFToPDFAError",
     "ConversionError",
     "ValidationError",

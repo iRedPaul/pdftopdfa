@@ -253,6 +253,57 @@ bypasses detection. `allowed_characters` restricts CTC decoding itself, so a
 disallowed character cannot win a decoding step. Omitting both options uses
 the standard OCR pipeline unchanged.
 
+An already-cropped table can be recognized from a local image path or a
+`PIL.Image.Image`:
+
+```python
+from pathlib import Path
+
+from pdftopdfa import recognize_table
+
+result = recognize_table(
+    Path("cropped-table.png"),
+    table_classification_model_dir=Path(
+        "/opt/pdftopdfa/models/PP-LCNet_x1_0_table_cls"
+    ),
+    wired_table_structure_recognition_model_dir=Path(
+        "/opt/pdftopdfa/models/SLANeXt_wired"
+    ),
+    wireless_table_structure_recognition_model_dir=Path(
+        "/opt/pdftopdfa/models/SLANeXt_wireless"
+    ),
+    wired_table_cells_detection_model_dir=Path(
+        "/opt/pdftopdfa/models/RT-DETR-L_wired_table_cell_det"
+    ),
+    wireless_table_cells_detection_model_dir=Path(
+        "/opt/pdftopdfa/models/RT-DETR-L_wireless_table_cell_det"
+    ),
+    detection_model_dir=Path(
+        "/opt/pdftopdfa/models/PP-OCRv6_medium_det"
+    ),
+    recognition_model_dir=Path(
+        "/opt/pdftopdfa/models/PP-OCRv6_medium_rec"
+    ),
+)
+```
+
+`recognize_table()` returns an immutable `TableRecognitionResult` with its
+`TableType`, HTML, and a tuple of `TableCell` values. Cell rows and columns are
+zero-based. Spans, text, and pixel bounding boxes are plain Python values.
+Confidence is the mean confidence of OCR text boxes assigned to the cell, or
+`None` for an empty cell. PaddleX and NumPy result objects never escape the
+function.
+
+All seven model directories are required and must each contain exactly
+`inference.onnx` and `inference.yml`. Directories and artifacts must be local,
+regular, and not symbolic links. URL input is rejected. Classification runs
+first; only the selected wired or wireless structure and cell-model paths are
+then supplied to the cached `TableRecognitionPipelineV2`. Document
+orientation, unwarping, layout detection, and table-orientation models are
+disabled, so PaddleX never receives a missing model path that it could resolve
+by downloading. Classification and table predictions are serialized for safe
+reuse of the cached ONNX sessions.
+
 Use `pdfa=False` with a neutral output name such as `scan_processed.pdf` to
 write the OCR result directly without font embedding, PDF/A sanitization,
 metadata synchronization, color-profile embedding, or PDF/A validation. The
