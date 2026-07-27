@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.8.3] - 2026-07-27
+
+### Features
+
+- Add `directml:<index>` OCR execution providers for selecting a specific GPU
+- Add DirectML device enumeration with adapter descriptions and selection strings
+
+### Changes
+
+- Canonicalize DirectML device indices and reject malformed or out-of-range provider values
+- Preserve strict DirectML availability and CPU-fallback checks for indexed providers
+
+### Documentation
+
+- Document multi-GPU DirectML selection for CLI and Python usage
+
 ## [0.8.2] - 2026-07-27
 
 ### Changes
