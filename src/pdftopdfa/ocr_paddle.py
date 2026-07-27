@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import stat
 import statistics
 import threading
@@ -19,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 import ocrmypdf
 from ocrmypdf.helpers import Resolution
-from ocrmypdf.hocrtransform import BoundingBox, OcrClass, OcrElement
+from ocrmypdf.hocrtransform import Baseline, BoundingBox, OcrClass, OcrElement
 from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
 from PIL import Image
 from pydantic import BaseModel
@@ -453,12 +454,13 @@ def _optional_word_data(result: Any, line_count: int) -> tuple[Any, Any] | None:
     return words, regions
 
 
-def _clipped_polygon(
+def _polygon_geometry(
     value: Any,
     width: int,
     height: int,
     *,
     scale: float = 1.0,
+    clip: bool = True,
 ) -> tuple[list[tuple[float, float]], BoundingBox] | None:
     try:
         if len(value) != 4:
@@ -471,10 +473,13 @@ def _clipped_polygon(
             y = float(point[1])
             if not math.isfinite(x) or not math.isfinite(y):
                 return None
+            if clip:
+                x = min(max(x, 0.0), float(width))
+                y = min(max(y, 0.0), float(height))
             polygon.append(
                 (
-                    min(max(x, 0.0), float(width)) * scale,
-                    min(max(y, 0.0), float(height)) * scale,
+                    x * scale,
+                    y * scale,
                 )
             )
     except (TypeError, ValueError, IndexError):
@@ -525,6 +530,100 @@ def _line_angle(polygon: list[tuple[float, float]]) -> float:
     return -image_angle
 
 
+def _word_regions_are_vertical(polygon: list[tuple[float, float]]) -> bool:
+    width = max(point[0] for point in polygon) - min(point[0] for point in polygon)
+    height = max(point[1] for point in polygon) - min(point[1] for point in polygon)
+    return width <= 0.0 or height / width > 1.5
+
+
+def _line_uses_side_edges(polygon: list[tuple[float, float]]) -> bool:
+    crop_width = max(
+        math.dist(polygon[0], polygon[1]),
+        math.dist(polygon[3], polygon[2]),
+    )
+    crop_height = max(
+        math.dist(polygon[0], polygon[3]),
+        math.dist(polygon[1], polygon[2]),
+    )
+    return crop_width <= 0.0 or crop_height / crop_width >= 1.5
+
+
+def _text_layer_geometry(
+    source_polygon: list[tuple[float, float]],
+    rendered_polygon: list[tuple[float, float]],
+    text: str,
+) -> tuple[float, Baseline]:
+    # A single narrow glyph has no reliable vertical signal; prefer horizontal.
+    if len(text.strip()) > 1 and _line_uses_side_edges(source_polygon):
+        first_start, first_end = source_polygon[0], source_polygon[3]
+        second_start, second_end = source_polygon[1], source_polygon[2]
+        baseline_start, baseline_end = source_polygon[0], source_polygon[3]
+        opposite_start, opposite_end = source_polygon[1], source_polygon[2]
+    else:
+        first_start, first_end = source_polygon[0], source_polygon[1]
+        second_start, second_end = source_polygon[3], source_polygon[2]
+        baseline_start, baseline_end = source_polygon[3], source_polygon[2]
+        opposite_start, opposite_end = source_polygon[0], source_polygon[1]
+
+    dx = (first_end[0] - first_start[0]) + (second_end[0] - second_start[0])
+    dy = (first_end[1] - first_start[1]) + (second_end[1] - second_start[1])
+    length = math.hypot(dx, dy)
+    if length <= 1e-6:
+        dx = first_end[0] - first_start[0]
+        dy = first_end[1] - first_start[1]
+        length = math.hypot(dx, dy)
+    if length <= 1e-6:
+        return _line_angle(source_polygon), Baseline()
+
+    unit_x = dx / length
+    unit_y = dy / length
+    normal_x = -unit_y
+    normal_y = unit_x
+    if (
+        (baseline_start[0] + baseline_end[0]) / 2.0
+        - (opposite_start[0] + opposite_end[0]) / 2.0
+    ) * normal_x + (
+        (baseline_start[1] + baseline_end[1]) / 2.0
+        - (opposite_start[1] + opposite_end[1]) / 2.0
+    ) * normal_y < 0.0:
+        normal_x = -normal_x
+        normal_y = -normal_y
+
+    local_points = [
+        (
+            point[0] * unit_x + point[1] * unit_y,
+            point[0] * normal_x + point[1] * normal_y,
+        )
+        for point in rendered_polygon
+    ]
+    baseline_points = [
+        (
+            point[0] * unit_x + point[1] * unit_y,
+            point[0] * normal_x + point[1] * normal_y,
+        )
+        for point in (baseline_start, baseline_end)
+    ]
+    baseline_dx = baseline_points[1][0] - baseline_points[0][0]
+    slope = (
+        (baseline_points[1][1] - baseline_points[0][1]) / baseline_dx
+        if abs(baseline_dx) > 1e-6
+        else 0.0
+    )
+    if abs(slope) <= 1e-12:
+        slope = 0.0
+    left = min(point[0] for point in local_points)
+    bottom = max(point[1] for point in local_points)
+    baseline_at_left = baseline_points[0][1] + slope * (left - baseline_points[0][0])
+    intercept = baseline_at_left - bottom
+    if abs(intercept) <= 1e-6:
+        intercept = 0.0
+    textangle = -math.degrees(math.atan2(unit_y, unit_x))
+    return textangle, Baseline(
+        slope=slope,
+        intercept=intercept,
+    )
+
+
 def _confidence(value: Any) -> float | None:
     try:
         confidence = float(value)
@@ -555,23 +654,210 @@ def _fallback_word(
 
 def _combined_word_geometry(
     geometries: list[tuple[list[tuple[float, float]], BoundingBox]],
+    *,
+    uses_side_edges: bool,
 ) -> tuple[list[tuple[float, float]], BoundingBox]:
     if len(geometries) == 1:
         return geometries[0]
 
-    left = min(geometry[1].left for geometry in geometries)
-    top = min(geometry[1].top for geometry in geometries)
-    right = max(geometry[1].right for geometry in geometries)
-    bottom = max(geometry[1].bottom for geometry in geometries)
+    if uses_side_edges:
+        polygon = [
+            geometries[0][0][0],
+            geometries[0][0][1],
+            geometries[-1][0][2],
+            geometries[-1][0][3],
+        ]
+    else:
+        polygon = [
+            geometries[0][0][0],
+            geometries[-1][0][1],
+            geometries[-1][0][2],
+            geometries[0][0][3],
+        ]
+    left = min(point[0] for point in polygon)
+    top = min(point[1] for point in polygon)
+    right = max(point[0] for point in polygon)
+    bottom = max(point[1] for point in polygon)
     bbox = BoundingBox(left=left, top=top, right=right, bottom=bottom)
-    return (
-        [(left, top), (right, top), (right, bottom), (left, bottom)],
-        bbox,
+    return polygon, bbox
+
+
+def _line_slice(
+    polygon: list[tuple[float, float]],
+    start: float,
+    end: float,
+) -> tuple[list[tuple[float, float]], BoundingBox]:
+    def interpolate(
+        first: tuple[float, float],
+        second: tuple[float, float],
+        position: float,
+    ) -> tuple[float, float]:
+        return (
+            first[0] + (second[0] - first[0]) * position,
+            first[1] + (second[1] - first[1]) * position,
+        )
+
+    if _line_uses_side_edges(polygon):
+        word_polygon = [
+            interpolate(polygon[0], polygon[3], start),
+            interpolate(polygon[1], polygon[2], start),
+            interpolate(polygon[1], polygon[2], end),
+            interpolate(polygon[0], polygon[3], end),
+        ]
+    else:
+        word_polygon = [
+            interpolate(polygon[0], polygon[1], start),
+            interpolate(polygon[0], polygon[1], end),
+            interpolate(polygon[3], polygon[2], end),
+            interpolate(polygon[3], polygon[2], start),
+        ]
+
+    return word_polygon, BoundingBox(
+        left=min(point[0] for point in word_polygon),
+        top=min(point[1] for point in word_polygon),
+        right=max(point[0] for point in word_polygon),
+        bottom=max(point[1] for point in word_polygon),
     )
+
+
+def _projected_line_slice(
+    line_polygon: list[tuple[float, float]],
+    start: float,
+    end: float,
+    width: int,
+    height: int,
+    scale: float,
+) -> tuple[list[tuple[float, float]], BoundingBox] | None:
+    polygon, _bbox = _line_slice(line_polygon, start, end)
+    return _polygon_geometry(
+        polygon,
+        width,
+        height,
+        scale=scale,
+    )
+
+
+def _proportional_word_geometry(
+    source_polygon: list[tuple[float, float]],
+    line_polygon: list[tuple[float, float]],
+    start: float,
+    end: float,
+    width: int,
+    height: int,
+    scale: float,
+) -> tuple[list[tuple[float, float]], BoundingBox]:
+    geometry = _projected_line_slice(
+        source_polygon,
+        start,
+        end,
+        width,
+        height,
+        scale,
+    )
+    return geometry or _line_slice(line_polygon, start, end)
+
+
+def _project_word_region(
+    line_polygon: list[tuple[float, float]],
+    value: Any,
+    width: int,
+    height: int,
+    scale: float,
+) -> tuple[list[tuple[float, float]], BoundingBox] | None:
+    geometry = _polygon_geometry(
+        _word_polygon(value),
+        width,
+        height,
+        clip=False,
+    )
+    if geometry is None:
+        return None
+    _polygon, bbox = geometry
+
+    if _word_regions_are_vertical(line_polygon):
+        line_start = line_polygon[0][1]
+        line_end = line_polygon[2][1]
+        region_start = bbox.top
+        region_end = bbox.bottom
+    else:
+        line_start = line_polygon[0][0]
+        line_end = line_polygon[1][0]
+        region_start = bbox.left
+        region_end = bbox.right
+
+    line_length = line_end - line_start
+    if abs(line_length) <= 1e-6:
+        return None
+    start, end = sorted(
+        (
+            (region_start - line_start) / line_length,
+            (region_end - line_start) / line_length,
+        )
+    )
+    start = min(max(start, 0.0), 1.0)
+    end = min(max(end, 0.0), 1.0)
+    if end - start <= 1e-6:
+        return None
+    return _projected_line_slice(
+        line_polygon,
+        start,
+        end,
+        width,
+        height,
+        scale,
+    )
+
+
+def _fallback_words(
+    text: str,
+    source_polygon: list[tuple[float, float]],
+    line_polygon: list[tuple[float, float]],
+    line_bbox: BoundingBox,
+    confidence: float | None,
+    language: str,
+    width: int,
+    height: int,
+    scale: float,
+) -> list[OcrElement]:
+    matches = list(re.finditer(r"\S+", text))
+    if not matches:
+        return [
+            _fallback_word(
+                text,
+                line_polygon,
+                line_bbox,
+                confidence,
+                language,
+            )
+        ]
+
+    words = []
+    for match in matches:
+        start = match.start() / len(text)
+        end = match.end() / len(text)
+        geometry = _proportional_word_geometry(
+            source_polygon,
+            line_polygon,
+            start,
+            end,
+            width,
+            height,
+            scale,
+        )
+        words.append(
+            _fallback_word(
+                match.group(),
+                *geometry,
+                confidence,
+                language,
+            )
+        )
+    return words
 
 
 def _words_for_line(
     text: str,
+    source_polygon: list[tuple[float, float]],
     line_polygon: list[tuple[float, float]],
     line_bbox: BoundingBox,
     confidence: float | None,
@@ -594,42 +880,67 @@ def _words_for_line(
         normalized_text = " ".join(text.split())
         if all(not any(character.isspace() for character in token) for token in tokens):
             if " ".join(tokens) == normalized_text:
+                matches = list(re.finditer(r"\S+", text))
+                if len(matches) != len(tokens):
+                    raise ValueError
                 words = []
-                for token, region in zip(tokens, word_regions, strict=True):
-                    geometry = _clipped_polygon(
-                        _word_polygon(region),
+                for token, region, match in zip(
+                    tokens,
+                    word_regions,
+                    matches,
+                    strict=True,
+                ):
+                    geometry = _project_word_region(
+                        source_polygon,
+                        region,
                         width,
                         height,
-                        scale=scale,
+                        scale,
                     )
                     if geometry is None:
-                        raise ValueError
+                        geometry = _proportional_word_geometry(
+                            source_polygon,
+                            line_polygon,
+                            match.start() / len(text),
+                            match.end() / len(text),
+                            width,
+                            height,
+                            scale,
+                        )
                     polygon, bbox = geometry
                     words.append(
-                        OcrElement(
-                            ocr_class=OcrClass.WORD,
-                            bbox=bbox,
-                            poly=polygon,
-                            text=token,
-                            confidence=confidence,
-                            direction="ltr",
-                            language=language,
+                        _fallback_word(
+                            token,
+                            polygon,
+                            bbox,
+                            confidence,
+                            language,
                         )
                     )
                 return words
 
         grouped_words: list[
-            tuple[str, list[tuple[list[tuple[float, float]], BoundingBox]]]
+            tuple[
+                str,
+                list[tuple[list[tuple[float, float]], BoundingBox]] | None,
+            ]
         ] = []
         current_text = ""
         current_geometries: list[tuple[list[tuple[float, float]], BoundingBox]] = []
+        current_geometry_valid = True
 
         def finish_word() -> None:
-            nonlocal current_text, current_geometries
+            nonlocal current_geometry_valid, current_geometries, current_text
             if current_text:
-                grouped_words.append((current_text, current_geometries))
+                grouped_words.append(
+                    (
+                        current_text,
+                        current_geometries if current_geometry_valid else None,
+                    )
+                )
             current_text = ""
             current_geometries = []
+            current_geometry_valid = True
 
         for token, region in zip(tokens, word_regions, strict=True):
             if token[:1].isspace():
@@ -637,16 +948,18 @@ def _words_for_line(
 
             content = token.strip()
             if content:
-                geometry = _clipped_polygon(
-                    _word_polygon(region),
+                geometry = _project_word_region(
+                    source_polygon,
+                    region,
                     width,
                     height,
-                    scale=scale,
+                    scale,
                 )
                 if geometry is None:
-                    raise ValueError
+                    current_geometry_valid = False
+                else:
+                    current_geometries.append(geometry)
                 current_text += content
-                current_geometries.append(geometry)
 
             if token[-1:].isspace():
                 finish_word()
@@ -656,32 +969,55 @@ def _words_for_line(
             raise ValueError
         if " ".join(word[0] for word in grouped_words) != " ".join(text.split()):
             raise ValueError
+        matches = list(re.finditer(r"\S+", text))
+        if len(matches) != len(grouped_words):
+            raise ValueError
 
         words = []
-        for token, geometries in grouped_words:
-            polygon, bbox = _combined_word_geometry(geometries)
+        for (token, geometries), match in zip(
+            grouped_words,
+            matches,
+            strict=True,
+        ):
+            if token != match.group():
+                raise ValueError
+            if geometries is None:
+                polygon, bbox = _proportional_word_geometry(
+                    source_polygon,
+                    line_polygon,
+                    match.start() / len(text),
+                    match.end() / len(text),
+                    width,
+                    height,
+                    scale,
+                )
+            else:
+                polygon, bbox = _combined_word_geometry(
+                    geometries,
+                    uses_side_edges=_line_uses_side_edges(source_polygon),
+                )
             words.append(
-                OcrElement(
-                    ocr_class=OcrClass.WORD,
-                    bbox=bbox,
-                    poly=polygon,
-                    text=token,
-                    confidence=confidence,
-                    direction="ltr",
-                    language=language,
+                _fallback_word(
+                    token,
+                    polygon,
+                    bbox,
+                    confidence,
+                    language,
                 )
             )
         return words
     except (TypeError, ValueError):
-        return [
-            _fallback_word(
-                text,
-                line_polygon,
-                line_bbox,
-                confidence,
-                language,
-            )
-        ]
+        return _fallback_words(
+            text,
+            source_polygon,
+            line_polygon,
+            line_bbox,
+            confidence,
+            language,
+            width,
+            height,
+            scale,
+        )
 
 
 def _image_properties(input_file: Path) -> tuple[int, int, float]:
@@ -755,7 +1091,7 @@ class PaddleOcrEngine(OcrEngine):
         minimum_length = max(20.0, min(width, height) * 0.05)
         angles = []
         for value in polygons:
-            geometry = _clipped_polygon(value, width, height)
+            geometry = _polygon_geometry(value, width, height)
             if geometry is None:
                 continue
             polygon, _bbox = geometry
@@ -806,32 +1142,48 @@ class PaddleOcrEngine(OcrEngine):
                 raise OCRError(
                     f"PaddleOCR result field rec_texts[{index}] must be a string"
                 )
-            geometry = _clipped_polygon(
+            source_geometry = _polygon_geometry(
+                polygons[index],
+                width,
+                height,
+                clip=False,
+            )
+            geometry = _polygon_geometry(
                 polygons[index],
                 width,
                 height,
                 scale=scale,
             )
-            if not text or geometry is None:
+            if not text or source_geometry is None or geometry is None:
                 continue
 
             plain_text.append(text)
+            source_polygon, _source_bbox = source_geometry
             polygon, bbox = geometry
+            scaled_source_polygon = [(x * scale, y * scale) for x, y in source_polygon]
+            textangle, baseline = _text_layer_geometry(
+                scaled_source_polygon,
+                polygon,
+                text,
+            )
             confidence = _confidence(scores[index])
             if word_data is None:
-                words = [
-                    _fallback_word(
-                        text,
-                        polygon,
-                        bbox,
-                        confidence,
-                        language,
-                    )
-                ]
+                words = _fallback_words(
+                    text,
+                    source_polygon,
+                    polygon,
+                    bbox,
+                    confidence,
+                    language,
+                    width,
+                    height,
+                    scale,
+                )
             else:
                 word_texts, word_regions = word_data
                 words = _words_for_line(
                     text,
+                    source_polygon,
                     polygon,
                     bbox,
                     confidence,
@@ -853,7 +1205,8 @@ class PaddleOcrEngine(OcrEngine):
                     children=words,
                     direction="ltr",
                     language=language,
-                    textangle=_line_angle(polygon),
+                    baseline=baseline,
+                    textangle=textangle,
                 )
             )
 

@@ -19,8 +19,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from ocrmypdf.helpers import Resolution
-from ocrmypdf.hocrtransform import BoundingBox, OcrClass
-from pikepdf import Dictionary, Name, Pdf
+from ocrmypdf.hocrtransform import Baseline, BoundingBox, OcrClass
+from pdfminer.high_level import extract_text
+from pikepdf import Dictionary, Name, Pdf, parse_content_stream
 from PIL import Image, ImageDraw, ImageFont
 
 import pdftopdfa.ocr_paddle as ocr_paddle
@@ -122,6 +123,16 @@ def _result(
         "rec_boxes": boxes,
         **word_data,
     }
+
+
+def _assert_polygon(
+    actual: list[tuple[float, float]] | None,
+    expected: list[tuple[float, float]],
+) -> None:
+    assert actual is not None
+    assert len(actual) == len(expected)
+    for actual_point, expected_point in zip(actual, expected, strict=True):
+        assert actual_point == pytest.approx(expected_point)
 
 
 def test_model_contract_uses_expected_paddle_names() -> None:
@@ -539,6 +550,248 @@ def test_generate_ocr_maps_lines_words_geometry_and_metadata(
     assert page.children[1].textangle == pytest.approx(-math.degrees(math.atan2(5, 90)))
 
 
+@pytest.mark.parametrize(
+    (
+        "line_polygon",
+        "word_regions",
+        "expected_word_polygons",
+        "expected_textangle",
+    ),
+    [
+        pytest.param(
+            [[20, 20], [220, 20], [220, 60], [20, 60]],
+            [
+                [[20, 20], [100, 20], [100, 60], [20, 60]],
+                [[120, 20], [220, 20], [220, 60], [120, 60]],
+            ],
+            [
+                [(20, 20), (100, 20), (100, 60), (20, 60)],
+                [(120, 20), (220, 20), (220, 60), (120, 60)],
+            ],
+            0.0,
+            id="straight",
+        ),
+        pytest.param(
+            [[20, 20], [120, 20], [120, 140], [20, 140]],
+            [
+                [[20, 20], [60, 20], [60, 140], [20, 140]],
+                [[70, 20], [120, 20], [120, 140], [70, 140]],
+            ],
+            [
+                [(20, 20), (60, 20), (60, 140), (20, 140)],
+                [(70, 20), (120, 20), (120, 140), (70, 140)],
+            ],
+            0.0,
+            id="near-square-horizontal",
+        ),
+        pytest.param(
+            [[20, 20], [220, 40], [216, 80], [16, 60]],
+            [
+                [[20, 20], [100, 20], [100, 80], [20, 80]],
+                [[120, 20], [220, 20], [220, 80], [120, 80]],
+            ],
+            [
+                [(20, 20), (100, 28), (96, 68), (16, 60)],
+                [(120, 30), (220, 40), (216, 80), (116, 70)],
+            ],
+            -math.degrees(math.atan2(20, 200)),
+            id="skewed",
+        ),
+        pytest.param(
+            [[220, 20], [260, 20], [240, 180], [200, 180]],
+            [
+                [[220, 20], [220, 84], [260, 84], [260, 20]],
+                [[220, 100], [220, 180], [260, 180], [260, 100]],
+            ],
+            [
+                [(220, 20), (260, 20), (252, 84), (212, 84)],
+                [(210, 100), (250, 100), (240, 180), (200, 180)],
+            ],
+            -math.degrees(math.atan2(160, -20)),
+            id="rotated-90",
+        ),
+    ],
+)
+def test_generate_ocr_projects_recognition_spans_onto_line_polygon(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+    line_polygon: list[list[float]],
+    word_regions: list[list[list[float]]],
+    expected_word_polygons: list[list[tuple[float, float]]],
+    expected_textangle: float,
+) -> None:
+    xs = [point[0] for point in line_polygon]
+    ys = [point[1] for point in line_polygon]
+    result = _result(
+        texts=["First second"],
+        polygons=[line_polygon],
+        boxes=[[min(xs), min(ys), max(xs), max(ys)]],
+        text_word=[["First", "second"]],
+        text_word_region=[word_regions],
+    )
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(model_dirs),
+        )
+
+    line = page.children[0]
+    assert plain_text == "First second"
+    assert line.text == "First second"
+    _assert_polygon(line.poly, [tuple(point) for point in line_polygon])
+    assert line.baseline == Baseline(slope=0.0, intercept=0.0)
+    assert line.textangle == pytest.approx(expected_textangle)
+    assert [word.text for word in line.children] == ["First", "second"]
+    assert all(word.bbox != line.bbox for word in line.children)
+    for word, expected_polygon in zip(
+        line.children,
+        expected_word_polygons,
+        strict=True,
+    ):
+        _assert_polygon(word.poly, expected_polygon)
+
+
+def test_generate_ocr_keeps_narrow_single_character_horizontal(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    result = _result(
+        texts=["I"],
+        polygons=[[[100, 20], [110, 20], [110, 50], [100, 50]]],
+        boxes=[[100, 20, 110, 50]],
+        text_word=[["I"]],
+        text_word_region=[[[[100, 20], [100, 50], [110, 50], [110, 20]]]],
+    )
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, _plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(model_dirs),
+        )
+
+    assert page.children[0].textangle == 0.0
+
+
+def test_generate_ocr_projects_steep_line_along_its_long_edges(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    angle = math.radians(80)
+    direction = (100 * math.cos(angle), 100 * math.sin(angle))
+    normal = (-20 * math.sin(angle), 20 * math.cos(angle))
+    line_polygon = [
+        (100, 20),
+        (100 + direction[0], 20 + direction[1]),
+        (
+            100 + direction[0] + normal[0],
+            20 + direction[1] + normal[1],
+        ),
+        (100 + normal[0], 20 + normal[1]),
+    ]
+    line_start = line_polygon[0][1]
+    line_end = line_polygon[2][1]
+    boundaries = (0.0, 0.4, 0.5, 1.0)
+    word_regions = [
+        [
+            (line_polygon[0][0], line_start + (line_end - line_start) * start),
+            (line_polygon[0][0], line_start + (line_end - line_start) * end),
+            (line_polygon[1][0], line_start + (line_end - line_start) * end),
+            (line_polygon[1][0], line_start + (line_end - line_start) * start),
+        ]
+        for start, end in zip(boundaries[::2], boundaries[1::2], strict=True)
+    ]
+    result = _result(
+        texts=["First second"],
+        polygons=[line_polygon],
+        boxes=[[80, 20, 118, 122]],
+        text_word=[["First", "second"]],
+        text_word_region=[word_regions],
+    )
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, _plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(model_dirs),
+        )
+
+    line = page.children[0]
+    assert line.textangle == pytest.approx(-80)
+    expected_boundaries = ((0.0, 0.4), (0.5, 1.0))
+    for word, (start, end) in zip(
+        line.children,
+        expected_boundaries,
+        strict=True,
+    ):
+        expected_polygon = [
+            (
+                line_polygon[0][0] + direction[0] * start,
+                line_polygon[0][1] + direction[1] * start,
+            ),
+            (
+                line_polygon[0][0] + direction[0] * end,
+                line_polygon[0][1] + direction[1] * end,
+            ),
+            (
+                line_polygon[3][0] + direction[0] * end,
+                line_polygon[3][1] + direction[1] * end,
+            ),
+            (
+                line_polygon[3][0] + direction[0] * start,
+                line_polygon[3][1] + direction[1] * start,
+            ),
+        ]
+        _assert_polygon(word.poly, expected_polygon)
+
+
+def test_generate_ocr_projects_before_clipping_at_page_edge(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    result = _result(
+        texts=["Visible"],
+        polygons=[[[-20, 20], [180, 60], [170, 100], [-30, 60]]],
+        boxes=[[-30, 20, 180, 100]],
+        text_word=[["Visible"]],
+        text_word_region=[[[[-10, 20], [70, 20], [70, 100], [-10, 100]]]],
+    )
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, _plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(model_dirs),
+        )
+
+    word = page.children[0].children[0]
+    _assert_polygon(
+        word.poly,
+        [(0, 22), (70, 38), (60, 78), (0, 62)],
+    )
+
+
+def test_generate_ocr_derives_orientation_from_full_line_polygon(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    result = _result(
+        texts=["Edge"],
+        polygons=[[[-200, 20], [20, 30], [20, 70], [-200, 60]]],
+        boxes=[[-200, 20, 20, 70]],
+        text_word=[["Edge"]],
+        text_word_region=[[[[-10, 20], [20, 20], [20, 70], [-10, 70]]]],
+    )
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, _plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(model_dirs),
+        )
+
+    line = page.children[0]
+    _assert_polygon(line.poly, [(0, 20), (20, 30), (20, 70), (0, 60)])
+    assert line.textangle == pytest.approx(-math.degrees(math.atan2(20, 440)))
+
+
 def test_cpu_and_directml_produce_identical_ocr_output(
     model_dirs: tuple[Path, Path],
     page_image: Path,
@@ -666,13 +919,15 @@ def test_generate_ocr_groups_space_tokens_and_attaches_punctuation(
 ) -> None:
     result = _result(
         texts=["AI systems,"],
+        polygons=[[[20, 20], [220, 40], [216, 80], [16, 60]]],
+        boxes=[[16, 20, 220, 80]],
         text_word=[["AI", " ", "systems", ","]],
-        text_word_boxes=[
+        text_word_region=[
             [
-                [10, 20, 30, 40],
-                [31, 20, 35, 40],
-                [36, 20, 100, 40],
-                [101, 20, 105, 40],
+                [[20, 20], [60, 20], [60, 80], [20, 80]],
+                [[60, 20], [80, 20], [80, 80], [60, 80]],
+                [[80, 20], [180, 20], [180, 80], [80, 80]],
+                [[180, 20], [190, 20], [190, 80], [180, 80]],
             ]
         ],
     )
@@ -685,10 +940,46 @@ def test_generate_ocr_groups_space_tokens_and_attaches_punctuation(
 
     assert [word.text for word in page.children[0].children] == ["AI", "systems,"]
     assert page.children[0].children[1].bbox == BoundingBox(
-        left=36,
-        top=20,
-        right=105,
-        bottom=40,
+        left=76,
+        top=26,
+        right=190,
+        bottom=77,
+    )
+    _assert_polygon(
+        page.children[0].children[1].poly,
+        [(80, 26), (190, 37), (186, 77), (76, 66)],
+    )
+
+
+def test_generate_ocr_combines_vertical_tokens_without_losing_orientation(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    result = _result(
+        texts=["AB,"],
+        polygons=[[[100, 20], [140, 20], [140, 180], [100, 180]]],
+        boxes=[[100, 20, 140, 180]],
+        text_word=[["A", "B", ","]],
+        text_word_region=[
+            [
+                [[100, 20], [100, 70], [140, 70], [140, 20]],
+                [[100, 70], [100, 120], [140, 120], [140, 70]],
+                [[100, 120], [100, 140], [140, 140], [140, 120]],
+            ]
+        ],
+    )
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, _plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(model_dirs),
+        )
+
+    words = page.children[0].children
+    assert [word.text for word in words] == ["AB,"]
+    _assert_polygon(
+        words[0].poly,
+        [(100, 20), (140, 20), (140, 140), (100, 140)],
     )
 
 
@@ -707,7 +998,14 @@ def test_generate_ocr_scales_raster_coordinates_to_ocrmypdf_page_dpi(
         Image.new("RGB", (400, 200), "white"),
     )
 
-    with patch.object(ocr_paddle, "_predict", return_value=_result()):
+    result = _result(
+        texts=["Scale"],
+        polygons=[[[20, 20], [220, 30], [210, 90], [10, 60]]],
+        boxes=[[10, 20, 220, 90]],
+        text_word=[["Scale"]],
+        text_word_region=[[[[20, 20], [220, 20], [220, 90], [20, 90]]]],
+    )
+    with patch.object(ocr_paddle, "_predict", return_value=result):
         page, _plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
             page_image,
             _options(model_dirs),
@@ -718,8 +1016,18 @@ def test_generate_ocr_scales_raster_coordinates_to_ocrmypdf_page_dpi(
     assert page.children[0].bbox == BoundingBox(
         left=5,
         top=10,
-        right=65,
-        bottom=20,
+        right=110,
+        bottom=45,
+    )
+    _assert_polygon(
+        page.children[0].poly,
+        [(10, 10), (110, 15), (105, 45), (5, 30)],
+    )
+    assert page.children[0].baseline.slope == pytest.approx(0.0492610837)
+    assert page.children[0].baseline.intercept == pytest.approx(-4.975185951)
+    _assert_polygon(
+        page.children[0].children[0].poly,
+        [(10, 10), (110, 15), (105, 45), (5, 30)],
     )
     assert ocr_paddle._coordinate_dpi_by_image == {}
 
@@ -787,16 +1095,135 @@ def test_vector_only_force_page_completes_without_zero_dpi(
         assert len(pdf.pages) == 1
 
 
+def test_rotated_page_grafts_polygon_text_layer(
+    tmp_path: Path,
+    model_dirs: tuple[Path, Path],
+) -> None:
+    input_path = tmp_path / "rotated.pdf"
+    output_path = tmp_path / "rotated-ocr.pdf"
+    with Pdf.new() as pdf:
+        image = pdf.make_stream(b"\x80")
+        image[Name.Type] = Name.XObject
+        image[Name.Subtype] = Name.Image
+        image[Name.Width] = 1
+        image[Name.Height] = 1
+        image[Name.ColorSpace] = Name.DeviceGray
+        image[Name.BitsPerComponent] = 8
+        page = pdf.add_blank_page(page_size=(72, 144))
+        page.obj[Name.Rotate] = 90
+        page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Im0=image))
+        page.obj[Name.Contents] = pdf.make_stream(b"q 72 0 0 144 0 0 cm /Im0 Do Q")
+        pdf.save(input_path)
+
+    result = _result(
+        texts=["Rotate test"],
+        polygons=[[[100, 100], [500, 120], [498, 220], [98, 200]]],
+        boxes=[[98, 100, 500, 220]],
+        text_word=[["Rotate", "test"]],
+        text_word_region=[
+            [
+                [[100, 100], [300, 100], [300, 220], [100, 220]],
+                [[320, 100], [500, 100], [500, 220], [320, 220]],
+            ]
+        ],
+    )
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        apply_ocr(
+            input_path,
+            output_path,
+            detection_model_dir=model_dirs[0],
+            recognition_model_dir=model_dirs[1],
+        )
+
+    assert "".join(extract_text(output_path).split()) == "Rotatetest"
+    with Pdf.open(output_path) as pdf:
+        page = pdf.pages[0]
+        assert int(page.Rotate) == 90
+        forms = [
+            xobject
+            for name, xobject in page.Resources.XObject.items()
+            if str(name).startswith("/OCR-")
+        ]
+        assert len(forms) == 1
+        assert [float(value) for value in forms[0].BBox] == [0, 0, 144, 72]
+        page_matrix = next(
+            instruction.operands
+            for instruction in parse_content_stream(page)
+            if str(instruction.operator) == "cm"
+        )
+        assert [float(value) for value in page_matrix] == pytest.approx(
+            [0, 1, -1, 0, 72, 0]
+        )
+
+        form_instructions = list(parse_content_stream(forms[0]))
+        line_matrix = next(
+            instruction.operands
+            for instruction in form_instructions
+            if str(instruction.operator) == "cm"
+        )
+        assert [float(value) for value in line_matrix] == pytest.approx(
+            [0.998752, -0.049938, 0.049938, 0.998752, 11.40, 48.02],
+            abs=1e-6,
+        )
+        word_positions = [
+            [float(value) for value in instruction.operands]
+            for instruction in form_instructions
+            if str(instruction.operator) == "Td"
+        ]
+        assert len(word_positions) == 2
+        assert word_positions[0] == pytest.approx([0, 0], abs=0.01)
+        assert word_positions[1] == pytest.approx([26.43, 0], abs=0.01)
+
+
+def test_missing_word_regions_split_line_at_recognized_spaces(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    result = _result(
+        texts=["one  longer"],
+        polygons=[[[20, 20], [220, 40], [216, 80], [16, 60]]],
+        boxes=[[16, 20, 220, 80]],
+    )
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(model_dirs),
+        )
+
+    line = page.children[0]
+    assert plain_text == "one  longer"
+    assert line.text == "one  longer"
+    assert [word.text for word in line.children] == ["one", "longer"]
+    _assert_polygon(
+        line.children[0].poly,
+        [
+            (20, 20),
+            (20 + 200 * 3 / 11, 20 + 20 * 3 / 11),
+            (16 + 200 * 3 / 11, 60 + 20 * 3 / 11),
+            (16, 60),
+        ],
+    )
+    _assert_polygon(
+        line.children[1].poly,
+        [
+            (20 + 200 * 5 / 11, 20 + 20 * 5 / 11),
+            (220, 40),
+            (216, 80),
+            (16 + 200 * 5 / 11, 60 + 20 * 5 / 11),
+        ],
+    )
+
+
 @pytest.mark.parametrize(
     ("word_texts", "word_regions"),
     [
         (["Hello"], [[10, 20, 130, 40]]),
         (["Hello", "world"], [[10, 20, 130, 40]]),
         (["Goodbye", "world"], [[10, 20, 60, 40], [65, 20, 130, 40]]),
-        (["Hello", "world"], [[10, 20, 10, 40], [65, 20, 130, 40]]),
     ],
 )
-def test_word_mismatch_falls_back_to_full_line(
+def test_word_mismatch_uses_proportional_fallback_words(
     model_dirs: tuple[Path, Path],
     page_image: Path,
     word_texts: list[str],
@@ -814,9 +1241,31 @@ def test_word_mismatch_falls_back_to_full_line(
         )
 
     line = page.children[0]
-    assert len(line.children) == 1
-    assert line.children[0].text == "Hello world"
-    assert line.children[0].bbox == line.bbox
+    assert [word.text for word in line.children] == ["Hello", "world"]
+    assert line.children[0].bbox.right == pytest.approx(10 + 120 * 5 / 11)
+    assert line.children[1].bbox.left == pytest.approx(10 + 120 * 6 / 11)
+    assert all(word.bbox != line.bbox for word in line.children)
+
+
+def test_invalid_word_region_preserves_other_recognition_boundaries(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    result = _result(
+        text_word=[["Hello", "world"]],
+        text_word_boxes=[[[10, 20, 10, 40], [80, 20, 130, 40]]],
+    )
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, _plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(model_dirs),
+        )
+
+    words = page.children[0].children
+    assert [word.text for word in words] == ["Hello", "world"]
+    assert words[0].bbox.right == pytest.approx(10 + 120 * 5 / 11)
+    assert words[1].bbox == BoundingBox(left=80, top=20, right=130, bottom=40)
 
 
 def test_invalid_geometry_is_discarded_and_valid_geometry_is_clipped(
@@ -927,7 +1376,7 @@ def test_inconsistent_top_level_arrays_fail_closed(
         )
 
 
-def test_inconsistent_optional_word_arrays_fall_back_to_full_line(
+def test_inconsistent_optional_word_arrays_use_proportional_fallback_words(
     model_dirs: tuple[Path, Path],
     page_image: Path,
 ) -> None:
@@ -943,9 +1392,8 @@ def test_inconsistent_optional_word_arrays_fall_back_to_full_line(
         )
 
     line = page.children[0]
-    assert len(line.children) == 1
-    assert line.children[0].text == line.text
-    assert line.children[0].bbox == line.bbox
+    assert [word.text for word in line.children] == ["Hello", "world"]
+    assert all(word.bbox != line.bbox for word in line.children)
 
 
 @pytest.mark.parametrize(
@@ -955,7 +1403,7 @@ def test_inconsistent_optional_word_arrays_fall_back_to_full_line(
         ([["Hello", "world"]], "not an array"),
     ],
 )
-def test_malformed_optional_word_arrays_fall_back_to_full_line(
+def test_malformed_optional_word_arrays_use_proportional_fallback_words(
     model_dirs: tuple[Path, Path],
     page_image: Path,
     word_texts: object,
@@ -973,7 +1421,8 @@ def test_malformed_optional_word_arrays_fall_back_to_full_line(
         )
 
     line = page.children[0]
-    assert [word.text for word in line.children] == [line.text]
+    assert [word.text for word in line.children] == ["Hello", "world"]
+    assert all(word.bbox != line.bbox for word in line.children)
 
 
 @pytest.mark.parametrize(

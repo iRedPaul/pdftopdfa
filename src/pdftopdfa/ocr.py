@@ -1448,12 +1448,15 @@ def apply_ocr(
             ocr_kwargs.pop("skip_text", None)
             ocr_kwargs["redo_ocr"] = True
 
-        ocrmypdf.ocr(
-            source,
-            destination,
-            language=languages,
-            **ocr_kwargs,
-        )
+        from .ocr_fpdf import install_fpdf_renderer
+
+        with install_fpdf_renderer():
+            ocrmypdf.ocr(
+                source,
+                destination,
+                language=languages,
+                **ocr_kwargs,
+            )
 
     try:
         if rotate_pages:
