@@ -19,6 +19,7 @@ from colorama import Fore, Style, init
 
 # Local
 from . import __version__
+from ._ocr_runtime import OCR_EXECUTION_PROVIDERS
 from .converter import (
     ConversionResult,
     convert_directory,
@@ -219,6 +220,13 @@ def _print_validation_result(
     "use with --ocr-detection-model-dir.",
 )
 @click.option(
+    "--ocr-execution-provider",
+    type=click.Choice(OCR_EXECUTION_PROVIDERS),
+    default="cpu",
+    show_default=True,
+    help="ONNX Runtime provider for all Paddle OCR models.",
+)
+@click.option(
     "--ocr-force",
     "ocr_force",
     is_flag=True,
@@ -286,6 +294,7 @@ def main(
     ocr_lang: str,
     ocr_detection_model_dir: Path | None,
     ocr_recognition_model_dir: Path | None,
+    ocr_execution_provider: str,
     convert_calibrated: bool,
     preserve_stamps: bool,
     skip_any_pdfa: bool,
@@ -334,7 +343,13 @@ def main(
             "--ocr-detection-model-dir and --ocr-recognition-model-dir "
             "must be provided together"
         )
-    if ocr_enabled or ocr_force or deskew or rotate_pages:
+    if (
+        ocr_enabled
+        or ocr_force
+        or deskew
+        or rotate_pages
+        or ocr_execution_provider != "cpu"
+    ):
         if not model_pair_complete:
             raise click.UsageError(
                 "OCR requires --ocr-detection-model-dir and --ocr-recognition-model-dir"
@@ -368,6 +383,7 @@ def main(
                 ocr_force=ocr_force,
                 ocr_deskew=deskew,
                 ocr_rotate_pages=rotate_pages,
+                ocr_execution_provider=ocr_execution_provider,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 skip_any_pdfa=skip_any_pdfa,
@@ -390,6 +406,7 @@ def main(
                 ocr_force=ocr_force,
                 ocr_deskew=deskew,
                 ocr_rotate_pages=rotate_pages,
+                ocr_execution_provider=ocr_execution_provider,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 skip_any_pdfa=skip_any_pdfa,
@@ -437,6 +454,7 @@ def _convert_single_file(
     ocr_force: bool = False,
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
+    ocr_execution_provider: str = "cpu",
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     skip_any_pdfa: bool = False,
@@ -459,6 +477,7 @@ def _convert_single_file(
         ocr_force: If True, force OCR even on pages with existing text.
         ocr_deskew: If True, straighten scan-like, raster-dominant pages.
         ocr_rotate_pages: If True, normalize page orientation before OCR.
+        ocr_execution_provider: ONNX Runtime provider for Paddle models.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations
             to standard PDF Stamp annotations instead of flattening them.
@@ -503,6 +522,7 @@ def _convert_single_file(
         ocr_force=ocr_force,
         ocr_deskew=ocr_deskew,
         ocr_rotate_pages=ocr_rotate_pages,
+        ocr_execution_provider=ocr_execution_provider,
         convert_calibrated=convert_calibrated,
         preserve_stamps=preserve_stamps,
         allow_signature_invalidation=allow_signature_invalidation,
@@ -567,6 +587,7 @@ def _convert_directory(
     ocr_force: bool = False,
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
+    ocr_execution_provider: str = "cpu",
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     skip_any_pdfa: bool = False,
@@ -590,6 +611,7 @@ def _convert_directory(
         ocr_force: If True, force OCR even on pages with existing text.
         ocr_deskew: If True, straighten scan-like, raster-dominant pages.
         ocr_rotate_pages: If True, normalize page orientation before OCR.
+        ocr_execution_provider: ONNX Runtime provider for Paddle models.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations
             to standard PDF Stamp annotations instead of flattening them.
@@ -627,6 +649,7 @@ def _convert_directory(
         ocr_force=ocr_force,
         ocr_deskew=ocr_deskew,
         ocr_rotate_pages=ocr_rotate_pages,
+        ocr_execution_provider=ocr_execution_provider,
         force_overwrite=force,
         convert_calibrated=convert_calibrated,
         preserve_stamps=preserve_stamps,

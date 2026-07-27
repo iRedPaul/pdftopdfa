@@ -18,8 +18,9 @@ Instead of re-rendering via Ghostscript, it modifies the PDF structure directly 
 - **ICC color profiles** -- automatically embeds sRGB, CMYK, and grayscale profiles
 - **Batch processing** -- converts entire directories, optionally recursive
 - **Integrated validation** -- checks conformance via [veraPDF](https://verapdf.org/)
-- **OCR support** -- optional PP-OCRv6 Medium text recognition on the CPU,
-  with explicit offline model directories and no runtime model downloads
+- **OCR support** -- optional PP-OCRv6 Medium text recognition on the CPU or
+  through DirectML on Windows 11, with explicit offline model directories and
+  no runtime model downloads
 - **Simple API** -- usable as CLI tool or Python library
 
 ## How It Works
@@ -44,8 +45,8 @@ pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with 
 - Python 3.12, 3.13, or 3.14
 - macOS 14 or later on Apple Silicon, Linux, or Windows
 
-Intel-based Macs are not supported. Installation on macOS requires the ARM64
-wheels provided by ONNX Runtime for Apple Silicon.
+Intel-based Macs are not supported. CPU OCR on macOS requires the ARM64 wheels
+provided by ONNX Runtime for Apple Silicon.
 
 ```bash
 pip install pdftopdfa
@@ -53,13 +54,33 @@ pip install pdftopdfa
 
 ### Optional: OCR support
 
+Install exactly one OCR runtime. CPU inference is the default:
+
 ```bash
 pip install "pdftopdfa[ocr]"
 ```
 
-OCR uses PaddleOCR 3.7 with ONNX Runtime on the CPU. It does not download
-models at runtime. Detection and recognition models must be obtained separately
-and passed explicitly on every OCR invocation.
+For DirectML inference on Windows 11:
+
+```bash
+pip install "pdftopdfa[directml]"
+```
+
+Do not install both extras in the same Python installation: `onnxruntime` and
+`onnxruntime-directml` provide overlapping runtime files. DirectML requires
+Windows 11, a DirectX 12-capable integrated or dedicated Intel, AMD, or NVIDIA
+GPU, and a current graphics driver.
+
+OCR uses PaddleOCR 3.7 with the selected ONNX Runtime provider. Installing the
+DirectML extra does not select it automatically; use
+`--ocr-execution-provider directml` or
+`ocr_execution_provider="directml"`. CPU remains the default. If DirectML is
+requested but unavailable, processing stops with an error instead of falling
+back to the CPU.
+
+OCR does not download models at runtime. Detection and recognition models must
+be obtained separately and passed explicitly on every OCR invocation. CPU and
+DirectML use the same FP32 ONNX model files.
 
 #### PP-OCRv6 model setup
 
@@ -127,6 +148,12 @@ pdftopdfa --ocr-lang de+en \
   --ocr-recognition-model-dir "$REC_MODEL" \
   document.pdf
 
+# Use the same models through DirectML on Windows 11
+pdftopdfa --ocr-execution-provider directml \
+  --ocr-detection-model-dir "$DET_MODEL" \
+  --ocr-recognition-model-dir "$REC_MODEL" \
+  document.pdf
+
 # Automatically orient pages without deskewing them
 pdftopdfa --rotate-pages \
   --ocr-detection-model-dir "$DET_MODEL" \
@@ -171,13 +198,15 @@ ocr_result = convert_to_pdfa(
     ocr_recognition_model_dir=Path(
         "/opt/pdftopdfa/models/PP-OCRv6_medium_rec_onnx"
     ),
+    ocr_execution_provider="cpu",
 )
 ```
 
 Supplying both model directories enables OCR in `convert_to_pdfa()`,
 `convert_files()`, and `convert_directory()`. Supplying only one directory, or
 requesting an OCR option without both directories, raises `ValueError` before
-processing starts.
+processing starts. Set `ocr_execution_provider="directml"` to use an
+installation made with the `directml` extra on Windows 11.
 
 Set `pdfa=False` to apply only the requested OCR processing. This skips font
 embedding, PDF/A sanitization, metadata synchronization, color-profile
@@ -247,12 +276,13 @@ Contributions are welcome! Please open an [issue](https://github.com/iredpaul/pd
 - [tqdm](https://tqdm.github.io/) -- Progress bars
 - [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) -- document
   orientation and PP-OCRv6 text recognition
-- [ONNX Runtime](https://onnxruntime.ai/) -- CPU inference for Paddle models
 
 **Optional:**
 
 - [OCRmyPDF](https://ocrmypdf.readthedocs.io/) -- PDF rasterization, text-layer
   generation, and page merging for optional OCR
+- [ONNX Runtime](https://onnxruntime.ai/) -- CPU or DirectML inference for
+  Paddle models
 - [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) -- PDF page rasterizer for OCR
 - [veraPDF](https://verapdf.org/) -- ISO-compliant PDF/A validation
 

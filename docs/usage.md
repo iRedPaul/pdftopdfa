@@ -4,6 +4,10 @@ This guide covers everyday usage of `pdftopdfa` from the command line and Python
 
 For OCR model setup and processing behavior, see [OCR Guide](ocr.md).
 
+OCR users must install exactly one runtime extra: `pdftopdfa[ocr]` for CPU or
+`pdftopdfa[directml]` for DirectML on Windows 11. CPU is the default execution
+provider; DirectML must be selected explicitly.
+
 For the full list of PDF/A-2/3 compliance rules, see the [veraPDF PDF/A-2 and PDF/A-3 rules reference](https://github.com/veraPDF/veraPDF-validation-profiles/wiki/PDFA-Parts-2-and-3-rules).
 
 ## Basic Usage
@@ -92,6 +96,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `--ocr-lang LANG` | PaddleOCR language code (default: `en`), for example `de` or `de+en`; does not enable OCR by itself |
 | `--ocr-detection-model-dir DIR` | Directory containing compatible PP-OCRv6 Medium detection `inference.onnx` and `inference.yml` |
 | `--ocr-recognition-model-dir DIR` | Directory containing compatible PP-OCRv6 Medium recognition `inference.onnx` and `inference.yml` |
+| `--ocr-execution-provider [cpu\|directml]` | ONNX Runtime execution provider (default: `cpu`); DirectML requires the `directml` extra on Windows 11 |
 | `--deskew` | Straighten scan-like, raster-dominant pages; requires both model-directory options and implies `--ocr` |
 | `--rotate-pages` | Automatically orient pages with the bundled Paddle model; requires both model-directory options and implies `--ocr` |
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
@@ -150,6 +155,7 @@ def convert_to_pdfa(
     ocr_force: bool = False,
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
+    ocr_execution_provider: str = "cpu",
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
@@ -174,8 +180,14 @@ result = convert_to_pdfa(
     ocr_recognition_model_dir=Path(
         "/opt/pdftopdfa/models/PP-OCRv6_medium_rec"
     ),
+    ocr_execution_provider="cpu",
 )
 ```
+
+Set `ocr_execution_provider="directml"` to use DirectML on Windows 11 after
+installing `pdftopdfa[directml]`. The same FP32 ONNX model directories are used
+for both providers. If DirectML is requested but unavailable, the call raises
+`OCRError` instead of falling back to CPU.
 
 Pass `pdfa=False` to keep the existing OCR behavior while skipping all
 PDF/A-specific processing. If no OCR option is selected, the input is copied
@@ -226,6 +238,7 @@ def convert_directory(
     ocr_force: bool = False,
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
+    ocr_execution_provider: str = "cpu",
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
@@ -263,6 +276,7 @@ def convert_files(
     ocr_force: bool = False,
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
+    ocr_execution_provider: str = "cpu",
     force_overwrite: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -328,14 +342,17 @@ All custom exceptions inherit from `PDFToPDFAError`:
 
 OCR configuration is validated before input processing:
 
-- CLI use of `--ocr`, `--ocr-force`, `--deskew`, or `--rotate-pages` without
-  both model-directory options raises a Click `UsageError`.
+- CLI use of `--ocr`, `--ocr-force`, `--deskew`, `--rotate-pages`, or
+  `--ocr-execution-provider directml` without both model-directory options
+  raises a Click `UsageError`.
 - Providing only one model-directory option also raises `UsageError`.
 - The high-level Python APIs raise `ValueError` when only one model directory
-  is supplied, or when languages or OCR processing options are supplied
-  without the complete pair.
+  is supplied, or when languages, OCR processing options, or
+  `ocr_execution_provider="directml"` are supplied without the complete pair.
 - Invalid language codes such as `eng` and `deu` are rejected. Use `en`, `de`,
   or `["de", "en"]` for mixed German/English metadata.
+- Requesting DirectML when `DmlExecutionProvider` is unavailable raises
+  `OCRError`; CPU fallback is intentionally disabled.
 - Missing, altered, or structurally invalid model artifacts raise `OCRError`.
 
 Example:

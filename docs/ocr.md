@@ -7,8 +7,9 @@ PDFs. General CLI and API usage is documented in the
 ## Architecture
 
 Text detection, recognition, word positions, and deskew use PP-OCRv6 Medium
-from PaddleOCR 3.7 through ONNX Runtime on the CPU. OCRmyPDF is used for page
-rasterization, searchable text-layer generation, page merging, and PDF
+from PaddleOCR 3.7 through ONNX Runtime. CPU inference is the default;
+DirectML inference is available explicitly on Windows 11. OCRmyPDF is used for
+page rasterization, searchable text-layer generation, page merging, and PDF
 geometry.
 
 The recognition models are supplied explicitly by the application. There is no
@@ -25,13 +26,43 @@ the source raster is prepared.
 
 ## Installation
 
-Install the OCR extras:
+Install exactly one OCR runtime. For CPU inference:
 
 ```bash
 pip install "pdftopdfa[ocr]"
 ```
 
+For DirectML inference on Windows 11:
+
+```bash
+pip install "pdftopdfa[directml]"
+```
+
+Do not install both extras in the same Python installation. The
+`onnxruntime` and `onnxruntime-directml` distributions provide overlapping
+runtime files.
+
 No additional system OCR executable is required.
+
+## Execution Providers
+
+CPU is selected by default. DirectML must be selected explicitly:
+
+```bash
+pdftopdfa --ocr-execution-provider directml \
+  --ocr-detection-model-dir C:/models/PP-OCRv6_medium_det \
+  --ocr-recognition-model-dir C:/models/PP-OCRv6_medium_rec \
+  scan.pdf
+```
+
+The Python equivalent is `ocr_execution_provider="directml"`. DirectML
+requires Windows 11, DirectX 12, a current graphics driver, and an integrated
+or dedicated Intel, AMD, or NVIDIA GPU. It uses the same FP32 detection,
+recognition, and bundled orientation ONNX models as CPU execution.
+
+The selected provider applies to text detection, recognition, deskew, and page
+orientation. If DirectML is requested but `DmlExecutionProvider` is not
+available, `pdftopdfa` raises a clear error and does not fall back to CPU.
 
 ## Offline Model Contract
 
@@ -128,9 +159,11 @@ pdftopdfa --no-pdfa --deskew --rotate-pages \
   scan.pdf
 ```
 
-`--ocr`, `--ocr-force`, `--deskew`, and `--rotate-pages` are rejected unless
-both model options are present. Providing only one model option is also
-rejected. `--ocr-lang` selects metadata but does not activate OCR by itself.
+`--ocr`, `--ocr-force`, `--deskew`, `--rotate-pages`, and an explicit
+`--ocr-execution-provider directml` are rejected unless both model options are
+present. Providing only one model option is also rejected. `--ocr-lang`
+selects metadata but does not activate OCR by itself.
+`--ocr-execution-provider` defaults to `cpu`.
 
 ## Python API
 
@@ -153,14 +186,18 @@ result = convert_to_pdfa(
     ocr_recognition_model_dir=Path(
         "/opt/pdftopdfa/models/PP-OCRv6_medium_rec"
     ),
+    ocr_execution_provider="cpu",
     ocr_rotate_pages=True,
 )
 ```
 
 The same keywords are available on `convert_files()` and
 `convert_directory()`. Supplying only one directory, or supplying
-`ocr_languages`, `ocr_force`, `ocr_deskew`, or `ocr_rotate_pages` without the
-complete pair, raises `ValueError` before input processing starts.
+`ocr_languages`, `ocr_force`, `ocr_deskew`, `ocr_rotate_pages`, or
+`ocr_execution_provider="directml"` without the complete pair, raises
+`ValueError` before input processing starts.
+Set `ocr_execution_provider="directml"` only in an installation made with the
+`directml` extra.
 
 The lower-level function requires both model directories as keyword-only
 arguments:
@@ -180,12 +217,14 @@ result_path = apply_ocr(
     recognition_model_dir=Path(
         "/opt/pdftopdfa/models/PP-OCRv6_medium_rec"
     ),
+    ocr_execution_provider="cpu",
     deskew=True,
 )
 ```
 
 `apply_ocr()` raises `OCRError` for missing, structurally invalid, unreadable,
-or incompatible model artifacts and for OCR execution failures.
+or incompatible model artifacts, an unavailable requested provider, and OCR
+execution failures.
 
 Use `pdfa=False` with a neutral output name such as `scan_processed.pdf` to
 write the OCR result directly without font embedding, PDF/A sanitization,
@@ -256,7 +295,8 @@ Before OCR starts, `--rotate-pages` renders and classifies every page with the
 bundled `PP-LCNet_x1_0_doc_ori` model, including pages later skipped because
 they already contain text. Predictions below 0.80 leave the page unchanged and
 produce a warning. Missing, corrupt, or unusable bundled model files abort the
-conversion.
+conversion. The orientation model uses the same selected execution provider as
+text detection and recognition.
 
 ## Offline Deployment
 
@@ -269,7 +309,8 @@ configured local ONNX files.
 Applications frozen with tools such as PyInstaller must collect the
 `pdftopdfa` package data as well as PaddleOCR, PaddleX, ONNX Runtime, OpenCV,
 NumPy, OCRmyPDF, pypdfium2, and the ONNX Runtime native libraries. Network
-access is not required at runtime. PaddleX may create the empty housekeeping
+access is not required at runtime. Bundle exactly one of the CPU or DirectML
+ONNX Runtime distributions. PaddleX may create the empty housekeeping
 directories `func_ret`, `locks`, and `temp` below its configured cache path,
 but it does not store or download model artifacts there when the explicit
 model directories are used. Point `PADDLE_PDX_CACHE_HOME` at a writable
@@ -277,13 +318,24 @@ scratch directory when the application filesystem is read-only.
 
 ## Troubleshooting
 
-### `OCR not available - pip install pdftopdfa[ocr]`
+### OCR is not available
 
-Install the OCR extras:
+Install exactly one OCR extra:
 
 ```bash
+# CPU
 pip install "pdftopdfa[ocr]"
+
+# DirectML on Windows 11
+pip install "pdftopdfa[directml]"
 ```
+
+### DirectML is unavailable
+
+Confirm that only the `directml` extra is installed, Windows 11 is current, the
+GPU supports DirectX 12, and the latest Intel, AMD, or NVIDIA driver is
+installed. `pdftopdfa` intentionally stops instead of retrying the request on
+CPU.
 
 ### Model directories are rejected
 

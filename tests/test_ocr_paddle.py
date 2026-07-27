@@ -21,7 +21,7 @@ import pytest
 from ocrmypdf.helpers import Resolution
 from ocrmypdf.hocrtransform import BoundingBox, OcrClass
 from pikepdf import Dictionary, Name, Pdf
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 import pdftopdfa.ocr_paddle as ocr_paddle
 from pdftopdfa.exceptions import OCRError
@@ -82,12 +82,14 @@ def _options(
     deskew: bool = False,
     force_ocr: bool = False,
     clean: bool = False,
+    execution_provider: str = "cpu",
 ) -> SimpleNamespace:
     detection_dir, recognition_dir = model_dirs
     return SimpleNamespace(
         paddle=SimpleNamespace(
             detection_model_dir=detection_dir,
             recognition_model_dir=recognition_dir,
+            execution_provider=execution_provider,
         ),
         languages=languages or ["en"],
         ocr_engine="paddle",
@@ -240,6 +242,70 @@ def test_paddle_constructor_is_offline_and_cpu_only(
     )
 
 
+def test_paddle_constructor_uses_directml_without_cpu_fallback(
+    model_dirs: tuple[Path, Path],
+) -> None:
+    engine_config = {
+        "providers": ["DmlExecutionProvider"],
+        "execution_mode": "sequential",
+        "enable_mem_pattern": False,
+    }
+    detection_session = MagicMock()
+    recognition_session = MagicMock()
+    detection_session.get_providers.return_value = [
+        "DmlExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    recognition_session.get_providers.return_value = [
+        "DmlExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    model = SimpleNamespace(
+        paddlex_pipeline=SimpleNamespace(
+            text_det_model=SimpleNamespace(
+                runner=SimpleNamespace(session=detection_session)
+            ),
+            text_rec_model=SimpleNamespace(
+                runner=SimpleNamespace(session=recognition_session)
+            ),
+        )
+    )
+    paddle_constructor = MagicMock(return_value=model)
+    fake_module = SimpleNamespace(PaddleOCR=paddle_constructor)
+
+    with (
+        patch.dict(sys.modules, {"paddleocr": fake_module}),
+        patch.object(
+            ocr_paddle,
+            "onnxruntime_engine_config",
+            return_value=engine_config,
+        ),
+    ):
+        created_model = ocr_paddle._create_model(
+            *model_dirs,
+            execution_provider="directml",
+        )
+
+    assert created_model is model
+    paddle_constructor.assert_called_once_with(
+        text_detection_model_name="test_detection",
+        text_detection_model_dir=str(model_dirs[0]),
+        text_recognition_model_name="test_recognition",
+        text_recognition_model_dir=str(model_dirs[1]),
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        text_det_limit_side_len=1600,
+        text_det_limit_type="max",
+        return_word_box=True,
+        engine="onnxruntime",
+        device="cpu",
+        engine_config=engine_config,
+    )
+    detection_session.disable_fallback.assert_called_once_with()
+    recognition_session.disable_fallback.assert_called_once_with()
+
+
 def test_paddle_constructor_respects_quiet_logging(
     model_dirs: tuple[Path, Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -297,6 +363,30 @@ def test_model_session_is_lazy_reused_and_replaced_for_new_directories(
 
     assert create_model.call_count == 2
     first_model.close.assert_called_once_with()
+
+
+def test_model_session_is_replaced_when_execution_provider_changes(
+    model_dirs: tuple[Path, Path],
+) -> None:
+    cpu_model = MagicMock()
+    directml_model = MagicMock()
+    cpu_options = _options(model_dirs)
+    directml_options = _options(model_dirs, execution_provider="directml")
+
+    with patch.object(
+        ocr_paddle,
+        "_create_model",
+        side_effect=[cpu_model, directml_model],
+    ) as create_model:
+        assert ocr_paddle._get_model(cpu_options) is cpu_model
+        assert ocr_paddle._get_model(cpu_options) is cpu_model
+        assert ocr_paddle._get_model(directml_options) is directml_model
+        assert ocr_paddle._get_model(directml_options) is directml_model
+
+    assert create_model.call_args_list[0].args == (*model_dirs, "cpu")
+    assert create_model.call_args_list[1].args == (*model_dirs, "directml")
+    cpu_model.close.assert_called_once_with()
+    directml_model.close.assert_not_called()
 
 
 def test_explicit_validation_reloads_same_path_after_artifact_replacement(
@@ -447,6 +537,103 @@ def test_generate_ocr_maps_lines_words_geometry_and_metadata(
         bottom=40,
     )
     assert page.children[1].textangle == pytest.approx(-math.degrees(math.atan2(5, 90)))
+
+
+def test_cpu_and_directml_produce_identical_ocr_output(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    result = _result(
+        texts=["Hello world", "Second line"],
+        scores=[0.95, 0.8],
+        polygons=[
+            [[10, 20], [130, 20], [130, 40], [10, 40]],
+            [[20, 60], [150, 60], [150, 80], [20, 80]],
+        ],
+        boxes=[[10, 20, 130, 40], [20, 60, 150, 80]],
+        text_word=[["Hello", "world"], ["Second", "line"]],
+        text_word_boxes=[
+            [[10, 20, 55, 40], [60, 20, 130, 40]],
+            [[20, 60, 85, 80], [90, 60, 150, 80]],
+        ],
+    )
+
+    outputs = []
+    for execution_provider in ("cpu", "directml"):
+        with patch.object(ocr_paddle, "_predict", return_value=result):
+            outputs.append(
+                ocr_paddle.PaddleOcrEngine.generate_ocr(
+                    page_image,
+                    _options(
+                        model_dirs,
+                        ["de", "en"],
+                        execution_provider=execution_provider,
+                    ),
+                    page_number=7,
+                )
+            )
+
+    cpu_page, cpu_plain_text = outputs[0]
+    directml_page, directml_plain_text = outputs[1]
+    assert directml_plain_text == cpu_plain_text
+    assert directml_page == cpu_page
+
+
+def test_cpu_and_directml_real_inference_produce_identical_ocr_output(
+    tmp_path: Path,
+) -> None:
+    """Compare real providers when DirectML hardware and test models are available."""
+    detection_dir = os.environ.get("PDFTOPDFA_TEST_OCR_DETECTION_MODEL_DIR")
+    recognition_dir = os.environ.get("PDFTOPDFA_TEST_OCR_RECOGNITION_MODEL_DIR")
+    if not detection_dir or not recognition_dir:
+        pytest.skip("DirectML OCR model directories are not configured")
+
+    try:
+        import onnxruntime
+    except ImportError:
+        pytest.skip("ONNX Runtime is not installed")
+    if "DmlExecutionProvider" not in onnxruntime.get_available_providers():
+        pytest.skip("DmlExecutionProvider is not available")
+
+    image_path = tmp_path / "directml-parity.png"
+    image = Image.new("RGB", (1200, 300), "white")
+    font_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "pdftopdfa"
+        / "resources"
+        / "fonts"
+        / "LiberationSans-Regular.ttf"
+    )
+    ImageDraw.Draw(image).text(
+        (50, 80),
+        "DIRECTML OCR PARITY 123",
+        fill="black",
+        font=ImageFont.truetype(font_path, 80),
+    )
+    image.save(image_path, dpi=(300, 300))
+
+    model_dirs = Path(detection_dir), Path(recognition_dir)
+    outputs = []
+    for execution_provider in ("cpu", "directml"):
+        try:
+            outputs.append(
+                ocr_paddle.PaddleOcrEngine.generate_ocr(
+                    image_path,
+                    _options(model_dirs, execution_provider=execution_provider),
+                    page_number=1,
+                )
+            )
+        except OCRError as exc:
+            if execution_provider == "directml" and "refusing CPU fallback" in str(exc):
+                pytest.skip("No usable DirectML device is available")
+            raise
+
+    cpu_page, cpu_plain_text = outputs[0]
+    directml_page, directml_plain_text = outputs[1]
+    assert cpu_plain_text.strip()
+    assert directml_plain_text == cpu_plain_text
+    assert directml_page == cpu_page
 
 
 def test_generate_ocr_accepts_axis_aligned_word_boxes(

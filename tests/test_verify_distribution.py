@@ -7,6 +7,7 @@
 import hashlib
 import importlib.util
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,30 @@ def _load_verify_script():
 
 
 _VERIFY_SCRIPT = _load_verify_script()
+
+
+def test_cpu_and_directml_runtimes_are_separate_extras() -> None:
+    """The overlapping ONNX Runtime wheels must never be co-installed."""
+    project_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    project = tomllib.loads(project_path.read_text(encoding="utf-8"))["project"]
+
+    base_dependencies = project["dependencies"]
+    cpu_dependencies = project["optional-dependencies"]["ocr"]
+    directml_dependencies = project["optional-dependencies"]["directml"]
+
+    assert not any(
+        dependency.startswith("onnxruntime") for dependency in base_dependencies
+    )
+    assert "onnxruntime==1.27.0" in cpu_dependencies
+    assert not any(
+        dependency.startswith("onnxruntime-directml") for dependency in cpu_dependencies
+    )
+    assert (
+        "onnxruntime-directml==1.24.4; sys_platform == 'win32'" in directml_dependencies
+    )
+    assert not any(
+        dependency.startswith("onnxruntime==") for dependency in directml_dependencies
+    )
 
 
 def _valid_archive_files() -> dict[str, bytes]:

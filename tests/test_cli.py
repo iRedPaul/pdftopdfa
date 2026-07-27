@@ -22,6 +22,7 @@ from pdftopdfa.cli import (
     main,
 )
 from pdftopdfa.converter import ConversionResult
+from pdftopdfa.exceptions import OCRError
 from pdftopdfa.verapdf import is_verapdf_available
 
 OCR_MODEL_ARGS = [
@@ -59,6 +60,7 @@ class TestCliHelp:
 
         assert result.exit_code == 0
         assert "--ocr" in result.output
+        assert "--ocr-execution-provider [cpu|directml]" in result.output
         assert "--deskew" in result.output
         assert "--rotate-pages" in result.output
 
@@ -460,13 +462,21 @@ class TestCliDirectory:
 
         result = runner.invoke(
             main,
-            [str(input_dir), "--deskew", "--rotate-pages", *OCR_MODEL_ARGS],
+            [
+                str(input_dir),
+                "--deskew",
+                "--rotate-pages",
+                "--ocr-execution-provider",
+                "directml",
+                *OCR_MODEL_ARGS,
+            ],
         )
 
         assert result.exit_code == EXIT_SUCCESS
         kwargs = mock_convert_directory.call_args.kwargs
         assert kwargs["ocr_deskew"] is True
         assert kwargs["ocr_rotate_pages"] is True
+        assert kwargs["ocr_execution_provider"] == "directml"
 
     def test_cli_convert_directory(
         self, runner: CliRunner, tmp_dir: Path, sample_pdf_bytes: bytes
@@ -616,6 +626,102 @@ class TestCliOcr:
         assert mock_apply_ocr.call_args.kwargs["recognition_model_dir"] == Path(
             "recognition-model"
         )
+        assert mock_apply_ocr.call_args.kwargs["ocr_execution_provider"] == "cpu"
+
+    @patch("pdftopdfa.converter.onnxruntime_engine_config")
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_cli_ocr_selects_directml(
+        self,
+        _mock_is_ocr_available,
+        mock_apply_ocr,
+        _mock_engine_config,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """--ocr-execution-provider directml is forwarded explicitly."""
+        import shutil
+
+        mock_apply_ocr.side_effect = lambda inp, out, *args, **kwargs: (
+            shutil.copy2(inp, out) or out
+        )
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--ocr-execution-provider",
+                "directml",
+                *OCR_MODEL_ARGS,
+            ],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert mock_apply_ocr.call_args.kwargs["ocr_execution_provider"] == "directml"
+
+    def test_cli_directml_requires_model_pair(
+        self,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Selecting DirectML enables OCR and therefore requires both models."""
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--ocr-execution-provider",
+                "directml",
+            ],
+        )
+
+        assert result.exit_code == 2
+        assert "OCR requires --ocr-detection-model-dir" in result.output
+        assert not output_path.exists()
+
+    @patch(
+        "pdftopdfa.converter.onnxruntime_engine_config",
+        side_effect=OCRError(
+            "DirectML was requested, but DmlExecutionProvider is unavailable. "
+            "Install pdftopdfa[directml]."
+        ),
+    )
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_cli_directml_unavailable_fails_without_cpu_fallback(
+        self,
+        _mock_is_ocr_available,
+        mock_apply_ocr,
+        _mock_engine_config,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Unavailable DirectML is a clear conversion error, not CPU fallback."""
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--ocr-execution-provider",
+                "directml",
+                *OCR_MODEL_ARGS,
+            ],
+        )
+
+        assert result.exit_code == EXIT_CONVERSION_FAILED
+        assert "DmlExecutionProvider is unavailable" in result.output
+        assert "pdftopdfa[directml]" in result.output
+        assert not output_path.exists()
+        mock_apply_ocr.assert_not_called()
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")

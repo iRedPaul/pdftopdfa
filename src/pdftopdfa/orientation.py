@@ -19,6 +19,11 @@ from importlib.resources import as_file, files
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from ._ocr_runtime import (
+    onnxruntime_engine_config,
+    require_execution_provider,
+    validate_ocr_execution_provider,
+)
 from .exceptions import OCRError
 
 logger = logging.getLogger(__name__)
@@ -38,6 +43,7 @@ _MODEL_RESOURCE_PARTS = (
 _MODEL_MANIFEST = "manifest.json"
 
 _model: Any | None = None
+_model_execution_provider: str | None = None
 _model_dir: Path | None = None
 _model_lock = threading.RLock()
 _prediction_lock = threading.Lock()
@@ -147,18 +153,28 @@ def _resolve_model_directory() -> Path:
         return model_dir
 
 
-def _create_model() -> Any:
-    """Create a CPU-only PaddleOCR classifier from bundled ONNX files."""
+def _create_model(execution_provider: str = "cpu") -> Any:
+    """Create a PaddleOCR classifier from the bundled ONNX files."""
     try:
         from paddleocr import DocImgOrientationClassification
 
-        return DocImgOrientationClassification(
+        model = DocImgOrientationClassification(
             model_name=MODEL_NAME,
             model_dir=str(_resolve_model_directory()),
             engine="onnxruntime",
             device="cpu",
-            engine_config={"providers": ["CPUExecutionProvider"]},
+            engine_config=onnxruntime_engine_config(execution_provider),
         )
+        if execution_provider == "directml":
+            try:
+                session = model.paddlex_predictor.runner.session
+                require_execution_provider(session, execution_provider)
+            except Exception:
+                close = getattr(model, "close", None)
+                if callable(close):
+                    close()
+                raise
+        return model
     except OCRError:
         raise
     except Exception as exc:
@@ -167,19 +183,27 @@ def _create_model() -> Any:
         ) from exc
 
 
-def _get_model() -> Any:
-    """Return the process-wide lazy PaddleOCR classifier."""
-    global _model
+def _get_model(execution_provider: str = "cpu") -> Any:
+    """Return the process-wide lazy PaddleOCR classifier for a provider."""
+    global _model, _model_execution_provider
 
+    execution_provider = validate_ocr_execution_provider(execution_provider)
     with _model_lock:
-        if _model is None:
-            _model = _create_model()
+        if _model is None or _model_execution_provider != execution_provider:
+            if _model is not None:
+                close = getattr(_model, "close", None)
+                if callable(close):
+                    close()
+                _model = None
+                _model_execution_provider = None
+            _model = _create_model(execution_provider)
+            _model_execution_provider = execution_provider
         return _model
 
 
 def _reset_model_cache_for_tests() -> None:
     """Close and clear the model singleton for isolated tests."""
-    global _model
+    global _model, _model_execution_provider
 
     with _model_lock:
         if _model is not None:
@@ -187,6 +211,7 @@ def _reset_model_cache_for_tests() -> None:
             if callable(close):
                 close()
         _model = None
+        _model_execution_provider = None
 
 
 def _parse_prediction(result: Any, page_number: int) -> _Prediction:
@@ -217,11 +242,21 @@ def _parse_prediction(result: Any, page_number: int) -> _Prediction:
     return _Prediction(page_number, correction_angle, score)
 
 
-def _predict_batch(images: list[Any], page_numbers: list[int]) -> list[_Prediction]:
+def _predict_batch(
+    images: list[Any],
+    page_numbers: list[int],
+    *,
+    execution_provider: str = "cpu",
+) -> list[_Prediction]:
     """Run one serialized PaddleOCR batch and validate its output."""
     try:
         with _prediction_lock:
-            results = list(_get_model().predict(images, batch_size=len(images)))
+            results = list(
+                _get_model(execution_provider).predict(
+                    images,
+                    batch_size=len(images),
+                )
+            )
     except OCRError:
         raise
     except Exception as exc:
@@ -245,6 +280,8 @@ def _predict_batch(images: list[Any], page_numbers: list[int]) -> list[_Predicti
 def _refine_low_confidence_predictions(
     images: list[Any],
     predictions: list[_Prediction],
+    *,
+    execution_provider: str = "cpu",
 ) -> list[_Prediction]:
     """Retry uncertain pages with rotated and spatial Paddle consensus."""
     import numpy as np
@@ -275,6 +312,7 @@ def _refine_low_confidence_predictions(
         batch_predictions = _predict_batch(
             retry_images[start:end],
             [predictions[index].page_number for index, _ in batch_metadata],
+            execution_provider=execution_provider,
         )
         for prediction, (index, pre_rotation) in zip(
             batch_predictions,
@@ -346,6 +384,7 @@ def _refine_low_confidence_predictions(
         batch_predictions = _predict_batch(
             spatial_images[start:end],
             [predictions[index].page_number for index in batch_indices],
+            execution_provider=execution_provider,
         )
         for prediction, index in zip(
             batch_predictions,
@@ -379,7 +418,11 @@ def _refine_low_confidence_predictions(
     return refined
 
 
-def _classify_pdf_pages(pdf_path: Path) -> list[_Prediction]:
+def _classify_pdf_pages(
+    pdf_path: Path,
+    *,
+    execution_provider: str = "cpu",
+) -> list[_Prediction]:
     """Render and classify every visible page in a PDF."""
     try:
         import numpy as np
@@ -413,22 +456,29 @@ def _classify_pdf_pages(pdf_path: Path) -> list[_Prediction]:
                     batch_predictions = _predict_batch(
                         batch_images,
                         batch_page_numbers,
+                        execution_provider=execution_provider,
                     )
                     predictions.extend(
                         _refine_low_confidence_predictions(
                             batch_images,
                             batch_predictions,
+                            execution_provider=execution_provider,
                         )
                     )
                     batch_images = []
                     batch_page_numbers = []
 
             if batch_images:
-                batch_predictions = _predict_batch(batch_images, batch_page_numbers)
+                batch_predictions = _predict_batch(
+                    batch_images,
+                    batch_page_numbers,
+                    execution_provider=execution_provider,
+                )
                 predictions.extend(
                     _refine_low_confidence_predictions(
                         batch_images,
                         batch_predictions,
+                        execution_provider=execution_provider,
                     )
                 )
         finally:
@@ -471,14 +521,20 @@ def _corrected_page_rotate(existing_rotate: int, correction_angle: int) -> int:
 def normalize_pdf_orientation(
     input_path: Path,
     output_path: Path,
+    *,
+    execution_provider: str = "cpu",
 ) -> list[OrientationResult]:
     """Normalize all confidently detected page orientations into a PDF copy."""
+    execution_provider = validate_ocr_execution_provider(execution_provider)
     input_path = Path(input_path)
     output_path = Path(output_path)
     if input_path.resolve() == output_path.resolve():
         raise OCRError("Paddle orientation input and output paths must differ")
 
-    predictions = _classify_pdf_pages(input_path)
+    predictions = _classify_pdf_pages(
+        input_path,
+        execution_provider=execution_provider,
+    )
 
     try:
         import pikepdf

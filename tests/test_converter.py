@@ -538,6 +538,29 @@ class TestConvertToPdfa:
 
         assert not output_path.exists()
 
+    def test_convert_with_directml_reports_directml_extra_when_ocr_unavailable(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """The DirectML error must not recommend installing the CPU runtime."""
+        output_path = tmp_dir / "output.pdf"
+
+        with (
+            patch("pdftopdfa.converter.onnxruntime_engine_config"),
+            patch("pdftopdfa.ocr.is_ocr_available", return_value=False),
+            pytest.raises(OCRError, match=r"pdftopdfa\[directml\]"),
+        ):
+            convert_to_pdfa(
+                sample_pdf,
+                output_path,
+                ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+                ocr_execution_provider="directml",
+            )
+
+        assert not output_path.exists()
+
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_with_ocr_languages_parameter(
@@ -579,6 +602,36 @@ class TestConvertToPdfa:
         assert call_args[0][2] == ["en"]  # Languages parameter
         assert call_args.kwargs["detection_model_dir"] == _DETECTION_MODEL_DIR
         assert call_args.kwargs["recognition_model_dir"] == _RECOGNITION_MODEL_DIR
+        assert call_args.kwargs["ocr_execution_provider"] == "cpu"
+
+    @patch("pdftopdfa.converter.onnxruntime_engine_config")
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_convert_passes_directml_execution_provider(
+        self,
+        _mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        _mock_engine_config: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """The public API forwards an explicit DirectML selection."""
+        import shutil
+
+        mock_apply_ocr.side_effect = lambda source, destination, *args, **kwargs: (
+            shutil.copy2(source, destination) or destination
+        )
+
+        result = convert_to_pdfa(
+            sample_pdf,
+            tmp_dir / "output.pdf",
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            ocr_execution_provider="directml",
+        )
+
+        assert result.success is True
+        assert mock_apply_ocr.call_args.kwargs["ocr_execution_provider"] == "directml"
 
     @pytest.mark.parametrize(
         ("api_option", "apply_option"),
@@ -717,6 +770,37 @@ class TestConvertToPdfa:
                 convert_directory(
                     input_path,
                     ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                    show_progress=False,
+                )
+
+        assert not output_path.exists()
+
+    @pytest.mark.parametrize("api_name", ["single", "batch", "directory"])
+    def test_invalid_ocr_execution_provider_is_rejected(
+        self,
+        api_name: str,
+        tmp_dir: Path,
+    ) -> None:
+        """Every public converter rejects unknown execution providers."""
+        input_path = tmp_dir / "missing.pdf"
+        output_path = tmp_dir / "output.pdf"
+
+        with pytest.raises(ValueError, match="OCR execution provider"):
+            if api_name == "single":
+                convert_to_pdfa(
+                    input_path,
+                    output_path,
+                    ocr_execution_provider="cuda",
+                )
+            elif api_name == "batch":
+                convert_files(
+                    [(input_path, output_path)],
+                    ocr_execution_provider="cuda",
+                )
+            else:
+                convert_directory(
+                    input_path,
+                    ocr_execution_provider="cuda",
                     show_progress=False,
                 )
 
@@ -2081,9 +2165,14 @@ class TestConvertDirectory:
 
         assert mock_convert_files.call_args.kwargs["skip_any_pdfa"] is True
 
+    @patch("pdftopdfa.converter.onnxruntime_engine_config")
     @patch("pdftopdfa.converter.convert_files")
     def test_convert_directory_passes_processing_options(
-        self, mock_convert_files: MagicMock, tmp_dir: Path, sample_pdf_bytes: bytes
+        self,
+        mock_convert_files: MagicMock,
+        _mock_engine_config: MagicMock,
+        tmp_dir: Path,
+        sample_pdf_bytes: bytes,
     ) -> None:
         """convert_directory forwards both independent processing options."""
         input_dir = tmp_dir / "input"
@@ -2098,6 +2187,7 @@ class TestConvertDirectory:
             ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_deskew=True,
             ocr_rotate_pages=True,
+            ocr_execution_provider="directml",
         )
 
         kwargs = mock_convert_files.call_args.kwargs
@@ -2105,6 +2195,7 @@ class TestConvertDirectory:
         assert kwargs["ocr_recognition_model_dir"] == _RECOGNITION_MODEL_DIR
         assert kwargs["ocr_deskew"] is True
         assert kwargs["ocr_rotate_pages"] is True
+        assert kwargs["ocr_execution_provider"] == "directml"
 
     @patch("pdftopdfa.converter.convert_files")
     def test_convert_directory_passes_allow_signature_invalidation(
@@ -2251,9 +2342,13 @@ class TestConvertFiles:
             is True
         )
 
+    @patch("pdftopdfa.converter.onnxruntime_engine_config")
     @patch("pdftopdfa.converter.convert_to_pdfa")
     def test_convert_files_passes_processing_options(
-        self, mock_convert_to_pdfa: MagicMock, tmp_dir: Path
+        self,
+        mock_convert_to_pdfa: MagicMock,
+        _mock_engine_config: MagicMock,
+        tmp_dir: Path,
     ) -> None:
         """convert_files forwards both independent processing options."""
         in_path = tmp_dir / "test.pdf"
@@ -2272,6 +2367,7 @@ class TestConvertFiles:
             ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_deskew=True,
             ocr_rotate_pages=True,
+            ocr_execution_provider="directml",
         )
 
         kwargs = mock_convert_to_pdfa.call_args.kwargs
@@ -2279,6 +2375,7 @@ class TestConvertFiles:
         assert kwargs["ocr_recognition_model_dir"] == _RECOGNITION_MODEL_DIR
         assert kwargs["ocr_deskew"] is True
         assert kwargs["ocr_rotate_pages"] is True
+        assert kwargs["ocr_execution_provider"] == "directml"
 
     def test_convert_files_cancellation(
         self, tmp_dir: Path, sample_pdf_bytes: bytes

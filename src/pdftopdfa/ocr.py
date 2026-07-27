@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     import pikepdf
 
 # Local
+from ._ocr_runtime import onnxruntime_engine_config
 from .exceptions import OCRError
 from .orientation import _effective_page_rotate, normalize_pdf_orientation
 from .utils import log_suppressed_error
@@ -1343,6 +1344,7 @@ def apply_ocr(
     force: bool = False,
     deskew: bool = False,
     rotate_pages: bool = False,
+    ocr_execution_provider: str = "cpu",
     _annotated_pages: frozenset[int] | None = None,
 ) -> Path:
     """Performs OCR on a PDF.
@@ -1365,6 +1367,8 @@ def apply_ocr(
             PaddleOCR (default: False).
         rotate_pages: If True, normalize page orientation with the bundled
             Paddle model (default: False).
+        ocr_execution_provider: ONNX Runtime provider to use for all Paddle
+            models: ``"cpu"`` (default) or ``"directml"``.
 
     Returns:
         Path to the OCR-processed PDF.
@@ -1376,9 +1380,12 @@ def apply_ocr(
         languages = ["en"]
     if force and deskew:
         raise OCRError("Deskew cannot be combined with forced OCR")
+    onnxruntime_engine_config(ocr_execution_provider)
     if not HAS_OCR:
+        extra = "directml" if ocr_execution_provider == "directml" else "ocr"
         raise OCRError(
-            "OCR not available. Install the OCR dependency: pip install pdftopdfa[ocr]"
+            "OCR not available. Install the OCR dependency: "
+            f"pip install pdftopdfa[{extra}]"
         )
 
     from .ocr_paddle import validate_model_directories
@@ -1395,12 +1402,13 @@ def apply_ocr(
 
     logger.info(
         "Starting PaddleOCR for %s (languages: %s, force: %s, deskew: %s, "
-        "rotate pages: %s)",
+        "rotate pages: %s, execution provider: %s)",
         input_path,
         "+".join(languages),
         force,
         deskew,
         rotate_pages,
+        ocr_execution_provider,
     )
 
     ocr_input_path = input_path
@@ -1432,6 +1440,7 @@ def apply_ocr(
             "plugins": [_PADDLE_OCR_PLUGIN, _ROTATION_FIX_PLUGIN],
             "paddle_detection_model_dir": detection_model_dir,
             "paddle_recognition_model_dir": recognition_model_dir,
+            "paddle_execution_provider": ocr_execution_provider,
         }
         if pages is not None:
             ocr_kwargs["pages"] = ",".join(str(page) for page in pages)
@@ -1455,7 +1464,11 @@ def apply_ocr(
                 Path(orientation_temp.name) / f"{input_path.stem}_oriented.pdf"
             )
             orientation_started = time.perf_counter()
-            normalize_pdf_orientation(input_path, ocr_input_path)
+            normalize_pdf_orientation(
+                input_path,
+                ocr_input_path,
+                execution_provider=ocr_execution_provider,
+            )
             logger.info(
                 "Paddle orientation preflight completed in %.2fs",
                 time.perf_counter() - orientation_started,

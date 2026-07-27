@@ -121,6 +121,43 @@ class TestBundledModel:
             engine_config={"providers": ["CPUExecutionProvider"]},
         )
 
+    @patch("pdftopdfa.orientation._resolve_model_directory")
+    @patch("paddleocr.DocImgOrientationClassification")
+    def test_model_uses_directml_without_cpu_fallback(
+        self,
+        mock_model_class: MagicMock,
+        mock_resolve: MagicMock,
+        tmp_dir: Path,
+    ) -> None:
+        """DirectML uses the bundled model and disables runtime fallback."""
+        engine_config = {
+            "providers": ["DmlExecutionProvider"],
+            "execution_mode": "sequential",
+            "enable_mem_pattern": False,
+        }
+        mock_resolve.return_value = tmp_dir
+        session = mock_model_class.return_value.paddlex_predictor.runner.session
+        session.get_providers.return_value = [
+            "DmlExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+
+        with patch.object(
+            orientation,
+            "onnxruntime_engine_config",
+            return_value=engine_config,
+        ):
+            orientation._create_model("directml")
+
+        mock_model_class.assert_called_once_with(
+            model_name=MODEL_NAME,
+            model_dir=str(tmp_dir),
+            engine="onnxruntime",
+            device="cpu",
+            engine_config=engine_config,
+        )
+        session.disable_fallback.assert_called_once_with()
+
     @patch("pdftopdfa.orientation._create_model")
     def test_model_is_created_once_per_process(self, mock_create: MagicMock) -> None:
         """Repeated calls reuse the same lazy model instance."""
@@ -129,7 +166,27 @@ class TestBundledModel:
 
         assert _get_model() is instance
         assert _get_model() is instance
-        mock_create.assert_called_once_with()
+        mock_create.assert_called_once_with("cpu")
+
+    @patch("pdftopdfa.orientation._create_model")
+    def test_model_is_replaced_when_execution_provider_changes(
+        self,
+        mock_create: MagicMock,
+    ) -> None:
+        """A cached CPU session is never reused for DirectML execution."""
+        cpu_model = MagicMock()
+        directml_model = MagicMock()
+        mock_create.side_effect = [cpu_model, directml_model]
+
+        assert _get_model("cpu") is cpu_model
+        assert _get_model("cpu") is cpu_model
+        assert _get_model("directml") is directml_model
+        assert _get_model("directml") is directml_model
+
+        assert mock_create.call_args_list[0].args == ("cpu",)
+        assert mock_create.call_args_list[1].args == ("directml",)
+        cpu_model.close.assert_called_once_with()
+        directml_model.close.assert_not_called()
 
     @patch("pdftopdfa.orientation._create_model")
     def test_parallel_model_access_creates_one_instance(
@@ -144,7 +201,7 @@ class TestBundledModel:
             results = list(executor.map(lambda _: _get_model(), range(32)))
 
         assert all(result is instance for result in results)
-        mock_create.assert_called_once_with()
+        mock_create.assert_called_once_with("cpu")
 
 
 class TestPredictionValidation:
@@ -226,7 +283,8 @@ class TestPredictionValidation:
         pdf_path = tmp_dir / "nine_pages.pdf"
         _make_pdf(pdf_path, ORIENTATION_BATCH_SIZE + 1)
 
-        def make_results(images, page_numbers):
+        def make_results(images, page_numbers, *, execution_provider):
+            assert execution_provider == "cpu"
             assert all(image.flags.c_contiguous for image in images)
             assert all(image.shape[2] == 3 for image in images)
             return [_Prediction(page, 0, 0.9) for page in page_numbers]

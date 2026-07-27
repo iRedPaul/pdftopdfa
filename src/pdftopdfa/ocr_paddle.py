@@ -24,6 +24,11 @@ from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
 from PIL import Image
 from pydantic import BaseModel
 
+from ._ocr_runtime import (
+    onnxruntime_engine_config,
+    require_execution_provider,
+    validate_ocr_execution_provider,
+)
 from .exceptions import OCRError
 from .ocr import PADDLE_OCR_LANGUAGES
 
@@ -49,7 +54,7 @@ class _ModelSpec:
 @dataclass(frozen=True)
 class _CachedPrediction:
     result: Any
-    model_pair: tuple[Path, Path]
+    model_pair: tuple[Path, Path, str]
     image_size: tuple[int, int]
 
 
@@ -62,6 +67,7 @@ class _PaddleOptions(BaseModel):
 
     detection_model_dir: Path | None = None
     recognition_model_dir: Path | None = None
+    execution_provider: str = "cpu"
 
 
 class _TesseractCompatibilityOptions(BaseModel):
@@ -77,6 +83,7 @@ _prediction_lock = threading.RLock()
 _cached_pair: tuple[Path, Path] | None = None
 _cached_fingerprint: tuple[tuple[int, int, int, int, int, int], ...] | None = None
 _cached_model: Any | None = None
+_cached_execution_provider: str | None = None
 _pending_deskew_results: dict[tuple[Path, int], _CachedPrediction] = {}
 _prediction_result_by_image: dict[Path, _CachedPrediction] = {}
 _coordinate_dpi_lock = threading.Lock()
@@ -188,18 +195,23 @@ def _replace_cached_model(
     pair: tuple[Path, Path],
     fingerprint: tuple[tuple[int, int, int, int, int, int], ...],
 ) -> None:
-    global _cached_fingerprint, _cached_model, _cached_pair
+    global _cached_execution_provider, _cached_fingerprint, _cached_model, _cached_pair
 
     if _cached_model is not None:
         close = getattr(_cached_model, "close", None)
         if callable(close):
             close()
     _cached_model = None
+    _cached_execution_provider = None
     _cached_pair = pair
     _cached_fingerprint = fingerprint
 
 
-def _create_model(detection_model_dir: Path, recognition_model_dir: Path) -> Any:
+def _create_model(
+    detection_model_dir: Path,
+    recognition_model_dir: Path,
+    execution_provider: str = "cpu",
+) -> Any:
     try:
         from paddleocr import PaddleOCR
 
@@ -207,7 +219,7 @@ def _create_model(detection_model_dir: Path, recognition_model_dir: Path) -> Any
         paddlex_logger.setLevel(
             max(paddlex_logger.getEffectiveLevel(), logger.getEffectiveLevel())
         )
-        return PaddleOCR(
+        model = PaddleOCR(
             text_detection_model_name=_DETECTION_MODEL.name,
             text_detection_model_dir=str(detection_model_dir),
             text_recognition_model_name=_RECOGNITION_MODEL.name,
@@ -220,15 +232,37 @@ def _create_model(detection_model_dir: Path, recognition_model_dir: Path) -> Any
             return_word_box=True,
             engine="onnxruntime",
             device="cpu",
-            engine_config={"providers": ["CPUExecutionProvider"]},
+            engine_config=onnxruntime_engine_config(execution_provider),
         )
+        if execution_provider == "directml":
+            try:
+                pipeline = model.paddlex_pipeline
+                require_execution_provider(
+                    pipeline.text_det_model.runner.session,
+                    execution_provider,
+                )
+                require_execution_provider(
+                    pipeline.text_rec_model.runner.session,
+                    execution_provider,
+                )
+            except Exception:
+                close = getattr(model, "close", None)
+                if callable(close):
+                    close()
+                raise
+        return model
+    except OCRError:
+        raise
     except Exception as exc:
         raise OCRError(f"Could not initialize PaddleOCR: {exc}") from exc
 
 
 def _get_model(options: OcrOptions) -> Any:
     paddle_options = options.paddle
-    global _cached_model
+    execution_provider = validate_ocr_execution_provider(
+        getattr(paddle_options, "execution_provider", "cpu")
+    )
+    global _cached_execution_provider, _cached_model
     with _prediction_lock:
         pair = _resolve_and_validate_model_directories(
             paddle_options.detection_model_dir,
@@ -236,12 +270,21 @@ def _get_model(options: OcrOptions) -> Any:
             recheck=False,
         )
         with _model_lock:
+            if (
+                _cached_model is not None
+                and _cached_execution_provider != execution_provider
+            ):
+                close = getattr(_cached_model, "close", None)
+                if callable(close):
+                    close()
+                _cached_model = None
             if _cached_model is None:
-                _cached_model = _create_model(*pair)
+                _cached_model = _create_model(*pair, execution_provider)
+                _cached_execution_provider = execution_provider
             return _cached_model
 
 
-def _model_pair_for_cache(options: OcrOptions) -> tuple[Path, Path] | None:
+def _model_pair_for_cache(options: OcrOptions) -> tuple[Path, Path, str] | None:
     try:
         paddle_options = options.paddle
         if (
@@ -249,10 +292,14 @@ def _model_pair_for_cache(options: OcrOptions) -> tuple[Path, Path] | None:
             or paddle_options.recognition_model_dir is None
         ):
             return None
-        return (
+        pair = (
             Path(paddle_options.detection_model_dir).expanduser().resolve(),
             Path(paddle_options.recognition_model_dir).expanduser().resolve(),
         )
+        execution_provider = validate_ocr_execution_provider(
+            getattr(paddle_options, "execution_provider", "cpu")
+        )
+        return (*pair, execution_provider)
     except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
         return None
 
@@ -847,7 +894,7 @@ class PaddleOcrEngine(OcrEngine):
 
 def _reset_model_cache_for_tests() -> None:
     """Clear and close cached PaddleOCR state for isolated tests."""
-    global _cached_fingerprint, _cached_model, _cached_pair
+    global _cached_execution_provider, _cached_fingerprint, _cached_model, _cached_pair
     with _prediction_lock, _model_lock:
         if _cached_model is not None:
             close = getattr(_cached_model, "close", None)
@@ -856,6 +903,7 @@ def _reset_model_cache_for_tests() -> None:
         _cached_model = None
         _cached_pair = None
         _cached_fingerprint = None
+        _cached_execution_provider = None
         _pending_deskew_results.clear()
         _prediction_result_by_image.clear()
     with _coordinate_dpi_lock:
@@ -888,6 +936,11 @@ def add_options(parser: Any) -> None:
     parser.add_argument(
         "--paddle-recognition-model-dir",
         type=Path,
+        help=SUPPRESS,
+    )
+    parser.add_argument(
+        "--paddle-execution-provider",
+        default="cpu",
         help=SUPPRESS,
     )
 

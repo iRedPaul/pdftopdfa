@@ -16,6 +16,10 @@ from ocrmypdf.exceptions import PriorOcrFoundError
 from pikepdf import Dictionary, Name, Pdf
 from PIL import Image
 
+from pdftopdfa._ocr_runtime import (
+    onnxruntime_engine_config,
+    require_execution_provider,
+)
 from pdftopdfa.exceptions import OCRError
 from pdftopdfa.ocr import (
     _finalize_ocr_output,
@@ -41,7 +45,11 @@ def _mock_paddle_orientation():
     """Keep OCR unit tests independent from the orientation model."""
     with patch("pdftopdfa.ocr.normalize_pdf_orientation") as mock_normalize:
 
-        def copy_input(input_path: Path, output_path: Path) -> list[object]:
+        def copy_input(
+            input_path: Path,
+            output_path: Path,
+            **_kwargs: object,
+        ) -> list[object]:
             shutil.copy2(input_path, output_path)
             return []
 
@@ -68,6 +76,59 @@ def validate_models(model_dirs: tuple[Path, Path]):
 def _copy_ocr_input(input_path: Path, output_path: Path, **_kwargs: object) -> None:
     """Model OCRmyPDF's output contract in option-boundary tests."""
     shutil.copy2(input_path, output_path)
+
+
+class TestOcrExecutionProvider:
+    """Tests for strict ONNX Runtime provider selection."""
+
+    def test_cpu_is_the_default_configuration(self) -> None:
+        assert onnxruntime_engine_config("cpu") == {
+            "providers": ["CPUExecutionProvider"]
+        }
+
+    def test_directml_uses_required_session_options(self) -> None:
+        fake_onnxruntime = SimpleNamespace(
+            get_available_providers=lambda: [
+                "DmlExecutionProvider",
+                "CPUExecutionProvider",
+            ]
+        )
+
+        with patch.dict("sys.modules", {"onnxruntime": fake_onnxruntime}):
+            config = onnxruntime_engine_config("directml")
+
+        assert config == {
+            "providers": ["DmlExecutionProvider"],
+            "execution_mode": "sequential",
+            "enable_mem_pattern": False,
+        }
+
+    def test_unavailable_directml_is_fail_closed(self) -> None:
+        fake_onnxruntime = SimpleNamespace(
+            get_available_providers=lambda: ["CPUExecutionProvider"]
+        )
+
+        with (
+            patch.dict("sys.modules", {"onnxruntime": fake_onnxruntime}),
+            pytest.raises(
+                OCRError,
+                match=r"DmlExecutionProvider.*pdftopdfa\[directml\]",
+            ),
+        ):
+            onnxruntime_engine_config("directml")
+
+    def test_unknown_provider_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported OCR execution provider"):
+            onnxruntime_engine_config("cuda")
+
+    def test_initialized_cpu_fallback_is_rejected(self) -> None:
+        session = MagicMock()
+        session.get_providers.return_value = ["CPUExecutionProvider"]
+
+        with pytest.raises(OCRError, match="refusing CPU fallback"):
+            require_execution_provider(session, "directml")
+
+        session.disable_fallback.assert_not_called()
 
 
 def _add_content_page(
@@ -1205,7 +1266,33 @@ class TestApplyOcr:
             ],
             "paddle_detection_model_dir": detection,
             "paddle_recognition_model_dir": recognition,
+            "paddle_execution_provider": "cpu",
         }
+
+    def test_passes_directml_to_ocrmypdf_plugin(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        output = tmp_dir / "output.pdf"
+        with (
+            patch("pdftopdfa.ocr.onnxruntime_engine_config"),
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=_copy_ocr_input,
+            ) as mock_ocr,
+        ):
+            apply_ocr(
+                sample_pdf,
+                output,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                ocr_execution_provider="directml",
+            )
+
+        assert mock_ocr.call_args.kwargs["paddle_execution_provider"] == "directml"
 
     def test_defaults_to_english_metadata(
         self,
@@ -1516,7 +1603,37 @@ class TestApplyOcr:
             )
 
         _mock_paddle_orientation.assert_called_once()
+        assert _mock_paddle_orientation.call_args.kwargs["execution_provider"] == "cpu"
         assert mock_ocr.call_args.args[0] != sample_pdf
+
+    def test_rotation_preflight_uses_directml(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        _mock_paddle_orientation: MagicMock,
+    ) -> None:
+        with (
+            patch("pdftopdfa.ocr.onnxruntime_engine_config"),
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=_copy_ocr_input,
+            ),
+        ):
+            apply_ocr(
+                sample_pdf,
+                tmp_dir / "output.pdf",
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                rotate_pages=True,
+                ocr_execution_provider="directml",
+            )
+
+        assert (
+            _mock_paddle_orientation.call_args.kwargs["execution_provider"]
+            == "directml"
+        )
 
     def test_invalid_language_is_ocr_error(
         self,

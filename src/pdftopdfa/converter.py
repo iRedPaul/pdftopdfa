@@ -21,6 +21,10 @@ import pikepdf
 from tqdm import tqdm
 
 # Local
+from ._ocr_runtime import (
+    onnxruntime_engine_config,
+    validate_ocr_execution_provider,
+)
 from .color_profile import embed_color_profiles
 from .exceptions import (
     ConversionError,
@@ -81,8 +85,10 @@ def _validate_ocr_configuration(
     ocr_force: bool,
     ocr_deskew: bool,
     ocr_rotate_pages: bool,
+    ocr_execution_provider: str,
 ) -> tuple[bool, list[str]]:
     """Validate OCR activation and return its effective language list."""
+    ocr_execution_provider = validate_ocr_execution_provider(ocr_execution_provider)
     if (ocr_detection_model_dir is None) != (ocr_recognition_model_dir is None):
         raise ValueError(
             "OCR detection and recognition model directories must be provided together"
@@ -94,6 +100,7 @@ def _validate_ocr_configuration(
         or ocr_force
         or ocr_deskew
         or ocr_rotate_pages
+        or ocr_execution_provider != "cpu"
     )
     if ocr_requested and ocr_detection_model_dir is None:
         raise ValueError(
@@ -103,6 +110,7 @@ def _validate_ocr_configuration(
     effective_languages = ocr_languages if ocr_languages is not None else ["en"]
     if ocr_requested:
         validate_ocr_languages(effective_languages)
+        onnxruntime_engine_config(ocr_execution_provider)
     return ocr_requested, effective_languages
 
 
@@ -782,6 +790,7 @@ def convert_to_pdfa(
     ocr_force: bool = False,
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
+    ocr_execution_provider: str = "cpu",
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
@@ -810,6 +819,8 @@ def convert_to_pdfa(
         ocr_deskew: If True, enable OCR and straighten scan-like,
             raster-dominant pages.
         ocr_rotate_pages: If True, enable OCR and normalize page orientation.
+        ocr_execution_provider: ONNX Runtime provider for Paddle models:
+            ``"cpu"`` (default) or ``"directml"``.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
@@ -832,6 +843,7 @@ def convert_to_pdfa(
         ocr_force=ocr_force,
         ocr_deskew=ocr_deskew,
         ocr_rotate_pages=ocr_rotate_pages,
+        ocr_execution_provider=ocr_execution_provider,
     )
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
@@ -992,7 +1004,8 @@ def convert_to_pdfa(
             from .ocr import apply_ocr, is_ocr_available
 
             if not is_ocr_available():
-                raise OCRError("OCR not available - pip install pdftopdfa[ocr]")
+                extra = "directml" if ocr_execution_provider == "directml" else "ocr"
+                raise OCRError(f"OCR not available - pip install pdftopdfa[{extra}]")
             else:
                 fd, tmp_path = tempfile.mkstemp(
                     suffix=".pdf", prefix=f".{input_path.stem}_ocr_"
@@ -1051,6 +1064,7 @@ def convert_to_pdfa(
                     force=ocr_force,
                     deskew=ocr_deskew,
                     rotate_pages=ocr_rotate_pages,
+                    ocr_execution_provider=ocr_execution_provider,
                     _annotated_pages=annotated_pages,
                 )
 
@@ -1416,6 +1430,7 @@ def convert_files(
     ocr_force: bool = False,
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
+    ocr_execution_provider: str = "cpu",
     force_overwrite: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -1445,6 +1460,8 @@ def convert_files(
         ocr_deskew: If True, enable OCR and straighten scan-like,
             raster-dominant pages.
         ocr_rotate_pages: If True, enable OCR and normalize page orientation.
+        ocr_execution_provider: ONNX Runtime provider for Paddle models:
+            ``"cpu"`` (default) or ``"directml"``.
         force_overwrite: If True, existing output files are overwritten.
             If False, existing outputs are skipped with an error result.
         preserve_stamps: If True, known proprietary stamp annotations are
@@ -1466,6 +1483,7 @@ def convert_files(
         ocr_force=ocr_force,
         ocr_deskew=ocr_deskew,
         ocr_rotate_pages=ocr_rotate_pages,
+        ocr_execution_provider=ocr_execution_provider,
     )
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
@@ -1513,6 +1531,7 @@ def convert_files(
                 ocr_force=ocr_force,
                 ocr_deskew=ocr_deskew,
                 ocr_rotate_pages=ocr_rotate_pages,
+                ocr_execution_provider=ocr_execution_provider,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 allow_signature_invalidation=allow_signature_invalidation,
@@ -1556,6 +1575,7 @@ def convert_directory(
     ocr_force: bool = False,
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
+    ocr_execution_provider: str = "cpu",
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
@@ -1585,6 +1605,8 @@ def convert_directory(
         ocr_deskew: If True, enable OCR and straighten scan-like,
             raster-dominant pages.
         ocr_rotate_pages: If True, enable OCR and normalize page orientation.
+        ocr_execution_provider: ONNX Runtime provider for Paddle models:
+            ``"cpu"`` (default) or ``"directml"``.
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
             flattened into page content.
@@ -1605,6 +1627,7 @@ def convert_directory(
         ocr_force=ocr_force,
         ocr_deskew=ocr_deskew,
         ocr_rotate_pages=ocr_rotate_pages,
+        ocr_execution_provider=ocr_execution_provider,
     )
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
@@ -1694,6 +1717,7 @@ def convert_directory(
         ocr_force=ocr_force,
         ocr_deskew=ocr_deskew,
         ocr_rotate_pages=ocr_rotate_pages,
+        ocr_execution_provider=ocr_execution_provider,
         force_overwrite=force_overwrite,
         on_progress=_on_progress if show_progress else None,
         convert_calibrated=convert_calibrated,
