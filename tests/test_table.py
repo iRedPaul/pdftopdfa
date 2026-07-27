@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -729,24 +730,93 @@ def test_empty_results_are_plain_typed_results(
     assert result.cells == ()
 
 
-def test_inconsistent_html_and_box_cells_fail_closed(
+def test_inconsistent_html_and_box_cells_keep_structure_without_boxes(
+    model_dirs: dict[str, Path],
+    image_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    html = (
+        "<table><tbody>"
+        '<tr><td rowspan="2">A</td><td>B</td></tr>'
+        "<tr><td>C</td></tr>"
+        "</tbody></table>"
+    )
+    classifier, pipeline = _fake_models(
+        "wired_table",
+        _prediction(html=html, boxes=((0, 0, 120, 80),)),
+    )
+
+    with (
+        patch.object(table, "_create_table_classifier", return_value=classifier),
+        patch.object(table, "_create_table_pipeline", return_value=pipeline),
+        caplog.at_level(logging.WARNING, logger="pdftopdfa.table"),
+    ):
+        result = recognize_table(image_path, **model_dirs)
+
+    assert result.html == html
+    assert [
+        (
+            cell.row,
+            cell.column,
+            cell.row_span,
+            cell.column_span,
+            cell.text,
+            cell.bounding_box,
+            cell.confidence,
+        )
+        for cell in result.cells
+    ] == [
+        (0, 0, 2, 1, "A", None, None),
+        (0, 1, 1, 1, "B", None, None),
+        (1, 1, 1, 1, "C", None, None),
+    ]
+    assert "html=3" in caplog.text
+    assert "cell_box_list=1" in caplog.text
+
+
+def test_skewed_cell_boxes_are_grouped_into_rows_by_top_tolerance(
     model_dirs: dict[str, Path],
     image_path: Path,
 ) -> None:
+    # A skewed scan whose second row starts above the bottom of the first row,
+    # and whose HTML row lengths (2, 3) do not match the detected row sizes
+    # (3, 2). Rows must be grouped by top proximity, not by the HTML lengths.
+    html = (
+        "<table><tbody>"
+        '<tr><td colspan="2">A</td><td>B</td></tr>'
+        "<tr><td>C</td><td>D</td><td>E</td></tr>"
+        "</tbody></table>"
+    )
     classifier, pipeline = _fake_models(
         "wired_table",
         _prediction(
-            html="<table><tr><td>A</td><td>B</td></tr></table>",
-            boxes=((0, 0, 120, 80),),
+            html=html,
+            boxes=(
+                (40, 33, 80, 63),
+                (80, 9, 120, 39),
+                (0, 0, 40, 30),
+                (0, 28, 40, 58),
+                (40, 5, 80, 35),
+            ),
+            ocr_boxes=(),
+            texts=(),
+            scores=(),
         ),
     )
 
     with (
         patch.object(table, "_create_table_classifier", return_value=classifier),
         patch.object(table, "_create_table_pipeline", return_value=pipeline),
-        pytest.raises(OCRError, match="inconsistent table cells"),
     ):
-        recognize_table(image_path, **model_dirs)
+        result = recognize_table(image_path, **model_dirs)
+
+    assert [(cell.text, cell.bounding_box) for cell in result.cells] == [
+        ("A", TableBoundingBox(0.0, 0.0, 40.0, 30.0)),
+        ("B", TableBoundingBox(40.0, 5.0, 80.0, 35.0)),
+        ("C", TableBoundingBox(80.0, 9.0, 120.0, 39.0)),
+        ("D", TableBoundingBox(0.0, 28.0, 40.0, 58.0)),
+        ("E", TableBoundingBox(40.0, 33.0, 80.0, 63.0)),
+    ]
 
 
 def test_repeated_calls_reuse_models_but_repeat_predictions(

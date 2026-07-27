@@ -85,7 +85,10 @@ OCR and table recognition do not download models at runtime. Every model must
 be obtained separately and passed through an explicit local directory on each
 public API invocation. CPU and DirectML use the same FP32 ONNX model files.
 See the [OCR guide](docs/ocr.md) for the `recognize_table()` model contract and
-typed result.
+typed result. Cell text and grid structure come from the table-structure model,
+while bounding boxes come from the separate cell-detection model; if the two
+models report different cell counts, cells are returned without
+`bounding_box` and `confidence` instead of failing.
 
 #### PP-OCRv6 model setup
 

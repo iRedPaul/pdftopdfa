@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from dataclasses import dataclass
@@ -27,6 +28,8 @@ from ._ocr_runtime import (
 )
 from .exceptions import OCRError
 
+logger = logging.getLogger(__name__)
+
 _TABLE_CLASSIFICATION_MODEL = _ModelSpec(name="PP-LCNet_x1_0_table_cls")
 _WIRED_STRUCTURE_MODEL = _ModelSpec(name="SLANeXt_wired")
 _WIRELESS_STRUCTURE_MODEL = _ModelSpec(name="SLANeXt_wireless")
@@ -36,6 +39,9 @@ _TEXT_DETECTION_MODEL = _ModelSpec(name="PP-OCRv6_medium_det")
 _TEXT_RECOGNITION_MODEL = _ModelSpec(name="PP-OCRv6_medium_rec")
 _TEXT_DETECTION_LIMIT_SIDE_LEN = 1600
 _OCR_CELL_OVERLAP = 0.7
+# Maximum top-coordinate distance in pixels between a cell box and the first
+# box of its row, matching sort_table_cells_boxes() in PaddleX.
+_CELL_ROW_TOLERANCE = 10.0
 
 
 class TableType(StrEnum):
@@ -64,7 +70,7 @@ class TableCell:
     row_span: int
     column_span: int
     text: str
-    bounding_box: TableBoundingBox
+    bounding_box: TableBoundingBox | None
     confidence: float | None
 
 
@@ -616,29 +622,34 @@ def _cell_confidence(
     return sum(scores) / len(scores)
 
 
-def _order_cell_boxes(
-    cell_data: tuple[tuple[int, int, int, int, str], ...],
-    box_values: tuple[Any, ...],
-) -> tuple[TableBoundingBox, ...]:
+def _order_cell_boxes(box_values: tuple[Any, ...]) -> tuple[TableBoundingBox, ...]:
+    """Sort detected cell boxes into reading order.
+
+    Rows are grouped by top-coordinate proximity instead of by the row lengths
+    of the recognized HTML, because the two come from independent models. A box
+    joins the current row while its top stays within ``_CELL_ROW_TOLERANCE`` of
+    the top of that row's first box, so a skewed scan does not shift boxes into
+    a neighboring row.
+    """
     boxes = [
         _bounding_box(box, f"cell_box_list[{index}]")
         for index, box in enumerate(box_values)
     ]
-    boxes.sort(key=lambda box: (box.top, box.left))
+    boxes.sort(key=lambda box: box.top)
 
-    row_counts: list[int] = []
-    for row, *_rest in cell_data:
-        if len(row_counts) <= row:
-            row_counts.extend(0 for _index in range(row - len(row_counts) + 1))
-        row_counts[row] += 1
-
-    ordered = []
-    offset = 0
-    for count in row_counts:
-        row_boxes = boxes[offset : offset + count]
-        row_boxes.sort(key=lambda box: box.left)
-        ordered.extend(row_boxes)
-        offset += count
+    ordered: list[TableBoundingBox] = []
+    row: list[TableBoundingBox] = []
+    row_top: float | None = None
+    for box in boxes:
+        if row_top is not None and box.top - row_top <= _CELL_ROW_TOLERANCE:
+            row.append(box)
+            continue
+        row.sort(key=lambda row_box: row_box.left)
+        ordered.extend(row)
+        row = [box]
+        row_top = box.top
+    row.sort(key=lambda row_box: row_box.left)
+    ordered.extend(row)
     return tuple(ordered)
 
 
@@ -670,16 +681,28 @@ def _serialize_result(
     if not box_values:
         return TableRecognitionResult(table_type=table_type, html=html, cells=())
     cell_data = _html_cell_data(html)
-    if len(cell_data) != len(box_values):
-        raise OCRError(
-            "PaddleOCR returned inconsistent table cells: "
-            f"html={len(cell_data)}, cell_box_list={len(box_values)}"
+    boxes: tuple[TableBoundingBox | None, ...]
+    confidences: tuple[float | None, ...]
+    if len(cell_data) == len(box_values):
+        detected = _order_cell_boxes(box_values)
+        ocr_result = _optional_field(result, "overall_ocr_res")
+        if not ocr_result:
+            ocr_result = _field(table_result, "table_ocr_pred")
+        ocr_data = _ocr_data(ocr_result)
+        boxes = detected
+        confidences = tuple(_cell_confidence(box, ocr_data) for box in detected)
+    else:
+        # The structure model builds the HTML and the cell-detection model
+        # builds the boxes, so differing counts are expected model behaviour.
+        # Text and grid come from the HTML alone and stay usable without boxes.
+        logger.warning(
+            "PaddleOCR table cell counts differ (html=%d, cell_box_list=%d); "
+            "returning cells without bounding boxes and confidence",
+            len(cell_data),
+            len(box_values),
         )
-    boxes = _order_cell_boxes(cell_data, box_values)
-    ocr_result = _optional_field(result, "overall_ocr_res")
-    if not ocr_result:
-        ocr_result = _field(table_result, "table_ocr_pred")
-    ocr_data = _ocr_data(ocr_result)
+        boxes = (None,) * len(cell_data)
+        confidences = (None,) * len(cell_data)
     cells = tuple(
         TableCell(
             row=row,
@@ -688,11 +711,12 @@ def _serialize_result(
             column_span=column_span,
             text=text,
             bounding_box=box,
-            confidence=_cell_confidence(box, ocr_data),
+            confidence=confidence,
         )
-        for (row, column, row_span, column_span, text), box in zip(
+        for (row, column, row_span, column_span, text), box, confidence in zip(
             cell_data,
             boxes,
+            confidences,
             strict=True,
         )
     )
@@ -716,6 +740,12 @@ def recognize_table(
     Cell ``row`` and ``column`` values are zero-based. Cell confidence is the
     mean OCR confidence of text boxes contained by that cell, or ``None`` for
     an empty cell.
+
+    Grid structure and text come from the structure model, while bounding boxes
+    come from the independent cell-detection model. If the two models disagree
+    on the number of cells, a warning is logged and every cell is returned with
+    ``bounding_box`` and ``confidence`` set to ``None``; rows, columns, spans,
+    and text stay usable.
     """
     execution_provider = validate_ocr_execution_provider(ocr_execution_provider)
     with _prediction_lock:

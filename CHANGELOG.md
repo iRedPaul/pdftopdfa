@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.2] - 2026-07-27
+
+### Changes
+
+- Make `TableCell.bounding_box` optional because cell boxes are no longer guaranteed
+
+### Bug Fixes
+
+- Return table cells without boxes and confidence instead of failing when the structure and cell-detection models report different cell counts
+- Group detected table-cell boxes into rows by top-coordinate tolerance so skewed scans no longer pair cells with boxes of a neighboring row
+
 ## [0.8.1] - 2026-07-27
 
 ### Features

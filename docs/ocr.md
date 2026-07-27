@@ -294,6 +294,13 @@ Confidence is the mean confidence of OCR text boxes assigned to the cell, or
 `None` for an empty cell. PaddleX and NumPy result objects never escape the
 function.
 
+Grid structure and text come from the table-structure model, while
+`bounding_box` comes from the independent cell-detection model. Both models can
+report a different number of cells for the same table. In that case a warning
+is logged and every returned cell has `bounding_box` and `confidence` set to
+`None`, so `TableCell.bounding_box` is `TableBoundingBox | None`. Rows,
+columns, spans, text, and HTML remain usable.
+
 All seven model directories are required and must each contain exactly
 `inference.onnx` and `inference.yml`. Directories and artifacts must be local,
 regular, and not symbolic links. URL input is rejected. Classification runs
