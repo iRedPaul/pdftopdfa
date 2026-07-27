@@ -26,12 +26,6 @@ EXTERNAL_OCR_MODEL_MARKERS = {
     "pp-ocrv6_medium_det",
     "pp-ocrv6_medium_rec",
 }
-EXTERNAL_OCR_MODEL_HASHES = {
-    "eb13b44b25bb36f89528b68720af8a61d9cf381176107f465db1757b65d086e1",
-    "7298d5ead546584af2504d03355f881ac7a7bc0eb1e282d3e159277c1d0af871",
-    "9c09abf0957f7968c7586464b7397b84ad2387a0497a351af40e9acc71b673ba",
-    "991b700facf5b50a7de193468207d5f4255b538dde0d312ae3b7c7a9b6873129",
-}
 ALLOWED_TESSERACT_IDENTIFIERS = {
     "_TESSERACT_PLUGIN",
     "_TesseractCompatibilityOptions",
@@ -119,13 +113,8 @@ def _verify_files(names: list[str], read_file) -> None:
         )
 
     for name in names:
-        content = read_file(name)
-        if hashlib.sha256(content).hexdigest() in EXTERNAL_OCR_MODEL_HASHES:
-            raise RuntimeError(
-                f"External PP-OCRv6 model artifact must not be distributed: {name}"
-            )
         if _is_package_python_source(name):
-            _verify_no_active_tesseract(name, content)
+            _verify_no_active_tesseract(name, read_file(name))
 
     roots = {
         name[: -len("/manifest.json")]

@@ -209,13 +209,13 @@ def _print_validation_result(
 @click.option(
     "--ocr-detection-model-dir",
     type=click.Path(file_okay=False, path_type=Path),
-    help="Verified PP-OCRv6 Medium detection model directory; "
+    help="PP-OCRv6 Medium detection model directory; "
     "use with --ocr-recognition-model-dir.",
 )
 @click.option(
     "--ocr-recognition-model-dir",
     type=click.Path(file_okay=False, path_type=Path),
-    help="Verified PP-OCRv6 Medium recognition model directory; "
+    help="PP-OCRv6 Medium recognition model directory; "
     "use with --ocr-detection-model-dir.",
 )
 @click.option(
@@ -231,7 +231,7 @@ def _print_validation_result(
     "--deskew",
     is_flag=True,
     default=False,
-    help="Straighten skewed pages. Implies --ocr.",
+    help="Straighten scan-like, raster-dominant pages. Implies --ocr.",
 )
 @click.option(
     "--rotate-pages",
@@ -457,7 +457,7 @@ def _convert_single_file(
         ocr_detection_model_dir: PP-OCRv6 Medium detection model directory.
         ocr_recognition_model_dir: PP-OCRv6 Medium recognition model directory.
         ocr_force: If True, force OCR even on pages with existing text.
-        ocr_deskew: If True, straighten skewed pages during OCR.
+        ocr_deskew: If True, straighten scan-like, raster-dominant pages.
         ocr_rotate_pages: If True, normalize page orientation before OCR.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations
@@ -588,7 +588,7 @@ def _convert_directory(
         ocr_detection_model_dir: PP-OCRv6 Medium detection model directory.
         ocr_recognition_model_dir: PP-OCRv6 Medium recognition model directory.
         ocr_force: If True, force OCR even on pages with existing text.
-        ocr_deskew: If True, straighten skewed pages during OCR.
+        ocr_deskew: If True, straighten scan-like, raster-dominant pages.
         ocr_rotate_pages: If True, normalize page orientation before OCR.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations

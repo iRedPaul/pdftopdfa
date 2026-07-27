@@ -28,9 +28,9 @@ pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with 
 
 1. **Pre-check** -- skips encrypted and digitally signed PDFs, then detects if the PDF is already a valid PDF/A file (skips conversion if the existing level meets or exceeds the target; optionally skips any veraPDF-compliant PDF/A via `--skip-any-pdfa`; see [Usage Guide](docs/usage.md#already-compliant-pdfs) for details)
 2. **OCR** (optional) -- optionally orients pages with the bundled PaddleOCR
-   orientation model, straightens skewed scans, and recognizes text with
-   externally supplied PP-OCRv6 Medium models; OCRmyPDF rasterizes pages and
-   creates the searchable text layer
+   orientation model, straightens only scan-like raster-dominant pages, and
+   recognizes text with externally supplied PP-OCRv6 Medium models; OCRmyPDF
+   rasterizes OCR target pages and creates the searchable text layer
 3. **Font compliance** -- analyzes all fonts, embeds missing ones, adds ToUnicode mappings, subsets embedded fonts, and fixes encoding issues
 4. **Sanitization** -- removes or fixes non-compliant elements (JavaScript, non-standard actions, transparency groups, annotations, optional content, etc.)
 5. **Metadata** -- synchronizes XMP metadata with the document info dictionary and sets the PDF/A conformance level
@@ -71,15 +71,10 @@ Download the files from these exact model revisions:
   [`PP-OCRv6_medium_rec_onnx` at `50c7eac`](https://huggingface.co/PaddlePaddle/PP-OCRv6_medium_rec_onnx/tree/50c7eacafc52fa7bcf4194e8cd08e46f8558504b)
 
 Each model directory must contain exactly `inference.onnx` and
-`inference.yml`. Missing files, extra files, symbolic links, unexpected sizes,
-or hash mismatches are rejected before PaddleOCR is initialized.
-
-| Model | File | Size (bytes) | SHA-256 |
-| --- | --- | ---: | --- |
-| Detection | `inference.onnx` | 62,032,837 | `eb13b44b25bb36f89528b68720af8a61d9cf381176107f465db1757b65d086e1` |
-| Detection | `inference.yml` | 886 | `7298d5ead546584af2504d03355f881ac7a7bc0eb1e282d3e159277c1d0af871` |
-| Recognition | `inference.onnx` | 76,554,979 | `9c09abf0957f7968c7586464b7397b84ad2387a0497a351af40e9acc71b673ba` |
-| Recognition | `inference.yml` | 150,580 | `991b700facf5b50a7de193468207d5f4255b538dde0d312ae3b7c7a9b6873129` |
+`inference.yml`. Before initialization, `pdftopdfa` performs a quick
+structural check that rejects missing or extra entries, non-regular files, and
+symbolic links. PaddleOCR then loads the model files and checks that they are
+compatible detection and recognition models.
 
 The models are not included in the source distribution or wheel. Keep them in
 deployment-managed, read-only directories. Both

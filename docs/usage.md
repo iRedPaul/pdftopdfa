@@ -90,9 +90,9 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `--ocr` | Enable OCR for scanned/image-based PDFs; requires both model-directory options |
 | `--ocr-force` | Replace an existing OCR layer; requires both model-directory options, implies `--ocr`, and disables the compliant-PDF/A skip optimization |
 | `--ocr-lang LANG` | PaddleOCR language code (default: `en`), for example `de` or `de+en`; does not enable OCR by itself |
-| `--ocr-detection-model-dir DIR` | Directory containing the verified PP-OCRv6 Medium detection `inference.onnx` and `inference.yml` |
-| `--ocr-recognition-model-dir DIR` | Directory containing the verified PP-OCRv6 Medium recognition `inference.onnx` and `inference.yml` |
-| `--deskew` | Straighten skewed pages; requires both model-directory options and implies `--ocr` |
+| `--ocr-detection-model-dir DIR` | Directory containing compatible PP-OCRv6 Medium detection `inference.onnx` and `inference.yml` |
+| `--ocr-recognition-model-dir DIR` | Directory containing compatible PP-OCRv6 Medium recognition `inference.onnx` and `inference.yml` |
+| `--deskew` | Straighten scan-like, raster-dominant pages; requires both model-directory options and implies `--ocr` |
 | `--rotate-pages` | Automatically orient pages with the bundled Paddle model; requires both model-directory options and implies `--ocr` |
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
 | `--preserve-stamps` | Convert known proprietary stamp annotations to standard PDF Stamp annotations instead of flattening them |

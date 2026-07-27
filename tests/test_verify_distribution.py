@@ -48,19 +48,17 @@ def _valid_archive_files() -> dict[str, bytes]:
     return files
 
 
-def test_external_model_hash_is_detected_regardless_of_extension(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.parametrize(
+    "model_name",
+    ["PP-OCRv6_medium_det", "PP-OCRv6_medium_rec"],
+)
+def test_external_model_name_marker_is_detected(model_name: str) -> None:
     files = _valid_archive_files()
-    content = b"external model content"
-    files["archive/pdftopdfa/resources/models/model.bin"] = content
-    monkeypatch.setattr(
-        _VERIFY_SCRIPT,
-        "EXTERNAL_OCR_MODEL_HASHES",
-        {hashlib.sha256(content).hexdigest()},
+    files[f"archive/pdftopdfa/resources/models/{model_name}/inference.onnx"] = (
+        b"external model content"
     )
 
-    with pytest.raises(RuntimeError, match="External PP-OCRv6 model artifact"):
+    with pytest.raises(RuntimeError, match="External PP-OCRv6 model files"):
         _VERIFY_SCRIPT._verify_files(list(files), files.__getitem__)
 
 

@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
 import os
@@ -37,13 +36,6 @@ def _isolated_model_cache():
     ocr_paddle._reset_model_cache_for_tests()
 
 
-def _artifact(data: bytes) -> ocr_paddle._Artifact:
-    return ocr_paddle._Artifact(
-        size=len(data),
-        sha256=hashlib.sha256(data).hexdigest(),
-    )
-
-
 @pytest.fixture
 def model_dirs(
     tmp_path: Path,
@@ -67,12 +59,7 @@ def model_dirs(
         model_dir.mkdir()
         for filename, data in artifacts.items():
             (model_dir / filename).write_bytes(data)
-        specs[kind] = ocr_paddle._ModelSpec(
-            name=f"test_{kind}",
-            artifacts={
-                filename: _artifact(data) for filename, data in artifacts.items()
-            },
-        )
+        specs[kind] = ocr_paddle._ModelSpec(name=f"test_{kind}")
         directories[kind] = model_dir
 
     monkeypatch.setattr(ocr_paddle, "_DETECTION_MODEL", specs["detection"])
@@ -91,6 +78,10 @@ def page_image(tmp_path: Path) -> Path:
 def _options(
     model_dirs: tuple[Path, Path],
     languages: list[str] | None = None,
+    *,
+    deskew: bool = False,
+    force_ocr: bool = False,
+    clean: bool = False,
 ) -> SimpleNamespace:
     detection_dir, recognition_dir = model_dirs
     return SimpleNamespace(
@@ -100,6 +91,9 @@ def _options(
         ),
         languages=languages or ["en"],
         ocr_engine="paddle",
+        deskew=deskew,
+        force_ocr=force_ocr,
+        clean=clean,
     )
 
 
@@ -128,30 +122,9 @@ def _result(
     }
 
 
-def test_pinned_model_contract_matches_plan() -> None:
-    """The accepted external artifacts are immutable and reviewable."""
+def test_model_contract_uses_expected_paddle_names() -> None:
     assert ocr_paddle._DETECTION_MODEL.name == "PP-OCRv6_medium_det"
-    assert ocr_paddle._DETECTION_MODEL.artifacts == {
-        "inference.onnx": ocr_paddle._Artifact(
-            size=62_032_837,
-            sha256=("eb13b44b25bb36f89528b68720af8a61d9cf381176107f465db1757b65d086e1"),
-        ),
-        "inference.yml": ocr_paddle._Artifact(
-            size=886,
-            sha256=("7298d5ead546584af2504d03355f881ac7a7bc0eb1e282d3e159277c1d0af871"),
-        ),
-    }
     assert ocr_paddle._RECOGNITION_MODEL.name == "PP-OCRv6_medium_rec"
-    assert ocr_paddle._RECOGNITION_MODEL.artifacts == {
-        "inference.onnx": ocr_paddle._Artifact(
-            size=76_554_979,
-            sha256=("9c09abf0957f7968c7586464b7397b84ad2387a0497a351af40e9acc71b673ba"),
-        ),
-        "inference.yml": ocr_paddle._Artifact(
-            size=150_580,
-            sha256=("991b700facf5b50a7de193468207d5f4255b538dde0d312ae3b7c7a9b6873129"),
-        ),
-    }
 
 
 @pytest.mark.parametrize(
@@ -166,42 +139,23 @@ def test_model_directories_require_complete_pair(
         ocr_paddle.validate_model_directories(detection, recognition)
 
 
-def test_model_validation_hashes_until_session_is_initialized(
+def test_model_structure_is_checked_once_before_lazy_session_initialization(
     model_dirs: tuple[Path, Path],
 ) -> None:
     expected = tuple(path.resolve() for path in model_dirs)
 
-    assert ocr_paddle.validate_model_directories(*model_dirs) == expected
-    with patch.object(ocr_paddle, "_sha256", wraps=ocr_paddle._sha256) as sha256:
-        assert ocr_paddle.validate_model_directories(*model_dirs) == expected
-    assert sha256.call_count == 4
-
-    ocr_paddle._cached_model = object()
-
-    with patch.object(
-        ocr_paddle,
-        "_sha256",
-        side_effect=AssertionError("unchanged artifacts must use the validation cache"),
+    with (
+        patch.object(
+            ocr_paddle,
+            "_validate_model_directory",
+            wraps=ocr_paddle._validate_model_directory,
+        ) as validate_directory,
+        patch.object(ocr_paddle, "_create_model", return_value=object()),
     ):
         assert ocr_paddle.validate_model_directories(*model_dirs) == expected
+        assert ocr_paddle._get_model(_options(model_dirs)) is not None
 
-
-def test_model_validation_rehashes_same_size_tampering_before_initialization(
-    model_dirs: tuple[Path, Path],
-) -> None:
-    detection_dir, recognition_dir = model_dirs
-    assert ocr_paddle.validate_model_directories(*model_dirs)
-
-    artifact = detection_dir / "inference.onnx"
-    original_stat = artifact.stat()
-    artifact.write_bytes(b"x" * original_stat.st_size)
-    os.utime(
-        artifact,
-        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
-    )
-
-    with pytest.raises(OCRError, match="failed SHA-256 verification"):
-        ocr_paddle.validate_model_directories(detection_dir, recognition_dir)
+    assert validate_directory.call_count == 2
 
 
 @pytest.mark.parametrize("fault", ["missing", "extra"])
@@ -220,25 +174,17 @@ def test_model_directory_requires_exact_files(
         ocr_paddle.validate_model_directories(detection_dir, recognition_dir)
 
 
-def test_model_validation_rejects_wrong_size(
+def test_model_validation_accepts_unpinned_regular_artifacts(
     model_dirs: tuple[Path, Path],
 ) -> None:
     detection_dir, recognition_dir = model_dirs
-    (detection_dir / "inference.onnx").write_bytes(b"wrong size")
+    (detection_dir / "inference.onnx").write_bytes(b"different model revision")
+    (recognition_dir / "inference.yml").write_bytes(b"different model config")
 
-    with pytest.raises(OCRError, match=r"has size \d+, expected \d+"):
-        ocr_paddle.validate_model_directories(detection_dir, recognition_dir)
-
-
-def test_model_validation_rejects_wrong_hash(
-    model_dirs: tuple[Path, Path],
-) -> None:
-    detection_dir, recognition_dir = model_dirs
-    artifact = recognition_dir / "inference.yml"
-    artifact.write_bytes(b"x" * artifact.stat().st_size)
-
-    with pytest.raises(OCRError, match="failed SHA-256 verification"):
-        ocr_paddle.validate_model_directories(detection_dir, recognition_dir)
+    assert ocr_paddle.validate_model_directories(
+        detection_dir,
+        recognition_dir,
+    ) == (detection_dir.resolve(), recognition_dir.resolve())
 
 
 @pytest.mark.parametrize("symlink_kind", ["directory", "artifact"])
@@ -312,8 +258,50 @@ def test_paddle_constructor_respects_quiet_logging(
         ocr_paddle._create_model(*model_dirs)
 
 
-def test_model_session_is_lazy_reused_and_replaced_after_artifact_change(
+def test_model_load_and_compatibility_errors_are_wrapped(
     model_dirs: tuple[Path, Path],
+) -> None:
+    fake_module = SimpleNamespace(
+        PaddleOCR=MagicMock(side_effect=ValueError("Model name mismatch"))
+    )
+
+    with (
+        patch.dict(sys.modules, {"paddleocr": fake_module}),
+        pytest.raises(OCRError, match="Could not initialize.*Model name mismatch"),
+    ):
+        ocr_paddle._create_model(*model_dirs)
+
+
+def test_model_session_is_lazy_reused_and_replaced_for_new_directories(
+    model_dirs: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    first_model = MagicMock()
+    second_model = MagicMock()
+    options = _options(model_dirs)
+    other_dirs = (tmp_path / "other-detection", tmp_path / "other-recognition")
+    for model_dir in other_dirs:
+        model_dir.mkdir()
+        for filename in ocr_paddle._MODEL_FILENAMES:
+            (model_dir / filename).write_bytes(b"other model artifact")
+    other_options = _options(other_dirs)
+
+    with patch.object(
+        ocr_paddle,
+        "_create_model",
+        side_effect=[first_model, second_model],
+    ) as create_model:
+        assert ocr_paddle._get_model(options) is first_model
+        assert ocr_paddle._get_model(options) is first_model
+        assert ocr_paddle._get_model(other_options) is second_model
+
+    assert create_model.call_count == 2
+    first_model.close.assert_called_once_with()
+
+
+def test_explicit_validation_reloads_same_path_after_artifact_replacement(
+    model_dirs: tuple[Path, Path],
+    tmp_path: Path,
 ) -> None:
     first_model = MagicMock()
     second_model = MagicMock()
@@ -325,19 +313,40 @@ def test_model_session_is_lazy_reused_and_replaced_after_artifact_change(
         side_effect=[first_model, second_model],
     ) as create_model:
         assert ocr_paddle._get_model(options) is first_model
-        assert ocr_paddle._get_model(options) is first_model
 
-        artifact = model_dirs[0] / "inference.yml"
-        stat = artifact.stat()
+        artifact = model_dirs[0] / "inference.onnx"
+        original_stat = artifact.stat()
+        replacement = tmp_path / "replacement.onnx"
+        replacement.write_bytes(b"x" * original_stat.st_size)
         os.utime(
-            artifact,
-            ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+            replacement,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
         )
+        replacement.replace(artifact)
 
+        ocr_paddle.validate_model_directories(*model_dirs)
         assert ocr_paddle._get_model(options) is second_model
 
     assert create_model.call_count == 2
     first_model.close.assert_called_once_with()
+
+
+def test_failed_same_path_validation_keeps_loaded_model(
+    model_dirs: tuple[Path, Path],
+) -> None:
+    model = MagicMock()
+    options = _options(model_dirs)
+
+    with patch.object(ocr_paddle, "_create_model", return_value=model):
+        assert ocr_paddle._get_model(options) is model
+        artifact = model_dirs[0] / "inference.yml"
+        artifact.unlink()
+
+        with pytest.raises(OCRError, match="missing"):
+            ocr_paddle.validate_model_directories(*model_dirs)
+
+    assert ocr_paddle._cached_model is model
+    model.close.assert_not_called()
 
 
 def test_parallel_predictions_share_one_session_and_are_serialized(
@@ -821,6 +830,274 @@ def _rotated_polygon(angle: float, top: float) -> list[list[float]]:
         [30.0 + dx, top + dy + height],
         [30.0, top + height],
     ]
+
+
+def _ocr_page_context(
+    ocr_image: Path,
+    options: SimpleNamespace,
+    *,
+    pageno: int = 0,
+    textareas: tuple[tuple[float, float, float, float], ...] = (),
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        pageinfo=SimpleNamespace(
+            dpi=SimpleNamespace(to_scalar=lambda: 300.0),
+            get_textareas=lambda **_kwargs: iter(textareas),
+        ),
+        options=options,
+        pageno=pageno,
+        get_path=lambda name: ocr_image if name == "ocr.png" else None,
+    )
+
+
+def test_zero_deskew_reuses_prediction_once_for_exact_ocr_image(
+    tmp_path: Path,
+    model_dirs: tuple[Path, Path],
+) -> None:
+    work_folder = tmp_path / "ocrmypdf.io.zero"
+    work_folder.mkdir()
+    page_image = work_folder / "000001_rasterize.png"
+    ocr_image = work_folder / "000001_ocr.png"
+    Image.new("RGB", (400, 200), "white").save(page_image, dpi=(300, 300))
+    Image.new("RGB", (400, 200), "white").save(ocr_image, dpi=(300, 300))
+    result = _result(
+        text_word=[["Hello", "world"]],
+        text_word_region=[
+            [
+                [[10, 20], [65, 20], [65, 40], [10, 40]],
+                [[70, 20], [130, 20], [130, 40], [70, 40]],
+            ]
+        ],
+    )
+    model = MagicMock()
+    model.predict.return_value = [result]
+    options = _options(model_dirs, deskew=True)
+    page_context = _ocr_page_context(ocr_image, options)
+
+    with patch.object(ocr_paddle, "_get_model", return_value=model):
+        correction = ocr_paddle.PaddleOcrEngine.get_deskew(page_image, options)
+        ocr_paddle.filter_ocr_image(
+            page_context,
+            Image.new("RGB", (400, 200), "white"),
+        )
+        page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            ocr_image,
+            options,
+        )
+
+    assert correction == 0.0
+    assert model.predict.call_count == 1
+    assert plain_text == "Hello world"
+    assert page.children[0].bbox == BoundingBox(
+        left=10,
+        top=20,
+        right=130,
+        bottom=40,
+    )
+    assert [word.bbox for word in page.children[0].children] == [
+        BoundingBox(left=10, top=20, right=65, bottom=40),
+        BoundingBox(left=70, top=20, right=130, bottom=40),
+    ]
+    assert ocr_paddle._pending_deskew_results == {}
+    assert ocr_paddle._prediction_result_by_image == {}
+
+
+def test_zero_deskew_repredicts_when_ocrmypdf_masks_existing_text(
+    tmp_path: Path,
+    model_dirs: tuple[Path, Path],
+) -> None:
+    work_folder = tmp_path / "ocrmypdf.io.masked"
+    work_folder.mkdir()
+    page_image = work_folder / "000001_rasterize.png"
+    ocr_image = work_folder / "000001_ocr.png"
+    Image.new("RGB", (400, 200), "white").save(page_image, dpi=(300, 300))
+    Image.new("RGB", (400, 200), "white").save(ocr_image, dpi=(300, 300))
+    model = MagicMock()
+    model.predict.side_effect = [
+        [_result(texts=["Deskew raster"])],
+        [_result(texts=["Masked OCR raster"])],
+    ]
+    options = _options(model_dirs, deskew=True)
+    page_context = _ocr_page_context(
+        ocr_image,
+        options,
+        textareas=((0.0, 0.0, 10.0, 10.0),),
+    )
+
+    with patch.object(ocr_paddle, "_get_model", return_value=model):
+        assert ocr_paddle.PaddleOcrEngine.get_deskew(page_image, options) == 0.0
+        ocr_paddle.filter_ocr_image(
+            page_context,
+            Image.new("RGB", (400, 200), "white"),
+        )
+        _page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            ocr_image,
+            options,
+        )
+
+    assert plain_text == "Masked OCR raster"
+    assert model.predict.call_count == 2
+    assert ocr_paddle._pending_deskew_results == {}
+    assert ocr_paddle._prediction_result_by_image == {}
+
+
+def test_filter_skips_textarea_check_without_cached_deskew(
+    tmp_path: Path,
+    model_dirs: tuple[Path, Path],
+) -> None:
+    ocr_image = tmp_path / "000001_ocr.png"
+    get_textareas = MagicMock(side_effect=AssertionError("unexpected text scan"))
+    page_context = _ocr_page_context(ocr_image, _options(model_dirs))
+    page_context.pageinfo.get_textareas = get_textareas
+
+    ocr_paddle.filter_ocr_image(
+        page_context,
+        Image.new("RGB", (400, 200), "white"),
+    )
+
+    get_textareas.assert_not_called()
+
+
+def test_zero_deskew_cache_is_scoped_to_run_and_page(
+    tmp_path: Path,
+    model_dirs: tuple[Path, Path],
+) -> None:
+    runs = []
+    results_by_folder = {}
+    for name, text in (("first", "First page"), ("second", "Second page")):
+        work_folder = tmp_path / f"ocrmypdf.io.{name}"
+        work_folder.mkdir()
+        raster_image = work_folder / "000001_rasterize.png"
+        ocr_image = work_folder / "000001_ocr.png"
+        Image.new("RGB", (400, 200), "white").save(
+            raster_image,
+            dpi=(300, 300),
+        )
+        Image.new("RGB", (400, 200), "white").save(ocr_image, dpi=(300, 300))
+        options = _options(model_dirs, deskew=True)
+        runs.append((raster_image, ocr_image, options))
+        results_by_folder[work_folder.resolve()] = _result(texts=[text])
+
+    def predict(input_file: str, **_kwargs: object) -> list[dict[str, object]]:
+        return [results_by_folder[Path(input_file).resolve().parent]]
+
+    after_deskew = threading.Barrier(2)
+    after_filter = threading.Barrier(2)
+    model = MagicMock()
+    model.predict.side_effect = predict
+
+    def process_page(
+        run: tuple[Path, Path, SimpleNamespace],
+    ) -> str:
+        raster_image, ocr_image, options = run
+        assert ocr_paddle.PaddleOcrEngine.get_deskew(raster_image, options) == 0.0
+        after_deskew.wait(timeout=5)
+        ocr_paddle.filter_ocr_image(
+            _ocr_page_context(ocr_image, options),
+            Image.new("RGB", (400, 200), "white"),
+        )
+        after_filter.wait(timeout=5)
+        _page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            ocr_image,
+            options,
+        )
+        return plain_text
+
+    with (
+        patch.object(ocr_paddle, "_get_model", return_value=model),
+        ThreadPoolExecutor(max_workers=2) as executor,
+    ):
+        plain_texts = list(executor.map(process_page, runs))
+
+    assert plain_texts == ["First page", "Second page"]
+    assert model.predict.call_count == 2
+    assert ocr_paddle._pending_deskew_results == {}
+    assert ocr_paddle._prediction_result_by_image == {}
+
+
+def test_aborted_zero_deskew_does_not_leak_into_non_deskew_run(
+    tmp_path: Path,
+    model_dirs: tuple[Path, Path],
+) -> None:
+    work_folder = tmp_path / "ocrmypdf.io.reused"
+    work_folder.mkdir()
+    raster_image = work_folder / "000001_rasterize.png"
+    ocr_image = work_folder / "000001_ocr.png"
+    Image.new("RGB", (400, 200), "white").save(raster_image, dpi=(300, 300))
+    Image.new("RGB", (400, 200), "white").save(ocr_image, dpi=(300, 300))
+    deskew_options = _options(model_dirs, deskew=True)
+    non_deskew_options = _options(model_dirs)
+    model = MagicMock()
+    model.predict.side_effect = [
+        [_result(texts=["Aborted page"])],
+        [_result(texts=["Current page"])],
+    ]
+
+    with patch.object(ocr_paddle, "_get_model", return_value=model):
+        assert (
+            ocr_paddle.PaddleOcrEngine.get_deskew(
+                raster_image,
+                deskew_options,
+            )
+            == 0.0
+        )
+        ocr_paddle.filter_ocr_image(
+            _ocr_page_context(ocr_image, non_deskew_options),
+            Image.new("RGB", (400, 200), "white"),
+        )
+        _page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            ocr_image,
+            non_deskew_options,
+        )
+
+    assert plain_text == "Current page"
+    assert model.predict.call_count == 2
+    assert ocr_paddle._pending_deskew_results == {}
+    assert ocr_paddle._prediction_result_by_image == {}
+
+
+def test_nonzero_deskew_runs_ocr_prediction_again(
+    tmp_path: Path,
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    ocr_image = tmp_path / "ocr.png"
+    Image.new("RGB", (400, 200), "white").save(ocr_image, dpi=(300, 300))
+    polygons = [_rotated_polygon(3.0, 40), _rotated_polygon(3.0, 100)]
+    result = _result(
+        texts=["one", "two"],
+        scores=[0.9, 0.9],
+        polygons=polygons,
+        boxes=[[30, 40, 160, 70], [30, 100, 160, 130]],
+    )
+    model = MagicMock()
+    model.predict.return_value = [result]
+    page_context = SimpleNamespace(
+        pageinfo=SimpleNamespace(
+            dpi=SimpleNamespace(to_scalar=lambda: 300.0),
+        ),
+        get_path=lambda name: ocr_image if name == "ocr.png" else None,
+    )
+    options = _options(model_dirs)
+
+    with patch.object(ocr_paddle, "_get_model", return_value=model):
+        correction = ocr_paddle.PaddleOcrEngine.get_deskew(page_image, options)
+        ocr_paddle.filter_ocr_image(
+            page_context,
+            Image.new("RGB", (400, 200), "white"),
+        )
+        page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            ocr_image,
+            options,
+        )
+
+    assert correction == pytest.approx(3.0, abs=0.01)
+    assert model.predict.call_count == 2
+    assert plain_text == "one\ntwo"
+    assert [line.poly for line in page.children] == [
+        [tuple(point) for point in polygon] for polygon in polygons
+    ]
+    assert ocr_paddle._prediction_result_by_image == {}
 
 
 @pytest.mark.parametrize("angle", [-3.0, 3.0])

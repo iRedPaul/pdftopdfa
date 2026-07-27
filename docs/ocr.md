@@ -16,7 +16,7 @@ automatic model resolution, runtime download, or secondary recognition engine.
 Document orientation uses a separate `PP-LCNet_x1_0_doc_ori` model bundled
 with `pdftopdfa`.
 
-The verified Paddle session is reused across pages. OCRmyPDF runs one page job
+The initialized Paddle session is reused across pages. OCRmyPDF runs one page job
 at a time and Paddle predictions are serialized, avoiding concurrent access to
 the PaddleX session. The detector limits its inference image to 1,600 pixels
 on the longest side. OCR uses a minimum rasterization resolution of 600 DPI;
@@ -55,17 +55,11 @@ PP-OCRv6_medium_rec/
 └── inference.yml
 ```
 
-| Model | File | Size (bytes) | SHA-256 |
-| --- | --- | ---: | --- |
-| Detection | `inference.onnx` | 62,032,837 | `eb13b44b25bb36f89528b68720af8a61d9cf381176107f465db1757b65d086e1` |
-| Detection | `inference.yml` | 886 | `7298d5ead546584af2504d03355f881ac7a7bc0eb1e282d3e159277c1d0af871` |
-| Recognition | `inference.onnx` | 76,554,979 | `9c09abf0957f7968c7586464b7397b84ad2387a0497a351af40e9acc71b673ba` |
-| Recognition | `inference.yml` | 150,580 | `991b700facf5b50a7de193468207d5f4255b538dde0d312ae3b7c7a9b6873129` |
-
-Before the first model initialization, `pdftopdfa` rejects missing or extra
-directory entries, symbolic links, non-regular files, unexpected sizes, and
-SHA-256 mismatches. A successfully verified unchanged path pair and its
-inference session are reused.
+Before the first model initialization, `pdftopdfa` quickly rejects missing or
+extra directory entries, non-regular files, and symbolic links. PaddleOCR then
+loads the ONNX and YAML files and checks that they are compatible detection and
+recognition models. Each conversion repeats only the quick structure and file
+metadata check; an unchanged initialized inference session is reused.
 
 The PP-OCRv6 models are intentionally not included in the repository, wheel,
 or source distribution. Store them in deployment-managed, preferably read-only
@@ -190,8 +184,8 @@ result_path = apply_ocr(
 )
 ```
 
-`apply_ocr()` raises `OCRError` for missing, unreadable, altered, or unsupported
-model artifacts and for OCR execution failures.
+`apply_ocr()` raises `OCRError` for missing, structurally invalid, unreadable,
+or incompatible model artifacts and for OCR execution failures.
 
 Use `pdfa=False` with a neutral output name such as `scan_processed.pdf` to
 write the OCR result directly without font embedding, PDF/A sanitization,
@@ -205,6 +199,9 @@ When OCR is enabled, processing runs for the document:
 - Pages without a text layer receive OCR.
 - Pages that already contain text are skipped.
 - Mixed documents are handled page by page.
+
+With deskew enabled, scan-like pages are selected separately as described
+below. An existing invisible OCR text layer does not exclude such a page.
 
 Use force mode to replace an existing OCR layer:
 
@@ -230,15 +227,30 @@ intentional.
 `--deskew` and `--rotate-pages` are independent opt-in operations. Both enable
 OCR and require the external detection and recognition model directories.
 
-Deskew performs an additional PaddleOCR pass. It derives a correction angle
-from at least two sufficiently long text polygons within ±10 degrees. With
-insufficient evidence the page is left unchanged. Deskewing may alter page
-appearance and increase file size.
+Deskew first selects pages where one opaque, unclipped raster image visibly
+covers at least 80% of the page and where there is no uncovered native text,
+painted vector content, or shading. Image coverage is intersected with the page,
+so off-page or tightly clipped images do not qualify. This leaves digitally
+generated pages unchanged and handles mixed documents page by page. Invisible
+OCR text, including clipping-only or fully transparent text, is allowed and is
+removed from a temporary page-local copy before the selected scan is processed.
 
-PDFs containing annotations are OCRed without deskewing, and a warning is
+Non-deskew raster pages and selected scan pages are OCRed in disjoint targeted
+page runs. No page receives OCR twice, and a pure scan needs only one run.
+
+For each selected page, PaddleOCR derives a correction angle from at least two
+sufficiently long text polygons within ±10 degrees. With insufficient evidence
+the page is left geometrically unchanged, and that page- and run-scoped
+prediction is reused for the OCR text layer instead of running the full model
+again. A page that is actually rotated is recognized again after correction so
+its text and coordinates describe the corrected raster. Deskewing may alter
+page appearance and increase file size.
+
+An annotated scan-like page is OCRed without deskewing, and a warning is
 emitted. Annotation geometry cannot be transformed safely through a raster
 deskew operation, so this prevents links and interactive content from becoming
-misaligned.
+misaligned. Annotations on other pages do not disable deskewing for the rest of
+the document.
 
 Before OCR starts, `--rotate-pages` renders and classifies every page with the
 bundled `PP-LCNet_x1_0_doc_ori` model, including pages later skipped because
@@ -280,11 +292,10 @@ Check that:
 - both directory options were supplied;
 - each directory contains only `inference.onnx` and `inference.yml`;
 - neither directories nor files are symbolic links;
-- the files match the sizes and SHA-256 values above;
 - the process can read all four files.
 
-Model validation is intentionally fail-closed and never downloads a
-replacement.
+The structural check and PaddleOCR initialization are intentionally fail-closed
+and never download a replacement.
 
 ### Unsupported language code
 

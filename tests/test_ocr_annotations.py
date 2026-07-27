@@ -584,13 +584,13 @@ class TestOcrAnnotationIntegration:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
-    def test_deskew_is_skipped_when_annotations_are_preserved(
+    def test_annotated_pages_are_forwarded_to_deskew_planning(
         self,
         mock_is_available: MagicMock,
         mock_apply_ocr: MagicMock,
         tmp_dir: Path,
     ) -> None:
-        """Conversion keeps annotation geometry aligned by disabling deskew."""
+        """Conversion lets OCR skip deskew only on annotated pages."""
         import shutil
 
         from pdftopdfa.converter import convert_to_pdfa
@@ -610,11 +610,8 @@ class TestOcrAnnotationIntegration:
         )
 
         assert result.success
-        assert mock_apply_ocr.call_args.kwargs["deskew"] is False
-        assert any(
-            "Deskew skipped because the PDF contains annotations" in warning
-            for warning in result.warnings
-        )
+        assert mock_apply_ocr.call_args.kwargs["deskew"] is True
+        assert mock_apply_ocr.call_args.kwargs["_annotated_pages"] == frozenset({1})
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)

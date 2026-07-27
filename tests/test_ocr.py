@@ -12,15 +12,18 @@ from unittest.mock import MagicMock, patch
 import pikepdf
 import pytest
 from conftest import new_pdf
+from ocrmypdf.exceptions import PriorOcrFoundError
 from pikepdf import Dictionary, Name, Pdf
 from PIL import Image
 
 from pdftopdfa.exceptions import OCRError
 from pdftopdfa.ocr import (
     _finalize_ocr_output,
+    _find_deskew_pages,
     _ocr_form_names,
     _page_has_images,
     _page_has_text,
+    _prepare_deskew_input,
     _strip_invisible_text_from_form,
     apply_ocr,
     is_ocr_available,
@@ -54,7 +57,7 @@ def model_dirs(tmp_dir: Path) -> tuple[Path, Path]:
 
 @pytest.fixture
 def validate_models(model_dirs: tuple[Path, Path]):
-    """Bypass artifact hashing in tests that exercise only OCRmyPDF options."""
+    """Bypass model validation in tests that exercise only OCRmyPDF options."""
     with patch(
         "pdftopdfa.ocr_paddle.validate_model_directories",
         return_value=model_dirs,
@@ -65,6 +68,54 @@ def validate_models(model_dirs: tuple[Path, Path]):
 def _copy_ocr_input(input_path: Path, output_path: Path, **_kwargs: object) -> None:
     """Model OCRmyPDF's output contract in option-boundary tests."""
     shutil.copy2(input_path, output_path)
+
+
+def _add_content_page(
+    pdf: Pdf,
+    *,
+    image_scale: int = 100,
+    visible_text: bool = False,
+    hidden_form_text: bool = False,
+    visible_form_text: bool = False,
+    vector: bool = False,
+) -> None:
+    """Add a page with controlled raster, text, and vector content."""
+    page = pdf.add_blank_page(page_size=(100, 100))
+    image = pdf.make_stream(bytes([128]) * 100)
+    image[Name.Type] = Name.XObject
+    image[Name.Subtype] = Name.Image
+    image[Name.Width] = 10
+    image[Name.Height] = 10
+    image[Name.ColorSpace] = Name.DeviceGray
+    image[Name.BitsPerComponent] = 8
+
+    font = Dictionary(
+        Type=Name.Font,
+        Subtype=Name.Type1,
+        BaseFont=Name.Helvetica,
+    )
+    xobjects = Dictionary(Im0=image)
+    page.obj[Name.Resources] = Dictionary(
+        XObject=xobjects,
+        Font=Dictionary(F1=font),
+    )
+    content = [f"q {image_scale} 0 0 {image_scale} 0 0 cm /Im0 Do Q".encode("ascii")]
+    if visible_text:
+        content.append(b"BT /F1 12 Tf 0 Tr 10 50 Td (Native text) Tj ET")
+    if hidden_form_text or visible_form_text:
+        render_mode = 0 if visible_form_text else 3
+        form = pdf.make_stream(
+            f"BT /F1 12 Tf {render_mode} Tr 10 50 Td (Form text) Tj ET".encode()
+        )
+        form[Name.Type] = Name.XObject
+        form[Name.Subtype] = Name.Form
+        form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+        form[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+        xobjects["/HiddenText"] = form
+        content.append(b"/HiddenText Do")
+    if vector:
+        content.append(b"0 0 10 10 re f")
+    page.obj[Name.Contents] = pdf.make_stream(b"\n".join(content))
 
 
 class TestOcrDetection:
@@ -265,6 +316,849 @@ def test_invisible_form_cleanup_preserves_text_show_operator(
 class TestApplyOcr:
     """Tests for the fixed PaddleOCR/OCRmyPDF boundary."""
 
+    def test_deskew_selects_full_page_scan_for_one_targeted_call(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "scan.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            pdf.save(input_path)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=True,
+            )
+
+        mock_ocr.assert_called_once()
+        assert mock_ocr.call_args.args == (input_path, output_path)
+        kwargs = mock_ocr.call_args.kwargs
+        assert kwargs["deskew"] is True
+        assert kwargs["pages"] == "1"
+        assert kwargs["jobs"] == 1
+        assert kwargs["skip_text"] is True
+        assert "force_ocr" not in kwargs
+        assert "redo_ocr" not in kwargs
+
+    def test_deskew_copies_digital_page_without_ocrmypdf(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "digital.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, visible_text=True)
+            pdf.save(input_path)
+
+        with patch("pdftopdfa.ocr.ocrmypdf.ocr") as mock_ocr:
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=True,
+            )
+
+        mock_ocr.assert_not_called()
+        with Pdf.open(input_path) as source, Pdf.open(output_path) as output:
+            assert source.pages[0].Contents.read_bytes() == (
+                output.pages[0].Contents.read_bytes()
+            )
+
+    def test_deskew_accepts_scan_with_invisible_form_text(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "ocr-scan.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, hidden_form_text=True)
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == [1]
+        prepared_page_has_text = []
+
+        def inspect_and_copy(
+            source: Path,
+            destination: Path,
+            **_kwargs: object,
+        ) -> None:
+            with Pdf.open(source) as pdf:
+                prepared_page_has_text.append(_page_has_text(pdf.pages[0]))
+            shutil.copy2(source, destination)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=inspect_and_copy,
+        ) as mock_ocr:
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=True,
+            )
+
+        mock_ocr.assert_called_once()
+        assert mock_ocr.call_args.kwargs["pages"] == "1"
+        assert mock_ocr.call_args.kwargs["skip_text"] is True
+        assert "force_ocr" not in mock_ocr.call_args.kwargs
+        assert prepared_page_has_text == [False]
+
+    def test_prior_ocr_fallback_preserves_deskew_text_layer(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "ocr-scan.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, hidden_form_text=True)
+            pdf.save(input_path)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=PriorOcrFoundError(),
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=True,
+            )
+
+        with Pdf.open(output_path) as pdf:
+            assert b"(Form text)" in (
+                pdf.pages[0].Resources.XObject.HiddenText.read_bytes()
+            )
+
+    def test_deskew_handles_mixed_pdf_page_by_page_in_disjoint_calls(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "mixed.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            _add_content_page(pdf, visible_text=True)
+            _add_content_page(pdf, hidden_form_text=True)
+            _add_content_page(pdf, vector=True)
+            pdf.save(input_path)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=True,
+            )
+
+        assert mock_ocr.call_count == 2
+        regular_call, deskew_call = mock_ocr.call_args_list
+        assert regular_call.kwargs["pages"] == "4"
+        assert regular_call.kwargs["deskew"] is False
+        assert deskew_call.kwargs["pages"] == "1,3"
+        assert deskew_call.kwargs["deskew"] is True
+        assert all(
+            call.kwargs["skip_text"] is True and "force_ocr" not in call.kwargs
+            for call in mock_ocr.call_args_list
+        )
+
+    def test_deskew_rejects_vector_and_small_image_pages(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "not-scans.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, vector=True)
+            _add_content_page(pdf, image_scale=50)
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == []
+
+    @pytest.mark.parametrize(
+        "unsafe_content",
+        [
+            "shading",
+            "clip",
+            "off-page",
+            "optional-content",
+            "embedded-alpha",
+            "invalid-blend",
+        ],
+    )
+    def test_deskew_rejects_unsafe_image_coverage(
+        self,
+        tmp_dir: Path,
+        unsafe_content: str,
+    ) -> None:
+        input_path = tmp_dir / f"{unsafe_content}.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            if unsafe_content == "shading":
+                page.Contents.write(page.Contents.read_bytes() + b"\n/Sh0 sh")
+            elif unsafe_content == "clip":
+                page.Contents.write(b"0 0 10 100 re W n q 100 0 0 100 0 0 cm /Im0 Do Q")
+            elif unsafe_content == "off-page":
+                page.Contents.write(b"q 100 0 0 100 50 0 cm /Im0 Do Q")
+            elif unsafe_content == "optional-content":
+                ocg = Dictionary(Type=Name.OCG, Name="Hidden scan")
+                pdf.Root[Name.OCProperties] = Dictionary(
+                    OCGs=pikepdf.Array([ocg]),
+                    D=Dictionary(OFF=pikepdf.Array([ocg])),
+                )
+                page.Resources[Name.Properties] = Dictionary(MC0=ocg)
+                page.Contents.write(
+                    b"BT /F1 12 Tf 0 Tr 10 50 Td (Native text) Tj ET\n"
+                    b"/OC /MC0 BDC q 100 0 0 100 0 0 cm /Im0 Do Q EMC"
+                )
+            elif unsafe_content == "embedded-alpha":
+                page.Resources.XObject.Im0[Name.SMaskInData] = 1
+                page.Contents.write(
+                    b"BT /F1 12 Tf 0 Tr 10 50 Td (Native text) Tj ET\n"
+                    b"q 100 0 0 100 0 0 cm /Im0 Do Q"
+                )
+            else:
+                page.Resources[Name.ExtGState] = Dictionary(
+                    GS0=Dictionary(BM=pikepdf.Array([]))
+                )
+                page.Contents.write(
+                    b"BT /F1 12 Tf 0 Tr 10 50 Td (Native text) Tj ET\n"
+                    b"/GS0 gs q 100 0 0 100 0 0 cm /Im0 Do Q"
+                )
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == []
+
+    def test_deskew_accepts_full_page_inline_scan(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "inline-scan.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            pdf.pages[0].Contents.write(
+                b"q 100 0 0 100 0 0 cm "
+                b"BI /W 10 /H 10 /CS /G /BPC 8 ID\n" + bytes([128]) * 100 + b"\nEI Q"
+            )
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == [1]
+
+    @pytest.mark.parametrize("image_kind", ["xobject", "inline"])
+    def test_deskew_rejects_pattern_painted_image_masks(
+        self,
+        tmp_dir: Path,
+        image_kind: str,
+    ) -> None:
+        input_path = tmp_dir / f"{image_kind}-image-mask.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            pattern = pdf.make_stream(b"1 0 0 rg 0 0 5 10 re f 0 0 1 rg 5 0 5 10 re f")
+            pattern[Name.Type] = Name.Pattern
+            pattern[Name.PatternType] = 1
+            pattern[Name.PaintType] = 1
+            pattern[Name.TilingType] = 1
+            pattern[Name.BBox] = pikepdf.Array([0, 0, 10, 10])
+            pattern[Name.XStep] = 10
+            pattern[Name.YStep] = 10
+            pattern[Name.Resources] = Dictionary()
+            page.Resources[Name.Pattern] = Dictionary(P1=pattern)
+
+            if image_kind == "xobject":
+                image_mask = pdf.make_stream(b"\x00")
+                image_mask[Name.Type] = Name.XObject
+                image_mask[Name.Subtype] = Name.Image
+                image_mask[Name.Width] = 1
+                image_mask[Name.Height] = 1
+                image_mask[Name.ImageMask] = True
+                image_mask[Name.BitsPerComponent] = 1
+                page.Resources.XObject[Name.Mask] = image_mask
+                mask_paint = b"q 50 0 0 50 25 25 cm /Mask Do Q"
+            else:
+                mask_paint = (
+                    b"q 50 0 0 50 25 25 cm BI /W 1 /H 1 /IM true /BPC 1 ID \x00 EI Q"
+                )
+            page.Contents.write(
+                page.Contents.read_bytes() + b"\n/Pattern cs /P1 scn " + mask_paint
+            )
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == []
+
+    @pytest.mark.parametrize(
+        "image_kind",
+        [
+            "xobject-separation",
+            "xobject-separation-alias",
+            "xobject-devicen-alias",
+            "xobject-short-alias",
+            "xobject-defaultgray",
+            "xobject-indexed",
+            "xobject-missing-color-space",
+            "inline-separation-alias",
+        ],
+    )
+    def test_deskew_rejects_nonmarking_full_page_images(
+        self,
+        tmp_dir: Path,
+        image_kind: str,
+    ) -> None:
+        input_path = tmp_dir / f"{image_kind}.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            tint = Dictionary(
+                FunctionType=2,
+                Domain=pikepdf.Array([0, 1]),
+                C0=pikepdf.Array([0]),
+                C1=pikepdf.Array([1]),
+                N=1,
+            )
+            separation = pikepdf.Array(
+                [Name.Separation, Name("/None"), Name.DeviceGray, tint]
+            )
+            if image_kind == "xobject-devicen-alias":
+                color_space = pikepdf.Array(
+                    [
+                        Name.DeviceN,
+                        pikepdf.Array([Name("/None")]),
+                        Name.DeviceGray,
+                        tint,
+                    ]
+                )
+            elif image_kind == "xobject-indexed":
+                color_space = pikepdf.Array(
+                    [Name.Indexed, separation, 0, pikepdf.String(b"\x00")]
+                )
+            else:
+                color_space = separation
+            native_text = b"BT /F1 12 Tf 0 Tr 10 50 Td (Native text) Tj ET\n"
+
+            if image_kind == "inline-separation-alias":
+                page.Resources[Name.ColorSpace] = Dictionary(CS0=color_space)
+                page.Contents.write(
+                    native_text + b"q 100 0 0 100 0 0 cm "
+                    b"BI /W 1 /H 1 /CS /CS0 /BPC 8 ID \x80 EI Q"
+                )
+            else:
+                image = page.Resources.XObject.Im0
+                if image_kind == "xobject-separation":
+                    image[Name.ColorSpace] = color_space
+                elif image_kind == "xobject-short-alias":
+                    page.Resources[Name.ColorSpace] = Dictionary()
+                    page.Resources.ColorSpace[Name("/G")] = color_space
+                    image[Name.ColorSpace] = Name("/G")
+                elif image_kind == "xobject-defaultgray":
+                    page.Resources[Name.ColorSpace] = Dictionary(
+                        DefaultGray=color_space
+                    )
+                    image[Name.ColorSpace] = Name.DeviceGray
+                elif image_kind == "xobject-indexed":
+                    image[Name.ColorSpace] = color_space
+                elif image_kind == "xobject-missing-color-space":
+                    del image[Name.ColorSpace]
+                else:
+                    page.Resources[Name.ColorSpace] = Dictionary(CS0=color_space)
+                    image[Name.ColorSpace] = Name.CS0
+                page.Contents.write(native_text + b"q 100 0 0 100 0 0 cm /Im0 Do Q")
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == []
+
+    def test_deskew_resolves_marking_color_space_alias(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "marking-color-space-alias.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            page.Resources[Name.ColorSpace] = Dictionary(CS0=Name.DeviceGray)
+            page.Resources.XObject.Im0[Name.ColorSpace] = Name.CS0
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == [1]
+
+    @pytest.mark.parametrize("mask_kind", ["nonempty", "missing-group"])
+    def test_deskew_rejects_unsafe_soft_mask_group(
+        self,
+        tmp_dir: Path,
+        mask_kind: str,
+    ) -> None:
+        input_path = tmp_dir / f"{mask_kind}-soft-mask.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            mask_group = pdf.make_stream(
+                b"0 0 100 100 re f" if mask_kind == "nonempty" else b""
+            )
+            mask_group[Name.Type] = Name.XObject
+            mask_group[Name.Subtype] = Name.Form
+            mask_group[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            if mask_kind == "nonempty":
+                mask_group[Name.Group] = Dictionary(
+                    S=Name.Transparency,
+                    CS=Name.DeviceGray,
+                )
+            page.Resources[Name.ExtGState] = Dictionary(
+                GS0=Dictionary(SMask=Dictionary(S=Name.Alpha, G=mask_group))
+            )
+            page.Contents.write(
+                page.Contents.read_bytes() + b"\n/GS0 gs q 10 0 0 10 0 0 cm /Im0 Do Q"
+            )
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == []
+
+    def test_deskew_allows_unsupported_soft_mask_reset_before_image(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "reset-soft-mask.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            mask_group = pdf.make_stream(b"0 0 100 100 re f")
+            mask_group[Name.Type] = Name.XObject
+            mask_group[Name.Subtype] = Name.Form
+            mask_group[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            mask_group[Name.Group] = Dictionary(
+                S=Name.Transparency,
+                CS=Name.DeviceGray,
+            )
+            page.Resources[Name.ExtGState] = Dictionary(
+                GS0=Dictionary(SMask=Dictionary(S=Name.Alpha, G=mask_group)),
+                GS1=Dictionary(SMask=Name("/None")),
+            )
+            page.Contents.write(b"/GS0 gs /GS1 gs q 100 0 0 100 0 0 cm /Im0 Do Q")
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == [1]
+
+    @pytest.mark.parametrize("hidden_kind", ["render-mode-3", "alpha-zero"])
+    def test_deskew_accepts_invisible_text_with_unsupported_soft_mask(
+        self,
+        tmp_dir: Path,
+        hidden_kind: str,
+    ) -> None:
+        input_path = tmp_dir / f"{hidden_kind}-soft-mask.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            mask_group = pdf.make_stream(b"0 0 100 100 re f")
+            mask_group[Name.Type] = Name.XObject
+            mask_group[Name.Subtype] = Name.Form
+            mask_group[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            mask_group[Name.Group] = Dictionary(
+                S=Name.Transparency,
+                CS=Name.DeviceGray,
+            )
+            graphics_state = Dictionary(SMask=Dictionary(S=Name.Alpha, G=mask_group))
+            render_mode = 3
+            if hidden_kind == "alpha-zero":
+                graphics_state[Name("/ca")] = 0
+                render_mode = 0
+            page.Resources[Name.ExtGState] = Dictionary(GS0=graphics_state)
+            page.Contents.write(
+                page.Contents.read_bytes()
+                + f"\n/GS0 gs BT /F1 12 Tf {render_mode} Tr "
+                "10 50 Td (OCR) Tj ET".encode()
+            )
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == [1]
+
+    def test_deskew_accepts_empty_alpha_soft_mask_ocr_text(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "empty-soft-mask.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            mask_group = pdf.make_stream(b"")
+            mask_group[Name.Type] = Name.XObject
+            mask_group[Name.Subtype] = Name.Form
+            mask_group[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            mask_group[Name.Group] = Dictionary(
+                S=Name.Transparency,
+                CS=Name.DeviceGray,
+            )
+            page.Resources[Name.ExtGState] = Dictionary(
+                GS0=Dictionary(SMask=Dictionary(S=Name.Alpha, G=mask_group))
+            )
+            page.Contents.write(
+                page.Contents.read_bytes()
+                + b"\n/GS0 gs BT /F1 12 Tf 0 Tr 10 50 Td (OCR) Tj ET"
+            )
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == [1]
+
+    @pytest.mark.parametrize("hidden_kind", ["render-mode-7", "alpha-zero"])
+    def test_deskew_accepts_other_invisible_ocr_text(
+        self,
+        tmp_dir: Path,
+        hidden_kind: str,
+    ) -> None:
+        input_path = tmp_dir / f"{hidden_kind}.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            if hidden_kind == "render-mode-7":
+                hidden_text = b"BT /F1 12 Tf 7 Tr 10 50 Td (OCR) Tj ET"
+            else:
+                page.Resources[Name.ExtGState] = Dictionary(GS0=Dictionary(ca=0))
+                hidden_text = b"/GS0 gs BT /F1 12 Tf 0 Tr 10 50 Td (OCR) Tj ET"
+            page.Contents.write(page.Contents.read_bytes() + b"\n" + hidden_text)
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == [1]
+
+    @pytest.mark.parametrize(
+        "hidden_kind",
+        [
+            "render-mode-3",
+            "alpha-zero",
+            "optional-form",
+            "extgstate-font",
+            "malformed-extgstate-font",
+        ],
+    )
+    def test_deskew_rejects_type3_text_even_with_hidden_outer_state(
+        self,
+        tmp_dir: Path,
+        hidden_kind: str,
+    ) -> None:
+        input_path = tmp_dir / f"type3-{hidden_kind}.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            glyph = pdf.make_stream(b"500 0 d0 0 0 500 500 re f")
+            type3_font = Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type3,
+                FontBBox=pikepdf.Array([0, 0, 500, 500]),
+                FontMatrix=pikepdf.Array([0.001, 0, 0, 0.001, 0, 0]),
+                CharProcs=Dictionary(A=glyph),
+                Encoding=Dictionary(
+                    Type=Name.Encoding,
+                    Differences=pikepdf.Array([65, Name.A]),
+                ),
+                FirstChar=65,
+                LastChar=65,
+                Widths=pikepdf.Array([500]),
+                Resources=Dictionary(),
+            )
+            page.Resources.Font[Name.F3] = type3_font
+
+            if hidden_kind == "render-mode-3":
+                type3_text = b"BT /F3 12 Tf 3 Tr 10 50 Td (A) Tj ET"
+            elif hidden_kind == "alpha-zero":
+                page.Resources[Name.ExtGState] = Dictionary(GS0=Dictionary(ca=0, CA=0))
+                type3_text = b"/GS0 gs BT /F3 12 Tf 0 Tr 10 50 Td (A) Tj ET"
+            elif hidden_kind == "optional-form":
+                ocg = Dictionary(Type=Name.OCG, Name="Hidden Type3 text")
+                pdf.Root[Name.OCProperties] = Dictionary(
+                    OCGs=pikepdf.Array([ocg]),
+                    D=Dictionary(OFF=pikepdf.Array([ocg])),
+                )
+                form = pdf.make_stream(b"BT /F3 12 Tf 3 Tr 10 50 Td (A) Tj ET")
+                form[Name.Type] = Name.XObject
+                form[Name.Subtype] = Name.Form
+                form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+                form[Name.OC] = ocg
+                form[Name.Resources] = Dictionary(Font=Dictionary(F3=type3_font))
+                page.Resources.XObject[Name.Type3Form] = form
+                type3_text = b"/Type3Form Do"
+            else:
+                font_setting = (
+                    pikepdf.Array([type3_font])
+                    if hidden_kind == "malformed-extgstate-font"
+                    else pikepdf.Array([type3_font, 12])
+                )
+                page.Resources[Name.ExtGState] = Dictionary(
+                    GSFont=Dictionary(Font=font_setting)
+                )
+                type3_text = b"BT /F1 12 Tf ET /GSFont gs BT 3 Tr 10 50 Td (A) Tj ET"
+
+            page.Contents.write(page.Contents.read_bytes() + b"\n" + type3_text)
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == []
+
+    def test_deskew_accepts_optional_content_hidden_ocr_text(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "optional-hidden-ocr.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            ocg = Dictionary(Type=Name.OCG, Name="Hidden OCR")
+            pdf.Root[Name.OCProperties] = Dictionary(
+                OCGs=pikepdf.Array([ocg]),
+                D=Dictionary(OFF=pikepdf.Array([ocg])),
+            )
+            page.Resources[Name.Properties] = Dictionary(OCRLayer=ocg)
+            page.Contents.write(
+                page.Contents.read_bytes() + b"\n/OC /OCRLayer BDC "
+                b"BT /F1 12 Tf 3 Tr 10 50 Td (OCR) Tj ET EMC"
+            )
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == [1]
+
+    def test_deskew_accepts_optional_form_with_alpha_zero_ocr_text(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "optional-form-hidden-ocr.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            ocg = Dictionary(Type=Name.OCG, Name="Hidden OCR")
+            pdf.Root[Name.OCProperties] = Dictionary(
+                OCGs=pikepdf.Array([ocg]),
+                D=Dictionary(OFF=pikepdf.Array([ocg])),
+            )
+            form = pdf.make_stream(b"/GS0 gs BT /F1 12 Tf 0 Tr 10 50 Td (OCR) Tj ET")
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            form[Name.OC] = ocg
+            form[Name.Resources] = Dictionary(
+                Font=page.Resources.Font,
+                ExtGState=Dictionary(GS0=Dictionary(ca=0)),
+            )
+            page.Resources.XObject[Name.HiddenOCR] = form
+            page.Contents.write(page.Contents.read_bytes() + b"\n/HiddenOCR Do")
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == [1]
+
+    def test_deskew_rejects_optional_form_with_visible_text(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "optional-form-visible-text.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            ocg = Dictionary(Type=Name.OCG, Name="Optional text")
+            pdf.Root[Name.OCProperties] = Dictionary(
+                OCGs=pikepdf.Array([ocg]),
+                D=Dictionary(OFF=pikepdf.Array([ocg])),
+            )
+            form = pdf.make_stream(b"BT /F1 12 Tf 0 Tr 10 50 Td (Text) Tj ET")
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            form[Name.OC] = ocg
+            form[Name.Resources] = Dictionary(Font=page.Resources.Font)
+            page.Resources.XObject[Name.OptionalText] = form
+            page.Contents.write(page.Contents.read_bytes() + b"\n/OptionalText Do")
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == []
+
+    def test_deskew_accepts_text_occluded_by_full_page_image(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "occluded-text.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            pdf.pages[0].Contents.write(
+                b"BT /F1 12 Tf 0 Tr 10 50 Td (OCR) Tj ET\n"
+                b"q 100 0 0 100 0 0 cm /Im0 Do Q"
+            )
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == [1]
+
+    def test_deskew_does_not_hide_text_behind_partial_page_image(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "partial-occlusion.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            pdf.pages[0].Contents.write(
+                b"BT /F1 12 Tf 0 Tr 10 50 Td (Native text) Tj ET\n"
+                b"q 99.9 0 0 100 0 0 cm /Im0 Do Q"
+            )
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == []
+
+    def test_deskew_rejects_text_clip_that_affects_later_image(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "text-clip.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            pdf.pages[0].Contents.write(
+                b"q 100 0 0 100 0 0 cm /Im0 Do Q\n"
+                b"BT /F1 12 Tf 7 Tr 10 50 Td (clip) Tj ET\n"
+                b"q 10 0 0 10 0 0 cm /Im0 Do Q"
+            )
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == []
+
+    def test_regular_and_deskew_pages_are_ocrd_once_in_disjoint_runs(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "two-raster-pages.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            _add_content_page(pdf, image_scale=50)
+            pdf.save(input_path)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=True,
+            )
+
+        assert mock_ocr.call_count == 2
+        regular_call, deskew_call = mock_ocr.call_args_list
+        assert regular_call.kwargs["pages"] == "2"
+        assert regular_call.kwargs["deskew"] is False
+        assert deskew_call.kwargs["pages"] == "1"
+        assert deskew_call.kwargs["deskew"] is True
+        assert all(
+            call.kwargs["skip_text"] is True
+            and call.kwargs["jobs"] == 1
+            and "force_ocr" not in call.kwargs
+            for call in mock_ocr.call_args_list
+        )
+
+    def test_deskew_preserves_tagging_on_unselected_digital_page(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "tagged-mixed.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            _add_content_page(pdf, visible_text=True)
+            pdf.Root[Name.StructTreeRoot] = Dictionary(
+                Type=Name.StructTreeRoot,
+                K=pikepdf.Array([]),
+            )
+            pdf.Root[Name.MarkInfo] = Dictionary(Marked=True)
+            pdf.pages[1].obj[Name.StructParents] = 0
+            pdf.save(input_path)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=True,
+            )
+
+        with Pdf.open(output_path) as pdf:
+            assert Name.StructTreeRoot in pdf.Root
+            assert bool(pdf.Root.MarkInfo.Marked)
+            assert int(pdf.pages[1].obj.StructParents) == 0
+
+    def test_deskew_text_preparation_clones_shared_form(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "shared-form.pdf"
+        output_path = tmp_dir / "prepared.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            _add_content_page(pdf, visible_text=True)
+            shared = pdf.make_stream(b"BT /F1 12 Tf 3 Tr 10 50 Td (shared OCR) Tj ET")
+            shared[Name.Type] = Name.XObject
+            shared[Name.Subtype] = Name.Form
+            shared[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            for page in pdf.pages:
+                page.Resources.XObject[Name.Shared] = shared
+                page.Contents.write(page.Contents.read_bytes() + b"\n/Shared Do")
+            pdf.save(input_path)
+
+        _prepare_deskew_input(input_path, output_path, (1,))
+
+        with Pdf.open(output_path) as pdf:
+            selected = pdf.pages[0].Resources.XObject.Shared
+            digital = pdf.pages[1].Resources.XObject.Shared
+            assert b"Tj" not in selected.read_bytes()
+            assert b"Tj" in digital.read_bytes()
+
+    def test_deskew_rejects_visible_form_text_with_inherited_resources(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "inherited-resources.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, visible_form_text=True)
+            page = pdf.pages[0]
+            page.obj.Parent[Name.Resources] = page.obj[Name.Resources]
+            del page.obj[Name.Resources]
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == []
+
+    def test_deskew_rejects_form_without_bbox(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "form-without-bbox.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, hidden_form_text=True)
+            del pdf.pages[0].Resources.XObject.HiddenText[Name.BBox]
+            pdf.save(input_path)
+
+        assert _find_deskew_pages(input_path) == []
+
     def test_passes_fixed_offline_configuration(
         self,
         sample_pdf: Path,
@@ -359,6 +1253,43 @@ class TestApplyOcr:
         kwargs = mock_ocr.call_args.kwargs
         assert kwargs["redo_ocr"] is True
         assert "skip_text" not in kwargs
+
+    def test_prior_ocr_fallback_preserves_existing_ocr_form(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page()
+            existing_ocr = pdf.make_stream(b"BT 3 Tr (old OCR) Tj ET")
+            existing_ocr[Name.Type] = Name.XObject
+            existing_ocr[Name.Subtype] = Name.Form
+            existing_ocr[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            page.obj[Name.Resources] = Dictionary(
+                XObject=Dictionary({"/OCR-existing": existing_ocr})
+            )
+            page.obj[Name.Contents] = pdf.make_stream(b"/OCR-existing Do")
+            pdf.save(input_path)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=PriorOcrFoundError(),
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                force=True,
+            )
+
+        with Pdf.open(output_path) as pdf:
+            assert b"(old OCR)" in (
+                pdf.pages[0].Resources.XObject["/OCR-existing"].read_bytes()
+            )
 
     def test_force_removes_only_invisible_text_from_existing_ocr_forms(
         self,
@@ -492,22 +1423,32 @@ class TestApplyOcr:
                 deskew=True,
             )
 
-    def test_annotations_disable_deskew(
+    def test_annotations_disable_deskew_only_for_annotated_scan(
         self,
-        sample_pdf: Path,
         tmp_dir: Path,
         model_dirs: tuple[Path, Path],
         validate_models: MagicMock,
     ) -> None:
-        with (
-            patch("pdftopdfa.ocr._pdf_has_annotations", return_value=True),
-            patch(
-                "pdftopdfa.ocr.ocrmypdf.ocr",
-                side_effect=_copy_ocr_input,
-            ) as mock_ocr,
-        ):
+        input_path = tmp_dir / "annotated-scan.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            pdf.pages[0].obj[Name.Annots] = pikepdf.Array(
+                [
+                    Dictionary(
+                        Type=Name.Annot,
+                        Subtype=Name.Link,
+                        Rect=pikepdf.Array([0, 0, 10, 10]),
+                    )
+                ]
+            )
+            pdf.save(input_path)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
             apply_ocr(
-                sample_pdf,
+                input_path,
                 tmp_dir / "output.pdf",
                 detection_model_dir=model_dirs[0],
                 recognition_model_dir=model_dirs[1],
@@ -515,6 +1456,44 @@ class TestApplyOcr:
             )
 
         assert mock_ocr.call_args.kwargs["deskew"] is False
+        assert mock_ocr.call_args.kwargs["pages"] == "1"
+
+    def test_annotation_on_digital_page_does_not_disable_scan_deskew(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "mixed-annotation.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            _add_content_page(pdf, visible_text=True)
+            pdf.pages[1].obj[Name.Annots] = pikepdf.Array(
+                [
+                    Dictionary(
+                        Type=Name.Annot,
+                        Subtype=Name.Link,
+                        Rect=pikepdf.Array([0, 0, 10, 10]),
+                    )
+                ]
+            )
+            pdf.save(input_path)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
+            apply_ocr(
+                input_path,
+                tmp_dir / "output.pdf",
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=True,
+            )
+
+        mock_ocr.assert_called_once()
+        assert mock_ocr.call_args.kwargs["deskew"] is True
+        assert mock_ocr.call_args.kwargs["pages"] == "1"
 
     def test_rotation_preflight_supplies_temporary_pdf(
         self,

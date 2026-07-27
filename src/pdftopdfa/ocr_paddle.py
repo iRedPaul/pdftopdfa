@@ -6,9 +6,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
+import stat
 import statistics
 import threading
 from argparse import SUPPRESS
@@ -42,43 +42,19 @@ _TEXT_DETECTION_LIMIT_SIDE_LEN = 1600
 
 
 @dataclass(frozen=True)
-class _Artifact:
-    size: int
-    sha256: str
+class _ModelSpec:
+    name: str
 
 
 @dataclass(frozen=True)
-class _ModelSpec:
-    name: str
-    artifacts: dict[str, _Artifact]
+class _CachedPrediction:
+    result: Any
+    model_pair: tuple[Path, Path]
+    image_size: tuple[int, int]
 
 
-_DETECTION_MODEL = _ModelSpec(
-    name="PP-OCRv6_medium_det",
-    artifacts={
-        "inference.onnx": _Artifact(
-            size=62_032_837,
-            sha256="eb13b44b25bb36f89528b68720af8a61d9cf381176107f465db1757b65d086e1",
-        ),
-        "inference.yml": _Artifact(
-            size=886,
-            sha256="7298d5ead546584af2504d03355f881ac7a7bc0eb1e282d3e159277c1d0af871",
-        ),
-    },
-)
-_RECOGNITION_MODEL = _ModelSpec(
-    name="PP-OCRv6_medium_rec",
-    artifacts={
-        "inference.onnx": _Artifact(
-            size=76_554_979,
-            sha256="9c09abf0957f7968c7586464b7397b84ad2387a0497a351af40e9acc71b673ba",
-        ),
-        "inference.yml": _Artifact(
-            size=150_580,
-            sha256="991b700facf5b50a7de193468207d5f4255b538dde0d312ae3b7c7a9b6873129",
-        ),
-    },
-)
+_DETECTION_MODEL = _ModelSpec(name="PP-OCRv6_medium_det")
+_RECOGNITION_MODEL = _ModelSpec(name="PP-OCRv6_medium_rec")
 
 
 class _PaddleOptions(BaseModel):
@@ -99,26 +75,18 @@ class _TesseractCompatibilityOptions(BaseModel):
 _model_lock = threading.RLock()
 _prediction_lock = threading.RLock()
 _cached_pair: tuple[Path, Path] | None = None
-_cached_signature: tuple[tuple[int, int, int], ...] | None = None
+_cached_fingerprint: tuple[tuple[int, int, int, int, int, int], ...] | None = None
 _cached_model: Any | None = None
+_pending_deskew_results: dict[tuple[Path, int], _CachedPrediction] = {}
+_prediction_result_by_image: dict[Path, _CachedPrediction] = {}
 _coordinate_dpi_lock = threading.Lock()
 _coordinate_dpi_by_image: dict[Path, float] = {}
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _model_signature(
+def _validate_model_directory(
     model_dir: Path,
     spec: _ModelSpec,
-    *,
-    verify_hashes: bool,
-) -> tuple[tuple[int, int, int], ...]:
+) -> tuple[tuple[int, int, int, int, int, int], ...]:
     if model_dir.is_symlink() or not model_dir.is_dir():
         raise OCRError(f"{spec.name} model directory does not exist: {model_dir}")
 
@@ -140,41 +108,40 @@ def _model_signature(
             f"and inference.yml ({'; '.join(details)})"
         )
 
-    signature: list[tuple[int, int, int]] = []
+    fingerprint = []
     for filename in sorted(_MODEL_FILENAMES):
         path = model_dir / filename
-        if path.is_symlink() or not path.is_file():
-            raise OCRError(f"{spec.name} model artifact is not a regular file: {path}")
         try:
-            stat = path.stat()
+            artifact_stat = path.lstat()
         except OSError as exc:
             raise OCRError(
                 f"Could not inspect {spec.name} model artifact: {exc}"
             ) from exc
-
-        expected = spec.artifacts[filename]
-        if stat.st_size != expected.size:
-            raise OCRError(
-                f"{spec.name} {filename} has size {stat.st_size}, "
-                f"expected {expected.size}"
+        if path.is_symlink() or not stat.S_ISREG(artifact_stat.st_mode):
+            raise OCRError(f"{spec.name} model artifact is not a regular file: {path}")
+        fingerprint.append(
+            (
+                artifact_stat.st_dev,
+                artifact_stat.st_ino,
+                artifact_stat.st_mode,
+                artifact_stat.st_size,
+                artifact_stat.st_mtime_ns,
+                artifact_stat.st_ctime_ns,
             )
-        if verify_hashes:
-            try:
-                actual_hash = _sha256(path)
-            except OSError as exc:
-                raise OCRError(
-                    f"Could not read {spec.name} model artifact: {exc}"
-                ) from exc
-            if actual_hash != expected.sha256:
-                raise OCRError(f"{spec.name} {filename} failed SHA-256 verification")
-        signature.append((stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
-    return tuple(signature)
+        )
+    return tuple(fingerprint)
 
 
 def _resolve_and_validate_model_directories(
-    detection_model_dir: Path,
-    recognition_model_dir: Path,
+    detection_model_dir: Path | None,
+    recognition_model_dir: Path | None,
+    *,
+    recheck: bool,
 ) -> tuple[Path, Path]:
+    if detection_model_dir is None or recognition_model_dir is None:
+        raise OCRError(
+            "Both PaddleOCR detection and recognition model directories are required"
+        )
     try:
         unresolved_pair = (
             Path(detection_model_dir).expanduser(),
@@ -191,24 +158,16 @@ def _resolve_and_validate_model_directories(
     except (OSError, RuntimeError) as exc:
         raise OCRError(f"Invalid PaddleOCR model directory: {exc}") from exc
 
-    global _cached_signature
     with _model_lock:
-        quick_signature = (
-            *_model_signature(pair[0], _DETECTION_MODEL, verify_hashes=False),
-            *_model_signature(pair[1], _RECOGNITION_MODEL, verify_hashes=False),
-        )
-        if (
-            _cached_model is not None
-            and pair == _cached_pair
-            and quick_signature == _cached_signature
-        ):
+        if not recheck and pair == _cached_pair and _cached_fingerprint is not None:
             return pair
 
-        verified_signature = (
-            *_model_signature(pair[0], _DETECTION_MODEL, verify_hashes=True),
-            *_model_signature(pair[1], _RECOGNITION_MODEL, verify_hashes=True),
+        fingerprint = (
+            *_validate_model_directory(pair[0], _DETECTION_MODEL),
+            *_validate_model_directory(pair[1], _RECOGNITION_MODEL),
         )
-        _replace_cached_model(pair, verified_signature)
+        if pair != _cached_pair or fingerprint != _cached_fingerprint:
+            _replace_cached_model(pair, fingerprint)
         return pair
 
 
@@ -216,23 +175,20 @@ def validate_model_directories(
     detection_model_dir: Path | None,
     recognition_model_dir: Path | None,
 ) -> tuple[Path, Path]:
-    """Validate the exact offline PP-OCRv6 Medium model artifacts."""
-    if detection_model_dir is None or recognition_model_dir is None:
-        raise OCRError(
-            "Both PaddleOCR detection and recognition model directories are required"
-        )
+    """Validate the offline PP-OCRv6 Medium model directory structure."""
     with _prediction_lock:
         return _resolve_and_validate_model_directories(
             detection_model_dir,
             recognition_model_dir,
+            recheck=True,
         )
 
 
 def _replace_cached_model(
     pair: tuple[Path, Path],
-    signature: tuple[tuple[int, int, int], ...],
+    fingerprint: tuple[tuple[int, int, int, int, int, int], ...],
 ) -> None:
-    global _cached_model, _cached_pair, _cached_signature
+    global _cached_fingerprint, _cached_model, _cached_pair
 
     if _cached_model is not None:
         close = getattr(_cached_model, "close", None)
@@ -240,7 +196,7 @@ def _replace_cached_model(
             close()
     _cached_model = None
     _cached_pair = pair
-    _cached_signature = signature
+    _cached_fingerprint = fingerprint
 
 
 def _create_model(detection_model_dir: Path, recognition_model_dir: Path) -> Any:
@@ -272,21 +228,90 @@ def _create_model(detection_model_dir: Path, recognition_model_dir: Path) -> Any
 
 def _get_model(options: OcrOptions) -> Any:
     paddle_options = options.paddle
-    pair = validate_model_directories(
-        paddle_options.detection_model_dir,
-        paddle_options.recognition_model_dir,
-    )
-
     global _cached_model
-    with _model_lock:
-        if _cached_model is None:
-            _cached_model = _create_model(*pair)
-        return _cached_model
+    with _prediction_lock:
+        pair = _resolve_and_validate_model_directories(
+            paddle_options.detection_model_dir,
+            paddle_options.recognition_model_dir,
+            recheck=False,
+        )
+        with _model_lock:
+            if _cached_model is None:
+                _cached_model = _create_model(*pair)
+            return _cached_model
+
+
+def _model_pair_for_cache(options: OcrOptions) -> tuple[Path, Path] | None:
+    try:
+        paddle_options = options.paddle
+        if (
+            paddle_options.detection_model_dir is None
+            or paddle_options.recognition_model_dir is None
+        ):
+            return None
+        return (
+            Path(paddle_options.detection_model_dir).expanduser().resolve(),
+            Path(paddle_options.recognition_model_dir).expanduser().resolve(),
+        )
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _page_cache_key(path: Path) -> tuple[Path, int] | None:
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return None
+    page_prefix, separator, _name = resolved.name.partition("_")
+    if not separator or not page_prefix.isascii() or not page_prefix.isdecimal():
+        return None
+    try:
+        page_number = int(page_prefix)
+    except ValueError:
+        return None
+    if page_number <= 0:
+        return None
+    return resolved.parent, page_number
+
+
+def _discard_stale_prediction_results() -> None:
+    stale_pages = [key for key in _pending_deskew_results if not key[0].is_dir()]
+    for key in stale_pages:
+        _pending_deskew_results.pop(key, None)
+
+    stale_images = [
+        path for path in _prediction_result_by_image if not path.parent.is_dir()
+    ]
+    for path in stale_images:
+        _prediction_result_by_image.pop(path, None)
+
+
+def _ocr_image_masks_text(page: PageContext) -> bool:
+    """Return conservatively whether OCRmyPDF will blank existing text areas."""
+    try:
+        return any(
+            page.pageinfo.get_textareas(
+                visible=None,
+                corrupt=None,
+            )
+        )
+    except Exception:
+        return True
 
 
 def _predict(input_file: Path, options: OcrOptions) -> Any:
     try:
         with _prediction_lock:
+            _discard_stale_prediction_results()
+            cached_prediction = _prediction_result_by_image.pop(
+                input_file.resolve(),
+                None,
+            )
+            if (
+                cached_prediction is not None
+                and cached_prediction.model_pair == _model_pair_for_cache(options)
+            ):
+                return cached_prediction.result
             results = list(
                 _get_model(options).predict(
                     str(input_file),
@@ -671,10 +696,15 @@ class PaddleOcrEngine(OcrEngine):
 
     @staticmethod
     def get_deskew(input_file: Path, options: OcrOptions) -> float:
+        page_key = _page_cache_key(input_file)
+        with _prediction_lock:
+            _discard_stale_prediction_results()
+            if page_key is not None:
+                _pending_deskew_results.pop(page_key, None)
+
         width, height, _dpi = _image_properties(input_file)
-        _texts, _scores, polygons, _boxes = _parallel_line_data(
-            _predict(input_file, options)
-        )
+        result = _predict(input_file, options)
+        _texts, _scores, polygons, _boxes = _parallel_line_data(result)
         minimum_length = max(20.0, min(width, height) * 0.05)
         angles = []
         for value in polygons:
@@ -693,7 +723,16 @@ class PaddleOcrEngine(OcrEngine):
                 and _MIN_DESKEW_ANGLE <= abs(angle) <= _MAX_DESKEW_ANGLE
             ):
                 angles.append(angle)
-        return statistics.median(angles) if len(angles) >= 2 else 0.0
+        correction = statistics.median(angles) if len(angles) >= 2 else 0.0
+        model_pair = _model_pair_for_cache(options)
+        if correction == 0.0 and page_key is not None and model_pair is not None:
+            with _prediction_lock:
+                _pending_deskew_results[page_key] = _CachedPrediction(
+                    result=result,
+                    model_pair=model_pair,
+                    image_size=(width, height),
+                )
+        return correction
 
     @staticmethod
     def supports_generate_ocr() -> bool:
@@ -808,7 +847,7 @@ class PaddleOcrEngine(OcrEngine):
 
 def _reset_model_cache_for_tests() -> None:
     """Clear and close cached PaddleOCR state for isolated tests."""
-    global _cached_model, _cached_pair, _cached_signature
+    global _cached_fingerprint, _cached_model, _cached_pair
     with _prediction_lock, _model_lock:
         if _cached_model is not None:
             close = getattr(_cached_model, "close", None)
@@ -816,7 +855,9 @@ def _reset_model_cache_for_tests() -> None:
                 close()
         _cached_model = None
         _cached_pair = None
-        _cached_signature = None
+        _cached_fingerprint = None
+        _pending_deskew_results.clear()
+        _prediction_result_by_image.clear()
     with _coordinate_dpi_lock:
         _coordinate_dpi_by_image.clear()
 
@@ -869,6 +910,34 @@ def filter_ocr_image(page: PageContext, image: Image.Image) -> None:
         page.pageinfo._dpi = Resolution(coordinate_dpi, coordinate_dpi)
 
     key = page.get_path("ocr.png").resolve()
+    with _prediction_lock:
+        _discard_stale_prediction_results()
+        _prediction_result_by_image.pop(key, None)
+        page_key = _page_cache_key(key)
+        pending = (
+            _pending_deskew_results.pop(page_key, None)
+            if page_key is not None
+            else None
+        )
+        options = getattr(page, "options", None)
+        expected_page = getattr(page, "pageno", None)
+        page_number_matches = page_key is not None and (
+            expected_page is None
+            or isinstance(expected_page, int)
+            and page_key[1] == expected_page + 1
+        )
+        if (
+            pending is not None
+            and options is not None
+            and bool(getattr(options, "deskew", False))
+            and not bool(getattr(options, "clean", False))
+            and not bool(getattr(options, "remove_background", False))
+            and pending.model_pair == _model_pair_for_cache(options)
+            and pending.image_size == image.size
+            and page_number_matches
+            and not _ocr_image_masks_text(page)
+        ):
+            _prediction_result_by_image[key] = pending
     with _coordinate_dpi_lock:
         _coordinate_dpi_by_image[key] = coordinate_dpi
 

@@ -522,6 +522,23 @@ def save_pdfa(
         _verify_file_structure(output_path, required_version)
 
 
+def _annotated_page_numbers(pdf_path: Path) -> frozenset[int]:
+    """Return one-based page numbers with non-empty annotation arrays."""
+    annotated_pages = set()
+    try:
+        with pikepdf.open(pdf_path) as pdf:
+            for page_number, page in enumerate(pdf.pages, start=1):
+                try:
+                    annots = page.get("/Annots")
+                    if annots is not None and len(annots) > 0:
+                        annotated_pages.add(page_number)
+                except Exception:
+                    continue
+    except Exception:
+        return frozenset()
+    return frozenset(annotated_pages)
+
+
 def _has_annotations(pdf_path: Path) -> bool:
     """Check whether any page in the PDF contains annotations.
 
@@ -531,18 +548,7 @@ def _has_annotations(pdf_path: Path) -> bool:
     Returns:
         ``True`` if at least one page has a non-empty ``/Annots`` array.
     """
-    try:
-        with pikepdf.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                try:
-                    annots = page.get("/Annots")
-                    if annots is not None and len(annots) > 0:
-                        return True
-                except Exception:
-                    continue
-    except Exception:
-        return False
-    return False
+    return bool(_annotated_page_numbers(pdf_path))
 
 
 def _strip_annotations_for_ocr(input_path: Path, clean_path: Path) -> bool:
@@ -801,7 +807,8 @@ def convert_to_pdfa(
         ocr_force: If True, force OCR even on pages that already contain
             text by using ocrmypdf's ``redo_ocr`` mode. This cannot be
             combined with ``ocr_deskew``.
-        ocr_deskew: If True, enable OCR and straighten skewed pages.
+        ocr_deskew: If True, enable OCR and straighten scan-like,
+            raster-dominant pages.
         ocr_rotate_pages: If True, enable OCR and normalize page orientation.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, known proprietary stamp annotations are
@@ -1020,16 +1027,8 @@ def convert_to_pdfa(
 
                 # Strip annotations before OCR so they are not
                 # rasterized into page images.
-                preserve_annots = _has_annotations(ocr_source_base)
-                effective_ocr_deskew = ocr_deskew
-                if preserve_annots and effective_ocr_deskew:
-                    effective_ocr_deskew = False
-                    warning = (
-                        "Deskew skipped because the PDF contains annotations whose "
-                        "geometry cannot be transformed safely"
-                    )
-                    logger.warning("%s: %s", warning, input_path)
-                    warnings.append(warning)
+                annotated_pages = _annotated_page_numbers(ocr_source_base)
+                preserve_annots = bool(annotated_pages)
                 ocr_source = ocr_source_base
                 if preserve_annots:
                     fd2, clean_tmp = tempfile.mkstemp(
@@ -1050,8 +1049,9 @@ def convert_to_pdfa(
                     detection_model_dir=ocr_detection_model_dir,
                     recognition_model_dir=ocr_recognition_model_dir,
                     force=ocr_force,
-                    deskew=effective_ocr_deskew,
+                    deskew=ocr_deskew,
                     rotate_pages=ocr_rotate_pages,
+                    _annotated_pages=annotated_pages,
                 )
 
                 # Re-inject original annotations into OCR output.
@@ -1442,7 +1442,8 @@ def convert_files(
             Must be provided with ``ocr_detection_model_dir``.
         ocr_force: If True, force OCR even on pages that already contain
             text. This cannot be combined with ``ocr_deskew``.
-        ocr_deskew: If True, enable OCR and straighten skewed pages.
+        ocr_deskew: If True, enable OCR and straighten scan-like,
+            raster-dominant pages.
         ocr_rotate_pages: If True, enable OCR and normalize page orientation.
         force_overwrite: If True, existing output files are overwritten.
             If False, existing outputs are skipped with an error result.
@@ -1581,7 +1582,8 @@ def convert_directory(
             Must be provided with ``ocr_detection_model_dir``.
         ocr_force: If True, force OCR even on pages that already contain
             text. This cannot be combined with ``ocr_deskew``.
-        ocr_deskew: If True, enable OCR and straighten skewed pages.
+        ocr_deskew: If True, enable OCR and straighten scan-like,
+            raster-dominant pages.
         ocr_rotate_pages: If True, enable OCR and normalize page orientation.
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being

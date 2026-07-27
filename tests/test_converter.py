@@ -616,6 +616,67 @@ class TestConvertToPdfa:
         assert mock_apply_ocr.call_args.args[2] == ["en"]
         assert mock_apply_ocr.call_args.kwargs[apply_option] is True
 
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_annotation_on_digital_page_does_not_disable_scan_deskew(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        tmp_dir: Path,
+    ) -> None:
+        """Annotation pages reach deskew planning after clean OCR preparation."""
+        input_path = tmp_dir / "mixed-annotation.pdf"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page(page_size=(100, 100))
+            digital_page = pdf.add_blank_page(page_size=(100, 100))
+            annotation = pdf.make_indirect(
+                Dictionary(
+                    Type=Name.Annot,
+                    Subtype=Name.Text,
+                    Rect=Array([0, 0, 10, 10]),
+                    Contents="Note",
+                )
+            )
+            digital_page.obj[Name.Annots] = Array([annotation])
+            pdf.save(input_path)
+
+        seen_clean_annotations = []
+
+        def create_ocr_output(
+            source: Path,
+            destination: Path,
+            *_args: object,
+            **_kwargs: object,
+        ) -> Path:
+            with Pdf.open(source) as pdf:
+                seen_clean_annotations.append(
+                    [page.obj.get("/Annots") for page in pdf.pages]
+                )
+            import shutil
+
+            shutil.copy2(source, destination)
+            return destination
+
+        mock_apply_ocr.side_effect = create_ocr_output
+        output_path = tmp_dir / "processed.pdf"
+
+        result = convert_to_pdfa(
+            input_path,
+            output_path,
+            pdfa=False,
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            ocr_deskew=True,
+        )
+
+        assert result.success is True
+        assert mock_apply_ocr.call_args.kwargs["deskew"] is True
+        assert mock_apply_ocr.call_args.kwargs["_annotated_pages"] == frozenset({2})
+        assert seen_clean_annotations == [[None, None]]
+        with Pdf.open(output_path) as pdf:
+            assert pdf.pages[0].obj.get("/Annots") is None
+            assert len(pdf.pages[1].obj.Annots) == 1
+
     def test_convert_rejects_deskew_with_forced_ocr(
         self, sample_pdf: Path, tmp_dir: Path
     ) -> None:
