@@ -96,7 +96,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `--ocr-lang LANG` | PaddleOCR language code (default: `en`), for example `de` or `de+en`; does not enable OCR by itself |
 | `--ocr-detection-model-dir DIR` | Directory containing compatible PP-OCRv6 Medium detection `inference.onnx` and `inference.yml` |
 | `--ocr-recognition-model-dir DIR` | Directory containing compatible PP-OCRv6 Medium recognition `inference.onnx` and `inference.yml` |
-| `--ocr-execution-provider [cpu\|directml]` | ONNX Runtime execution provider (default: `cpu`); DirectML requires the `directml` extra on Windows 11 |
+| `--ocr-execution-provider [cpu\|directml\|directml:INDEX]` | ONNX Runtime execution provider (default: `cpu`); DirectML requires the `directml` extra on Windows 11, and `directml:INDEX` selects a specific GPU |
 | `--deskew` | Straighten scan-like, raster-dominant pages; requires both model-directory options and implies `--ocr` |
 | `--rotate-pages` | Automatically orient pages with the bundled Paddle model; requires both model-directory options and implies `--ocr` |
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
@@ -187,7 +187,9 @@ result = convert_to_pdfa(
 Set `ocr_execution_provider="directml"` to use DirectML on Windows 11 after
 installing `pdftopdfa[directml]`. The same FP32 ONNX model directories are used
 for both providers. If DirectML is requested but unavailable, the call raises
-`OCRError` instead of falling back to CPU.
+`OCRError` instead of falling back to CPU. Use `"directml:<index>"`, for
+example `"directml:1"`, to pin a specific GPU; see
+[docs/ocr.md](ocr.md#selecting-a-gpu).
 
 Pass `pdfa=False` to keep the existing OCR behavior while skipping all
 PDF/A-specific processing. If no OCR option is selected, the input is copied

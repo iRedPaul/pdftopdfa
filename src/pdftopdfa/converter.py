@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 # Local
 from ._ocr_runtime import (
+    execution_provider_base,
     onnxruntime_engine_config,
     validate_ocr_execution_provider,
 )
@@ -820,7 +821,8 @@ def convert_to_pdfa(
             raster-dominant pages.
         ocr_rotate_pages: If True, enable OCR and normalize page orientation.
         ocr_execution_provider: ONNX Runtime provider for Paddle models:
-            ``"cpu"`` (default) or ``"directml"``.
+            ``"cpu"`` (default), ``"directml"`` or ``"directml:<index>"``
+            to select a specific adapter.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
@@ -1004,7 +1006,11 @@ def convert_to_pdfa(
             from .ocr import apply_ocr, is_ocr_available
 
             if not is_ocr_available():
-                extra = "directml" if ocr_execution_provider == "directml" else "ocr"
+                extra = (
+                    "directml"
+                    if execution_provider_base(ocr_execution_provider) == "directml"
+                    else "ocr"
+                )
                 raise OCRError(f"OCR not available - pip install pdftopdfa[{extra}]")
             else:
                 fd, tmp_path = tempfile.mkstemp(
@@ -1461,7 +1467,8 @@ def convert_files(
             raster-dominant pages.
         ocr_rotate_pages: If True, enable OCR and normalize page orientation.
         ocr_execution_provider: ONNX Runtime provider for Paddle models:
-            ``"cpu"`` (default) or ``"directml"``.
+            ``"cpu"`` (default), ``"directml"`` or ``"directml:<index>"``
+            to select a specific adapter.
         force_overwrite: If True, existing output files are overwritten.
             If False, existing outputs are skipped with an error result.
         preserve_stamps: If True, known proprietary stamp annotations are
@@ -1606,7 +1613,8 @@ def convert_directory(
             raster-dominant pages.
         ocr_rotate_pages: If True, enable OCR and normalize page orientation.
         ocr_execution_provider: ONNX Runtime provider for Paddle models:
-            ``"cpu"`` (default) or ``"directml"``.
+            ``"cpu"`` (default), ``"directml"`` or ``"directml:<index>"``
+            to select a specific adapter.
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
             flattened into page content.

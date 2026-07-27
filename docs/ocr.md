@@ -64,6 +64,34 @@ The selected provider applies to text detection, recognition, deskew, and page
 orientation. If DirectML is requested but `DmlExecutionProvider` is not
 available, `pdftopdfa` raises a clear error and does not fall back to CPU.
 
+### Selecting a GPU
+
+Plain `directml` lets DirectML pick the adapter. On a machine with more than
+one GPU, append the device index to choose explicitly:
+
+```bash
+pdftopdfa --ocr-execution-provider directml:1 \
+  --ocr-detection-model-dir C:/models/PP-OCRv6_medium_det \
+  --ocr-recognition-model-dir C:/models/PP-OCRv6_medium_rec \
+  scan.pdf
+```
+
+The Python equivalent is `ocr_execution_provider="directml:1"`. Indices start
+at 0 and follow the adapter order reported by
+`pdftopdfa._ocr_runtime.list_directml_devices()`:
+
+```python
+from pdftopdfa._ocr_runtime import list_directml_devices
+
+for device in list_directml_devices():
+    print(device.execution_provider, device.description)
+```
+
+The listing skips software adapters such as WARP and the Microsoft Basic
+Render Driver, because DirectML does not expose them as devices either. An
+index that no adapter uses fails at session creation rather than silently
+falling back.
+
 ## Offline Model Contract
 
 Download the files from these exact revisions:

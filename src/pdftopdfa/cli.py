@@ -19,7 +19,7 @@ from colorama import Fore, Style, init
 
 # Local
 from . import __version__
-from ._ocr_runtime import OCR_EXECUTION_PROVIDERS
+from ._ocr_runtime import validate_ocr_execution_provider
 from .converter import (
     ConversionResult,
     convert_directory,
@@ -144,6 +144,18 @@ def _print_validation_result(
             print_warning(warning)
 
 
+def _ocr_execution_provider_callback(
+    ctx: click.Context,
+    param: click.Parameter,
+    value: str,
+) -> str:
+    """Validate --ocr-execution-provider, which click.Choice cannot express."""
+    try:
+        return validate_ocr_execution_provider(value)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), ctx=ctx, param=param) from exc
+
+
 @click.command()
 @click.argument("input_path", required=False, type=click.Path(exists=True))
 @click.argument("output", required=False, type=click.Path())
@@ -221,10 +233,12 @@ def _print_validation_result(
 )
 @click.option(
     "--ocr-execution-provider",
-    type=click.Choice(OCR_EXECUTION_PROVIDERS),
+    metavar="[cpu|directml|directml:INDEX]",
     default="cpu",
     show_default=True,
-    help="ONNX Runtime provider for all Paddle OCR models.",
+    callback=_ocr_execution_provider_callback,
+    help="ONNX Runtime provider for all Paddle OCR models; "
+    "directml:INDEX selects a specific GPU.",
 )
 @click.option(
     "--ocr-force",
@@ -477,7 +491,8 @@ def _convert_single_file(
         ocr_force: If True, force OCR even on pages with existing text.
         ocr_deskew: If True, straighten scan-like, raster-dominant pages.
         ocr_rotate_pages: If True, normalize page orientation before OCR.
-        ocr_execution_provider: ONNX Runtime provider for Paddle models.
+        ocr_execution_provider: ONNX Runtime provider for Paddle models;
+            ``"directml:<index>"`` selects a specific adapter.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations
             to standard PDF Stamp annotations instead of flattening them.
@@ -611,7 +626,8 @@ def _convert_directory(
         ocr_force: If True, force OCR even on pages with existing text.
         ocr_deskew: If True, straighten scan-like, raster-dominant pages.
         ocr_rotate_pages: If True, normalize page orientation before OCR.
-        ocr_execution_provider: ONNX Runtime provider for Paddle models.
+        ocr_execution_provider: ONNX Runtime provider for Paddle models;
+            ``"directml:<index>"`` selects a specific adapter.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations
             to standard PDF Stamp annotations instead of flattening them.

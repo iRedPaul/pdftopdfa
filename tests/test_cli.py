@@ -60,7 +60,7 @@ class TestCliHelp:
 
         assert result.exit_code == 0
         assert "--ocr" in result.output
-        assert "--ocr-execution-provider [cpu|directml]" in result.output
+        assert "--ocr-execution-provider [cpu|directml|directml:INDEX]" in result.output
         assert "--deskew" in result.output
         assert "--rotate-pages" in result.output
 
@@ -661,6 +661,69 @@ class TestCliOcr:
 
         assert result.exit_code == EXIT_SUCCESS
         assert mock_apply_ocr.call_args.kwargs["ocr_execution_provider"] == "directml"
+
+    @patch("pdftopdfa.converter.onnxruntime_engine_config")
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_cli_ocr_selects_a_directml_device(
+        self,
+        _mock_is_ocr_available,
+        mock_apply_ocr,
+        _mock_engine_config,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """A device index is accepted and forwarded in canonical form."""
+        import shutil
+
+        mock_apply_ocr.side_effect = lambda inp, out, *args, **kwargs: (
+            shutil.copy2(inp, out) or out
+        )
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--ocr-execution-provider",
+                "directml:01",
+                *OCR_MODEL_ARGS,
+            ],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert mock_apply_ocr.call_args.kwargs["ocr_execution_provider"] == "directml:1"
+
+    @pytest.mark.parametrize(
+        "provider",
+        ["cuda", "cpu:0", "directml:", "directml:-1", "directml:x", "directml:64"],
+    )
+    def test_cli_rejects_malformed_execution_provider(
+        self,
+        provider: str,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Invalid provider strings fail as a usage error, not a conversion."""
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--ocr-execution-provider",
+                provider,
+                *OCR_MODEL_ARGS,
+            ],
+        )
+
+        assert result.exit_code == 2
+        assert "--ocr-execution-provider" in result.output
+        assert not output_path.exists()
 
     def test_cli_directml_requires_model_pair(
         self,

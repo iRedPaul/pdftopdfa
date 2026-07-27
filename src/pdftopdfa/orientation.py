@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ._ocr_runtime import (
+    execution_provider_base,
     onnxruntime_engine_config,
     require_execution_provider,
     validate_ocr_execution_provider,
@@ -165,7 +166,7 @@ def _create_model(execution_provider: str = "cpu") -> Any:
             device="cpu",
             engine_config=onnxruntime_engine_config(execution_provider),
         )
-        if execution_provider == "directml":
+        if execution_provider_base(execution_provider) == "directml":
             try:
                 session = model.paddlex_predictor.runner.session
                 require_execution_provider(session, execution_provider)

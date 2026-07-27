@@ -22,6 +22,7 @@ from PIL import Image
 from ._ocr_runtime import (
     _ModelSpec,
     _validate_model_directory,
+    execution_provider_base,
     onnxruntime_engine_config,
     require_execution_provider,
     validate_ocr_execution_provider,
@@ -216,7 +217,7 @@ def _create_table_classifier(
             enable_hpi=False,
             engine_config=onnxruntime_engine_config(execution_provider),
         )
-        if execution_provider == "directml":
+        if execution_provider_base(execution_provider) == "directml":
             try:
                 require_execution_provider(
                     classifier.paddlex_predictor.runner.session,
@@ -353,7 +354,7 @@ def _create_table_pipeline(
         ):
             _close(pipeline)
             raise OCRError("PaddleOCR did not preserve the selected table-model cache")
-        if execution_provider == "directml":
+        if execution_provider_base(execution_provider) == "directml":
             try:
                 selected_structure_model = (
                     paddlex_pipeline.wired_table_rec_model

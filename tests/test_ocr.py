@@ -5,6 +5,7 @@
 """Unit tests for the public OCR integration."""
 
 import shutil
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -18,8 +19,14 @@ from PIL import Image
 
 from pdftopdfa import recognize_image
 from pdftopdfa._ocr_runtime import (
+    _DXGIAdapterDesc1,
+    _is_directml_adapter,
+    _parse_execution_provider,
+    execution_provider_base,
+    list_directml_devices,
     onnxruntime_engine_config,
     require_execution_provider,
+    validate_ocr_execution_provider,
 )
 from pdftopdfa.exceptions import OCRError
 from pdftopdfa.ocr import (
@@ -161,6 +168,150 @@ class TestOcrExecutionProvider:
             require_execution_provider(session, "directml")
 
         session.disable_fallback.assert_not_called()
+
+
+class TestDirectMLDeviceIndex:
+    """Tests for the optional ``directml:<index>`` device suffix."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("cpu", ("cpu", None)),
+            ("directml", ("directml", None)),
+            ("directml:0", ("directml", 0)),
+            ("directml:1", ("directml", 1)),
+            ("directml:63", ("directml", 63)),
+        ],
+    )
+    def test_supported_providers_are_parsed(
+        self,
+        value: str,
+        expected: tuple[str, int | None],
+    ) -> None:
+        assert _parse_execution_provider(value) == expected
+
+    @pytest.mark.parametrize(
+        ("value", "message"),
+        [
+            ("cpu:0", "does not support a device index"),
+            ("directml:", "Invalid DirectML device index"),
+            ("directml:-1", "Invalid DirectML device index"),
+            ("directml:+1", "Invalid DirectML device index"),
+            ("directml:x", "Invalid DirectML device index"),
+            ("directml:١", "Invalid DirectML device index"),
+            ("directml:64", "out of range"),
+            (None, "expected a string"),
+        ],
+    )
+    def test_malformed_providers_are_rejected(
+        self,
+        value: object,
+        message: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=message):
+            _parse_execution_provider(value)
+
+    def test_device_index_is_canonicalized(self) -> None:
+        """Padded indices collapse so one device maps to one cache key."""
+        assert validate_ocr_execution_provider("directml:01") == "directml:1"
+        assert validate_ocr_execution_provider("directml:0") == "directml:0"
+        assert validate_ocr_execution_provider("directml") == "directml"
+
+    def test_base_name_strips_the_device_index(self) -> None:
+        assert execution_provider_base("directml:1") == "directml"
+        assert execution_provider_base("directml") == "directml"
+        assert execution_provider_base("cpu") == "cpu"
+
+    def test_device_index_becomes_a_provider_option(self) -> None:
+        fake_onnxruntime = SimpleNamespace(
+            get_available_providers=lambda: [
+                "DmlExecutionProvider",
+                "CPUExecutionProvider",
+            ]
+        )
+
+        with patch.dict("sys.modules", {"onnxruntime": fake_onnxruntime}):
+            config = onnxruntime_engine_config("directml:1")
+
+        assert config == {
+            "providers": ["DmlExecutionProvider"],
+            "execution_mode": "sequential",
+            "enable_mem_pattern": False,
+            "provider_options": [{"device_id": 1}],
+        }
+
+    def test_indexed_directml_still_rejects_cpu_fallback(self) -> None:
+        """The guard must not go silent because of the ``:1`` suffix."""
+        session = MagicMock()
+        session.get_providers.return_value = ["CPUExecutionProvider"]
+
+        with pytest.raises(OCRError, match="DirectML.*refusing CPU fallback"):
+            require_execution_provider(session, "directml:1")
+
+        session.disable_fallback.assert_not_called()
+
+    def test_indexed_directml_disables_fallback(self) -> None:
+        session = MagicMock()
+        session.get_providers.return_value = [
+            "DmlExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+
+        require_execution_provider(session, "directml:1")
+
+        session.disable_fallback.assert_called_once_with()
+
+
+class TestDirectMLDeviceEnumeration:
+    """Tests for the DXGI adapter listing behind ``directml:<index>``."""
+
+    def test_hardware_adapter_is_listed(self) -> None:
+        desc = _DXGIAdapterDesc1(
+            Description="Test GPU",
+            VendorId=0x10DE,
+            DedicatedVideoMemory=8 * 1024**3,
+            Flags=0,
+        )
+
+        assert _is_directml_adapter(desc) is True
+
+    def test_software_adapter_is_filtered(self) -> None:
+        """WARP is flagged as software and never becomes a device index."""
+        desc = _DXGIAdapterDesc1(
+            Description="Microsoft Basic Render Driver",
+            VendorId=0x1414,
+            DedicatedVideoMemory=0,
+            Flags=0x2,
+        )
+
+        assert _is_directml_adapter(desc) is False
+
+    def test_basic_render_driver_is_filtered(self) -> None:
+        """The Microsoft fallback adapter reports no dedicated video memory."""
+        desc = _DXGIAdapterDesc1(
+            Description="Microsoft Basic Render Driver",
+            VendorId=0x1414,
+            DedicatedVideoMemory=0,
+            Flags=0,
+        )
+
+        assert _is_directml_adapter(desc) is False
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="DXGI is available")
+    def test_enumeration_is_windows_only(self) -> None:
+        with pytest.raises(OCRError, match="only be enumerated on Windows"):
+            list_directml_devices()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="requires DXGI")
+    def test_device_ids_are_consecutive_and_usable(self) -> None:
+        """Every listed adapter yields a provider string the API accepts."""
+        devices = list_directml_devices()
+
+        assert [device.device_id for device in devices] == list(range(len(devices)))
+        for device in devices:
+            provider = device.execution_provider
+            assert provider == f"directml:{device.device_id}"
+            assert validate_ocr_execution_provider(provider) == provider
 
 
 def _add_content_page(

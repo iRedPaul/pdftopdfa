@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     import pikepdf
 
 # Local
-from ._ocr_runtime import onnxruntime_engine_config
+from ._ocr_runtime import execution_provider_base, onnxruntime_engine_config
 from .exceptions import OCRError
 from .orientation import _effective_page_rotate, normalize_pdf_orientation
 from .utils import log_suppressed_error
@@ -156,7 +156,11 @@ def recognize_image(
     """
     onnxruntime_engine_config(ocr_execution_provider)
     if not HAS_OCR:
-        extra = "directml" if ocr_execution_provider == "directml" else "ocr"
+        extra = (
+            "directml"
+            if execution_provider_base(ocr_execution_provider) == "directml"
+            else "ocr"
+        )
         raise OCRError(
             "OCR not available. Install the OCR dependency: "
             f"pip install pdftopdfa[{extra}]"
@@ -1404,7 +1408,8 @@ def apply_ocr(
         rotate_pages: If True, normalize page orientation with the bundled
             Paddle model (default: False).
         ocr_execution_provider: ONNX Runtime provider to use for all Paddle
-            models: ``"cpu"`` (default) or ``"directml"``.
+            models: ``"cpu"`` (default), ``"directml"`` or
+            ``"directml:<index>"`` to select a specific adapter.
 
     Returns:
         Path to the OCR-processed PDF.
@@ -1418,7 +1423,11 @@ def apply_ocr(
         raise OCRError("Deskew cannot be combined with forced OCR")
     onnxruntime_engine_config(ocr_execution_provider)
     if not HAS_OCR:
-        extra = "directml" if ocr_execution_provider == "directml" else "ocr"
+        extra = (
+            "directml"
+            if execution_provider_base(ocr_execution_provider) == "directml"
+            else "ocr"
+        )
         raise OCRError(
             "OCR not available. Install the OCR dependency: "
             f"pip install pdftopdfa[{extra}]"

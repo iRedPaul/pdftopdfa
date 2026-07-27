@@ -189,6 +189,39 @@ class TestBundledModel:
         directml_model.close.assert_not_called()
 
     @patch("pdftopdfa.orientation._create_model")
+    def test_model_is_replaced_when_directml_device_changes(
+        self,
+        mock_create: MagicMock,
+    ) -> None:
+        """Each DirectML adapter gets its own session instead of a shared one."""
+        first_model = MagicMock()
+        second_model = MagicMock()
+        mock_create.side_effect = [first_model, second_model]
+
+        assert _get_model("directml:0") is first_model
+        assert _get_model("directml:0") is first_model
+        assert _get_model("directml:1") is second_model
+        assert _get_model("directml:1") is second_model
+
+        assert mock_create.call_args_list[0].args == ("directml:0",)
+        assert mock_create.call_args_list[1].args == ("directml:1",)
+        first_model.close.assert_called_once_with()
+        second_model.close.assert_not_called()
+
+    @patch("pdftopdfa.orientation._create_model")
+    def test_padded_device_index_reuses_the_cached_model(
+        self,
+        mock_create: MagicMock,
+    ) -> None:
+        """A padded index names the same adapter as its canonical form."""
+        instance = MagicMock()
+        mock_create.return_value = instance
+
+        assert _get_model("directml:1") is instance
+        assert _get_model("directml:01") is instance
+        mock_create.assert_called_once_with("directml:1")
+
+    @patch("pdftopdfa.orientation._create_model")
     def test_parallel_model_access_creates_one_instance(
         self,
         mock_create: MagicMock,

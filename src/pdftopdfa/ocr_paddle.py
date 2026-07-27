@@ -32,6 +32,7 @@ from ._ocr_runtime import _MODEL_FILENAMES as _MODEL_FILENAMES
 from ._ocr_runtime import (
     _ModelSpec,
     _validate_model_directory,
+    execution_provider_base,
     onnxruntime_engine_config,
     require_execution_provider,
     validate_ocr_execution_provider,
@@ -186,7 +187,7 @@ def _create_model(
             device="cpu",
             engine_config=onnxruntime_engine_config(execution_provider),
         )
-        if execution_provider == "directml":
+        if execution_provider_base(execution_provider) == "directml":
             try:
                 pipeline = model.paddlex_pipeline
                 require_execution_provider(

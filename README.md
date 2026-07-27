@@ -81,6 +81,11 @@ DirectML extra does not select it automatically; use
 requested but unavailable, processing stops with an error instead of falling
 back to the CPU.
 
+On a machine with several GPUs, `directml:<index>` picks a specific adapter,
+for example `--ocr-execution-provider directml:1`. Plain `directml` leaves the
+choice to DirectML. `pdftopdfa._ocr_runtime.list_directml_devices()` lists the
+available adapters with the index each one uses.
+
 OCR and table recognition do not download models at runtime. Every model must
 be obtained separately and passed through an explicit local directory on each
 public API invocation. CPU and DirectML use the same FP32 ONNX model files.
@@ -214,7 +219,8 @@ Supplying both model directories enables OCR in `convert_to_pdfa()`,
 `convert_files()`, and `convert_directory()`. Supplying only one directory, or
 requesting an OCR option without both directories, raises `ValueError` before
 processing starts. Set `ocr_execution_provider="directml"` to use an
-installation made with the `directml` extra on Windows 11.
+installation made with the `directml` extra on Windows 11, or
+`ocr_execution_provider="directml:1"` to pin a specific adapter.
 
 Set `pdfa=False` to apply only the requested OCR processing. This skips font
 embedding, PDF/A sanitization, metadata synchronization, color-profile
