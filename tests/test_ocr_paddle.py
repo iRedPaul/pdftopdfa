@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 from ocrmypdf.helpers import Resolution
 from ocrmypdf.hocrtransform import Baseline, BoundingBox, OcrClass
@@ -500,6 +501,185 @@ def test_parallel_predictions_share_one_session_and_are_serialized(
     assert all(result["rec_texts"] == ["Hello world"] for result in results)
     assert create_model.call_count == 1
     assert maximum_active == 1
+
+
+def test_recognize_image_auto_reuses_existing_prediction_results(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    model = SimpleNamespace(
+        predict=MagicMock(
+            return_value=[
+                _result(
+                    texts=["First", "Second"],
+                    scores=[0.9, 0.8],
+                    polygons=[
+                        [[10, 20], [100, 20], [100, 40], [10, 40]],
+                        [[10, 50], [100, 50], [100, 70], [10, 70]],
+                    ],
+                    boxes=[[10, 20, 100, 40], [10, 50, 100, 70]],
+                )
+            ]
+        )
+    )
+
+    with patch.object(ocr_paddle, "_create_model", return_value=model) as create_model:
+        first = ocr_paddle.recognize_image(
+            page_image,
+            detection_model_dir=model_dirs[0],
+            recognition_model_dir=model_dirs[1],
+        )
+        second = ocr_paddle.recognize_image(
+            page_image,
+            detection_model_dir=model_dirs[0],
+            recognition_model_dir=model_dirs[1],
+        )
+
+    assert first == second == [("First", 0.9), ("Second", 0.8)]
+    assert create_model.call_count == 1
+    assert model.predict.call_count == 2
+
+
+def test_recognize_image_single_line_bypasses_detection_and_reuses_model(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    text_rec_model = MagicMock(
+        side_effect=[
+            [{"rec_text": "Whole image", "rec_score": 0.91}],
+            [{"rec_text": "Whole image", "rec_score": 0.91}],
+        ]
+    )
+    model = SimpleNamespace(
+        paddlex_pipeline=SimpleNamespace(text_rec_model=text_rec_model),
+        predict=MagicMock(),
+    )
+
+    with patch.object(ocr_paddle, "_create_model", return_value=model) as create_model:
+        for _index in range(2):
+            assert ocr_paddle.recognize_image(
+                page_image,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                layout="single_line",
+            ) == [("Whole image", 0.91)]
+
+    assert create_model.call_count == 1
+    assert text_rec_model.call_count == 2
+    model.predict.assert_not_called()
+
+
+def test_allowed_characters_mask_ctc_logits_before_decoding(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    class Decoder:
+        character = ["blank", "A", "B"]
+
+        @staticmethod
+        def get_ignored_tokens() -> list[int]:
+            return [0]
+
+        def __call__(
+            self,
+            prediction: list[np.ndarray],
+            **_kwargs: object,
+        ) -> tuple[list[str], list[float]]:
+            logits = prediction[0]
+            indices = logits.argmax(axis=-1)[0]
+            selected = np.concatenate(([True], indices[1:] != indices[:-1]))
+            selected &= indices != 0
+            text = "".join(self.character[index] for index in indices[selected])
+            score = float(logits.max(axis=-1)[0][selected].mean())
+            return [text], [score]
+
+    class TextRecognitionModel:
+        def __init__(self) -> None:
+            self.post_op = Decoder()
+            self.logits = np.array(
+                [[[0.1, 0.8, 0.9], [0.9, 0.05, 0.05]]],
+                dtype=np.float32,
+            )
+
+        def __call__(
+            self,
+            _input_file: str,
+            *,
+            return_word_box: bool,
+        ) -> list[dict[str, object]]:
+            assert return_word_box is False
+            texts, scores = self.post_op(
+                [self.logits],
+                return_word_box=return_word_box,
+            )
+            return [{"rec_text": texts[0], "rec_score": scores[0]}]
+
+    text_rec_model = TextRecognitionModel()
+    decoder = text_rec_model.post_op
+    model = SimpleNamespace(
+        paddlex_pipeline=SimpleNamespace(text_rec_model=text_rec_model),
+        predict=MagicMock(),
+    )
+
+    with patch.object(ocr_paddle, "_create_model", return_value=model):
+        restricted = ocr_paddle.recognize_image(
+            page_image,
+            detection_model_dir=model_dirs[0],
+            recognition_model_dir=model_dirs[1],
+            layout="single_line",
+            allowed_characters="A",
+        )
+        unrestricted = ocr_paddle.recognize_image(
+            page_image,
+            detection_model_dir=model_dirs[0],
+            recognition_model_dir=model_dirs[1],
+            layout="single_line",
+        )
+
+    assert restricted == [("A", pytest.approx(0.8))]
+    assert unrestricted == [("B", pytest.approx(0.9))]
+    assert text_rec_model.post_op is decoder
+    assert np.isfinite(text_rec_model.logits).all()
+
+
+def test_allowed_characters_also_restrict_auto_layout_decoding(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    decoder = MagicMock()
+    decoder.character = ["blank", "A", "B"]
+    decoder.get_ignored_tokens.return_value = [0]
+
+    def decode(
+        prediction: list[np.ndarray],
+        **_kwargs: object,
+    ) -> tuple[list[str], list[float]]:
+        assert np.isneginf(prediction[0][..., 2]).all()
+        return ["A"], [0.8]
+
+    decoder.side_effect = decode
+    text_rec_model = SimpleNamespace(post_op=decoder)
+
+    class Model:
+        paddlex_pipeline = SimpleNamespace(text_rec_model=text_rec_model)
+
+        @staticmethod
+        def predict(_input_file: str, **_kwargs: object) -> list[dict[str, object]]:
+            texts, scores = text_rec_model.post_op(
+                [np.array([[[0.1, 0.8, 0.9]]], dtype=np.float32)]
+            )
+            return [_result(texts=texts, scores=scores)]
+
+    with patch.object(ocr_paddle, "_create_model", return_value=Model()):
+        results = ocr_paddle.recognize_image(
+            page_image,
+            detection_model_dir=model_dirs[0],
+            recognition_model_dir=model_dirs[1],
+            allowed_characters="A",
+        )
+
+    assert results == [("A", 0.8)]
+    assert text_rec_model.post_op is decoder
 
 
 def test_generate_ocr_maps_lines_words_geometry_and_metadata(

@@ -13,11 +13,15 @@ import stat
 import statistics
 import threading
 from argparse import SUPPRESS
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import ocrmypdf
 from ocrmypdf.helpers import Resolution
 from ocrmypdf.hocrtransform import Baseline, BoundingBox, OcrClass, OcrElement
@@ -347,7 +351,58 @@ def _ocr_image_masks_text(page: PageContext) -> bool:
         return True
 
 
-def _predict(input_file: Path, options: OcrOptions) -> Any:
+@contextmanager
+def _allowed_character_decoder(
+    text_rec_model: Any,
+    allowed_characters: str | None,
+) -> Iterator[None]:
+    if allowed_characters is None:
+        yield
+        return
+
+    decoder = text_rec_model.post_op
+    try:
+        characters = decoder.character
+        ignored_tokens = set(decoder.get_ignored_tokens())
+    except AttributeError as exc:
+        raise OCRError("PP-OCRv6 CTC decoder is unavailable") from exc
+
+    allowed = set(allowed_characters)
+    masked_classes = np.array(
+        [
+            index not in ignored_tokens and character not in allowed
+            for index, character in enumerate(characters)
+        ],
+        dtype=bool,
+    )
+
+    def decode(prediction: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            logits = np.asarray(prediction[0])
+        except (IndexError, TypeError) as exc:
+            raise OCRError("PP-OCRv6 CTC decoder received invalid logits") from exc
+        if logits.ndim == 0 or logits.shape[-1] != len(characters):
+            raise OCRError("PP-OCRv6 CTC decoder received incompatible logits")
+
+        masked_logits = np.array(logits, copy=True)
+        masked_logits[..., masked_classes] = -np.inf
+        prediction = list(prediction)
+        prediction[0] = masked_logits
+        return decoder(prediction, *args, **kwargs)
+
+    text_rec_model.post_op = decode
+    try:
+        yield
+    finally:
+        text_rec_model.post_op = decoder
+
+
+def _predict(
+    input_file: Path,
+    options: OcrOptions,
+    *,
+    allowed_characters: str | None = None,
+) -> Any:
     try:
         with _prediction_lock:
             _discard_stale_prediction_results()
@@ -356,18 +411,34 @@ def _predict(input_file: Path, options: OcrOptions) -> Any:
                 None,
             )
             if (
-                cached_prediction is not None
+                allowed_characters is None
+                and cached_prediction is not None
                 and cached_prediction.model_pair == _model_pair_for_cache(options)
             ):
                 return cached_prediction.result
-            results = list(
-                _get_model(options).predict(
-                    str(input_file),
-                    return_word_box=True,
-                    text_det_limit_side_len=_TEXT_DETECTION_LIMIT_SIDE_LEN,
-                    text_det_limit_type="max",
+            model = _get_model(options)
+            if allowed_characters is None:
+                results = list(
+                    model.predict(
+                        str(input_file),
+                        return_word_box=True,
+                        text_det_limit_side_len=_TEXT_DETECTION_LIMIT_SIDE_LEN,
+                        text_det_limit_type="max",
+                    )
                 )
-            )
+            else:
+                with _allowed_character_decoder(
+                    model.paddlex_pipeline.text_rec_model,
+                    allowed_characters,
+                ):
+                    results = list(
+                        model.predict(
+                            str(input_file),
+                            return_word_box=True,
+                            text_det_limit_side_len=_TEXT_DETECTION_LIMIT_SIDE_LEN,
+                            text_det_limit_type="max",
+                        )
+                    )
     except OCRError:
         raise
     except Exception as exc:
@@ -382,6 +453,96 @@ def _predict(input_file: Path, options: OcrOptions) -> Any:
     except (KeyError, TypeError):
         pass
     return result
+
+
+def _text_confidence_results(
+    texts: Any,
+    scores: Any,
+) -> list[tuple[str, float]]:
+    text_count = _sequence_length(texts, "rec_texts")
+    score_count = _sequence_length(scores, "rec_scores")
+    if text_count != score_count:
+        raise OCRError(
+            "PaddleOCR returned inconsistent recognition arrays: "
+            f"rec_texts={text_count}, rec_scores={score_count}"
+        )
+
+    results = []
+    for index, (text, score) in enumerate(zip(texts, scores, strict=True)):
+        if not isinstance(text, str):
+            raise OCRError(
+                f"PaddleOCR result field rec_texts[{index}] must be a string"
+            )
+        confidence = _confidence(score)
+        if confidence is None:
+            raise OCRError(
+                f"PaddleOCR result field rec_scores[{index}] is not a valid confidence"
+            )
+        results.append((text, confidence))
+    return results
+
+
+def recognize_image(
+    input_path: str | Path,
+    *,
+    detection_model_dir: Path,
+    recognition_model_dir: Path,
+    ocr_execution_provider: str = "cpu",
+    layout: str = "auto",
+    allowed_characters: str | None = None,
+) -> list[tuple[str, float]]:
+    """Recognize text and confidence values in one image with PP-OCRv6."""
+    if layout not in {"auto", "single_line"}:
+        raise ValueError("layout must be 'auto' or 'single_line'")
+    if allowed_characters is not None and not isinstance(allowed_characters, str):
+        raise TypeError("allowed_characters must be a string or None")
+
+    input_file = Path(input_path)
+    options = SimpleNamespace(
+        paddle=_PaddleOptions(
+            detection_model_dir=detection_model_dir,
+            recognition_model_dir=recognition_model_dir,
+            execution_provider=ocr_execution_provider,
+        )
+    )
+
+    if layout == "auto":
+        result = _predict(
+            input_file,
+            options,
+            allowed_characters=allowed_characters,
+        )
+        return _text_confidence_results(
+            _field(result, "rec_texts"),
+            _field(result, "rec_scores"),
+        )
+
+    try:
+        with _prediction_lock:
+            model = _get_model(options)
+            text_rec_model = model.paddlex_pipeline.text_rec_model
+            with _allowed_character_decoder(text_rec_model, allowed_characters):
+                results = list(
+                    text_rec_model(
+                        str(input_file),
+                        return_word_box=False,
+                    )
+                )
+    except OCRError:
+        raise
+    except Exception as exc:
+        raise OCRError(f"PaddleOCR inference failed for {input_file}: {exc}") from exc
+
+    if len(results) != 1:
+        raise OCRError(f"PaddleOCR returned {len(results)} results for one image")
+    result = results[0]
+    text = _field(result, "rec_text")
+    if isinstance(text, tuple):
+        text = text[0]
+    return _text_confidence_results(
+        [text],
+        [_field(result, "rec_score")],
+    )
 
 
 def _field(result: Any, name: str) -> Any:

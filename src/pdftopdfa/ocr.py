@@ -138,6 +138,42 @@ def validate_ocr_languages(languages: list[str]) -> list[str]:
     return languages
 
 
+def recognize_image(
+    input_path: str | Path,
+    *,
+    detection_model_dir: Path,
+    recognition_model_dir: Path,
+    ocr_execution_provider: str = "cpu",
+    layout: str = "auto",
+    allowed_characters: str | None = None,
+) -> list[tuple[str, float]]:
+    """Recognize text and confidence values in an image with PP-OCRv6.
+
+    ``layout="auto"`` uses the normal text detection and recognition pipeline.
+    ``layout="single_line"`` bypasses text detection and sends the complete
+    image directly to the recognition model. When ``allowed_characters`` is
+    provided, disallowed CTC classes are masked before decoding.
+    """
+    onnxruntime_engine_config(ocr_execution_provider)
+    if not HAS_OCR:
+        extra = "directml" if ocr_execution_provider == "directml" else "ocr"
+        raise OCRError(
+            "OCR not available. Install the OCR dependency: "
+            f"pip install pdftopdfa[{extra}]"
+        )
+
+    from .ocr_paddle import recognize_image as recognize_with_paddle
+
+    return recognize_with_paddle(
+        input_path,
+        detection_model_dir=detection_model_dir,
+        recognition_model_dir=recognition_model_dir,
+        ocr_execution_provider=ocr_execution_provider,
+        layout=layout,
+        allowed_characters=allowed_characters,
+    )
+
+
 def _format_ocr_exception(exc: BaseException) -> str:
     """Return a stable, non-empty error description for OCR exceptions."""
     message = str(exc).strip()

@@ -16,6 +16,7 @@ from ocrmypdf.exceptions import PriorOcrFoundError
 from pikepdf import Dictionary, Name, Pdf
 from PIL import Image
 
+from pdftopdfa import recognize_image
 from pdftopdfa._ocr_runtime import (
     onnxruntime_engine_config,
     require_execution_provider,
@@ -76,6 +77,37 @@ def validate_models(model_dirs: tuple[Path, Path]):
 def _copy_ocr_input(input_path: Path, output_path: Path, **_kwargs: object) -> None:
     """Model OCRmyPDF's output contract in option-boundary tests."""
     shutil.copy2(input_path, output_path)
+
+
+def test_recognize_image_is_exposed_by_public_api(
+    model_dirs: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "line.png"
+    with (
+        patch("pdftopdfa.ocr.onnxruntime_engine_config"),
+        patch(
+            "pdftopdfa.ocr_paddle.recognize_image",
+            return_value=[("123", 0.9)],
+        ) as recognize_with_paddle,
+    ):
+        result = recognize_image(
+            image_path,
+            detection_model_dir=model_dirs[0],
+            recognition_model_dir=model_dirs[1],
+            layout="single_line",
+            allowed_characters="0123456789",
+        )
+
+    assert result == [("123", 0.9)]
+    recognize_with_paddle.assert_called_once_with(
+        image_path,
+        detection_model_dir=model_dirs[0],
+        recognition_model_dir=model_dirs[1],
+        ocr_execution_provider="cpu",
+        layout="single_line",
+        allowed_characters="0123456789",
+    )
 
 
 class TestOcrExecutionProvider:

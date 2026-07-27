@@ -21,6 +21,7 @@ from .exceptions import (
     ValidationError,
     VeraPDFError,
 )
+from .ocr import recognize_image
 
 try:
     __version__ = version("pdftopdfa")
@@ -32,6 +33,7 @@ __all__ = [
     "convert_to_pdfa",
     "convert_files",
     "convert_directory",
+    "recognize_image",
     "ConversionResult",
     "PDFToPDFAError",
     "ConversionError",

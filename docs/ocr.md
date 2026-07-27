@@ -226,6 +226,33 @@ result_path = apply_ocr(
 or incompatible model artifacts, an unavailable requested provider, and OCR
 execution failures.
 
+Individual images can be recognized without creating a PDF:
+
+```python
+from pathlib import Path
+
+from pdftopdfa import recognize_image
+
+results = recognize_image(
+    Path("serial-number.png"),
+    detection_model_dir=Path(
+        "/opt/pdftopdfa/models/PP-OCRv6_medium_det"
+    ),
+    recognition_model_dir=Path(
+        "/opt/pdftopdfa/models/PP-OCRv6_medium_rec"
+    ),
+    layout="single_line",
+    allowed_characters="0123456789",
+)
+```
+
+The result is a list of `(text, confidence)` pairs. The default
+`layout="auto"` uses text detection before recognizing each detected line.
+Use `layout="single_line"` when the complete image is one text line; this
+bypasses detection. `allowed_characters` restricts CTC decoding itself, so a
+disallowed character cannot win a decoding step. Omitting both options uses
+the standard OCR pipeline unchanged.
+
 Use `pdfa=False` with a neutral output name such as `scan_processed.pdf` to
 write the OCR result directly without font embedding, PDF/A sanitization,
 metadata synchronization, color-profile embedding, or PDF/A validation. The
