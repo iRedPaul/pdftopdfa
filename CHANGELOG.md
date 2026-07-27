@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.8.1] - 2026-07-27
+
+### Features
+
+- Add DirectML OCR execution on Windows 11 with explicit provider selection
+- Add direct OCR recognition for images with constrained decoding
+- Add local-model recognition for cropped wired and wireless tables with typed cells and HTML output
+
+### Changes
+
+- Restrict deskewing to scan-like raster-dominant pages with page-specific annotation handling
+- Improve OCR text-layer geometry and rendering with polygon-aware word placement
+- Replace pinned OCR model hashes with structural validation and model compatibility checks
+- Reuse OCR predictions across deskew and text-layer generation
+
+### Documentation
+
+- Document DirectML setup, direct image recognition, and table model contracts
+
+### CI / Build
+
+- Move ONNX Runtime to mutually exclusive CPU and DirectML OCR extras
+- Add the PaddleX OCR dependency required for local table recognition
+
 ## [0.8.0] - 2026-07-26
 
 ### Features
