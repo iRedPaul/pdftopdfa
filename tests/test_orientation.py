@@ -33,7 +33,7 @@ from pdftopdfa.orientation import (
     _predict_batch,
     _Prediction,
     _refine_low_confidence_predictions,
-    _reset_model_cache_for_tests,
+    _release_model_cache,
     _validate_model_directory,
     normalize_pdf_orientation,
 )
@@ -42,9 +42,9 @@ from pdftopdfa.orientation import (
 @pytest.fixture(autouse=True)
 def _reset_orientation_model():
     """Isolate the process-wide model singleton between tests."""
-    _reset_model_cache_for_tests()
+    _release_model_cache()
     yield
-    _reset_model_cache_for_tests()
+    _release_model_cache()
 
 
 def _bundled_model_dir() -> Path:
@@ -187,6 +187,21 @@ class TestBundledModel:
         assert mock_create.call_args_list[1].args == ("directml",)
         cpu_model.close.assert_called_once_with()
         directml_model.close.assert_not_called()
+
+    @patch("pdftopdfa.orientation._create_model")
+    def test_release_model_cache_closes_loaded_model(
+        self,
+        mock_create: MagicMock,
+    ) -> None:
+        model = MagicMock()
+        mock_create.return_value = model
+        assert _get_model() is model
+
+        _release_model_cache()
+
+        model.close.assert_called_once_with()
+        assert orientation._model is None
+        assert orientation._model_execution_provider is None
 
     @patch("pdftopdfa.orientation._create_model")
     def test_model_is_replaced_when_directml_device_changes(

@@ -1357,8 +1357,8 @@ class PaddleOcrEngine(OcrEngine):
         raise NotImplementedError("PaddleOCR requires the fpdf2 renderer")
 
 
-def _reset_model_cache_for_tests() -> None:
-    """Clear and close cached PaddleOCR state for isolated tests."""
+def _release_model_cache() -> None:
+    """Close and clear cached PaddleOCR state."""
     global _cached_execution_provider, _cached_fingerprint, _cached_model, _cached_pair
     with _prediction_lock, _model_lock:
         if _cached_model is not None:

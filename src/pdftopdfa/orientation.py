@@ -204,8 +204,8 @@ def _get_model(execution_provider: str = "cpu") -> Any:
         return _model
 
 
-def _reset_model_cache_for_tests() -> None:
-    """Close and clear the model singleton for isolated tests."""
+def _release_model_cache() -> None:
+    """Close and clear the model singleton."""
     global _model, _model_execution_provider
 
     with _model_lock:

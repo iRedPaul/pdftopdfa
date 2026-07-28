@@ -145,6 +145,7 @@ def test_recognize_image_is_exposed_by_public_api(
             "pdftopdfa.ocr_paddle.recognize_image",
             return_value=[("123", 0.9)],
         ) as recognize_with_paddle,
+        patch("pdftopdfa.ocr._release_ocr_models") as release_models,
     ):
         result = recognize_image(
             image_path,
@@ -163,6 +164,7 @@ def test_recognize_image_is_exposed_by_public_api(
         layout="single_line",
         allowed_characters="0123456789",
     )
+    release_models.assert_called_once_with()
 
 
 class TestOcrExecutionProvider:
@@ -2065,6 +2067,7 @@ class TestApplyOcr:
                 "pdftopdfa.ocr.ocrmypdf.ocr",
                 side_effect=RuntimeError("inference failed"),
             ),
+            patch("pdftopdfa.ocr._release_ocr_models") as release_models,
             pytest.raises(OCRError, match="inference failed"),
         ):
             apply_ocr(
@@ -2073,6 +2076,8 @@ class TestApplyOcr:
                 detection_model_dir=model_dirs[0],
                 recognition_model_dir=model_dirs[1],
             )
+
+        release_models.assert_called_once_with()
 
 
 class TestVisiblePageRotationFix:

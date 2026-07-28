@@ -33,9 +33,9 @@ from pdftopdfa.ocr import apply_ocr, validate_ocr_languages
 @pytest.fixture(autouse=True)
 def _isolated_model_cache():
     """Keep the process-wide Paddle session isolated between tests."""
-    ocr_paddle._reset_model_cache_for_tests()
+    ocr_paddle._release_model_cache()
     yield
-    ocr_paddle._reset_model_cache_for_tests()
+    ocr_paddle._release_model_cache()
 
 
 @pytest.fixture
@@ -399,6 +399,23 @@ def test_model_session_is_replaced_when_execution_provider_changes(
     assert create_model.call_args_list[1].args == (*model_dirs, "directml")
     cpu_model.close.assert_called_once_with()
     directml_model.close.assert_not_called()
+
+
+def test_release_model_cache_closes_loaded_model(
+    model_dirs: tuple[Path, Path],
+) -> None:
+    model = MagicMock()
+
+    with patch.object(ocr_paddle, "_create_model", return_value=model):
+        assert ocr_paddle._get_model(_options(model_dirs)) is model
+
+    ocr_paddle._release_model_cache()
+
+    model.close.assert_called_once_with()
+    assert ocr_paddle._cached_model is None
+    assert ocr_paddle._cached_pair is None
+    assert ocr_paddle._cached_fingerprint is None
+    assert ocr_paddle._cached_execution_provider is None
 
 
 def test_explicit_validation_reloads_same_path_after_artifact_replacement(

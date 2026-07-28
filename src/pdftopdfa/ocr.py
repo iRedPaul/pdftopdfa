@@ -9,6 +9,7 @@ in image-based PDFs (scanned documents).
 """
 
 import copy
+import gc
 import logging
 import math
 import shutil
@@ -169,14 +170,27 @@ def recognize_image(
 
     from .ocr_paddle import recognize_image as recognize_with_paddle
 
-    return recognize_with_paddle(
-        input_path,
-        detection_model_dir=detection_model_dir,
-        recognition_model_dir=recognition_model_dir,
-        ocr_execution_provider=ocr_execution_provider,
-        layout=layout,
-        allowed_characters=allowed_characters,
-    )
+    try:
+        return recognize_with_paddle(
+            input_path,
+            detection_model_dir=detection_model_dir,
+            recognition_model_dir=recognition_model_dir,
+            ocr_execution_provider=ocr_execution_provider,
+            layout=layout,
+            allowed_characters=allowed_characters,
+        )
+    finally:
+        _release_ocr_models()
+
+
+def _release_ocr_models() -> None:
+    """Release PaddleOCR models and their native ONNX Runtime sessions."""
+    from .ocr_paddle import _release_model_cache
+    from .orientation import _release_model_cache as release_orientation_model_cache
+
+    _release_model_cache()
+    release_orientation_model_cache()
+    gc.collect()
 
 
 def _format_ocr_exception(exc: BaseException) -> str:
@@ -1689,6 +1703,7 @@ def apply_ocr(
         raise OCRError(f"OCR failed: {_format_ocr_exception(e)}") from e
 
     finally:
+        _release_ocr_models()
         if pipeline_temp is not None:
             pipeline_temp.cleanup()
         if orientation_temp is not None:
