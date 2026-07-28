@@ -15,6 +15,7 @@ import pikepdf
 import pytest
 from conftest import new_pdf
 from ocrmypdf.exceptions import PriorOcrFoundError
+from ocrmypdf.pdfinfo import PdfInfo
 from pikepdf import Dictionary, Name, Pdf
 from PIL import Image
 
@@ -547,6 +548,17 @@ class TestOcrDetection:
         assert _page_has_text(pdf_with_image_obj.pages[0]) is False
         assert _page_has_images(pdf_with_text_obj.pages[0]) is False
         assert _page_has_text(pdf_with_text_obj.pages[0]) is True
+
+    def test_whitespace_only_text_does_not_suppress_ocr_detection(self) -> None:
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            page.Contents.write(
+                page.Contents.read_bytes() + b"\nBT /F1 11 Tf [( ) 10.5 ( )] TJ ET"
+            )
+
+            assert _page_has_text(page) is False
+            assert needs_ocr(pdf) is True
 
 
 class TestOcrLanguageMetadata:
@@ -1592,6 +1604,56 @@ class TestApplyOcr:
             "paddle_recognition_model_dir": recognition,
             "paddle_execution_provider": "cpu",
         }
+
+    def test_prepares_whitespace_only_image_page_for_regular_ocr(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "whitespace-text.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            _add_content_page(pdf, visible_text=True)
+            page = pdf.pages[0]
+            page.Contents.write(
+                page.Contents.read_bytes() + b"\nBT /F1 11 Tf [( )] TJ ET"
+            )
+            pdf.save(input_path)
+
+        assert [page.has_text for page in PdfInfo(input_path, max_workers=1).pages] == [
+            True,
+            True,
+        ]
+        prepared_text = []
+
+        def inspect_and_copy(
+            source: Path,
+            destination: Path,
+            **_kwargs: object,
+        ) -> None:
+            assert source != input_path
+            prepared_text.append(
+                [page.has_text for page in PdfInfo(source, max_workers=1).pages]
+            )
+            with Pdf.open(source) as pdf:
+                assert b"Native text" in pdf.pages[1].Contents.read_bytes()
+            shutil.copy2(source, destination)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=inspect_and_copy,
+        ) as mock_ocr:
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+            )
+
+        assert prepared_text == [[False, True]]
+        assert mock_ocr.call_args.kwargs["skip_text"] is True
 
     def test_passes_directml_to_ocrmypdf_plugin(
         self,

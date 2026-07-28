@@ -14,6 +14,7 @@ import math
 import shutil
 import time
 from dataclasses import dataclass, field
+from numbers import Number
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
@@ -985,7 +986,7 @@ def _prepare_deskew_input(
     output_path: Path,
     pages: tuple[int, ...],
 ) -> None:
-    """Create a copy whose selected scan pages no longer advertise old OCR text."""
+    """Create a copy without text-showing operators on the selected image pages."""
     import pikepdf
 
     try:
@@ -1191,7 +1192,7 @@ def needs_ocr(pdf: "pikepdf.Pdf", *, threshold: float = 0.5) -> bool:
 
     Checks each page for the presence of images without recognizable text.
     A page is considered to need OCR if it contains images but has no
-    text operators (Tj/TJ) in the content stream.
+    non-whitespace text operands in the content stream.
 
     Args:
         pdf: The pikepdf.Pdf object to analyze.
@@ -1261,7 +1262,7 @@ def _page_has_images(page: "pikepdf.Page") -> bool:
 
 
 def _page_has_text(page: "pikepdf.Page") -> bool:
-    """Checks if a page contains text operators.
+    """Checks if a page contains non-whitespace text operators.
 
     Uses pikepdf.parse_content_stream for reliable operator detection
     instead of raw byte matching (which can false-positive on binary data).
@@ -1280,8 +1281,11 @@ def _page_has_text(page: "pikepdf.Page") -> bool:
     text_operators = frozenset(["Tj", "TJ", "'", '"'])
 
     try:
-        for _operands, operator in pikepdf.parse_content_stream(page):
-            if str(operator) in text_operators:
+        for operands, operator in pikepdf.parse_content_stream(page):
+            operator_name = str(operator)
+            if operator_name in text_operators and _text_show_has_content(
+                operands, operator_name
+            ):
                 return True
     except Exception as e:
         log_suppressed_error(logger, e, "Error during text analysis: %s", e)
@@ -1343,8 +1347,11 @@ def _form_xobject_has_text(
         visited.add(objgen)
 
     try:
-        for _operands, operator in pikepdf.parse_content_stream(xobj):
-            if str(operator) in text_operators:
+        for operands, operator in pikepdf.parse_content_stream(xobj):
+            operator_name = str(operator)
+            if operator_name in text_operators and _text_show_has_content(
+                operands, operator_name
+            ):
                 return True
     except Exception as e:
         log_suppressed_error(
@@ -1372,6 +1379,62 @@ def _form_xobject_has_text(
         log_suppressed_error(logger, e, "Error checking nested XObjects: %s", e)
 
     return False
+
+
+def _text_show_has_content(operands: object, operator: str) -> bool:
+    """Return whether a text-showing operation contains non-whitespace bytes."""
+    import pikepdf
+
+    try:
+        values = operands[0] if operator == "TJ" else (operands[-1],)  # type: ignore[index]
+        for value in values:
+            if getattr(value, "_type_code", None) != pikepdf.ObjectType.string:
+                if operator == "TJ" and isinstance(value, Number):
+                    continue
+                return True
+            if bytes(value).strip(b" \t\n\f\r"):
+                return True
+        return False
+    except (IndexError, TypeError, ValueError):
+        return True
+
+
+def _find_whitespace_only_text_pages(pdf_path: Path) -> tuple[int, ...]:
+    """Return image pages OCRmyPDF misclassifies because text is only whitespace."""
+    import pikepdf
+    from ocrmypdf.pdfinfo import PdfInfo
+
+    try:
+        pdfinfo = PdfInfo(pdf_path, max_workers=1)
+        with pikepdf.open(pdf_path) as pdf:
+            if len(pdfinfo) != len(pdf.pages):
+                raise OCRError("Page count changed during OCR text analysis")
+            pages = tuple(
+                page_number
+                for page_number, (page_info, page) in enumerate(
+                    zip(pdfinfo.pages, pdf.pages, strict=True),
+                    start=1,
+                )
+                if page_info is not None
+                and page_info.has_text
+                and any(image.renderable for image in page_info.images)
+                and not _page_has_text(page)
+            )
+        if pages:
+            logger.info(
+                "Ignoring whitespace-only text on %d image page(s)",
+                len(pages),
+            )
+        return pages
+    except Exception as exc:
+        log_suppressed_error(
+            logger,
+            exc,
+            "Could not inspect whitespace-only page text in %s: %s",
+            pdf_path,
+            exc,
+        )
+        return ()
 
 
 def apply_ocr(
@@ -1525,6 +1588,19 @@ def apply_ocr(
         existing_ocr_form_names = _ocr_form_names(ocr_input_path)
         completed_input_path = ocr_input_path
 
+        if not force:
+            whitespace_text_pages = _find_whitespace_only_text_pages(ocr_input_path)
+            if whitespace_text_pages:
+                pipeline_temp = TemporaryDirectory(prefix="pdftopdfa_paddle_ocr_")
+                prepared_input = Path(pipeline_temp.name) / "ocr_input.pdf"
+                _prepare_deskew_input(
+                    ocr_input_path,
+                    prepared_input,
+                    whitespace_text_pages,
+                )
+                ocr_input_path = prepared_input
+                completed_input_path = prepared_input
+
         if force:
             run_ocr(ocr_input_path, output_path, redo=True)
         elif not deskew:
@@ -1543,7 +1619,10 @@ def apply_ocr(
             elif not plan.deskew_pages and not plan.regular_ocr_pages:
                 shutil.copy2(ocr_input_path, output_path)
             else:
-                pipeline_temp = TemporaryDirectory(prefix="pdftopdfa_paddle_deskew_")
+                if pipeline_temp is None:
+                    pipeline_temp = TemporaryDirectory(
+                        prefix="pdftopdfa_paddle_deskew_"
+                    )
                 current_input = ocr_input_path
 
                 if plan.regular_ocr_pages:
