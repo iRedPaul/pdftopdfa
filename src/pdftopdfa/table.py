@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 import threading
 from dataclasses import dataclass
 from enum import StrEnum
@@ -105,7 +106,16 @@ class _ResolvedModels:
     text_recognition: _ResolvedModel
 
 
+@dataclass(frozen=True)
+class _TableRuntime:
+    paddleocr: Any
+    common_args: Any
+    paddlex_table: Any
+
+
 _prediction_lock = threading.RLock()
+_runtime_lock = threading.Lock()
+_cached_runtime: _TableRuntime | None = None
 _cached_classifier_key: tuple[_ResolvedModel, str] | None = None
 _cached_classifier: Any | None = None
 _PipelineKey = tuple[
@@ -117,6 +127,39 @@ _PipelineKey = tuple[
     str,
 ]
 _cached_pipelines: dict[TableType, tuple[_PipelineKey, Any]] = {}
+
+
+def _is_frozen_windows() -> bool:
+    return sys.platform == "win32" and bool(getattr(sys, "frozen", False))
+
+
+def _get_table_runtime() -> _TableRuntime:
+    global _cached_runtime
+
+    with _runtime_lock:
+        if _cached_runtime is not None:
+            return _cached_runtime
+        if (
+            _is_frozen_windows()
+            and threading.current_thread() is not threading.main_thread()
+        ):
+            raise OCRError(
+                "PaddleOCR table recognition must be imported on the main thread "
+                "before starting worker threads in a frozen Windows application"
+            )
+
+        import paddleocr
+        import paddleocr._common_args as common_args
+        from paddlex.inference.pipelines.table_recognition import (
+            pipeline_v2 as paddlex_table,
+        )
+
+        _cached_runtime = _TableRuntime(
+            paddleocr=paddleocr,
+            common_args=common_args,
+            paddlex_table=paddlex_table,
+        )
+        return _cached_runtime
 
 
 def _resolve_model_directory(
@@ -207,9 +250,9 @@ def _create_table_classifier(
     execution_provider: str,
 ) -> Any:
     try:
-        from paddleocr import TableClassification
+        runtime = _get_table_runtime()
 
-        classifier = TableClassification(
+        classifier = runtime.paddleocr.TableClassification(
             model_name=_TABLE_CLASSIFICATION_MODEL.name,
             model_dir=str(model.path),
             topk=1,
@@ -266,16 +309,17 @@ def _create_table_pipeline(
         models,
     )
     try:
-        from paddleocr import TableRecognitionPipelineV2
-        from paddleocr._common_args import prepare_common_init_args
-        from paddlex.inference.pipelines.table_recognition.pipeline_v2 import (
-            _TableRecognitionPipelineV2 as PaddleXTableRecognitionPipelineV2,
+        runtime = _get_table_runtime()
+        table_recognition_pipeline_v2 = runtime.paddleocr.TableRecognitionPipelineV2
+        prepare_common_init_args = runtime.common_args.prepare_common_init_args
+        paddlex_table_recognition_pipeline_v2 = (
+            runtime.paddlex_table._TableRecognitionPipelineV2
         )
 
         selected_model_names = frozenset({structure_spec.name, cells_spec.name})
 
         class SelectedPaddleXTableRecognitionPipelineV2(
-            PaddleXTableRecognitionPipelineV2
+            paddlex_table_recognition_pipeline_v2
         ):
             def __init__(self, *args: Any, **kwargs: Any) -> None:
                 self._selected_models: dict[str, Any] = {}
@@ -312,7 +356,7 @@ def _create_table_pipeline(
                     cells_det_threshold,
                 )
 
-        class SelectedTableRecognitionPipelineV2(TableRecognitionPipelineV2):
+        class SelectedTableRecognitionPipelineV2(table_recognition_pipeline_v2):
             def _create_paddlex_pipeline(self) -> Any:
                 kwargs = prepare_common_init_args(None, self._common_args)
                 return SelectedPaddleXTableRecognitionPipelineV2(
@@ -803,3 +847,7 @@ def _reset_model_cache_for_tests() -> None:
         _cached_classifier = None
         _cached_classifier_key = None
         _cached_pipelines.clear()
+
+
+if _is_frozen_windows() and threading.current_thread() is threading.main_thread():
+    _get_table_runtime()

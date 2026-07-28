@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import os
@@ -344,11 +345,12 @@ def test_pipeline_constructor_receives_only_selected_local_model_paths(
 def test_classifier_constructor_is_local_onnx_only(
     model_dirs: dict[str, Path],
 ) -> None:
+    import paddleocr
+
     constructor = MagicMock(return_value=SimpleNamespace())
-    fake_paddleocr = SimpleNamespace(TableClassification=constructor)
     models = table._resolve_models(**model_dirs)
 
-    with patch.dict(sys.modules, {"paddleocr": fake_paddleocr}):
+    with patch.object(paddleocr, "TableClassification", constructor):
         created = table._create_table_classifier(models.classification, "cpu")
 
     assert created is constructor.return_value
@@ -361,6 +363,17 @@ def test_classifier_constructor_is_local_onnx_only(
         enable_hpi=False,
         engine_config={"providers": ["CPUExecutionProvider"]},
     )
+
+
+def test_frozen_windows_runtime_rejects_first_initialization_in_worker() -> None:
+    with (
+        patch.object(table, "_cached_runtime", None),
+        patch.object(table, "_is_frozen_windows", return_value=True),
+        ThreadPoolExecutor(max_workers=1) as executor,
+    ):
+        future = executor.submit(table._get_table_runtime)
+        with pytest.raises(OCRError, match="imported on the main thread"):
+            future.result()
 
 
 def test_pipeline_builds_selected_structure_and_cells_once(
@@ -1178,3 +1191,199 @@ print(json.dumps({"wired": len(wired.cells), "wireless": len(wireless.cells)}))
         "wired",
         "wireless",
     }
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows")
+def test_windows_pyinstaller_first_table_call_from_thread_for_cpu_and_directml(
+    tmp_path: Path,
+) -> None:
+    if importlib.util.find_spec("PyInstaller") is None:
+        pytest.skip("PyInstaller is not installed")
+
+    project_root = Path(__file__).resolve().parents[1]
+    fake_sources = {
+        "pdftopdfa/__init__.py": """
+from .table import TableType, recognize_table
+
+__all__ = ["TableType", "recognize_table"]
+""",
+        "paddleocr/__init__.py": """
+import threading
+from sklearn.preprocessing import StandardScaler
+
+IMPORT_THREAD_IDENT = threading.current_thread().ident
+TableClassification = object
+TableRecognitionPipelineV2 = object
+""",
+        "paddleocr/_common_args.py": """
+def prepare_common_init_args(_unused, common_args):
+    return common_args
+""",
+        "paddlex/__init__.py": "",
+        "paddlex/inference/__init__.py": "",
+        "paddlex/inference/pipelines/__init__.py": "",
+        "paddlex/inference/pipelines/table_recognition/__init__.py": "",
+        "paddlex/inference/pipelines/table_recognition/pipeline_v2.py": """
+class _TableRecognitionPipelineV2:
+    pass
+""",
+        "sklearn/__init__.py": """
+import threading
+
+IMPORT_THREAD_IDENT = threading.current_thread().ident
+""",
+        "sklearn/preprocessing.py": """
+import scipy
+
+class StandardScaler:
+    pass
+""",
+        "scipy/__init__.py": """
+import threading
+
+IMPORT_THREAD_IDENT = threading.current_thread().ident
+""",
+    }
+    for relative_path, source in fake_sources.items():
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source.lstrip(), encoding="utf-8")
+    for filename in ("_ocr_runtime.py", "exceptions.py", "table.py"):
+        source = project_root / "src" / "pdftopdfa" / filename
+        (tmp_path / "pdftopdfa" / filename).write_bytes(source.read_bytes())
+
+    launcher = tmp_path / "table_thread_app.py"
+    launcher.write_text(
+        """
+import sys
+import tempfile
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+from PIL import Image
+
+from pdftopdfa import TableType, recognize_table
+import paddleocr
+import pdftopdfa.table as table
+import scipy
+import sklearn
+
+assert getattr(sys, "frozen", False)
+assert paddleocr.IMPORT_THREAD_IDENT == threading.main_thread().ident
+assert sklearn.IMPORT_THREAD_IDENT == threading.main_thread().ident
+assert scipy.IMPORT_THREAD_IDENT == threading.main_thread().ident
+assert table._cached_runtime is not None
+assert "sklearn" in sys.modules
+assert "scipy" in sys.modules
+
+provider = sys.argv[1]
+prediction = [{"table_res_list": []}]
+classifier = SimpleNamespace(
+    predict=lambda _input: [{"label_names": ["wired_table"], "scores": [1.0]}],
+    close=lambda: None,
+)
+pipeline = SimpleNamespace(
+    predict=lambda _input, **_kwargs: prediction,
+    close=lambda: None,
+)
+table._create_table_classifier = lambda _model, _provider: classifier
+table._create_table_pipeline = lambda _type, _models, _provider: pipeline
+
+with tempfile.TemporaryDirectory() as temporary_directory:
+    root = Path(temporary_directory)
+    model_dirs = {}
+    for name in (
+        "table_classification_model_dir",
+        "wired_table_structure_recognition_model_dir",
+        "wireless_table_structure_recognition_model_dir",
+        "wired_table_cells_detection_model_dir",
+        "wireless_table_cells_detection_model_dir",
+        "detection_model_dir",
+        "recognition_model_dir",
+    ):
+        model_dir = root / name
+        model_dir.mkdir()
+        (model_dir / "inference.onnx").write_bytes(b"onnx")
+        (model_dir / "inference.yml").write_bytes(b"yaml")
+        model_dirs[name] = model_dir
+
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            results.append(
+                recognize_table(
+                    Image.new("RGB", (2, 2), "white"),
+                    ocr_execution_provider=provider,
+                    **model_dirs,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker, name="table-worker")
+    thread.start()
+    thread.join(60)
+    assert not thread.is_alive()
+    if errors:
+        raise errors[0]
+
+assert len(results) == 1
+assert results[0].table_type is TableType.WIRED
+assert table._cached_classifier_key[1] == provider
+assert table._cached_pipelines[TableType.WIRED][0][-1] == provider
+print(provider)
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    dist_path = tmp_path / "dist"
+    hooks_path = tmp_path / "hooks"
+    hooks_path.mkdir()
+    for package in ("scipy", "sklearn"):
+        (hooks_path / f"hook-{package}.py").write_text("", encoding="utf-8")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "PyInstaller",
+            "--noconfirm",
+            "--clean",
+            "--onedir",
+            "--noupx",
+            "--additional-hooks-dir",
+            str(hooks_path),
+            "--name",
+            "table-thread",
+            "--distpath",
+            str(dist_path),
+            "--workpath",
+            str(tmp_path / "build"),
+            "--specpath",
+            str(tmp_path),
+            str(launcher),
+        ],
+        cwd=project_root,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+    executable = dist_path / "table-thread" / "table-thread.exe"
+    for provider in ("cpu", "directml"):
+        completed = subprocess.run(
+            [executable, provider],
+            cwd=project_root,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert completed.stdout.strip().splitlines()[-1] == provider
