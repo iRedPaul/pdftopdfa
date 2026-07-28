@@ -42,7 +42,7 @@ from .metadata import (
     remove_pdfx_identification,
     sync_metadata,
 )
-from .ocr import validate_ocr_languages
+from .ocr import validate_ocr_languages, validate_ocr_page_layout
 from .sanitizers import (
     count_digital_signatures,
     sanitize_for_pdfa,
@@ -87,9 +87,12 @@ def _validate_ocr_configuration(
     ocr_deskew: bool,
     ocr_rotate_pages: bool,
     ocr_execution_provider: str,
+    ocr_layout: str,
+    ocr_layout_model_dir: Path | None,
 ) -> tuple[bool, list[str]]:
     """Validate OCR activation and return its effective language list."""
     ocr_execution_provider = validate_ocr_execution_provider(ocr_execution_provider)
+    ocr_layout = validate_ocr_page_layout(ocr_layout)
     if (ocr_detection_model_dir is None) != (ocr_recognition_model_dir is None):
         raise ValueError(
             "OCR detection and recognition model directories must be provided together"
@@ -102,6 +105,8 @@ def _validate_ocr_configuration(
         or ocr_deskew
         or ocr_rotate_pages
         or ocr_execution_provider != "cpu"
+        or ocr_layout != "none"
+        or ocr_layout_model_dir is not None
     )
     if ocr_requested and ocr_detection_model_dir is None:
         raise ValueError(
@@ -109,6 +114,12 @@ def _validate_ocr_configuration(
         )
 
     effective_languages = ocr_languages if ocr_languages is not None else ["en"]
+    if ocr_layout == "model" and ocr_layout_model_dir is None:
+        raise ValueError("OCR layout mode 'model' requires a layout model directory")
+    if ocr_layout != "model" and ocr_layout_model_dir is not None:
+        raise ValueError(
+            "An OCR layout model directory can only be used with layout mode 'model'"
+        )
     if ocr_requested:
         validate_ocr_languages(effective_languages)
         onnxruntime_engine_config(ocr_execution_provider)
@@ -792,6 +803,8 @@ def convert_to_pdfa(
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
+    ocr_layout: str = "none",
+    ocr_layout_model_dir: Path | None = None,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
@@ -823,6 +836,10 @@ def convert_to_pdfa(
         ocr_execution_provider: ONNX Runtime provider for Paddle models:
             ``"cpu"`` (default), ``"directml"`` or ``"directml:<index>"``
             to select a specific adapter.
+        ocr_layout: Page-layout mode: ``"none"``, ``"simple"``,
+            ``"regions"``, or ``"model"``.
+        ocr_layout_model_dir: Local PP-DocLayout_plus-L ONNX model directory.
+            Required only when ``ocr_layout="model"``.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
@@ -846,6 +863,8 @@ def convert_to_pdfa(
         ocr_deskew=ocr_deskew,
         ocr_rotate_pages=ocr_rotate_pages,
         ocr_execution_provider=ocr_execution_provider,
+        ocr_layout=ocr_layout,
+        ocr_layout_model_dir=ocr_layout_model_dir,
     )
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
@@ -866,7 +885,7 @@ def convert_to_pdfa(
         raise OCRError("Deskew cannot be combined with forced OCR")
     force_ocr_requested = ocr_force and ocr_requested
     explicit_ocr_processing_requested = (
-        force_ocr_requested or ocr_deskew or ocr_rotate_pages
+        force_ocr_requested or ocr_deskew or ocr_rotate_pages or ocr_layout != "none"
     )
 
     if pdfa:
@@ -1071,6 +1090,8 @@ def convert_to_pdfa(
                     deskew=ocr_deskew,
                     rotate_pages=ocr_rotate_pages,
                     ocr_execution_provider=ocr_execution_provider,
+                    layout_mode=ocr_layout,
+                    layout_model_dir=ocr_layout_model_dir,
                     _annotated_pages=annotated_pages,
                 )
 
@@ -1437,6 +1458,8 @@ def convert_files(
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
+    ocr_layout: str = "none",
+    ocr_layout_model_dir: Path | None = None,
     force_overwrite: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -1469,6 +1492,10 @@ def convert_files(
         ocr_execution_provider: ONNX Runtime provider for Paddle models:
             ``"cpu"`` (default), ``"directml"`` or ``"directml:<index>"``
             to select a specific adapter.
+        ocr_layout: Page-layout mode: ``"none"``, ``"simple"``,
+            ``"regions"``, or ``"model"``.
+        ocr_layout_model_dir: Local PP-DocLayout_plus-L ONNX model directory.
+            Required only when ``ocr_layout="model"``.
         force_overwrite: If True, existing output files are overwritten.
             If False, existing outputs are skipped with an error result.
         preserve_stamps: If True, known proprietary stamp annotations are
@@ -1491,6 +1518,8 @@ def convert_files(
         ocr_deskew=ocr_deskew,
         ocr_rotate_pages=ocr_rotate_pages,
         ocr_execution_provider=ocr_execution_provider,
+        ocr_layout=ocr_layout,
+        ocr_layout_model_dir=ocr_layout_model_dir,
     )
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
@@ -1539,6 +1568,8 @@ def convert_files(
                 ocr_deskew=ocr_deskew,
                 ocr_rotate_pages=ocr_rotate_pages,
                 ocr_execution_provider=ocr_execution_provider,
+                ocr_layout=ocr_layout,
+                ocr_layout_model_dir=ocr_layout_model_dir,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 allow_signature_invalidation=allow_signature_invalidation,
@@ -1583,6 +1614,8 @@ def convert_directory(
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
+    ocr_layout: str = "none",
+    ocr_layout_model_dir: Path | None = None,
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
@@ -1615,6 +1648,10 @@ def convert_directory(
         ocr_execution_provider: ONNX Runtime provider for Paddle models:
             ``"cpu"`` (default), ``"directml"`` or ``"directml:<index>"``
             to select a specific adapter.
+        ocr_layout: Page-layout mode: ``"none"``, ``"simple"``,
+            ``"regions"``, or ``"model"``.
+        ocr_layout_model_dir: Local PP-DocLayout_plus-L ONNX model directory.
+            Required only when ``ocr_layout="model"``.
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
             flattened into page content.
@@ -1636,6 +1673,8 @@ def convert_directory(
         ocr_deskew=ocr_deskew,
         ocr_rotate_pages=ocr_rotate_pages,
         ocr_execution_provider=ocr_execution_provider,
+        ocr_layout=ocr_layout,
+        ocr_layout_model_dir=ocr_layout_model_dir,
     )
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
@@ -1726,6 +1765,8 @@ def convert_directory(
         ocr_deskew=ocr_deskew,
         ocr_rotate_pages=ocr_rotate_pages,
         ocr_execution_provider=ocr_execution_provider,
+        ocr_layout=ocr_layout,
+        ocr_layout_model_dir=ocr_layout_model_dir,
         force_overwrite=force_overwrite,
         on_progress=_on_progress if show_progress else None,
         convert_calibrated=convert_calibrated,

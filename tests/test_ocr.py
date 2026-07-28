@@ -1605,7 +1605,48 @@ class TestApplyOcr:
             "paddle_detection_model_dir": detection,
             "paddle_recognition_model_dir": recognition,
             "paddle_execution_provider": "cpu",
+            "paddle_layout_mode": "none",
+            "paddle_layout_model_dir": None,
         }
+
+    def test_passes_model_layout_configuration(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        output = tmp_dir / "output.pdf"
+        layout_model = tmp_dir / "layout-model"
+        layout_model.mkdir()
+        detection, recognition = model_dirs
+
+        with (
+            patch(
+                "pdftopdfa.ocr_paddle.validate_layout_model_directory",
+                return_value=layout_model.resolve(),
+            ) as validate_layout,
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=_copy_ocr_input,
+            ) as mock_ocr,
+        ):
+            apply_ocr(
+                sample_pdf,
+                output,
+                detection_model_dir=detection,
+                recognition_model_dir=recognition,
+                layout_mode="model",
+                layout_model_dir=layout_model,
+            )
+
+        validate_models.assert_called_once_with(detection, recognition)
+        validate_layout.assert_called_once_with(layout_model)
+        assert mock_ocr.call_args.kwargs["paddle_layout_mode"] == "model"
+        assert (
+            mock_ocr.call_args.kwargs["paddle_layout_model_dir"]
+            == layout_model.resolve()
+        )
 
     def test_prepares_whitespace_only_image_page_for_regular_ocr(
         self,

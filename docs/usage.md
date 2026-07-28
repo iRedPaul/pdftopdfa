@@ -97,6 +97,8 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `--ocr-detection-model-dir DIR` | Directory containing compatible PP-OCRv6 Medium detection `inference.onnx` and `inference.yml` |
 | `--ocr-recognition-model-dir DIR` | Directory containing compatible PP-OCRv6 Medium recognition `inference.onnx` and `inference.yml` |
 | `--ocr-execution-provider [cpu\|directml\|directml:INDEX]` | ONNX Runtime execution provider (default: `cpu`); DirectML requires the `directml` extra on Windows 11, and `directml:INDEX` selects a specific GPU |
+| `--ocr-layout [none\|simple\|regions\|model]` | Page reading-order strategy (default: `none`); see [OCR Page Layout](ocr.md#page-layout) |
+| `--ocr-layout-model-dir DIR` | Local PP-DocLayout_plus-L ONNX model directory; valid only with `--ocr-layout model` |
 | `--deskew` | Straighten scan-like, raster-dominant pages; requires both model-directory options and implies `--ocr` |
 | `--rotate-pages` | Automatically orient pages with the bundled Paddle model; requires both model-directory options and implies `--ocr` |
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
@@ -156,6 +158,8 @@ def convert_to_pdfa(
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
+    ocr_layout: str = "none",
+    ocr_layout_model_dir: Path | None = None,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
@@ -241,6 +245,8 @@ def convert_directory(
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
+    ocr_layout: str = "none",
+    ocr_layout_model_dir: Path | None = None,
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
@@ -279,6 +285,8 @@ def convert_files(
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
+    ocr_layout: str = "none",
+    ocr_layout_model_dir: Path | None = None,
     force_overwrite: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,

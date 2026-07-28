@@ -241,6 +241,19 @@ def _ocr_execution_provider_callback(
     "directml:INDEX selects a specific GPU.",
 )
 @click.option(
+    "--ocr-layout",
+    type=click.Choice(["none", "simple", "regions", "model"]),
+    default="none",
+    show_default=True,
+    help="OCR page-layout handling mode.",
+)
+@click.option(
+    "--ocr-layout-model-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Local PP-DocLayout_plus-L ONNX model directory; "
+    "required with --ocr-layout model.",
+)
+@click.option(
     "--ocr-force",
     "ocr_force",
     is_flag=True,
@@ -309,6 +322,8 @@ def main(
     ocr_detection_model_dir: Path | None,
     ocr_recognition_model_dir: Path | None,
     ocr_execution_provider: str,
+    ocr_layout: str,
+    ocr_layout_model_dir: Path | None,
     convert_calibrated: bool,
     preserve_stamps: bool,
     skip_any_pdfa: bool,
@@ -363,6 +378,8 @@ def main(
         or deskew
         or rotate_pages
         or ocr_execution_provider != "cpu"
+        or ocr_layout != "none"
+        or ocr_layout_model_dir is not None
     ):
         if not model_pair_complete:
             raise click.UsageError(
@@ -370,6 +387,12 @@ def main(
             )
     if model_pair_complete:
         ocr_enabled = True
+    if ocr_layout == "model" and ocr_layout_model_dir is None:
+        raise click.UsageError("--ocr-layout model requires --ocr-layout-model-dir")
+    if ocr_layout != "model" and ocr_layout_model_dir is not None:
+        raise click.UsageError(
+            "--ocr-layout-model-dir can only be used with --ocr-layout model"
+        )
 
     ocr_languages = ocr_lang.split("+") if ocr_enabled else None
     if ocr_languages is not None:
@@ -398,6 +421,8 @@ def main(
                 ocr_deskew=deskew,
                 ocr_rotate_pages=rotate_pages,
                 ocr_execution_provider=ocr_execution_provider,
+                ocr_layout=ocr_layout,
+                ocr_layout_model_dir=ocr_layout_model_dir,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 skip_any_pdfa=skip_any_pdfa,
@@ -421,6 +446,8 @@ def main(
                 ocr_deskew=deskew,
                 ocr_rotate_pages=rotate_pages,
                 ocr_execution_provider=ocr_execution_provider,
+                ocr_layout=ocr_layout,
+                ocr_layout_model_dir=ocr_layout_model_dir,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 skip_any_pdfa=skip_any_pdfa,
@@ -469,6 +496,8 @@ def _convert_single_file(
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
+    ocr_layout: str = "none",
+    ocr_layout_model_dir: Path | None = None,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     skip_any_pdfa: bool = False,
@@ -493,6 +522,8 @@ def _convert_single_file(
         ocr_rotate_pages: If True, normalize page orientation before OCR.
         ocr_execution_provider: ONNX Runtime provider for Paddle models;
             ``"directml:<index>"`` selects a specific adapter.
+        ocr_layout: OCR page-layout mode.
+        ocr_layout_model_dir: Local PP-DocLayout_plus-L ONNX model directory.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations
             to standard PDF Stamp annotations instead of flattening them.
@@ -538,6 +569,8 @@ def _convert_single_file(
         ocr_deskew=ocr_deskew,
         ocr_rotate_pages=ocr_rotate_pages,
         ocr_execution_provider=ocr_execution_provider,
+        ocr_layout=ocr_layout,
+        ocr_layout_model_dir=ocr_layout_model_dir,
         convert_calibrated=convert_calibrated,
         preserve_stamps=preserve_stamps,
         allow_signature_invalidation=allow_signature_invalidation,
@@ -603,6 +636,8 @@ def _convert_directory(
     ocr_deskew: bool = False,
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
+    ocr_layout: str = "none",
+    ocr_layout_model_dir: Path | None = None,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     skip_any_pdfa: bool = False,
@@ -628,6 +663,8 @@ def _convert_directory(
         ocr_rotate_pages: If True, normalize page orientation before OCR.
         ocr_execution_provider: ONNX Runtime provider for Paddle models;
             ``"directml:<index>"`` selects a specific adapter.
+        ocr_layout: OCR page-layout mode.
+        ocr_layout_model_dir: Local PP-DocLayout_plus-L ONNX model directory.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations
             to standard PDF Stamp annotations instead of flattening them.
@@ -666,6 +703,8 @@ def _convert_directory(
         ocr_deskew=ocr_deskew,
         ocr_rotate_pages=ocr_rotate_pages,
         ocr_execution_provider=ocr_execution_provider,
+        ocr_layout=ocr_layout,
+        ocr_layout_model_dir=ocr_layout_model_dir,
         force_overwrite=force,
         convert_calibrated=convert_calibrated,
         preserve_stamps=preserve_stamps,

@@ -123,6 +123,7 @@ PADDLE_OCR_LANGUAGES = frozenset(
         "vi",
     }
 )
+OCR_PAGE_LAYOUT_MODES = frozenset({"none", "simple", "regions", "model"})
 
 
 def validate_ocr_languages(languages: list[str]) -> list[str]:
@@ -138,6 +139,15 @@ def validate_ocr_languages(languages: list[str]) -> list[str]:
             f"Supported codes: {supported}"
         )
     return languages
+
+
+def validate_ocr_page_layout(layout_mode: str) -> str:
+    """Validate and return an OCR page-layout mode."""
+    if layout_mode not in OCR_PAGE_LAYOUT_MODES:
+        raise ValueError(
+            f"OCR layout must be one of: {', '.join(sorted(OCR_PAGE_LAYOUT_MODES))}"
+        )
+    return layout_mode
 
 
 def recognize_image(
@@ -1462,6 +1472,8 @@ def apply_ocr(
     deskew: bool = False,
     rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
+    layout_mode: str = "none",
+    layout_model_dir: Path | None = None,
     _annotated_pages: frozenset[int] | None = None,
 ) -> Path:
     """Performs OCR on a PDF.
@@ -1487,6 +1499,10 @@ def apply_ocr(
         ocr_execution_provider: ONNX Runtime provider to use for all Paddle
             models: ``"cpu"`` (default), ``"directml"`` or
             ``"directml:<index>"`` to select a specific adapter.
+        layout_mode: OCR page-layout mode: ``"none"``, ``"simple"``,
+            ``"regions"``, or ``"model"``.
+        layout_model_dir: Local PP-DocLayout_plus-L ONNX model directory.
+            Required only when ``layout_mode="model"``.
 
     Returns:
         Path to the OCR-processed PDF.
@@ -1510,12 +1526,24 @@ def apply_ocr(
             f"pip install pdftopdfa[{extra}]"
         )
 
-    from .ocr_paddle import validate_model_directories
+    from .ocr_paddle import (
+        validate_layout_model_directory,
+        validate_model_directories,
+    )
 
     try:
         validate_ocr_languages(languages)
+        layout_mode = validate_ocr_page_layout(layout_mode)
     except ValueError as exc:
         raise OCRError(str(exc)) from exc
+    if layout_mode == "model":
+        if layout_model_dir is None:
+            raise OCRError("OCR layout mode 'model' requires a layout model directory")
+        layout_model_dir = validate_layout_model_directory(layout_model_dir)
+    elif layout_model_dir is not None:
+        raise OCRError(
+            "An OCR layout model directory can only be used with layout mode 'model'"
+        )
 
     detection_model_dir, recognition_model_dir = validate_model_directories(
         detection_model_dir,
@@ -1524,13 +1552,14 @@ def apply_ocr(
 
     logger.info(
         "Starting PaddleOCR for %s (languages: %s, force: %s, deskew: %s, "
-        "rotate pages: %s, execution provider: %s)",
+        "rotate pages: %s, execution provider: %s, layout: %s)",
         input_path,
         "+".join(languages),
         force,
         deskew,
         rotate_pages,
         ocr_execution_provider,
+        layout_mode,
     )
 
     ocr_input_path = input_path
@@ -1563,6 +1592,8 @@ def apply_ocr(
             "paddle_detection_model_dir": detection_model_dir,
             "paddle_recognition_model_dir": recognition_model_dir,
             "paddle_execution_provider": ocr_execution_provider,
+            "paddle_layout_mode": layout_mode,
+            "paddle_layout_model_dir": layout_model_dir,
         }
         if pages is not None:
             ocr_kwargs["pages"] = ",".join(str(page) for page in pages)
