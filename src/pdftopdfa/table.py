@@ -20,6 +20,7 @@ from lxml import html as lxml_html
 from PIL import Image
 
 from ._ocr_runtime import (
+    _format_exception_message,
     _ModelSpec,
     _validate_model_directory,
     execution_provider_base,
@@ -231,7 +232,8 @@ def _create_table_classifier(
         raise
     except Exception as exc:
         raise OCRError(
-            f"Could not initialize PaddleOCR table classification: {exc}"
+            "Could not initialize PaddleOCR table classification: "
+            f"{_format_exception_message(exc)}"
         ) from exc
 
 
@@ -385,7 +387,8 @@ def _create_table_pipeline(
         raise
     except Exception as exc:
         raise OCRError(
-            f"Could not initialize PaddleOCR table recognition: {exc}"
+            "Could not initialize PaddleOCR table recognition: "
+            f"{_format_exception_message(exc)}"
         ) from exc
 
 

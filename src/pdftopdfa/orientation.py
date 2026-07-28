@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ._ocr_runtime import (
+    _format_exception_message,
     execution_provider_base,
     onnxruntime_engine_config,
     require_execution_provider,
@@ -180,7 +181,8 @@ def _create_model(execution_provider: str = "cpu") -> Any:
         raise
     except Exception as exc:
         raise OCRError(
-            f"Could not load the bundled Paddle orientation model: {exc}"
+            "Could not load the bundled Paddle orientation model: "
+            f"{_format_exception_message(exc)}"
         ) from exc
 
 

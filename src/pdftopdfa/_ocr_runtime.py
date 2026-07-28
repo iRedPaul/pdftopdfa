@@ -129,6 +129,13 @@ def validate_ocr_execution_provider(value: str) -> str:
     return f"{base}:{device_id}"
 
 
+def _format_exception_message(exc: Exception) -> str:
+    """Preserve messages whose native byte encoding is not valid UTF-8."""
+    if isinstance(exc, UnicodeDecodeError):
+        return exc.object.decode(exc.encoding, errors="replace")
+    return str(exc)
+
+
 def onnxruntime_engine_config(value: str) -> dict[str, object]:
     """Return the strict PaddleX ONNX Runtime config for an OCR provider."""
     base, device_id = _parse_execution_provider(value)
@@ -143,7 +150,8 @@ def onnxruntime_engine_config(value: str) -> dict[str, object]:
     except Exception as exc:
         raise OCRError(
             "DirectML execution was requested, but the optional ONNX Runtime "
-            f"could not be loaded: {exc}. Install it on Windows 11 with: "
+            f"could not be loaded: {_format_exception_message(exc)}. "
+            "Install it on Windows 11 with: "
             "pip install pdftopdfa[directml]"
         ) from exc
 
@@ -177,7 +185,8 @@ def require_execution_provider(session: Any, value: str) -> None:
         providers = tuple(session.get_providers())
     except Exception as exc:
         raise OCRError(
-            f"Could not verify the ONNX Runtime {value} execution provider: {exc}"
+            f"Could not verify the ONNX Runtime {value} execution provider: "
+            f"{_format_exception_message(exc)}"
         ) from exc
 
     if not providers or providers[0] != expected:
@@ -246,7 +255,7 @@ _IID_IDXGI_FACTORY1 = _GUID(
 
 @dataclass(frozen=True)
 class DirectMLDevice:
-    """A DirectML-capable adapter and the device index that selects it."""
+    """A DirectML-capable adapter and its raw DXGI device index."""
 
     device_id: int
     description: str
@@ -294,8 +303,9 @@ def _hresult_error(operation: str, hresult: int) -> OCRError:
 def list_directml_devices() -> list[DirectMLDevice]:
     """Return the DirectML adapters in DXGI enumeration order.
 
-    The position in the returned list is the index to use in
-    ``"directml:<index>"``.
+    ``device_id`` is the raw DXGI adapter index used in
+    ``"directml:<device_id>"`` and may be non-consecutive. Duplicate adapters
+    with the same PCI identity are represented by their lowest DXGI index.
     """
     if sys.platform != "win32":
         raise OCRError("DirectML devices can only be enumerated on Windows")
@@ -315,6 +325,7 @@ def list_directml_devices() -> list[DirectMLDevice]:
         raise _hresult_error("CreateDXGIFactory1", hresult)
 
     devices: list[DirectMLDevice] = []
+    seen_pci_devices: set[tuple[int, int, int, int]] = set()
     try:
         enum_adapters = _com_method(
             factory,
@@ -327,7 +338,6 @@ def list_directml_devices() -> list[DirectMLDevice]:
         while True:
             adapter = ctypes.c_void_p()
             hresult = enum_adapters(factory, index, ctypes.byref(adapter))
-            index += 1
             if hresult == _DXGI_ERROR_NOT_FOUND:
                 break
             if hresult < 0 or not adapter:
@@ -343,10 +353,17 @@ def list_directml_devices() -> list[DirectMLDevice]:
                 hresult = get_desc(adapter, ctypes.byref(desc))
                 if hresult < 0:
                     raise _hresult_error("IDXGIAdapter1::GetDesc1", hresult)
-                if _is_directml_adapter(desc):
+                pci_identity = (
+                    desc.VendorId,
+                    desc.DeviceId,
+                    desc.SubSysId,
+                    desc.Revision,
+                )
+                if _is_directml_adapter(desc) and pci_identity not in seen_pci_devices:
+                    seen_pci_devices.add(pci_identity)
                     devices.append(
                         DirectMLDevice(
-                            device_id=len(devices),
+                            device_id=index,
                             description=desc.Description,
                             vendor_id=desc.VendorId,
                             dedicated_video_memory=desc.DedicatedVideoMemory,
@@ -354,6 +371,7 @@ def list_directml_devices() -> list[DirectMLDevice]:
                     )
             finally:
                 _com_release(adapter)
+            index += 1
     finally:
         _com_release(factory)
     return devices

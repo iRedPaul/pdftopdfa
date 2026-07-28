@@ -84,7 +84,9 @@ back to the CPU.
 On a machine with several GPUs, `directml:<index>` picks a specific adapter,
 for example `--ocr-execution-provider directml:1`. Plain `directml` leaves the
 choice to DirectML. `pdftopdfa._ocr_runtime.list_directml_devices()` lists the
-available adapters with the index each one uses.
+available adapters with the raw DXGI index each one uses. These indices may
+have gaps because software adapters are omitted. Repeated DXGI entries with
+the same PCI identity are listed once using their lowest index.
 
 OCR and table recognition do not download models at runtime. Every model must
 be obtained separately and passed through an explicit local directory on each

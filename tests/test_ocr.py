@@ -4,6 +4,7 @@
 
 """Unit tests for the public OCR integration."""
 
+import ctypes
 import shutil
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ from ocrmypdf.exceptions import PriorOcrFoundError
 from pikepdf import Dictionary, Name, Pdf
 from PIL import Image
 
+import pdftopdfa._ocr_runtime as ocr_runtime
 from pdftopdfa import recognize_image
 from pdftopdfa._ocr_runtime import (
     _DXGIAdapterDesc1,
@@ -86,6 +88,51 @@ def _copy_ocr_input(input_path: Path, output_path: Path, **_kwargs: object) -> N
     shutil.copy2(input_path, output_path)
 
 
+def _enumerate_mock_directml_devices(
+    descriptions: list[_DXGIAdapterDesc1],
+) -> list[ocr_runtime.DirectMLDevice]:
+    def create_factory(_iid: object, factory: object) -> int:
+        factory._obj.value = 1
+        return 0
+
+    def enum_adapters(_factory: object, index: int, adapter: object) -> int:
+        if index == len(descriptions):
+            return ocr_runtime._DXGI_ERROR_NOT_FOUND
+        adapter._obj.value = index + 2
+        return 0
+
+    def bind_com_method(
+        pointer: object,
+        method_index: int,
+        *_signature: object,
+    ) -> object:
+        if method_index == ocr_runtime._IDXGI_FACTORY1_ENUM_ADAPTERS1:
+            return enum_adapters
+        if method_index == ocr_runtime._IDXGI_ADAPTER1_GET_DESC1:
+            description = descriptions[pointer.value - 2]
+
+            def get_description(_adapter: object, output: object) -> int:
+                ctypes.memmove(
+                    output,
+                    ctypes.byref(description),
+                    ctypes.sizeof(description),
+                )
+                return 0
+
+            return get_description
+        raise AssertionError(f"Unexpected COM method index {method_index}")
+
+    create_factory_mock = MagicMock(side_effect=create_factory)
+    dxgi = SimpleNamespace(CreateDXGIFactory1=create_factory_mock)
+    with (
+        patch.object(sys, "platform", "win32"),
+        patch.object(ocr_runtime.ctypes, "WinDLL", return_value=dxgi, create=True),
+        patch.object(ocr_runtime, "_com_method", side_effect=bind_com_method),
+        patch.object(ocr_runtime, "_com_release"),
+    ):
+        return list_directml_devices()
+
+
 def test_recognize_image_is_exposed_by_public_api(
     model_dirs: tuple[Path, Path],
     tmp_path: Path,
@@ -152,6 +199,31 @@ class TestOcrExecutionProvider:
             pytest.raises(
                 OCRError,
                 match=r"DmlExecutionProvider.*pdftopdfa\[directml\]",
+            ),
+        ):
+            onnxruntime_engine_config("directml")
+
+    def test_native_error_bytes_survive_invalid_utf8(self) -> None:
+        message = b"ORT: Ger\xe4t nicht verf\xfcgbar"
+
+        def get_available_providers() -> list[str]:
+            raise UnicodeDecodeError(
+                "utf-8",
+                message,
+                8,
+                9,
+                "invalid start byte",
+            )
+
+        fake_onnxruntime = SimpleNamespace(
+            get_available_providers=get_available_providers
+        )
+
+        with (
+            patch.dict("sys.modules", {"onnxruntime": fake_onnxruntime}),
+            pytest.raises(
+                OCRError,
+                match=r"could not be loaded: ORT: Ger.+nicht verf.+gbar",
             ),
         ):
             onnxruntime_engine_config("directml")
@@ -297,17 +369,86 @@ class TestDirectMLDeviceEnumeration:
 
         assert _is_directml_adapter(desc) is False
 
+    def test_device_ids_preserve_raw_dxgi_indices(self) -> None:
+        descriptions = [
+            _DXGIAdapterDesc1(
+                Description="Software Adapter",
+                VendorId=0x1414,
+                Flags=0x2,
+            ),
+            _DXGIAdapterDesc1(
+                Description="GPU A",
+                VendorId=0x10DE,
+                DeviceId=0x1F95,
+                SubSysId=1,
+                Revision=1,
+                DedicatedVideoMemory=4 * 1024**3,
+            ),
+            _DXGIAdapterDesc1(
+                Description="GPU B",
+                VendorId=0x1002,
+                DeviceId=0x73DF,
+                SubSysId=2,
+                Revision=2,
+                DedicatedVideoMemory=8 * 1024**3,
+            ),
+        ]
+
+        devices = _enumerate_mock_directml_devices(descriptions)
+
+        assert [device.description for device in devices] == ["GPU A", "GPU B"]
+        assert [device.device_id for device in devices] == [1, 2]
+        assert [device.execution_provider for device in devices] == [
+            "directml:1",
+            "directml:2",
+        ]
+
+    def test_duplicate_pci_adapters_keep_lowest_dxgi_index(self) -> None:
+        descriptions = [
+            _DXGIAdapterDesc1(
+                Description="GPU",
+                VendorId=0x10DE,
+                DeviceId=0x1F95,
+                SubSysId=0x3A3E17AA,
+                Revision=161,
+                DedicatedVideoMemory=4 * 1024**3,
+            )
+            for _ in range(3)
+        ]
+
+        devices = _enumerate_mock_directml_devices(descriptions)
+
+        assert [device.device_id for device in devices] == [0]
+
+    def test_distinct_device_ids_are_not_deduplicated(self) -> None:
+        descriptions = [
+            _DXGIAdapterDesc1(
+                Description=f"GPU {device_id}",
+                VendorId=0x10DE,
+                DeviceId=device_id,
+                SubSysId=1,
+                Revision=1,
+                DedicatedVideoMemory=4 * 1024**3,
+            )
+            for device_id in (1, 2)
+        ]
+
+        devices = _enumerate_mock_directml_devices(descriptions)
+
+        assert [device.device_id for device in devices] == [0, 1]
+
     @pytest.mark.skipif(sys.platform == "win32", reason="DXGI is available")
     def test_enumeration_is_windows_only(self) -> None:
         with pytest.raises(OCRError, match="only be enumerated on Windows"):
             list_directml_devices()
 
     @pytest.mark.skipif(sys.platform != "win32", reason="requires DXGI")
-    def test_device_ids_are_consecutive_and_usable(self) -> None:
+    def test_device_ids_are_ordered_and_usable(self) -> None:
         """Every listed adapter yields a provider string the API accepts."""
         devices = list_directml_devices()
 
-        assert [device.device_id for device in devices] == list(range(len(devices)))
+        device_ids = [device.device_id for device in devices]
+        assert device_ids == sorted(set(device_ids))
         for device in devices:
             provider = device.execution_provider
             assert provider == f"directml:{device.device_id}"

@@ -30,6 +30,7 @@ from pydantic import BaseModel
 
 from ._ocr_runtime import _MODEL_FILENAMES as _MODEL_FILENAMES
 from ._ocr_runtime import (
+    _format_exception_message,
     _ModelSpec,
     _validate_model_directory,
     execution_provider_base,
@@ -207,7 +208,9 @@ def _create_model(
     except OCRError:
         raise
     except Exception as exc:
-        raise OCRError(f"Could not initialize PaddleOCR: {exc}") from exc
+        raise OCRError(
+            f"Could not initialize PaddleOCR: {_format_exception_message(exc)}"
+        ) from exc
 
 
 def _get_model(options: OcrOptions) -> Any:
