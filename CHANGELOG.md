@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.8.4] - 2026-07-28
+
+### Features
+
+- Add `simple`, `regions`, and `model` OCR layout modes for multi-column and block-based reading order
+- Add offline PP-DocLayout_plus-L block detection for layout-aware OCR
+
+### Changes
+
+- Release OCR detection, recognition, orientation, and layout model sessions after processing
+- Preload the PaddleOCR table runtime on the main thread in frozen Windows applications
+
+### Bug Fixes
+
+- Treat image pages containing only whitespace text as needing OCR
+- Preserve raw DXGI adapter indices and deduplicate repeated hardware entries
+- Preserve native OCR error messages that contain non-UTF-8 bytes
+
+### Documentation
+
+- Document OCR layout modes, local layout-model setup, and CLI and Python usage
+
 ## [0.8.3] - 2026-07-27
 
 ### Features
