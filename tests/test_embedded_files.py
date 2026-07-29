@@ -805,6 +805,20 @@ class TestSanitizeForPdfaEmbeddedFiles:
         af = pdf.Root["/AF"]
         assert len(af) == 1
 
+    def test_direct_filespec_is_shared_with_root_af_after_save(self) -> None:
+        """A direct embedded FileSpec is promoted before adding it to /Root/AF."""
+        pdf = _make_pdf_with_embedded(b"data", "factur-x.xml")
+
+        ensure_af_relationships(pdf)
+
+        buf = BytesIO()
+        pdf.save(buf)
+        with pikepdf.open(buf) as saved_pdf:
+            embedded = saved_pdf.Root.Names.EmbeddedFiles.Names[1]
+            associated = saved_pdf.Root.AF[0]
+            assert embedded.objgen != (0, 0)
+            assert associated.objgen == embedded.objgen
+
 
 # --- Tests for ensure_embedded_file_subtypes ---
 

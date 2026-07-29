@@ -798,9 +798,8 @@ def ensure_af_relationships(pdf: Pdf) -> int:
         Number of FileSpec dictionaries that were fixed.
     """
     fixed_count = 0
-    # Collect all FileSpec references, deduplicated by objgen.
-    # Direct objects (objgen == (0,0)) cannot be deduplicated this way,
-    # so we track them separately by list identity.
+    # Promote direct FileSpecs so /EmbeddedFiles and /AF can share the same
+    # serialized object, then deduplicate them by objgen.
     seen_objgen: set[tuple[int, int]] = set()
     all_filespecs: list[object] = []
 
@@ -815,10 +814,12 @@ def ensure_af_relationships(pdf: Pdf) -> int:
                 og = resolved.objgen
             except (AttributeError, ValueError, TypeError):
                 og = (0, 0)
-            if og != (0, 0):
-                if og in seen_objgen:
-                    return
-                seen_objgen.add(og)
+            if og == (0, 0):
+                resolved = pdf.make_indirect(resolved)
+                og = resolved.objgen
+            if og in seen_objgen:
+                return
+            seen_objgen.add(og)
 
             # Check/fix AFRelationship
             af_rel = resolved.get("/AFRelationship")
@@ -834,7 +835,7 @@ def ensure_af_relationships(pdf: Pdf) -> int:
                     str(af_rel),
                 )
 
-            all_filespecs.append(obj)
+            all_filespecs.append(resolved)
         except Exception as e:
             log_suppressed_error(logger, e, "Error processing FileSpec: %s", e)
 
