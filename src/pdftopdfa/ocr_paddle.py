@@ -1489,12 +1489,11 @@ class PaddleOcrEngine(OcrEngine):
                 second[1] - first[1],
             )
             angle = -_line_angle(polygon)
-            if (
-                edge_length >= minimum_length
-                and _MIN_DESKEW_ANGLE <= abs(angle) <= _MAX_DESKEW_ANGLE
-            ):
+            if edge_length >= minimum_length and abs(angle) <= _MAX_DESKEW_ANGLE:
                 angles.append(angle)
         correction = statistics.median(angles) if len(angles) >= 2 else 0.0
+        if abs(correction) < _MIN_DESKEW_ANGLE:
+            correction = 0.0
         model_pair = _model_pair_for_cache(options)
         if correction == 0.0 and page_key is not None and model_pair is not None:
             with _prediction_lock:

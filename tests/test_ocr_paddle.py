@@ -2086,6 +2086,50 @@ def test_deskew_preserves_pillow_correction_sign(
     assert correction == pytest.approx(angle, abs=0.01)
 
 
+def test_deskew_includes_straight_lines_in_median(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    angles = [0.0, 0.0, 0.0, 3.0, 3.0]
+    result = _result(
+        texts=["one", "two", "three", "four", "five"],
+        scores=[0.9] * len(angles),
+        polygons=[
+            _rotated_polygon(angle, 20 + index * 30)
+            for index, angle in enumerate(angles)
+        ],
+        boxes=[[30, 20 + index * 30, 160, 40 + index * 30] for index in range(5)],
+    )
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        correction = ocr_paddle.PaddleOcrEngine.get_deskew(
+            page_image,
+            _options(model_dirs),
+        )
+
+    assert correction == 0.0
+
+
+def test_deskew_ignores_tiny_median_correction(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    result = _result(
+        texts=["one", "two"],
+        scores=[0.9, 0.9],
+        polygons=[_rotated_polygon(0.04, 40), _rotated_polygon(0.04, 100)],
+        boxes=[[30, 40, 160, 70], [30, 100, 160, 130]],
+    )
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        correction = ocr_paddle.PaddleOcrEngine.get_deskew(
+            page_image,
+            _options(model_dirs),
+        )
+
+    assert correction == 0.0
+
+
 def test_deskew_requires_two_long_lines_within_ten_degrees(
     model_dirs: tuple[Path, Path],
     page_image: Path,
