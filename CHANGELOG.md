@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.8.5] - 2026-07-29
+
+### Changes
+
+- Simplify OCR layout handling to optional column-based ordering without additional models or OCR passes
+- Restrict Latin-language OCR decoding to Latin letters while retaining numbers, punctuation, and symbols
+
+### Bug Fixes
+
+- Preserve valid ToUnicode mappings while replacing only invalid destinations
+- Share direct FileSpec objects between embedded-file name trees and associated-file arrays
+- Improve deskew angle filtering by retaining near-zero lines in the median calculation
+
+### Documentation
+
+- Update OCR layout and Latin-script recognition documentation
+
 ## [0.8.4] - 2026-07-28
 
 ### Features
