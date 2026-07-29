@@ -21,8 +21,8 @@ Instead of re-rendering via Ghostscript, it modifies the PDF structure directly 
 - **OCR support** -- optional PP-OCRv6 Medium text recognition on the CPU or
   through DirectML on Windows 11, with explicit offline model directories and
   no runtime model downloads
-- **Layout-aware OCR** -- optional column ordering, per-column recognition, or
-  PP-DocLayout_plus-L block detection for multi-column documents
+- **Layout-aware OCR** -- optional column-based reading order for multi-column
+  documents without an additional model or OCR pass
 - **Table recognition** -- recognizes already-cropped wired and wireless
   tables as typed cells and HTML using only explicitly supplied local ONNX
   models
@@ -165,8 +165,8 @@ pdftopdfa --ocr-lang de+en \
   --ocr-recognition-model-dir "$REC_MODEL" \
   document.pdf
 
-# Recognize detected columns separately for a cleaner reading order
-pdftopdfa --ocr-layout regions \
+# Order OCR lines by detected columns for a cleaner reading order
+pdftopdfa --ocr-layout \
   --ocr-detection-model-dir "$DET_MODEL" \
   --ocr-recognition-model-dir "$REC_MODEL" \
   document.pdf

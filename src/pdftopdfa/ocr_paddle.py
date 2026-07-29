@@ -17,7 +17,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -64,7 +63,6 @@ class _CachedPrediction:
 
 _DETECTION_MODEL = _ModelSpec(name="PP-OCRv6_medium_det")
 _RECOGNITION_MODEL = _ModelSpec(name="PP-OCRv6_medium_rec")
-_LAYOUT_MODEL = _ModelSpec(name="PP-DocLayout_plus-L")
 
 
 @dataclass(frozen=True)
@@ -81,8 +79,7 @@ class _PaddleOptions(BaseModel):
     detection_model_dir: Path | None = None
     recognition_model_dir: Path | None = None
     execution_provider: str = "cpu"
-    layout_mode: str = "none"
-    layout_model_dir: Path | None = None
+    layout: bool = False
 
 
 class _TesseractCompatibilityOptions(BaseModel):
@@ -99,12 +96,6 @@ _cached_pair: tuple[Path, Path] | None = None
 _cached_fingerprint: tuple[tuple[int, int, int, int, int, int], ...] | None = None
 _cached_model: Any | None = None
 _cached_execution_provider: str | None = None
-_cached_layout_model_dir: Path | None = None
-_cached_layout_fingerprint: tuple[tuple[int, int, int, int, int, int], ...] | None = (
-    None
-)
-_cached_layout_model: Any | None = None
-_cached_layout_execution_provider: str | None = None
 _pending_deskew_results: dict[tuple[Path, int], _CachedPrediction] = {}
 _prediction_result_by_image: dict[Path, _CachedPrediction] = {}
 _coordinate_dpi_lock = threading.Lock()
@@ -163,51 +154,6 @@ def validate_model_directories(
         )
 
 
-def _resolve_and_validate_layout_model_directory(
-    layout_model_dir: Path | None,
-    *,
-    recheck: bool,
-) -> Path:
-    if layout_model_dir is None:
-        raise OCRError("A PP-DocLayout_plus-L model directory is required")
-    try:
-        unresolved = Path(layout_model_dir).expanduser()
-    except (OSError, TypeError, ValueError) as exc:
-        raise OCRError(f"Invalid layout model directory: {exc}") from exc
-    if unresolved.is_symlink():
-        raise OCRError("Layout model directory must not be a symbolic link")
-    try:
-        model_dir = unresolved.resolve()
-    except (OSError, RuntimeError) as exc:
-        raise OCRError(f"Invalid layout model directory: {exc}") from exc
-
-    global _cached_layout_fingerprint, _cached_layout_model_dir
-    with _model_lock:
-        if (
-            not recheck
-            and model_dir == _cached_layout_model_dir
-            and _cached_layout_fingerprint is not None
-        ):
-            return model_dir
-
-        fingerprint = _validate_model_directory(model_dir, _LAYOUT_MODEL)
-        if (
-            model_dir != _cached_layout_model_dir
-            or fingerprint != _cached_layout_fingerprint
-        ):
-            _replace_cached_layout_model(model_dir, fingerprint)
-        return model_dir
-
-
-def validate_layout_model_directory(layout_model_dir: Path | None) -> Path:
-    """Validate the offline PP-DocLayout_plus-L ONNX model directory."""
-    with _prediction_lock:
-        return _resolve_and_validate_layout_model_directory(
-            layout_model_dir,
-            recheck=True,
-        )
-
-
 def _replace_cached_model(
     pair: tuple[Path, Path],
     fingerprint: tuple[tuple[int, int, int, int, int, int], ...],
@@ -222,23 +168,6 @@ def _replace_cached_model(
     _cached_execution_provider = None
     _cached_pair = pair
     _cached_fingerprint = fingerprint
-
-
-def _replace_cached_layout_model(
-    model_dir: Path,
-    fingerprint: tuple[tuple[int, int, int, int, int, int], ...],
-) -> None:
-    global _cached_layout_execution_provider
-    global _cached_layout_fingerprint, _cached_layout_model, _cached_layout_model_dir
-
-    if _cached_layout_model is not None:
-        close = getattr(_cached_layout_model, "close", None)
-        if callable(close):
-            close()
-    _cached_layout_model = None
-    _cached_layout_execution_provider = None
-    _cached_layout_model_dir = model_dir
-    _cached_layout_fingerprint = fingerprint
 
 
 def _create_model(
@@ -293,44 +222,6 @@ def _create_model(
         ) from exc
 
 
-def _create_layout_model(
-    layout_model_dir: Path,
-    execution_provider: str = "cpu",
-) -> Any:
-    try:
-        from paddleocr import LayoutDetection
-
-        model = LayoutDetection(
-            model_name=_LAYOUT_MODEL.name,
-            model_dir=str(layout_model_dir),
-            threshold=0.5,
-            layout_nms=True,
-            engine="onnxruntime",
-            device="cpu",
-            enable_hpi=False,
-            engine_config=onnxruntime_engine_config(execution_provider),
-        )
-        if execution_provider_base(execution_provider) == "directml":
-            try:
-                require_execution_provider(
-                    model.paddlex_predictor.runner.session,
-                    execution_provider,
-                )
-            except Exception:
-                close = getattr(model, "close", None)
-                if callable(close):
-                    close()
-                raise
-        return model
-    except OCRError:
-        raise
-    except Exception as exc:
-        raise OCRError(
-            "Could not initialize PP-DocLayout_plus-L: "
-            f"{_format_exception_message(exc)}"
-        ) from exc
-
-
 def _get_model(options: OcrOptions) -> Any:
     paddle_options = options.paddle
     execution_provider = validate_ocr_execution_provider(
@@ -356,35 +247,6 @@ def _get_model(options: OcrOptions) -> Any:
                 _cached_model = _create_model(*pair, execution_provider)
                 _cached_execution_provider = execution_provider
             return _cached_model
-
-
-def _get_layout_model(options: OcrOptions) -> Any:
-    paddle_options = options.paddle
-    execution_provider = validate_ocr_execution_provider(
-        getattr(paddle_options, "execution_provider", "cpu")
-    )
-    global _cached_layout_execution_provider, _cached_layout_model
-    with _prediction_lock:
-        model_dir = _resolve_and_validate_layout_model_directory(
-            getattr(paddle_options, "layout_model_dir", None),
-            recheck=False,
-        )
-        with _model_lock:
-            if (
-                _cached_layout_model is not None
-                and _cached_layout_execution_provider != execution_provider
-            ):
-                close = getattr(_cached_layout_model, "close", None)
-                if callable(close):
-                    close()
-                _cached_layout_model = None
-            if _cached_layout_model is None:
-                _cached_layout_model = _create_layout_model(
-                    model_dir,
-                    execution_provider,
-                )
-                _cached_layout_execution_provider = execution_provider
-            return _cached_layout_model
 
 
 def _model_pair_for_cache(options: OcrOptions) -> tuple[Path, Path, str] | None:
@@ -551,31 +413,6 @@ def _predict(
     except (KeyError, TypeError):
         pass
     return result
-
-
-def _predict_layout(input_file: Path, options: OcrOptions) -> Any:
-    try:
-        with _prediction_lock:
-            model = _get_layout_model(options)
-            results = list(
-                model.predict(
-                    str(input_file),
-                    batch_size=1,
-                    layout_nms=True,
-                )
-            )
-    except OCRError:
-        raise
-    except Exception as exc:
-        raise OCRError(
-            f"PP-DocLayout_plus-L inference failed for {input_file}: {exc}"
-        ) from exc
-
-    if len(results) != 1:
-        raise OCRError(
-            f"PP-DocLayout_plus-L returned {len(results)} results for one page image"
-        )
-    return results[0]
 
 
 def _text_confidence_results(
@@ -1359,10 +1196,8 @@ def _column_regions(
     content_regions: list[_LayoutRegion],
     width: int,
     height: int,
-    *,
-    minimum_regions_per_column: int = 2,
 ) -> list[_LayoutRegion]:
-    if len(content_regions) < minimum_regions_per_column * 2:
+    if len(content_regions) < 4:
         return [_LayoutRegion(0, 0, width, height)]
 
     intervals = sorted((region.left, region.right) for region in content_regions)
@@ -1391,10 +1226,7 @@ def _column_regions(
             for region in content_regions
             if (region.left + region.right) / 2 >= split
         ]
-        if (
-            len(left_regions) < minimum_regions_per_column
-            or len(right_regions) < minimum_regions_per_column
-        ):
+        if len(left_regions) < 2 or len(right_regions) < 2:
             continue
         candidates.append((gap, split))
 
@@ -1419,7 +1251,7 @@ def _column_regions(
             for region in content_regions
             if column.left <= (region.left + region.right) / 2 < column.right
         ]
-        if len(matches) < minimum_regions_per_column:
+        if len(matches) < 2:
             return [_LayoutRegion(0, 0, width, height)]
         content_span = max(region.right for region in matches) - min(
             region.left for region in matches
@@ -1427,118 +1259,6 @@ def _column_regions(
         if content_span < minimum_span:
             return [_LayoutRegion(0, 0, width, height)]
     return columns
-
-
-def _model_layout_regions(
-    result: Any,
-    width: int,
-    height: int,
-) -> list[_LayoutRegion]:
-    try:
-        boxes = result["boxes"]
-    except (KeyError, TypeError) as exc:
-        raise OCRError("PP-DocLayout_plus-L result is missing boxes") from exc
-    if isinstance(boxes, str | bytes):
-        raise OCRError("PP-DocLayout_plus-L result boxes must be a sequence")
-
-    regions = []
-    try:
-        values = list(boxes)
-    except TypeError as exc:
-        raise OCRError("PP-DocLayout_plus-L result boxes must be a sequence") from exc
-    for value in values:
-        try:
-            coordinate = value["coordinate"]
-        except (KeyError, TypeError):
-            continue
-        region = _region_from_geometry(coordinate, width, height)
-        if region is not None:
-            regions.append(region)
-
-    unique_regions = []
-    for region in sorted(
-        regions,
-        key=lambda item: (
-            item.top,
-            item.left,
-            item.bottom,
-            item.right,
-        ),
-    ):
-        if region not in unique_regions:
-            unique_regions.append(region)
-    if not unique_regions:
-        return [_LayoutRegion(0, 0, width, height)]
-    return _regions_in_reading_order(unique_regions, width, height)
-
-
-def _regions_in_reading_order(
-    regions: list[_LayoutRegion],
-    width: int,
-    height: int,
-) -> list[_LayoutRegion]:
-    columns = _column_regions(
-        regions,
-        width,
-        height,
-        minimum_regions_per_column=1,
-    )
-    if len(columns) == 1:
-        return sorted(
-            regions,
-            key=lambda region: (
-                region.top,
-                region.left,
-                region.bottom,
-                region.right,
-            ),
-        )
-
-    ordered = []
-    remaining = list(regions)
-    for column in columns:
-        matches = [
-            region
-            for region in remaining
-            if column.left <= (region.left + region.right) / 2 < column.right
-        ]
-        matches.sort(
-            key=lambda region: (
-                region.top,
-                region.left,
-                region.bottom,
-                region.right,
-            )
-        )
-        ordered.extend(matches)
-        for region in matches:
-            remaining.remove(region)
-    ordered.extend(
-        sorted(
-            remaining,
-            key=lambda region: (
-                region.top,
-                region.left,
-                region.bottom,
-                region.right,
-            ),
-        )
-    )
-    return ordered
-
-
-def _translate_element(element: OcrElement, x: float, y: float) -> None:
-    if element.bbox is not None:
-        element.bbox = BoundingBox(
-            left=element.bbox.left + x,
-            top=element.bbox.top + y,
-            right=element.bbox.right + x,
-            bottom=element.bbox.bottom + y,
-        )
-    if element.poly is not None:
-        element.poly = [(point_x + x, point_y + y) for point_x, point_y in element.poly]
-    for child in element.children:
-        _translate_element(child, x, y)
 
 
 def _line_column_index(
@@ -1690,69 +1410,6 @@ def _lines_from_result(
     return lines
 
 
-def _recognize_regions(
-    input_file: Path,
-    options: OcrOptions,
-    regions: list[_LayoutRegion],
-    *,
-    raster_dpi: float,
-    scale: float,
-    language: str,
-) -> list[OcrElement]:
-    if len(regions) == 1:
-        region = regions[0]
-        with Image.open(input_file) as image:
-            if region == _LayoutRegion(0, 0, image.width, image.height):
-                lines = _lines_from_result(
-                    _predict(input_file, options),
-                    image.width,
-                    image.height,
-                    scale,
-                    language,
-                )
-                return sorted(
-                    lines,
-                    key=lambda line: (
-                        line.bbox.top if line.bbox is not None else math.inf,
-                        line.bbox.left if line.bbox is not None else math.inf,
-                    ),
-                )
-
-    lines = []
-    with (
-        Image.open(input_file) as image,
-        TemporaryDirectory(
-            prefix="pdftopdfa_layout_",
-            dir=input_file.parent,
-        ) as temporary_directory,
-    ):
-        for index, region in enumerate(regions):
-            crop_path = Path(temporary_directory) / f"{index + 1:06}_region.png"
-            with image.crop(
-                (region.left, region.top, region.right, region.bottom)
-            ) as crop:
-                crop.save(crop_path, dpi=(raster_dpi, raster_dpi))
-                region_lines = _lines_from_result(
-                    _predict(crop_path, options),
-                    crop.width,
-                    crop.height,
-                    scale,
-                    language,
-                )
-            offset_x = region.left * scale
-            offset_y = region.top * scale
-            for line in region_lines:
-                _translate_element(line, offset_x, offset_y)
-            region_lines.sort(
-                key=lambda line: (
-                    line.bbox.top if line.bbox is not None else math.inf,
-                    line.bbox.left if line.bbox is not None else math.inf,
-                )
-            )
-            lines.extend(region_lines)
-    return lines
-
-
 class PaddleOcrEngine(OcrEngine):
     """OCRmyPDF engine backed by offline PP-OCRv6 Medium ONNX models."""
 
@@ -1831,62 +1488,28 @@ class PaddleOcrEngine(OcrEngine):
         width, height, raster_dpi = _image_properties(input_file)
         coordinate_dpi, scale = _take_coordinate_scale(input_file, raster_dpi)
         language = _language_metadata(options)
-        layout_mode = getattr(options.paddle, "layout_mode", "none")
-
-        if layout_mode == "model":
-            regions = _model_layout_regions(
-                _predict_layout(input_file, options),
-                width,
-                height,
-            )
-            lines = _recognize_regions(
-                input_file,
-                options,
-                regions,
-                raster_dpi=raster_dpi,
-                scale=scale,
-                language=language,
-            )
-        else:
-            result = _predict(input_file, options)
-            if layout_mode in {"simple", "regions"}:
-                content_regions = _result_text_regions(result, width, height)
-                columns = _column_regions(content_regions, width, height)
-                if layout_mode == "regions" and len(columns) > 1:
-                    lines = _recognize_regions(
-                        input_file,
-                        options,
-                        columns,
-                        raster_dpi=raster_dpi,
-                        scale=scale,
-                        language=language,
-                    )
-                else:
-                    lines = _lines_from_result(
-                        result,
-                        width,
-                        height,
-                        scale,
-                        language,
-                    )
-                    scaled_columns = [
-                        _LayoutRegion(
-                            round(column.left * scale),
-                            round(column.top * scale),
-                            round(column.right * scale),
-                            round(column.bottom * scale),
-                        )
-                        for column in columns
-                    ]
-                    lines = _sort_lines(lines, scaled_columns)
-            else:
-                lines = _lines_from_result(
-                    result,
-                    width,
-                    height,
-                    scale,
-                    language,
+        layout = bool(getattr(options.paddle, "layout", False))
+        result = _predict(input_file, options)
+        lines = _lines_from_result(
+            result,
+            width,
+            height,
+            scale,
+            language,
+        )
+        if layout:
+            content_regions = _result_text_regions(result, width, height)
+            columns = _column_regions(content_regions, width, height)
+            scaled_columns = [
+                _LayoutRegion(
+                    round(column.left * scale),
+                    round(column.top * scale),
+                    round(column.right * scale),
+                    round(column.bottom * scale),
                 )
+                for column in columns
+            ]
+            lines = _sort_lines(lines, scaled_columns)
 
         page = OcrElement(
             ocr_class=OcrClass.PAGE,
@@ -1926,25 +1549,15 @@ class PaddleOcrEngine(OcrEngine):
 def _release_model_cache() -> None:
     """Close and clear cached PaddleOCR state."""
     global _cached_execution_provider, _cached_fingerprint, _cached_model, _cached_pair
-    global _cached_layout_execution_provider
-    global _cached_layout_fingerprint, _cached_layout_model, _cached_layout_model_dir
     with _prediction_lock, _model_lock:
         if _cached_model is not None:
             close = getattr(_cached_model, "close", None)
-            if callable(close):
-                close()
-        if _cached_layout_model is not None:
-            close = getattr(_cached_layout_model, "close", None)
             if callable(close):
                 close()
         _cached_model = None
         _cached_pair = None
         _cached_fingerprint = None
         _cached_execution_provider = None
-        _cached_layout_model = None
-        _cached_layout_model_dir = None
-        _cached_layout_fingerprint = None
-        _cached_layout_execution_provider = None
         _pending_deskew_results.clear()
         _prediction_result_by_image.clear()
     with _coordinate_dpi_lock:
@@ -1985,13 +1598,8 @@ def add_options(parser: Any) -> None:
         help=SUPPRESS,
     )
     parser.add_argument(
-        "--paddle-layout-mode",
-        default="none",
-        help=SUPPRESS,
-    )
-    parser.add_argument(
-        "--paddle-layout-model-dir",
-        type=Path,
+        "--paddle-layout",
+        action="store_true",
         help=SUPPRESS,
     )
 

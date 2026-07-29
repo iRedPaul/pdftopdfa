@@ -61,8 +61,7 @@ class TestCliHelp:
         assert result.exit_code == 0
         assert "--ocr" in result.output
         assert "--ocr-execution-provider [cpu|directml|directml:INDEX]" in result.output
-        assert "--ocr-layout [none|simple|regions|model]" in result.output
-        assert "--ocr-layout-model-dir" in result.output
+        assert "--ocr-layout" in result.output
         assert "--deskew" in result.output
         assert "--rotate-pages" in result.output
 
@@ -632,7 +631,7 @@ class TestCliOcr:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
-    def test_cli_forwards_model_layout_configuration(
+    def test_cli_forwards_layout_configuration(
         self,
         _mock_is_ocr_available,
         mock_apply_ocr,
@@ -640,7 +639,7 @@ class TestCliOcr:
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """The layout selector and local model directory reach the OCR engine."""
+        """The layout flag reaches the OCR engine."""
         import shutil
 
         mock_apply_ocr.side_effect = lambda inp, out, *args, **kwargs: (
@@ -653,18 +652,12 @@ class TestCliOcr:
                 str(sample_pdf),
                 str(output_path),
                 "--ocr-layout",
-                "model",
-                "--ocr-layout-model-dir",
-                "layout-model",
                 *OCR_MODEL_ARGS,
             ],
         )
 
         assert result.exit_code == EXIT_SUCCESS
-        assert mock_apply_ocr.call_args.kwargs["layout_mode"] == "model"
-        assert mock_apply_ocr.call_args.kwargs["layout_model_dir"] == Path(
-            "layout-model"
-        )
+        assert mock_apply_ocr.call_args.kwargs["layout"] is True
 
     def test_cli_layout_requires_text_models(
         self,
@@ -672,40 +665,18 @@ class TestCliOcr:
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """A layout mode cannot run without the OCR model pair."""
+        """Layout processing cannot run without the OCR model pair."""
         result = runner.invoke(
             main,
             [
                 str(sample_pdf),
                 str(tmp_dir / "layout.pdf"),
                 "--ocr-layout",
-                "simple",
             ],
         )
 
         assert result.exit_code == 2
         assert "OCR requires --ocr-detection-model-dir" in result.output
-
-    def test_cli_model_layout_requires_layout_model(
-        self,
-        runner: CliRunner,
-        sample_pdf: Path,
-        tmp_dir: Path,
-    ) -> None:
-        """The learned layout mode fails before conversion without its model."""
-        result = runner.invoke(
-            main,
-            [
-                str(sample_pdf),
-                str(tmp_dir / "layout.pdf"),
-                "--ocr-layout",
-                "model",
-                *OCR_MODEL_ARGS,
-            ],
-        )
-
-        assert result.exit_code == 2
-        assert "--ocr-layout model requires --ocr-layout-model-dir" in result.output
 
     @patch("pdftopdfa.converter.onnxruntime_engine_config")
     @patch("pdftopdfa.ocr.apply_ocr")

@@ -606,56 +606,41 @@ class TestConvertToPdfa:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
-    def test_convert_forwards_model_layout_configuration(
+    def test_convert_forwards_layout_configuration(
         self,
         _mock_is_ocr_available: MagicMock,
         mock_apply_ocr: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """The public API forwards the selected layout mode and model path."""
+        """The public API forwards the layout flag."""
         import shutil
 
         mock_apply_ocr.side_effect = lambda source, destination, *args, **kwargs: (
             shutil.copy2(source, destination) or destination
         )
-        layout_model_dir = Path("layout-model")
-
         result = convert_to_pdfa(
             sample_pdf,
             tmp_dir / "layout.pdf",
             ocr_detection_model_dir=_DETECTION_MODEL_DIR,
             ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
-            ocr_layout="model",
-            ocr_layout_model_dir=layout_model_dir,
+            ocr_layout=True,
         )
 
         assert result.success is True
-        assert mock_apply_ocr.call_args.kwargs["layout_mode"] == "model"
-        assert mock_apply_ocr.call_args.kwargs["layout_model_dir"] == layout_model_dir
+        assert mock_apply_ocr.call_args.kwargs["layout"] is True
 
-    @pytest.mark.parametrize(
-        "kwargs",
-        [
-            {"ocr_layout": "invalid"},
-            {"ocr_layout": "model"},
-            {"ocr_layout_model_dir": Path("layout-model")},
-        ],
-    )
-    def test_convert_rejects_invalid_layout_configuration(
+    def test_convert_layout_requires_ocr_models(
         self,
-        kwargs: dict[str, object],
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """Invalid or incomplete layout settings fail before conversion."""
-        with pytest.raises(ValueError, match="OCR layout|layout model directory"):
+        """Layout processing cannot run without the OCR model pair."""
+        with pytest.raises(ValueError, match="OCR requires"):
             convert_to_pdfa(
                 sample_pdf,
                 tmp_dir / "layout.pdf",
-                ocr_detection_model_dir=_DETECTION_MODEL_DIR,
-                ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
-                **kwargs,
+                ocr_layout=True,
             )
 
     @patch("pdftopdfa.converter.onnxruntime_engine_config")

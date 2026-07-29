@@ -60,10 +60,9 @@ requires Windows 11, DirectX 12, a current graphics driver, and an integrated
 or dedicated Intel, AMD, or NVIDIA GPU. It uses the same FP32 detection,
 recognition, and bundled orientation ONNX models as CPU execution.
 
-The selected provider applies to text detection, recognition, deskew, page
-orientation, and optional model-based layout detection. If DirectML is
-requested but `DmlExecutionProvider` is not available, `pdftopdfa` raises a
-clear error and does not fall back to CPU.
+The selected provider applies to text detection, recognition, deskew, and page
+orientation. If DirectML is requested but `DmlExecutionProvider` is not
+available, `pdftopdfa` raises a clear error and does not fall back to CPU.
 
 ### Selecting a GPU
 
@@ -127,61 +126,28 @@ directories and pass both paths explicitly on every OCR invocation.
 
 ## Page Layout
 
-`--ocr-layout` controls how recognized text is ordered on pages containing
-separate columns or document blocks:
+`--ocr-layout` detects clear vertical columns from OCR word geometry and orders
+all lines in the left column before the next column. It does not run another
+OCR pass and does not require an additional model. Without the flag,
+PaddleOCR's original line order is preserved.
 
-| Mode | Behavior | Additional work |
-|---|---|---|
-| `none` | Keeps PaddleOCR's original line order. This is the default and preserves previous behavior. | None |
-| `simple` | Detects clear vertical columns from OCR word geometry and orders all lines in the left column before the next column. | No additional OCR pass |
-| `regions` | Detects clear vertical columns from an initial full-page OCR pass, then recognizes each detected column separately. | One OCR pass per detected column |
-| `model` | Uses PP-DocLayout_plus-L to detect document blocks, then recognizes each block separately in reading order. | One layout inference plus one OCR pass per detected block |
-
-`simple` is the fastest layout-aware option, but it cannot separate text that
-the first full-page recognition already merged into one line. `regions`
-addresses that case without another model. If it cannot identify a safe column
-boundary, it keeps the full-page recognition and applies the same ordering as
-`simple`. `model` is intended for more irregular layouts where columns alone
-are insufficient. If it detects no usable block, the full page is recognized
-once.
+The option cannot separate text that the full-page recognition already merged
+into one line. If no safe column boundary is found, it only normalizes the
+top-to-bottom line order.
 
 ```bash
 DET_MODEL=/opt/pdftopdfa/models/PP-OCRv6_medium_det
 REC_MODEL=/opt/pdftopdfa/models/PP-OCRv6_medium_rec
-LAYOUT_MODEL=/opt/pdftopdfa/models/PP-DocLayout_plus-L
 
-# Reorder existing OCR lines by detected columns
-pdftopdfa --ocr-layout simple \
-  --ocr-detection-model-dir "$DET_MODEL" \
-  --ocr-recognition-model-dir "$REC_MODEL" \
-  scan.pdf
-
-# Recognize each detected column independently
-pdftopdfa --ocr-layout regions \
-  --ocr-detection-model-dir "$DET_MODEL" \
-  --ocr-recognition-model-dir "$REC_MODEL" \
-  scan.pdf
-
-# Detect document blocks with the layout model before OCR
-pdftopdfa --ocr-layout model \
-  --ocr-layout-model-dir "$LAYOUT_MODEL" \
+# Order existing OCR lines by detected columns
+pdftopdfa --ocr-layout \
   --ocr-detection-model-dir "$DET_MODEL" \
   --ocr-recognition-model-dir "$REC_MODEL" \
   scan.pdf
 ```
 
-For `model`, download
-[`PP-DocLayout_plus-L_onnx` at `feb7461`](https://huggingface.co/PaddlePaddle/PP-DocLayout_plus-L_onnx/tree/feb74619326f634e0e883218598096a3733ad9f7).
-Its local directory follows the same offline contract and must contain exactly
-`inference.onnx` and `inference.yml`. The model is not downloaded at runtime.
-`--ocr-layout-model-dir` is required only for `model` and is rejected for the
-other modes.
-
-The Python equivalents are `ocr_layout="simple"`, `"regions"`, or `"model"`.
-For the model mode, also pass
-`ocr_layout_model_dir=Path("/opt/pdftopdfa/models/PP-DocLayout_plus-L")`.
-These keywords are available on `convert_to_pdfa()`, `convert_files()`, and
-`convert_directory()`.
+The Python equivalent is `ocr_layout=True`. The keyword is available on
+`convert_to_pdfa()`, `convert_files()`, and `convert_directory()`.
 
 ## Languages
 
@@ -246,8 +212,8 @@ pdftopdfa --no-pdfa --deskew --rotate-pages \
   scan.pdf
 ```
 
-`--ocr`, `--ocr-force`, `--deskew`, `--rotate-pages`, any layout mode other
-than `none`, and an explicit `--ocr-execution-provider directml` are rejected
+`--ocr`, `--ocr-force`, `--deskew`, `--rotate-pages`, `--ocr-layout`, and an
+explicit `--ocr-execution-provider directml` are rejected
 unless both text-model options are present. Providing only one text-model
 option is also rejected. `--ocr-lang` selects metadata but does not activate
 OCR by itself.
@@ -282,7 +248,7 @@ result = convert_to_pdfa(
 The same keywords are available on `convert_files()` and
 `convert_directory()`. Supplying only one directory, or supplying
 `ocr_languages`, `ocr_force`, `ocr_deskew`, `ocr_rotate_pages`, or
-an `ocr_layout` other than `"none"`, or
+`ocr_layout=True`, or
 `ocr_execution_provider="directml"` without the complete text-model pair, raises
 `ValueError` before input processing starts.
 Set `ocr_execution_provider="directml"` only in an installation made with the

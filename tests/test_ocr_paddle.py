@@ -85,8 +85,7 @@ def _options(
     force_ocr: bool = False,
     clean: bool = False,
     execution_provider: str = "cpu",
-    layout_mode: str = "none",
-    layout_model_dir: Path | None = None,
+    layout: bool = False,
 ) -> SimpleNamespace:
     detection_dir, recognition_dir = model_dirs
     return SimpleNamespace(
@@ -94,8 +93,7 @@ def _options(
             detection_model_dir=detection_dir,
             recognition_model_dir=recognition_dir,
             execution_provider=execution_provider,
-            layout_mode=layout_mode,
-            layout_model_dir=layout_model_dir,
+            layout=layout,
         ),
         languages=languages or ["en"],
         ocr_engine="paddle",
@@ -169,28 +167,6 @@ def _assert_polygon(
 def test_model_contract_uses_expected_paddle_names() -> None:
     assert ocr_paddle._DETECTION_MODEL.name == "PP-OCRv6_medium_det"
     assert ocr_paddle._RECOGNITION_MODEL.name == "PP-OCRv6_medium_rec"
-    assert ocr_paddle._LAYOUT_MODEL.name == "PP-DocLayout_plus-L"
-
-
-def test_layout_model_directory_uses_exact_offline_contract(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model_dir = tmp_path / "layout"
-    model_dir.mkdir()
-    (model_dir / "inference.onnx").write_bytes(b"layout onnx")
-    (model_dir / "inference.yml").write_bytes(b"layout yaml")
-    monkeypatch.setattr(
-        ocr_paddle,
-        "_LAYOUT_MODEL",
-        ocr_paddle._ModelSpec(name="test_layout"),
-    )
-
-    assert ocr_paddle.validate_layout_model_directory(model_dir) == model_dir.resolve()
-
-    (model_dir / "unexpected.txt").write_text("unexpected", encoding="utf-8")
-    with pytest.raises(OCRError, match="must contain exactly"):
-        ocr_paddle.validate_layout_model_directory(model_dir)
 
 
 @pytest.mark.parametrize(
@@ -302,27 +278,6 @@ def test_paddle_constructor_is_offline_and_cpu_only(
         return_word_box=True,
         engine="onnxruntime",
         device="cpu",
-        engine_config={"providers": ["CPUExecutionProvider"]},
-    )
-
-
-def test_layout_constructor_is_offline_and_cpu_only(tmp_path: Path) -> None:
-    layout_model_dir = tmp_path / "layout"
-    layout_constructor = MagicMock(return_value=object())
-    fake_module = SimpleNamespace(LayoutDetection=layout_constructor)
-
-    with patch.dict(sys.modules, {"paddleocr": fake_module}):
-        model = ocr_paddle._create_layout_model(layout_model_dir)
-
-    assert model is layout_constructor.return_value
-    layout_constructor.assert_called_once_with(
-        model_name="PP-DocLayout_plus-L",
-        model_dir=str(layout_model_dir),
-        threshold=0.5,
-        layout_nms=True,
-        engine="onnxruntime",
-        device="cpu",
-        enable_hpi=False,
         engine_config={"providers": ["CPUExecutionProvider"]},
     )
 
@@ -838,7 +793,7 @@ def test_column_detection_prefers_structural_gap_over_amount_columns() -> None:
     ]
 
 
-def test_simple_layout_orders_detected_columns_without_rerunning_ocr(
+def test_layout_orders_detected_columns_without_rerunning_ocr(
     model_dirs: tuple[Path, Path],
     page_image: Path,
 ) -> None:
@@ -849,7 +804,7 @@ def test_simple_layout_orders_detected_columns_without_rerunning_ocr(
     ) as predict:
         page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
             page_image,
-            _options(model_dirs, layout_mode="simple"),
+            _options(model_dirs, layout=True),
         )
 
     assert [line.text for line in page.children] == [
@@ -860,107 +815,6 @@ def test_simple_layout_orders_detected_columns_without_rerunning_ocr(
     ]
     assert plain_text == "Left top\nLeft bottom\nRight top\nRight bottom"
     predict.assert_called_once()
-
-
-def test_regions_layout_reruns_ocr_for_each_detected_column(
-    model_dirs: tuple[Path, Path],
-    page_image: Path,
-) -> None:
-    left_result = _result(
-        texts=["Left column"],
-        polygons=[[[20, 20], [120, 20], [120, 40], [20, 40]]],
-        boxes=[[20, 20, 120, 40]],
-    )
-    right_result = _result(
-        texts=["Right column"],
-        polygons=[[[85, 20], [185, 20], [185, 40], [85, 40]]],
-        boxes=[[85, 20, 185, 40]],
-    )
-    with patch.object(
-        ocr_paddle,
-        "_predict",
-        side_effect=[_two_column_result(), left_result, right_result],
-    ) as predict:
-        page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
-            page_image,
-            _options(model_dirs, layout_mode="regions"),
-        )
-
-    assert [line.text for line in page.children] == [
-        "Left column",
-        "Right column",
-    ]
-    assert plain_text == "Left column\nRight column"
-    assert page.children[1].bbox == BoundingBox(
-        left=270,
-        top=20,
-        right=370,
-        bottom=40,
-    )
-    assert predict.call_count == 3
-
-
-def test_model_layout_ocr_follows_detected_block_reading_order(
-    model_dirs: tuple[Path, Path],
-    page_image: Path,
-) -> None:
-    layout_result = {
-        "boxes": [
-            {"coordinate": [240, 0, 400, 50]},
-            {"coordinate": [0, 0, 160, 50]},
-            {"coordinate": [240, 80, 400, 130]},
-            {"coordinate": [0, 80, 160, 130]},
-        ]
-    }
-    region_results = [
-        _result(
-            texts=[text],
-            polygons=[[[10, 10], [140, 10], [140, 30], [10, 30]]],
-            boxes=[[10, 10, 140, 30]],
-        )
-        for text in ("Left top", "Left bottom", "Right top", "Right bottom")
-    ]
-    with (
-        patch.object(ocr_paddle, "_predict_layout", return_value=layout_result),
-        patch.object(ocr_paddle, "_predict", side_effect=region_results) as predict,
-    ):
-        page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
-            page_image,
-            _options(
-                model_dirs,
-                layout_mode="model",
-                layout_model_dir=Path("layout"),
-            ),
-        )
-
-    assert [line.text for line in page.children] == [
-        "Left top",
-        "Left bottom",
-        "Right top",
-        "Right bottom",
-    ]
-    assert plain_text == "Left top\nLeft bottom\nRight top\nRight bottom"
-    assert page.children[2].bbox == BoundingBox(
-        left=250,
-        top=10,
-        right=380,
-        bottom=30,
-    )
-    assert predict.call_count == 4
-
-
-def test_model_layout_orders_single_block_columns_left_to_right() -> None:
-    result = {
-        "boxes": [
-            {"coordinate": [240, 0, 400, 50]},
-            {"coordinate": [0, 40, 160, 90]},
-        ]
-    }
-
-    assert ocr_paddle._model_layout_regions(result, 400, 200) == [
-        ocr_paddle._LayoutRegion(0, 40, 160, 90),
-        ocr_paddle._LayoutRegion(240, 0, 400, 50),
-    ]
 
 
 @pytest.mark.parametrize(
