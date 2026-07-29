@@ -152,7 +152,7 @@ The Python equivalent is `ocr_layout=True`. The keyword is available on
 ## Languages
 
 The default language code is `en`. Use `de` for German and `de+en` on the CLI
-for mixed German/English metadata:
+for mixed German/English recognition:
 
 ```bash
 pdftopdfa --ocr-lang de+en \
@@ -163,6 +163,11 @@ pdftopdfa --ocr-lang de+en \
 
 The Python equivalent is `ocr_languages=["de", "en"]`. Legacy codes such as
 `eng` and `deu` are rejected without compatibility aliases.
+
+When every selected language uses the Latin script, the recognition decoder
+rejects non-Latin letters. Accented Latin letters, numbers, punctuation, and
+symbols remain available. Selecting `ch`, `chinese_cht`, or `japan`, including
+in a mixed language list, keeps the full model character set available.
 
 Accepted PaddleOCR 3.7 codes:
 
@@ -215,8 +220,8 @@ pdftopdfa --no-pdfa --deskew --rotate-pages \
 `--ocr`, `--ocr-force`, `--deskew`, `--rotate-pages`, `--ocr-layout`, and an
 explicit `--ocr-execution-provider directml` are rejected
 unless both text-model options are present. Providing only one text-model
-option is also rejected. `--ocr-lang` selects metadata but does not activate
-OCR by itself.
+option is also rejected. `--ocr-lang` selects the recognition script and
+metadata but does not activate OCR by itself.
 `--ocr-execution-provider` defaults to `cpu`.
 
 ## Python API

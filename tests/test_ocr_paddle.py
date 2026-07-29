@@ -727,6 +727,66 @@ def test_allowed_characters_also_restrict_auto_layout_decoding(
     assert text_rec_model.post_op is decoder
 
 
+def test_latin_character_filter_keeps_accents_numbers_and_punctuation() -> None:
+    for character in ("A", "ä", "ß", "é", "1", "€", "—"):
+        assert ocr_paddle._has_only_latin_letters(character)
+
+    for character in ("𩡥", "中", "Ж", "あ", "\uf140"):
+        assert not ocr_paddle._has_only_latin_letters(character)
+
+
+@pytest.mark.parametrize(
+    ("languages", "expected_text"),
+    [
+        pytest.param(["de"], "A", id="latin"),
+        pytest.param(["ch"], "𩡥", id="chinese"),
+    ],
+)
+def test_generate_ocr_restricts_non_latin_letters_for_latin_languages(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+    languages: list[str],
+    expected_text: str,
+) -> None:
+    class Decoder:
+        character = ["blank", "A", "𩡥"]
+
+        @staticmethod
+        def get_ignored_tokens() -> list[int]:
+            return [0]
+
+        def __call__(
+            self,
+            prediction: list[np.ndarray],
+            **_kwargs: object,
+        ) -> tuple[list[str], list[float]]:
+            logits = prediction[0]
+            index = int(logits.argmax(axis=-1)[0, 0])
+            return [self.character[index]], [float(logits[0, 0, index])]
+
+    decoder = Decoder()
+    text_rec_model = SimpleNamespace(post_op=decoder)
+
+    class Model:
+        paddlex_pipeline = SimpleNamespace(text_rec_model=text_rec_model)
+
+        @staticmethod
+        def predict(_input_file: str, **_kwargs: object) -> list[dict[str, object]]:
+            texts, scores = text_rec_model.post_op(
+                [np.array([[[0.1, 0.8, 0.9]]], dtype=np.float32)]
+            )
+            return [_result(texts=texts, scores=scores)]
+
+    with patch.object(ocr_paddle, "_create_model", return_value=Model()):
+        _page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(model_dirs, languages),
+        )
+
+    assert plain_text == expected_text
+    assert text_rec_model.post_op is decoder
+
+
 def test_generate_ocr_maps_lines_words_geometry_and_metadata(
     model_dirs: tuple[Path, Path],
     page_image: Path,

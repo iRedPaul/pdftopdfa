@@ -122,7 +122,9 @@ Conversely, `--ocr`, `--ocr-force`, `--deskew`, and `--rotate-pages` are
 rejected unless both model options are present.
 
 `--ocr-lang` defaults to `en`. Use `de` for German and `de+en` for mixed
-German/English metadata. The accepted PaddleOCR 3.7 codes are:
+German/English recognition. Latin-script languages restrict decoding to Latin
+letters while retaining numbers, punctuation, and symbols, which prevents
+Chinese-character output on German scans. The accepted PaddleOCR 3.7 codes are:
 
 `af`, `az`, `bs`, `ca`, `ch`, `chinese_cht`, `cs`, `cy`, `da`, `de`, `en`,
 `es`, `et`, `eu`, `fi`, `fr`, `french`, `ga`, `german`, `gl`, `hr`, `hu`,

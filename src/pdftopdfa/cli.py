@@ -217,7 +217,7 @@ def _ocr_execution_provider_callback(
     "--ocr-lang",
     "ocr_lang",
     default="en",
-    help="PaddleOCR language code (default: en). Examples: de, de+en",
+    help="PaddleOCR language and recognition script (default: en). Examples: de, de+en",
 )
 @click.option(
     "--ocr-detection-model-dir",

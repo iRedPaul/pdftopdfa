@@ -285,6 +285,43 @@ class TestSanitizeToUnicodeValues:
         assert new_mapping[2] != 0x0000
         assert new_mapping[3] != 0xFEFF
 
+    def test_valid_ligature_mapping_is_preserved(self):
+        """Sanitizing another entry preserves multi-codepoint mappings."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_tounicode(pdf, {0: 0x0000, 72: 0x0041})
+        cmap = bytes(font["/ToUnicode"].read_bytes()).replace(
+            b"<0048> <0041>",
+            b"<0048> <00660066>",
+        )
+        font["/ToUnicode"].write(cmap)
+        _make_page_with_font(pdf, font)
+
+        result = sanitize_tounicode_values(pdf)
+
+        assert result["tounicode_values_fixed"] == 1
+        new_data = bytes(font["/ToUnicode"].read_bytes())
+        assert b"<0000> <0000>" not in new_data
+        assert b"<0048> <00660066>" in new_data
+
+    def test_incrementing_bfrange_only_replaces_invalid_values(self):
+        """Valid destinations in an affected bfrange remain unchanged."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_tounicode(pdf, {1: 0x0041})
+        cmap = bytes(font["/ToUnicode"].read_bytes()).replace(
+            b"1 beginbfchar\n<0001> <0041>\nendbfchar",
+            b"1 beginbfrange\n<0001> <0003> <0000>\nendbfrange",
+        )
+        font["/ToUnicode"].write(cmap)
+        _make_page_with_font(pdf, font)
+
+        result = sanitize_tounicode_values(pdf)
+
+        assert result["tounicode_values_fixed"] == 1
+        new_mapping = parse_tounicode_cmap(bytes(font["/ToUnicode"].read_bytes()))
+        assert 0xE000 <= new_mapping[1] <= 0xF8FF
+        assert new_mapping[2] == 0x0001
+        assert new_mapping[3] == 0x0002
+
     def test_same_font_on_multiple_pages_fixed_once(self):
         """Same indirect font on two pages is only fixed once."""
         pdf = new_pdf()

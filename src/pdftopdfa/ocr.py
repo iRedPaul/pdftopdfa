@@ -1475,7 +1475,8 @@ def apply_ocr(
         input_path: Path to the input PDF.
         output_path: Path for the OCR-processed PDF.
         languages: PaddleOCR 3.7 PP-OCRv6 language codes (default: ``["en"]``).
-            Example: ``["de", "en"]`` for German + English metadata.
+            Latin-script languages restrict recognition to Latin letters.
+            Example: ``["de", "en"]`` for German + English recognition.
         detection_model_dir: Compatible PP-OCRv6 Medium detection model directory.
         recognition_model_dir: Compatible PP-OCRv6 Medium recognition model directory.
         force: If True, use ocrmypdf's ``redo_ocr`` mode to remove the

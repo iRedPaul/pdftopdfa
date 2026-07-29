@@ -17,6 +17,7 @@ but are missing from the font's ToUnicode CMap.
 """
 
 import logging
+import re
 
 import pikepdf
 from pikepdf import Pdf, Stream
@@ -24,7 +25,6 @@ from pikepdf import Pdf, Stream
 from ..fonts.analysis import get_font_type
 from ..fonts.tounicode import (
     _is_invalid_unicode,
-    filter_invalid_unicode_values,
     generate_cidfont_tounicode_cmap,
     generate_tounicode_cmap_data,
     parse_tounicode_cmap,
@@ -38,14 +38,113 @@ logger = logging.getLogger(__name__)
 # Text-showing operators (PDF Reference, Table 5.6)
 _TEXT_OPERATORS = frozenset({"Tj", "'", '"'})
 _TJ_OPERATOR = "TJ"
+_BFCHAR_BLOCK_PATTERN = re.compile(r"(beginbfchar\b)(.*?)(\bendbfchar)", re.DOTALL)
+_BFCHAR_ENTRY_PATTERN = re.compile(r"(<[0-9A-Fa-f]+>\s*)<([0-9A-Fa-f]+)>")
+_BFRANGE_BLOCK_PATTERN = re.compile(r"(beginbfrange\b)(.*?)(\bendbfrange)", re.DOTALL)
+_BFRANGE_ENTRY_PATTERN = re.compile(
+    r"(<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*)"
+    r"(?:<([0-9A-Fa-f]+)>|\[([^\]]*)\])"
+)
+_HEX_TOKEN_PATTERN = re.compile(r"<([0-9A-Fa-f]+)>")
+
+
+def _sanitize_tounicode_cmap(cmap_data: bytes) -> bytes:
+    """Replace invalid destinations without rebuilding the CMap."""
+    try:
+        text = cmap_data.decode("ascii")
+    except UnicodeDecodeError:
+        return cmap_data
+
+    parsed = parse_tounicode_cmap(cmap_data)
+    used_pua = {value for value in parsed.values() if 0xE000 <= value <= 0xF8FF}
+    next_pua = 0xE000
+
+    def sanitize_destination(hex_value: str) -> str:
+        nonlocal next_pua
+
+        if len(hex_value) % 4 != 0:
+            return hex_value
+
+        units = [
+            int(hex_value[index : index + 4], 16)
+            for index in range(0, len(hex_value), 4)
+        ]
+        changed = False
+        index = 0
+
+        while index < len(units):
+            value = units[index]
+            if (
+                0xD800 <= value <= 0xDBFF
+                and index + 1 < len(units)
+                and 0xDC00 <= units[index + 1] <= 0xDFFF
+            ):
+                index += 2
+                continue
+
+            if _is_invalid_unicode(value):
+                while next_pua in used_pua and next_pua <= 0xF8FF:
+                    next_pua += 1
+                if next_pua <= 0xF8FF:
+                    units[index] = next_pua
+                    used_pua.add(next_pua)
+                    next_pua += 1
+                    changed = True
+
+            index += 1
+
+        if not changed:
+            return hex_value
+        return "".join(f"{value:04X}" for value in units)
+
+    def sanitize_bfchar_block(match: re.Match[str]) -> str:
+        def sanitize_entry(entry: re.Match[str]) -> str:
+            destination = sanitize_destination(entry.group(2))
+            return f"{entry.group(1)}<{destination}>"
+
+        body = _BFCHAR_ENTRY_PATTERN.sub(sanitize_entry, match.group(2))
+        return f"{match.group(1)}{body}{match.group(3)}"
+
+    def sanitize_bfrange_block(match: re.Match[str]) -> str:
+        def sanitize_entry(entry: re.Match[str]) -> str:
+            destination = entry.group(4)
+            if destination is not None:
+                start = int(entry.group(2), 16)
+                end = int(entry.group(3), 16)
+                if end < start:
+                    return entry.group(0)
+
+                destination_start = int(destination, 16)
+                destinations = [
+                    f"{destination_start + offset:0{len(destination)}X}"
+                    for offset in range(end - start + 1)
+                ]
+                sanitized = [sanitize_destination(value) for value in destinations]
+                if sanitized == destinations:
+                    return entry.group(0)
+                values = " ".join(f"<{value}>" for value in sanitized)
+                return f"{entry.group(1)}[{values}]"
+
+            array_body = _HEX_TOKEN_PATTERN.sub(
+                lambda token: f"<{sanitize_destination(token.group(1))}>",
+                entry.group(5),
+            )
+            return f"{entry.group(1)}[{array_body}]"
+
+        body = _BFRANGE_ENTRY_PATTERN.sub(sanitize_entry, match.group(2))
+        return f"{match.group(1)}{body}{match.group(3)}"
+
+    text = _BFCHAR_BLOCK_PATTERN.sub(sanitize_bfchar_block, text)
+    text = _BFRANGE_BLOCK_PATTERN.sub(sanitize_bfrange_block, text)
+    return text.encode("ascii")
 
 
 def sanitize_tounicode_values(pdf: Pdf) -> dict[str, int]:
     """Replaces forbidden Unicode values in existing ToUnicode CMaps.
 
-    Iterates all fonts and checks their ToUnicode streams for U+0000,
-    U+FEFF, or U+FFFE. When found, regenerates the CMap with PUA
-    replacement codepoints.
+    Iterates all fonts and checks their ToUnicode streams for forbidden
+    values. Affected destinations are replaced with PUA codepoints while
+    valid mappings remain unchanged.
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
@@ -79,26 +178,9 @@ def sanitize_tounicode_values(pdf: Pdf) -> dict[str, int]:
                 except Exception:
                     continue
 
-                code_to_unicode = parse_tounicode_cmap(cmap_data)
-                if not code_to_unicode:
+                new_cmap = _sanitize_tounicode_cmap(cmap_data)
+                if new_cmap == cmap_data:
                     continue
-
-                # Check for invalid values (including surrogates)
-                has_invalid = any(
-                    _is_invalid_unicode(v) for v in code_to_unicode.values()
-                )
-                if not has_invalid:
-                    continue
-
-                # Replace invalid values
-                fixed = filter_invalid_unicode_values(code_to_unicode)
-
-                # Regenerate CMap based on font type
-                font_type = get_font_type(font_obj)
-                if font_type == "CIDFont":
-                    new_cmap = generate_cidfont_tounicode_cmap(fixed)
-                else:
-                    new_cmap = generate_tounicode_cmap_data(fixed)
 
                 # Replace the ToUnicode stream
                 new_stream = Stream(pdf, new_cmap)

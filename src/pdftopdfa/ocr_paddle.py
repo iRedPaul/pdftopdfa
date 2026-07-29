@@ -11,6 +11,7 @@ import math
 import re
 import statistics
 import threading
+import unicodedata
 from argparse import SUPPRESS
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -52,6 +53,7 @@ _TESSERACT_PLUGIN = "ocrmypdf.builtin_plugins.tesseract_ocr"
 _MIN_DESKEW_ANGLE = 0.05
 _MAX_DESKEW_ANGLE = 10.0
 _TEXT_DETECTION_LIMIT_SIDE_LEN = 1600
+_NON_LATIN_OCR_LANGUAGES = frozenset({"ch", "chinese_cht", "japan"})
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ class _CachedPrediction:
     result: Any
     model_pair: tuple[Path, Path, str]
     image_size: tuple[int, int]
+    latin_only: bool
 
 
 _DETECTION_MODEL = _ModelSpec(name="PP-OCRv6_medium_det")
@@ -311,12 +314,29 @@ def _ocr_image_masks_text(page: PageContext) -> bool:
         return True
 
 
+def _has_only_latin_letters(character: str) -> bool:
+    for value in character:
+        category = unicodedata.category(value)[0]
+        if category == "L":
+            if "LATIN" not in unicodedata.name(value, ""):
+                return False
+        elif not value.isspace() and category not in {"M", "N", "P", "S"}:
+            return False
+    return True
+
+
+def _latin_only(options: OcrOptions) -> bool:
+    return not _NON_LATIN_OCR_LANGUAGES.intersection(options.languages)
+
+
 @contextmanager
 def _allowed_character_decoder(
     text_rec_model: Any,
     allowed_characters: str | None,
+    *,
+    latin_only: bool = False,
 ) -> Iterator[None]:
-    if allowed_characters is None:
+    if allowed_characters is None and not latin_only:
         yield
         return
 
@@ -327,10 +347,16 @@ def _allowed_character_decoder(
     except AttributeError as exc:
         raise OCRError("PP-OCRv6 CTC decoder is unavailable") from exc
 
-    allowed = set(allowed_characters)
+    allowed = set(allowed_characters) if allowed_characters is not None else None
     masked_classes = np.array(
         [
-            index not in ignored_tokens and character not in allowed
+            index not in ignored_tokens
+            and (
+                allowed is not None
+                and character not in allowed
+                or latin_only
+                and not _has_only_latin_letters(character)
+            )
             for index, character in enumerate(characters)
         ],
         dtype=bool,
@@ -362,6 +388,7 @@ def _predict(
     options: OcrOptions,
     *,
     allowed_characters: str | None = None,
+    latin_only: bool = False,
 ) -> Any:
     try:
         with _prediction_lock:
@@ -374,10 +401,11 @@ def _predict(
                 allowed_characters is None
                 and cached_prediction is not None
                 and cached_prediction.model_pair == _model_pair_for_cache(options)
+                and cached_prediction.latin_only == latin_only
             ):
                 return cached_prediction.result
             model = _get_model(options)
-            if allowed_characters is None:
+            if allowed_characters is None and not latin_only:
                 results = list(
                     model.predict(
                         str(input_file),
@@ -390,6 +418,7 @@ def _predict(
                 with _allowed_character_decoder(
                     model.paddlex_pipeline.text_rec_model,
                     allowed_characters,
+                    latin_only=latin_only,
                 ):
                     results = list(
                         model.predict(
@@ -1444,7 +1473,8 @@ class PaddleOcrEngine(OcrEngine):
                 _pending_deskew_results.pop(page_key, None)
 
         width, height, _dpi = _image_properties(input_file)
-        result = _predict(input_file, options)
+        latin_only = _latin_only(options)
+        result = _predict(input_file, options, latin_only=latin_only)
         _texts, _scores, polygons, _boxes = _parallel_line_data(result)
         minimum_length = max(20.0, min(width, height) * 0.05)
         angles = []
@@ -1472,6 +1502,7 @@ class PaddleOcrEngine(OcrEngine):
                     result=result,
                     model_pair=model_pair,
                     image_size=(width, height),
+                    latin_only=latin_only,
                 )
         return correction
 
@@ -1489,7 +1520,7 @@ class PaddleOcrEngine(OcrEngine):
         coordinate_dpi, scale = _take_coordinate_scale(input_file, raster_dpi)
         language = _language_metadata(options)
         layout = bool(getattr(options.paddle, "layout", False))
-        result = _predict(input_file, options)
+        result = _predict(input_file, options, latin_only=_latin_only(options))
         lines = _lines_from_result(
             result,
             width,
