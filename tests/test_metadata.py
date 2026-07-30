@@ -1594,6 +1594,269 @@ def _parse_xmp_xml(xmp: bytes) -> etree._Element:
     return etree.fromstring(xmp[xml_start:xml_end])
 
 
+_XRECHNUNG_GUIDELINE_ID = (
+    "urn:cen.eu:en16931:2017#compliant#urn:xeinkauf.de:kosit:xrechnung_3.0"
+)
+
+
+def _make_xrechnung_pdf(
+    *,
+    guideline_id: str = _XRECHNUNG_GUIDELINE_ID,
+    type_code: str = "380",
+    extra_xmp_xml: str | None = None,
+) -> tuple[Pdf, bytes]:
+    """Create a PDF with one structurally consistent XRechnung attachment."""
+    cii_namespace = "urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100"
+    ram_namespace = (
+        "urn:un:unece:uncefact:data:standard:"
+        "ReusableAggregateBusinessInformationEntity:100"
+    )
+    xml_bytes = f"""\
+<rsm:CrossIndustryInvoice xmlns:rsm="{cii_namespace}" xmlns:ram="{ram_namespace}">
+  <rsm:ExchangedDocumentContext>
+    <ram:GuidelineSpecifiedDocumentContextParameter>
+      <ram:ID>{guideline_id}</ram:ID>
+    </ram:GuidelineSpecifiedDocumentContextParameter>
+  </rsm:ExchangedDocumentContext>
+  <rsm:ExchangedDocument>
+    <ram:TypeCode>{type_code}</ram:TypeCode>
+  </rsm:ExchangedDocument>
+</rsm:CrossIndustryInvoice>""".encode()
+
+    pdf = new_pdf()
+    pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
+    xml_stream = pdf.make_stream(xml_bytes)
+    xml_stream.Type = Name.EmbeddedFile
+    xml_stream.Subtype = Name("/text/xml")
+    filespec = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Filespec,
+            F="xrechnung.xml",
+            UF="xrechnung.xml",
+            AFRelationship=Name.Alternative,
+            EF=Dictionary(F=xml_stream, UF=xml_stream),
+        )
+    )
+    pdf.Root.Names = Dictionary(
+        EmbeddedFiles=Dictionary(Names=Array(["xrechnung.xml", filespec]))
+    )
+    pdf.Root.AF = Array([filespec])
+
+    if extra_xmp_xml is not None:
+        xmp_xml = f"""\
+<x:xmpmeta xmlns:x="{NAMESPACES["x"]}">
+  <rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}">
+    <rdf:Description rdf:about="">{extra_xmp_xml}</rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"""
+        embed_xmp_metadata(
+            pdf,
+            XMP_HEADER + xmp_xml.encode() + XMP_TRAILER,
+        )
+
+    return pdf, xml_bytes
+
+
+class TestXRechnungMetadataRepair:
+    """Tests for conservative XRechnung Factur-X metadata repair."""
+
+    def test_adds_canonical_factur_x_metadata_and_schema(self) -> None:
+        """Recognized XRechnung 3.0 gets complete canonical Factur-X XMP."""
+        escaped_legacy = (
+            '&lt;rdf:Description xmlns:zf="'
+            'urn:ferd:pdfa:CrossIndustryDocument:invoice:1p0#" '
+            'zf:ConformanceLevel="BASIC" zf:DocumentType="INVOICE" '
+            'zf:DocumentFileName="ZUGFeRD-invoice.xml" '
+            'zf:Version="1.0"/&gt;'
+        )
+        pdf, xml_bytes = _make_xrechnung_pdf(extra_xmp_xml=escaped_legacy)
+
+        sync_metadata(pdf, "3u")
+
+        assert (
+            bytes(pdf.Root.Names.EmbeddedFiles.Names[1].EF.F.read_bytes()) == xml_bytes
+        )
+        tree = _parse_xmp_xml(bytes(pdf.Root.Metadata.read_bytes()))
+        fx_namespace = NAMESPACES["fx"]
+        expected = {
+            "DocumentType": "INVOICE",
+            "DocumentFileName": "xrechnung.xml",
+            "Version": "3.0",
+            "ConformanceLevel": "XRECHNUNG",
+        }
+        for property_name, value in expected.items():
+            elems = list(tree.iter(f"{{{fx_namespace}}}{property_name}"))
+            assert [elem.text for elem in elems] == [value]
+            assert elems[0].prefix == "fx"
+
+        schema_blocks = [
+            li
+            for li in tree.findall(f".//{{{NAMESPACES['rdf']}}}li")
+            if (namespace := li.find(f"{{{_NS_PDFA_SCHEMA}}}namespaceURI")) is not None
+            and namespace.text == fx_namespace
+        ]
+        assert len(schema_blocks) == 1
+        schema = schema_blocks[0]
+        assert schema.findtext(f"{{{_NS_PDFA_SCHEMA}}}schema") == (
+            "Factur-X PDFA Extension Schema"
+        )
+        assert schema.findtext(f"{{{_NS_PDFA_SCHEMA}}}prefix") == "fx"
+        properties = schema.findall(f".//{{{_NS_PDFA_PROPERTY}}}name")
+        assert {prop.text for prop in properties} == set(expected)
+        assert {
+            elem.text for elem in schema.findall(f".//{{{_NS_PDFA_PROPERTY}}}valueType")
+        } == {"Text"}
+        assert {
+            elem.text for elem in schema.findall(f".//{{{_NS_PDFA_PROPERTY}}}category")
+        } == {"external"}
+
+    @pytest.mark.parametrize(
+        ("guideline_id", "type_code"),
+        [
+            (
+                "urn:cen.eu:en16931:2017#compliant#urn:xeinkauf.de:kosit:xrechnung_3.1",
+                "380",
+            ),
+            (_XRECHNUNG_GUIDELINE_ID, "381"),
+        ],
+    )
+    def test_unknown_xml_profile_does_not_add_factur_x_metadata(
+        self,
+        guideline_id: str,
+        type_code: str,
+    ) -> None:
+        """An unknown guideline or document type is not guessed."""
+        pdf, _ = _make_xrechnung_pdf(
+            guideline_id=guideline_id,
+            type_code=type_code,
+        )
+
+        sync_metadata(pdf, "3u")
+
+        tree = _parse_xmp_xml(bytes(pdf.Root.Metadata.read_bytes()))
+        assert not any(
+            list(tree.iter(f"{{{NAMESPACES['fx']}}}{property_name}"))
+            for property_name in (
+                "DocumentType",
+                "DocumentFileName",
+                "Version",
+                "ConformanceLevel",
+            )
+        )
+
+    def test_conflicting_factur_x_metadata_is_left_unchanged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Existing partial or conflicting Factur-X XMP is not overwritten."""
+        pdf, _ = _make_xrechnung_pdf(
+            extra_xmp_xml=(
+                f'<fx:Version xmlns:fx="{NAMESPACES["fx"]}">1.0</fx:Version>'
+            )
+        )
+
+        with caplog.at_level(logging.WARNING, logger="pdftopdfa.metadata"):
+            sync_metadata(pdf, "3u")
+
+        tree = _parse_xmp_xml(bytes(pdf.Root.Metadata.read_bytes()))
+        assert [elem.text for elem in tree.iter(f"{{{NAMESPACES['fx']}}}Version")] == [
+            "1.0"
+        ]
+        assert not list(tree.iter(f"{{{NAMESPACES['fx']}}}ConformanceLevel"))
+        assert "leaving it unchanged" in caplog.text
+
+    def test_correct_partial_factur_x_metadata_is_completed(self) -> None:
+        """Correct existing values are preserved while missing values are added."""
+        invalid_schema = f"""\
+<pdfaExtension:schemas
+    xmlns:pdfaExtension="{_NS_PDFA_EXTENSION}"
+    xmlns:pdfaSchema="{_NS_PDFA_SCHEMA}"
+    xmlns:pdfaProperty="{_NS_PDFA_PROPERTY}">
+  <rdf:Bag>
+    <rdf:li rdf:parseType="Resource">
+      <pdfaSchema:schema>Invalid Factur-X schema</pdfaSchema:schema>
+      <pdfaSchema:namespaceURI>{NAMESPACES["fx"]}</pdfaSchema:namespaceURI>
+      <pdfaSchema:prefix>fx</pdfaSchema:prefix>
+      <pdfaSchema:property>
+        <rdf:Seq>
+          <rdf:li rdf:parseType="Resource">
+            <pdfaProperty:name>Version</pdfaProperty:name>
+            <pdfaProperty:valueType>Integer</pdfaProperty:valueType>
+            <pdfaProperty:category>external</pdfaProperty:category>
+            <pdfaProperty:description>Invalid type</pdfaProperty:description>
+          </rdf:li>
+        </rdf:Seq>
+      </pdfaSchema:property>
+    </rdf:li>
+  </rdf:Bag>
+</pdfaExtension:schemas>"""
+        pdf, _ = _make_xrechnung_pdf(
+            extra_xmp_xml=(
+                f'<fx:Version xmlns:fx="{NAMESPACES["fx"]}">3.0</fx:Version>'
+                f"{invalid_schema}"
+            )
+        )
+
+        sync_metadata(pdf, "3u")
+
+        tree = _parse_xmp_xml(bytes(pdf.Root.Metadata.read_bytes()))
+        expected = {
+            "DocumentType": "INVOICE",
+            "DocumentFileName": "xrechnung.xml",
+            "Version": "3.0",
+            "ConformanceLevel": "XRECHNUNG",
+        }
+        for property_name, value in expected.items():
+            assert [
+                elem.text
+                for elem in tree.iter(f"{{{NAMESPACES['fx']}}}{property_name}")
+            ] == [value]
+
+    def test_noncanonical_hybrid_metadata_blocks_repair(self) -> None:
+        """Actual hybrid metadata in another namespace is not duplicated."""
+        legacy_namespace = "urn:zugferd:pdfa:CrossIndustryDocument:invoice:2p0#"
+        pdf, _ = _make_xrechnung_pdf(
+            extra_xmp_xml=(
+                f'<zf:Version xmlns:zf="{legacy_namespace}">2.0</zf:Version>'
+            )
+        )
+
+        sync_metadata(pdf, "3u")
+
+        tree = _parse_xmp_xml(bytes(pdf.Root.Metadata.read_bytes()))
+        assert not list(tree.iter(f"{{{NAMESPACES['fx']}}}Version"))
+        assert [elem.text for elem in tree.iter(f"{{{legacy_namespace}}}Version")] == [
+            "2.0"
+        ]
+
+    def test_missing_catalog_af_does_not_add_factur_x_metadata(self) -> None:
+        """A Name Tree attachment without matching Catalog /AF is ambiguous."""
+        pdf, _ = _make_xrechnung_pdf()
+        del pdf.Root["/AF"]
+
+        sync_metadata(pdf, "3u")
+
+        tree = _parse_xmp_xml(bytes(pdf.Root.Metadata.read_bytes()))
+        assert not list(tree.iter(f"{{{NAMESPACES['fx']}}}DocumentType"))
+
+    def test_parallel_factur_x_catalog_attachment_blocks_repair(self) -> None:
+        """A second hybrid invoice referenced only from Catalog /AF is ambiguous."""
+        pdf, _ = _make_xrechnung_pdf()
+        competing_filespec = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Filespec,
+                F="factur-x.xml",
+                UF="factur-x.xml",
+                AFRelationship=Name.Alternative,
+            )
+        )
+        pdf.Root.AF.append(competing_filespec)
+
+        sync_metadata(pdf, "3u")
+
+        tree = _parse_xmp_xml(bytes(pdf.Root.Metadata.read_bytes()))
+        assert not list(tree.iter(f"{{{NAMESPACES['fx']}}}DocumentType"))
+
+
 class TestExtensionSchemas:
     """Tests for PDF/A extension schema generation."""
 

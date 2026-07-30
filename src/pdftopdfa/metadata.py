@@ -17,7 +17,7 @@ from lxml import etree
 from lxml.builder import ElementMaker
 
 from .exceptions import ConversionError
-from .utils import log_suppressed_error, validate_pdfa_level
+from .utils import log_suppressed_error, resolve_indirect, validate_pdfa_level
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +100,7 @@ NAMESPACES = {
     "pdfuaid": "http://www.aiim.org/pdfua/ns/id/",
     "pdfeid": "http://www.aiim.org/pdfe/ns/id/",
     "pdfvtid": "http://www.npes.org/pdfvt/ns/id/",
+    "fx": "urn:factur-x:pdfa:CrossIndustryDocument:invoice:1p0#",
     "xmpMM": "http://ns.adobe.com/xap/1.0/mm/",
     "xmpRights": "http://ns.adobe.com/xap/1.0/rights/",
     "xmpTPg": "http://ns.adobe.com/xap/1.0/t/pg/",
@@ -133,6 +134,23 @@ etree.register_namespace("pdfaField", _NS_PDFA_FIELD)
 # XMP packet header and trailer
 XMP_HEADER = b'<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
 XMP_TRAILER = b'\n<?xpacket end="w"?>'
+
+_XRECHNUNG_FILENAME = "xrechnung.xml"
+_FACTUR_X_FILENAME = "factur-x.xml"
+_CII_NAMESPACE = "urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100"
+_RAM_NAMESPACE = (
+    "urn:un:unece:uncefact:data:standard:ReusableAggregateBusinessInformationEntity:100"
+)
+_XRECHNUNG_30_GUIDELINE_ID = (
+    "urn:cen.eu:en16931:2017#compliant#urn:xeinkauf.de:kosit:xrechnung_3.0"
+)
+_XRECHNUNG_30_FACTUR_X_PROPERTIES = {
+    "DocumentType": "INVOICE",
+    "DocumentFileName": _XRECHNUNG_FILENAME,
+    "Version": "3.0",
+    "ConformanceLevel": "XRECHNUNG",
+}
+_FACTUR_X_PROPERTY_NAMES = tuple(_XRECHNUNG_30_FACTUR_X_PROPERTIES)
 
 # XMP property tags that create_xmp_metadata() writes fresh.
 # Everything else found in existing XMP is preserved as-is.
@@ -660,6 +678,28 @@ _KNOWN_EXTENSION_SCHEMAS: dict[
         {
             "rev": ("Integer", "internal", "PDF/A revision year"),
             "corr": ("Text", "internal", "PDF/A corrigendum identifier"),
+        },
+    ),
+    NAMESPACES["fx"]: (
+        "Factur-X PDFA Extension Schema",
+        "fx",
+        {
+            "DocumentFileName": (
+                "Text",
+                "external",
+                "Name of the embedded XML invoice file",
+            ),
+            "DocumentType": ("Text", "external", "INVOICE"),
+            "Version": (
+                "Text",
+                "external",
+                "The actual version of the Factur-X XML schema",
+            ),
+            "ConformanceLevel": (
+                "Text",
+                "external",
+                "The conformance level of the Factur-X data",
+            ),
         },
     ),
 }
@@ -2608,6 +2648,7 @@ def create_xmp_metadata(
     now: datetime | None = None,
     existing_xmp_tree: etree._Element | None = None,
     non_catalog_extension_needs: dict[str, set[str]] | None = None,
+    factur_x_properties: Mapping[str, str] | None = None,
 ) -> bytes:
     """
     Create XMP metadata XML for PDF/A.
@@ -2627,6 +2668,8 @@ def create_xmp_metadata(
         non_catalog_extension_needs: Extra namespace_uri -> {prop_names}
              from non-catalog XMP streams that need extension schema
              declarations in the catalog XMP.
+        factur_x_properties: Canonical Factur-X properties inferred from an
+             embedded XRechnung, or None.
 
     Returns:
         UTF-8 encoded XMP metadata bytes with packet wrapper.
@@ -2639,6 +2682,7 @@ def create_xmp_metadata(
     ns_xmp = NAMESPACES["xmp"]
     ns_pdf = NAMESPACES["pdf"]
     ns_pdfaid = NAMESPACES["pdfaid"]
+    ns_fx = NAMESPACES["fx"]
     ns_xmpmm = NAMESPACES["xmpMM"]
 
     # Build the RDF description content
@@ -2653,6 +2697,8 @@ def create_xmp_metadata(
         "pdfaSchema": _NS_PDFA_SCHEMA,
         "pdfaProperty": _NS_PDFA_PROPERTY,
     }
+    if factur_x_properties is not None:
+        nsmap["fx"] = ns_fx
 
     # Create namespace-aware element makers (only rdf and dc are used as
     # factory functions; other namespaces use etree.SubElement directly)
@@ -2761,6 +2807,13 @@ def create_xmp_metadata(
         keywords_elem = etree.SubElement(description, f"{{{ns_pdf}}}Keywords")
         keywords_elem.text = keywords
 
+    if factur_x_properties is not None:
+        for property_name in _FACTUR_X_PROPERTY_NAMES:
+            if property_name not in factur_x_properties:
+                continue
+            elem = etree.SubElement(description, f"{{{ns_fx}}}{property_name}")
+            elem.text = factur_x_properties[property_name]
+
     # Merge preserved elements from existing XMP
     if existing_xmp_tree is not None:
         try:
@@ -2770,6 +2823,20 @@ def create_xmp_metadata(
         except Exception as e:
             logger.warning("Failed to collect preserved XMP properties: %s", e)
             preserved_elems, preserved_attrs, extra_ns = [], {}, {}
+
+        if factur_x_properties is not None:
+            factur_x_tags = {
+                f"{{{ns_fx}}}{property_name}"
+                for property_name in _FACTUR_X_PROPERTY_NAMES
+            }
+            preserved_elems = [
+                elem for elem in preserved_elems if elem.tag not in factur_x_tags
+            ]
+            preserved_attrs = {
+                name: value
+                for name, value in preserved_attrs.items()
+                if name not in factur_x_tags
+            }
 
         # Register extra namespaces for serialization
         for prefix, uri in extra_ns.items():
@@ -2805,6 +2872,8 @@ def create_xmp_metadata(
         original_blocks = _extract_extension_schema_blocks(existing_xmp_tree)
         if original_blocks:
             original_blocks = _sanitize_extension_schema_blocks(original_blocks)
+            if factur_x_properties is not None:
+                original_blocks.pop(ns_fx, None)
 
     # Build extension schemas for non-predefined properties
     # (includes properties from non-catalog XMP that lack their own
@@ -3272,6 +3341,261 @@ def _iter_non_catalog_metadata_holders(
         yield obj
 
 
+def _iter_embedded_file_name_tree_pairs(
+    node: object,
+    *,
+    depth: int = 0,
+) -> Iterator[tuple[object, object]]:
+    """Yield embedded-file Name Tree pairs without mutating the tree."""
+    if depth >= 64:
+        raise ValueError("EmbeddedFiles Name Tree is too deep")
+
+    resolved = resolve_indirect(node)
+    names = resolved.get("/Names")
+    kids = resolved.get("/Kids")
+    if names is not None and kids is not None:
+        raise ValueError("EmbeddedFiles Name Tree node has both /Names and /Kids")
+
+    if names is not None:
+        if len(names) % 2:
+            raise ValueError("EmbeddedFiles Name Tree has an odd /Names array")
+        for index in range(0, len(names), 2):
+            yield names[index], names[index + 1]
+
+    if kids is not None:
+        for child in kids:
+            yield from _iter_embedded_file_name_tree_pairs(
+                child,
+                depth=depth + 1,
+            )
+
+
+def _filespec_names(filespec: object) -> tuple[str | None, str | None]:
+    """Return a FileSpec's /F and /UF names as strings."""
+    resolved = resolve_indirect(filespec)
+    file_name = resolved.get("/F")
+    unicode_name = resolved.get("/UF")
+    return (
+        str(file_name) if file_name is not None else None,
+        str(unicode_name) if unicode_name is not None else None,
+    )
+
+
+def _indirect_objgen(obj: object) -> tuple[int, int] | None:
+    """Return a non-zero indirect object identifier."""
+    try:
+        objgen = resolve_indirect(obj).objgen
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return objgen if objgen != (0, 0) else None
+
+
+def _extract_xrechnung_30_xml(pdf: pikepdf.Pdf) -> bytes | None:
+    """Return an unambiguous embedded XRechnung 3.0 CII invoice."""
+    try:
+        names = pdf.Root.get("/Names")
+        if names is None:
+            return None
+        names = resolve_indirect(names)
+        embedded_files = names.get("/EmbeddedFiles")
+        if embedded_files is None:
+            return None
+        embedded_files = resolve_indirect(embedded_files)
+        pairs = list(_iter_embedded_file_name_tree_pairs(embedded_files))
+
+        entries: list[tuple[str, str | None, str | None, object]] = []
+        for tree_key, raw_filespec in pairs:
+            tree_name = str(tree_key)
+            file_name, unicode_name = _filespec_names(raw_filespec)
+            names_for_entry = (tree_name, file_name, unicode_name)
+            if _FACTUR_X_FILENAME in names_for_entry:
+                return None
+            if _XRECHNUNG_FILENAME in names_for_entry:
+                entries.append((tree_name, file_name, unicode_name, raw_filespec))
+
+        if len(entries) != 1:
+            return None
+
+        tree_name, file_name, unicode_name, raw_filespec = entries[0]
+        if (tree_name, file_name, unicode_name) != (
+            _XRECHNUNG_FILENAME,
+            _XRECHNUNG_FILENAME,
+            _XRECHNUNG_FILENAME,
+        ):
+            return None
+
+        filespec = resolve_indirect(raw_filespec)
+        if str(filespec.get("/Type")) != "/Filespec":
+            return None
+        if str(filespec.get("/AFRelationship")) != "/Alternative":
+            return None
+
+        filespec_objgen = _indirect_objgen(filespec)
+        if filespec_objgen is None:
+            return None
+
+        root_af = pdf.Root.get("/AF")
+        if root_af is None:
+            return None
+        af_entries = []
+        for raw_af_filespec in root_af:
+            af_file_name, af_unicode_name = _filespec_names(raw_af_filespec)
+            if _FACTUR_X_FILENAME in (af_file_name, af_unicode_name):
+                return None
+            if _XRECHNUNG_FILENAME in (af_file_name, af_unicode_name):
+                af_entries.append(raw_af_filespec)
+        if len(af_entries) != 1:
+            return None
+        if _filespec_names(af_entries[0]) != (
+            _XRECHNUNG_FILENAME,
+            _XRECHNUNG_FILENAME,
+        ):
+            return None
+        if _indirect_objgen(af_entries[0]) != filespec_objgen:
+            return None
+
+        embedded_streams = filespec.get("/EF")
+        if embedded_streams is None:
+            return None
+        embedded_streams = resolve_indirect(embedded_streams)
+        file_stream = resolve_indirect(embedded_streams.get("/F"))
+        unicode_stream = resolve_indirect(embedded_streams.get("/UF"))
+        if not isinstance(file_stream, pikepdf.Stream) or not isinstance(
+            unicode_stream, pikepdf.Stream
+        ):
+            return None
+        if str(file_stream.get("/Type")) != "/EmbeddedFile":
+            return None
+        if str(unicode_stream.get("/Type")) != "/EmbeddedFile":
+            return None
+        if str(file_stream.get("/Subtype")) != "/text/xml":
+            return None
+        if str(unicode_stream.get("/Subtype")) != "/text/xml":
+            return None
+
+        xml_bytes = bytes(file_stream.read_bytes())
+        if not xml_bytes or xml_bytes != bytes(unicode_stream.read_bytes()):
+            return None
+    except Exception as e:
+        log_suppressed_error(
+            logger,
+            e,
+            "Could not inspect embedded XRechnung XML: %s",
+            e,
+        )
+        return None
+
+    try:
+        root = etree.fromstring(xml_bytes, _SECURE_XML_PARSER)
+    except (etree.XMLSyntaxError, ValueError):
+        return None
+    if root.getroottree().docinfo.doctype:
+        return None
+    if root.tag != f"{{{_CII_NAMESPACE}}}CrossIndustryInvoice":
+        return None
+
+    guideline_ids = root.findall(
+        f"{{{_CII_NAMESPACE}}}ExchangedDocumentContext/"
+        f"{{{_RAM_NAMESPACE}}}GuidelineSpecifiedDocumentContextParameter/"
+        f"{{{_RAM_NAMESPACE}}}ID"
+    )
+    type_codes = root.findall(
+        f"{{{_CII_NAMESPACE}}}ExchangedDocument/{{{_RAM_NAMESPACE}}}TypeCode"
+    )
+    if len(guideline_ids) != 1 or len(type_codes) != 1:
+        return None
+    if len(guideline_ids[0]) or guideline_ids[0].text != _XRECHNUNG_30_GUIDELINE_ID:
+        return None
+    if len(type_codes[0]) or type_codes[0].text != "380":
+        return None
+
+    return xml_bytes
+
+
+def _iter_top_level_xmp_descriptions(
+    tree: etree._Element | None,
+) -> Iterator[etree._Element]:
+    """Yield top-level rdf:Description elements from an XMP tree."""
+    if tree is None:
+        return
+    ns_rdf = NAMESPACES["rdf"]
+    for rdf_root in tree.iter(f"{{{ns_rdf}}}RDF"):
+        yield from rdf_root.findall(f"{{{ns_rdf}}}Description")
+
+
+def _collect_factur_x_property_occurrences(
+    tree: etree._Element | None,
+) -> dict[str, list[str | None]]:
+    """Collect canonical Factur-X property occurrences, including invalid ones."""
+    result: dict[str, list[str | None]] = {
+        name: [] for name in _FACTUR_X_PROPERTY_NAMES
+    }
+    namespace = NAMESPACES["fx"]
+    for description in _iter_top_level_xmp_descriptions(tree):
+        for property_name in _FACTUR_X_PROPERTY_NAMES:
+            tag = f"{{{namespace}}}{property_name}"
+            if tag in description.attrib:
+                result[property_name].append(description.attrib[tag])
+            for elem in description.findall(tag):
+                value = None if len(elem) else elem.text
+                result[property_name].append(value)
+    return result
+
+
+def _has_noncanonical_hybrid_invoice_properties(
+    tree: etree._Element | None,
+) -> bool:
+    """Return whether another hybrid-invoice XMP namespace is in use."""
+    canonical_namespace = NAMESPACES["fx"]
+    for description in _iter_top_level_xmp_descriptions(tree):
+        names = list(description.attrib) + [
+            child.tag for child in description if isinstance(child.tag, str)
+        ]
+        for name in names:
+            if not name.startswith("{"):
+                continue
+            namespace, local_name = name[1:].split("}", 1)
+            if (
+                namespace != canonical_namespace
+                and "CrossIndustryDocument" in namespace
+                and local_name in _FACTUR_X_PROPERTY_NAMES
+            ):
+                return True
+    return False
+
+
+def _infer_factur_x_properties(
+    pdf: pikepdf.Pdf,
+    existing_xmp_tree: etree._Element | None,
+) -> dict[str, str] | None:
+    """Infer canonical Factur-X XMP only for an exact XRechnung 3.0 invoice."""
+    if _extract_xrechnung_30_xml(pdf) is None:
+        return None
+
+    occurrences = _collect_factur_x_property_occurrences(existing_xmp_tree)
+    conflicts = {
+        name: values
+        for name, values in occurrences.items()
+        if values and values != [_XRECHNUNG_30_FACTUR_X_PROPERTIES[name]]
+    }
+    if conflicts:
+        logger.warning(
+            "Existing Factur-X XMP metadata conflicts with or duplicates the "
+            "embedded XRechnung values; leaving it unchanged"
+        )
+        return None
+
+    if _has_noncanonical_hybrid_invoice_properties(existing_xmp_tree):
+        logger.warning(
+            "Existing non-canonical hybrid-invoice XMP metadata conflicts with "
+            "the embedded XRechnung; leaving it unchanged"
+        )
+        return None
+
+    logger.info("Adding Factur-X XMP metadata for embedded XRechnung 3.0")
+    return dict(_XRECHNUNG_30_FACTUR_X_PROPERTIES)
+
+
 def sync_metadata(
     pdf: pikepdf.Pdf,
     pdfa_level: str,
@@ -3331,6 +3655,9 @@ def sync_metadata(
         if source_xmp_tree is not None
         else _extract_existing_xmp(pdf)
     )
+    factur_x_properties = (
+        _infer_factur_x_properties(pdf, existing_xmp_tree) if pdfa_part == 3 else None
+    )
 
     # Scan non-catalog XMP streams for properties that need extension
     # schema declarations in the catalog XMP (veraPDF rule 6.6.2.3.1).
@@ -3344,6 +3671,7 @@ def sync_metadata(
         now=now,
         existing_xmp_tree=existing_xmp_tree,
         non_catalog_extension_needs=non_catalog_needs or None,
+        factur_x_properties=factur_x_properties,
     )
 
     # Embed in PDF
