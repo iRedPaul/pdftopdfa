@@ -145,13 +145,14 @@ def _log_signature_info(sig_dict: Dictionary, file_size: int | None = None) -> N
 
         if has_valid_subfilter and has_valid_byte_range:
             logger.info(
-                "Valid digital signature (SubFilter=%s) removed for PDF/A compliance",
+                "Valid digital signature (SubFilter=%s) removed during "
+                "document processing",
                 sub_filter_str,
             )
         elif has_valid_subfilter:
             logger.info(
                 "Digital signature with SubFilter=%s removed for "
-                "PDF/A compliance (ByteRange absent or malformed)",
+                "document processing (ByteRange absent or malformed)",
                 sub_filter_str,
             )
     except Exception:
@@ -172,7 +173,7 @@ def _neutralize_signature_dictionary(sig_dict: Dictionary) -> bool:
 
 
 def _collect_signature_fields(fields, visited=None):
-    """Collect signed signature fields from AcroForm /Fields recursively.
+    """Collect signed signature fields from an AcroForm field tree.
 
     Traverses the field tree via /Kids, collecting fields with /FT /Sig
     that have a /V (signature value) entry.
@@ -188,8 +189,9 @@ def _collect_signature_fields(fields, visited=None):
         visited = set()
 
     result = []
-
-    for field_ref in fields:
+    pending = list(reversed(fields))
+    while pending:
+        field_ref = pending.pop()
         try:
             field = _resolve(field_ref)
         except Exception:
@@ -214,11 +216,10 @@ def _collect_signature_fields(fields, visited=None):
         except Exception:
             pass
 
-        # Recurse into /Kids
         try:
             kids = field.get("/Kids")
             if kids is not None:
-                result.extend(_collect_signature_fields(kids, visited))
+                pending.extend(reversed(kids))
         except Exception:
             pass
 
@@ -353,7 +354,7 @@ def sanitize_signatures(pdf: Pdf, level: str = "3b") -> dict:
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
-        level: PDF/A conformance level ('2b', '2u', '3b', or '3u').
+        level: PDF/A conformance level.
 
     Returns:
         Dictionary with statistics:
@@ -409,7 +410,7 @@ def sanitize_signatures(pdf: Pdf, level: str = "3b") -> dict:
     if stats["signatures_found"] > 0:
         logger.warning(
             "Found %d digital signature dictionary/dictionaries; signatures are "
-            "removed for PDF/A conversion",
+            "removed during document processing",
             stats["signatures_found"],
         )
 

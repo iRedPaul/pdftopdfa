@@ -108,13 +108,14 @@ def sanitize_for_pdfa(
     Performs all necessary sanitization based on the
     conformance level:
 
-    - PDF/A-2b: Remove JavaScript, actions, XFA forms (transparency allowed)
-    - PDF/A-3b: Remove JavaScript, actions, XFA forms (embedded files
-                and transparency allowed)
+    - PDF/A-2: Remove JavaScript, actions, XFA forms (transparency allowed)
+    - PDF/A-3: Remove JavaScript, actions, XFA forms (embedded files and
+               transparency allowed)
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
-        level: PDF/A conformance level ('2b', '2u', '3b', or '3u').
+        level: PDF/A conformance level ('2a', '2b', '2u', '3a', '3b',
+            or '3u').
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
             flattened into page content.
@@ -222,11 +223,11 @@ def sanitize_for_pdfa(
     # Remove forbidden ViewerPreferences entries (ISO 19005-2, 6.1.2)
     result["viewer_prefs_entries_removed"] = remove_forbidden_viewer_preferences(pdf)
 
-    # Ensure /Lang key in catalog (ISO 19005-2, 6.7.3)
+    # Ensure /Lang key in catalog (ISO 19005-2, 6.7.4)
     result["catalog_lang_set"] = ensure_catalog_lang(pdf)
 
     # Ensure /MarkInfo dictionary in catalog (ISO 19005-2, §6.7.1)
-    result["mark_info_added"] = ensure_mark_info(pdf)
+    result["mark_info_added"] = ensure_mark_info(pdf, level)
 
     # Sanitize digital signatures for PDF/A compliance (all levels)
     sig_result = sanitize_signatures(pdf, level)
@@ -336,11 +337,14 @@ def sanitize_for_pdfa(
     result["structure_hex_invalid_fixed"] = structure_result.get("hex_invalid_fixed", 0)
 
     # Sanitize CIDFont structures for PDF/A-2 compliance (all levels)
-    cidfont_result = sanitize_cidfont_structures(pdf)
+    cidfont_result = sanitize_cidfont_structures(pdf, usage_cache)
     result["cidsysteminfo_fixed"] = cidfont_result.get("cidsysteminfo_fixed", 0)
     result["cidtogidmap_fixed"] = cidfont_result.get("cidtogidmap_fixed", 0)
     result["cidset_removed"] = cidfont_result.get("cidset_removed", 0)
     result["type1_charset_removed"] = cidfont_result.get("type1_charset_removed", 0)
+    result["cid_values_over_65535_fixed"] = cidfont_result.get(
+        "cid_values_over_65535_fixed", 0
+    )
     result["cid_values_over_65535_warned"] = cidfont_result.get(
         "cid_values_over_65535_warned", 0
     )
@@ -393,6 +397,13 @@ def sanitize_for_pdfa(
     glyph_coverage_result = sanitize_glyph_coverage(pdf, usage_cache)
     result["glyphs_added"] = glyph_coverage_result.get("glyphs_added", 0)
 
+    # Remove .notdef references before width repair so their original text
+    # advances can be preserved as TJ adjustments.
+    notdef_usage_result = sanitize_notdef_usage(pdf)
+    result["notdef_usage_fixed"] = notdef_usage_result.get("notdef_usage_fixed", 0)
+    if result["notdef_usage_fixed"]:
+        usage_cache.invalidate()
+
     # Validate and fix font widths (ISO 19005-2, 6.3.7)
     # Must run AFTER notdef/glyph_coverage — reads final font program state
     font_widths_result = sanitize_font_widths(pdf, usage_cache)
@@ -407,11 +418,11 @@ def sanitize_for_pdfa(
         "tounicode_values_fixed", 0
     )
 
-    # Fill ToUnicode gaps for Unicode levels (2u/3u) — rule 6.2.11.7.2
+    # Fill ToUnicode gaps for Unicode and accessible levels — rule 6.2.11.7.2
     # Every glyph used in content streams must be mappable to Unicode.
     # At 'b' levels veraPDF only checks ToUnicode existence, not coverage;
-    # at 'u' levels it checks every used glyph individually.
-    if level.endswith("u"):
+    # at 'u' and 'a' levels it checks every used glyph individually.
+    if level.endswith(("u", "a")):
         tounicode_gaps_result = fill_tounicode_gaps(pdf)
         result["tounicode_gaps_filled"] = tounicode_gaps_result.get(
             "tounicode_gaps_filled", 0
@@ -424,13 +435,9 @@ def sanitize_for_pdfa(
             "pua_actualtext_warnings", 0
         )
 
-    # Remove .notdef glyph references from content streams (ISO 19005-2, 6.2.11.8)
-    notdef_usage_result = sanitize_notdef_usage(pdf)
-    result["notdef_usage_fixed"] = notdef_usage_result.get("notdef_usage_fixed", 0)
-
-    # Remove non-compliant embedded files (only 2b/2u)
+    # Remove non-compliant embedded files (PDF/A-2)
     # PDF/A-2 allows embedded files that are themselves PDF/A-1 or PDF/A-2
-    if level in ("2b", "2u"):
+    if level.startswith("2"):
         embed_result = remove_non_compliant_embedded_files(pdf)
         result["files_removed"] = embed_result["removed"]
         result["embedded_files_kept"] = embed_result["kept"]
@@ -439,7 +446,7 @@ def sanitize_for_pdfa(
             "conversion_failed", 0
         )
 
-    # Ensure AF relationships and embedded file metadata (2b/2u and 3b/3u)
+    # Ensure AF relationships and embedded file metadata (PDF/A-2 and PDF/A-3)
     # PDF/A-2 (ISO 19005-2) and PDF/A-3 (ISO 19005-3) both require:
     # - /AFRelationship on FileSpec dicts and /Root/AF array
     # - /Subtype on embedded file streams

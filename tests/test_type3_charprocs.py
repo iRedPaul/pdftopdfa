@@ -254,8 +254,8 @@ class TestType3DefaultColorSpaces:
         assert str(font_cs[0]) == "/ICCBased"
         assert font_cs[1].objgen == marker_stream.objgen
 
-    def test_image_in_font_resources_replaced(self):
-        """Image XObject in font resources gets ICC replacement."""
+    def test_image_in_font_resources_uses_contextual_default(self):
+        """An image in Type3 resources uses the font's DefaultRGB."""
         pdf = new_pdf()
         img = pdf.make_stream(b"\xff\x00\x00")
         img[Name.Type] = Name.XObject
@@ -271,10 +271,10 @@ class TestType3DefaultColorSpaces:
         font = _make_type3_font_with_charprocs(pdf, b"1 0 0 rg", font_resources)
         self._run_apply_defaults(pdf, font)
 
-        cs = img.get("/ColorSpace")
-        # Should now be an ICCBased array, not bare DeviceRGB
-        assert isinstance(cs, Array)
-        assert str(cs[0]) == "/ICCBased"
+        assert img[Name.ColorSpace] == Name.DeviceRGB
+        default_rgb = font[Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
+        assert default_rgb[1][Name.N] == 3
 
     def test_gray_and_cmyk_defaults(self):
         """DefaultGray and DefaultCMYK can be added to font resources."""

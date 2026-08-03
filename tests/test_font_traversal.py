@@ -10,7 +10,11 @@ from conftest import new_pdf
 from font_helpers import _liberation_fonts_available
 from pikepdf import Array, Dictionary, Name
 
-from pdftopdfa.fonts.traversal import iter_acroform_dr_fonts, iter_all_page_fonts
+from pdftopdfa.fonts.traversal import (
+    get_page_resources,
+    iter_acroform_dr_fonts,
+    iter_all_page_fonts,
+)
 
 
 class TestIterAllPageFonts:
@@ -470,6 +474,112 @@ class TestIterAllPageFonts:
         fonts = list(iter_all_page_fonts(pdf.pages[0]))
         font_names = {str(f[1].get("/BaseFont")) for f in fonts}
         assert "/Courier" in font_names
+
+    def test_deep_direct_form_resources_have_no_depth_ceiling(self):
+        """Traverses a direct resource graph beyond the former safety cap."""
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type1,
+            BaseFont=Name("/DeepFont"),
+        )
+        resources = Dictionary(Font=Dictionary(Deep=font))
+        for _ in range(4097):
+            form = Dictionary(
+                Type=Name.XObject,
+                Subtype=Name.Form,
+                Resources=resources,
+            )
+            resources = Dictionary(XObject=Dictionary(Fm=form))
+
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 10, 10]),
+            Resources=resources,
+        )
+        page = pikepdf.Page(page_dict)
+
+        try:
+            fonts = list(iter_all_page_fonts(page))
+            assert [str(obj.get("/BaseFont")) for _, obj in fonts] == ["/DeepFont"]
+        finally:
+            del page_dict[Name.Resources]
+            current = resources
+            for _ in range(4097):
+                xobjects = current[Name.XObject]
+                nested_form = xobjects[Name("/Fm")]
+                nested_resources = nested_form[Name.Resources]
+                del nested_form[Name.Resources]
+                del xobjects[Name("/Fm")]
+                del current[Name.XObject]
+                current = nested_resources
+
+    def test_direct_form_resource_cycle_terminates(self):
+        """Detects direct resource cycles without relying on wrapper identity."""
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type1,
+            BaseFont=Name("/CycleFont"),
+        )
+        resources = Dictionary(Font=Dictionary(Cycle=font))
+        form = Dictionary(Type=Name.XObject, Subtype=Name.Form)
+        form[Name.Resources] = resources
+        resources[Name.XObject] = Dictionary(Fm=form)
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 10, 10]),
+            Resources=resources,
+        )
+
+        try:
+            fonts = list(iter_all_page_fonts(pikepdf.Page(page_dict)))
+            assert [str(obj.get("/BaseFont")) for _, obj in fonts] == ["/CycleFont"]
+        finally:
+            del form[Name.Resources]
+            del resources[Name.XObject]
+
+    def test_deep_direct_parent_chain_has_no_depth_ceiling(self):
+        """Finds inherited resources beyond the former direct-depth cap."""
+        resources = Dictionary(
+            Font=Dictionary(
+                Deep=Dictionary(
+                    Type=Name.Font,
+                    Subtype=Name.Type1,
+                    BaseFont=Name("/InheritedDeepFont"),
+                )
+            )
+        )
+        parent = Dictionary(Type=Name.Pages, Resources=resources)
+        for _ in range(4097):
+            parent = Dictionary(Type=Name.Pages, Parent=parent)
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 10, 10]),
+            Parent=parent,
+        )
+
+        try:
+            inherited = get_page_resources(pikepdf.Page(page_dict))
+            assert inherited is not None
+            assert str(inherited.Font.Deep.BaseFont) == "/InheritedDeepFont"
+        finally:
+            current = page_dict
+            while "/Parent" in current:
+                next_parent = current[Name.Parent]
+                del current[Name.Parent]
+                current = next_parent
+
+    def test_direct_parent_cycle_terminates(self):
+        """Detects a malformed direct page-tree cycle."""
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 10, 10]),
+        )
+        page_dict[Name.Parent] = page_dict
+
+        try:
+            assert get_page_resources(pikepdf.Page(page_dict)) is None
+        finally:
+            del page_dict[Name.Parent]
 
     def test_multiple_ap_keys(self):
         """Yields fonts from N, R, and D appearance streams."""

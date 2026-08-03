@@ -4,6 +4,7 @@
 
 """Tests for fonts/tounicode.py — ToUnicode CMap generation."""
 
+import copy
 import logging
 from unittest.mock import MagicMock, patch
 
@@ -11,16 +12,112 @@ import pikepdf
 import pytest
 from conftest import new_pdf
 from font_helpers import _liberation_fonts_available
+from fontTools.fontBuilder import FontBuilder
+from fontTools.misc.psCharStrings import T2CharString
 from pikepdf import Array, Dictionary, Name
 
 from pdftopdfa.fonts import FontEmbedder
 from pdftopdfa.fonts.tounicode import (
     build_identity_unicode_mapping,
+    flatten_cid_encoding_cmap,
     generate_cidfont_tounicode_cmap,
+    get_type0_cid_encoding_map,
+    map_type0_character_codes_to_cids,
+    parse_cid_encoding_cmap,
     parse_cidtogidmap_stream,
     parse_tounicode_cmap,
 )
 from pdftopdfa.utils import resolve_indirect as _resolve_indirect
+
+
+class TestCIDEncodingCMap:
+    """Tests for Type 0 character-code to CID translation."""
+
+    def test_parses_char_range_hex_and_codespace_entries(self):
+        mapping = parse_cid_encoding_cmap(
+            b"""
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+1 begincidchar
+<0041> 7
+endcidchar
+1 begincidrange
+<0100> <0102> <0010>
+endcidrange
+% <9999> 99
+"""
+        )
+
+        assert mapping.code_space_ranges == ((b"\x00\x00", b"\xff\xff"),)
+        assert mapping.map_code(0x41) == 7
+        assert mapping.map_code(0x101) == 17
+        assert mapping.map_code(0x9999) == 0
+
+    def test_maps_used_codes_from_embedded_type0_cmap(self):
+        pdf = new_pdf()
+        encoding = pdf.make_stream(
+            b"""
+1 begincidchar
+<0041> 9
+endcidchar
+"""
+        )
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            Encoding=encoding,
+            DescendantFonts=Array([]),
+        )
+
+        assert map_type0_character_codes_to_cids(font, {0x41, 0x42}) == {0, 9}
+
+    def test_resolves_and_flattens_1200_deep_usecmap_chain(self):
+        """Embedded /UseCMap chains do not depend on Python recursion."""
+        pdf = new_pdf()
+        encoding = pdf.make_stream(
+            b"1 begincodespacerange\n"
+            b"<0000> <FFFF>\n"
+            b"endcodespacerange\n"
+            b"1 begincidchar\n"
+            b"<0041> 7\n"
+            b"endcidchar\n"
+            b"endcmap\n"
+        )
+        for _ in range(1200):
+            child = pdf.make_stream(b"begincmap\nendcmap\n")
+            child[Name.UseCMap] = encoding
+            encoding = child
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            Encoding=encoding,
+            DescendantFonts=Array([]),
+        )
+
+        mapping = get_type0_cid_encoding_map(font)
+
+        assert mapping is not None
+        assert mapping.map_code(b"\x00A") == 7
+        flattened = flatten_cid_encoding_cmap(encoding.read_bytes(), mapping)
+        assert flattened is not None
+        assert b"<0041> 7" in flattened
+
+    def test_rejects_cyclic_usecmap_chain(self):
+        """An indirect /UseCMap cycle terminates and fails closed."""
+        pdf = new_pdf()
+        first = pdf.make_stream(b"begincmap\nendcmap\n")
+        second = pdf.make_stream(b"begincmap\nendcmap\n")
+        first[Name.UseCMap] = second
+        second[Name.UseCMap] = first
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            Encoding=first,
+            DescendantFonts=Array([]),
+        )
+
+        assert get_type0_cid_encoding_map(font) is None
 
 
 class TestSimpleFontToUnicode:
@@ -105,8 +202,10 @@ class TestSimpleFontToUnicode:
         assert "<21> <2701>" in cmap_text
         # a2 (code 34) -> Unicode U+2702 (BLACK SCISSORS)
         assert "<22> <2702>" in cmap_text
-        # Check mark (a179, code 233) -> Unicode U+2713
-        assert "<E9> <2713>" in cmap_text
+        # Heavy check mark (a20, code 52) -> Unicode U+2714
+        assert "<34> <2714>" in cmap_text
+        # Right-shaded white rightwards arrow (a179, code 233) -> Unicode U+27A9
+        assert "<E9> <27A9>" in cmap_text
 
     def test_resolve_symbol_glyph_custom_mapping(self):
         """_resolve_symbol_glyph_to_unicode uses custom mapping for variants."""
@@ -320,6 +419,28 @@ class TestType3FontToUnicode:
         assert code_to_unicode[66] == 0x0042  # B
         assert code_to_unicode[97] == 0x0061  # a
         assert code_to_unicode[98] == 0x0062  # b
+
+    def test_type3_preserves_adobe_glyph_name_sequences(self):
+        """Type3 glyph names can represent complete Unicode sequences."""
+        from pdftopdfa.fonts.tounicode import generate_tounicode_for_type3_font
+
+        encoding_dict = Dictionary(
+            Type=Name.Encoding,
+            Differences=Array([0, Name("/A.alt"), Name("/f_f")]),
+        )
+        font_dict = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type3,
+            FontBBox=Array([0, 0, 1000, 1000]),
+            Encoding=encoding_dict,
+            FirstChar=0,
+            LastChar=1,
+        )
+
+        assert generate_tounicode_for_type3_font(font_dict) == {
+            0: 0x41,
+            1: (0x66, 0x66),
+        }
 
     def test_type3_mixed_resolvable_and_custom_glyphs(self):
         """Type3 with mix of AGL-resolvable and custom glyphs."""
@@ -1239,8 +1360,311 @@ class TestFillToUnicodeGapsWithPUA:
         assert result[2] != result[3]
 
 
+def _make_type1c_builder(
+    glyph_names: list[str],
+    encoding: list[str] | str,
+    font_name: str = "TestType1C",
+) -> FontBuilder:
+    """Create a bare CFF font builder with the requested encoding."""
+    builder = FontBuilder(1000, isTTF=False)
+    builder.setupGlyphOrder(glyph_names)
+    builder.setupCharacterMap({})
+    char_strings = {name: T2CharString() for name in glyph_names}
+    for char_string in char_strings.values():
+        char_string.program = [0, "hmoveto", "endchar"]
+    builder.setupCFF(font_name, {}, char_strings, {})
+    builder.setupHorizontalMetrics({name: (500, 0) for name in glyph_names})
+    builder.setupHorizontalHeader(ascent=800, descent=-200)
+    builder.setupNameTable({"familyName": font_name, "styleName": "Regular"})
+    builder.setupOS2(sTypoAscender=800, sTypoDescender=-200, sCapHeight=700)
+    builder.setupPost()
+    builder.setupHead(unitsPerEm=1000)
+    builder.font["CFF "].cff.topDictIndex[0].Encoding = encoding
+    return builder
+
+
+def _make_type1c_program_with_internal_encoding() -> bytes:
+    """Create a bare CFF program with a custom byte encoding."""
+    glyph_names = [".notdef", "angle", "space"]
+
+    encoding = [".notdef"] * 256
+    encoding[0xA0] = "angle"
+    encoding[0xCD] = "space"
+    builder = _make_type1c_builder(glyph_names, encoding)
+    return builder.font.getTableData("CFF ")
+
+
 class TestNoEncodingPUAGapFilling:
     """Integration tests for PUA gap-filling in _add_tounicode_to_simple_font()."""
+
+    def test_type1c_uses_embedded_program_encoding(self) -> None:
+        """Encoding-less Type1C fonts retain their internal glyph mapping."""
+        from pdftopdfa.fonts.tounicode import generate_tounicode_from_cff_program
+
+        cff_data = _make_type1c_program_with_internal_encoding()
+        assert generate_tounicode_from_cff_program(cff_data) == {
+            0xA0: 0x2220,
+            0xCD: 0x20,
+        }
+
+        pdf = new_pdf()
+        font_file = pdf.make_stream(cff_data)
+        font_file[Name.Subtype] = Name("/Type1C")
+        descriptor = pdf.make_indirect(
+            Dictionary(
+                Type=Name.FontDescriptor,
+                FontName=Name("/TestType1C"),
+                FontFile3=pdf.make_indirect(font_file),
+            )
+        )
+        font_dict = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type1,
+            BaseFont=Name("/TestType1C"),
+            FontDescriptor=descriptor,
+            FirstChar=0xA0,
+            LastChar=0xA0,
+        )
+
+        assert FontEmbedder(pdf)._add_tounicode_to_simple_font(font_dict, "TestType1C")
+        to_unicode = _resolve_indirect(font_dict.ToUnicode)
+        mapping = parse_tounicode_cmap(bytes(to_unicode.read_bytes()))
+        assert mapping == {0xA0: 0x2220, 0xCD: 0x20}
+
+    def test_type1c_predefined_expert_encoding(self) -> None:
+        """CFF ExpertEncoding is not confused with StandardEncoding."""
+        from pdftopdfa.fonts.tounicode import generate_tounicode_from_cff_program
+
+        glyph_names = [
+            ".notdef",
+            "space",
+            "exclamsmall",
+            "ff",
+            "Macronsmall",
+            "Ydieresissmall",
+        ]
+        builder = _make_type1c_builder(
+            glyph_names,
+            "ExpertEncoding",
+            "ExpertAudit",
+        )
+        cff_data = builder.font.getTableData("CFF ")
+
+        mapping = generate_tounicode_from_cff_program(cff_data, "ExpertAudit")
+
+        assert mapping == {
+            32: 0x0020,
+            33: 0xF721,
+            86: 0xFB00,
+            175: 0xF7AF,
+            255: 0xF7FF,
+        }
+
+        pdf = new_pdf()
+        font_file = pdf.make_stream(cff_data)
+        font_file[Name.Subtype] = Name("/Type1C")
+        descriptor = pdf.make_indirect(
+            Dictionary(
+                Type=Name.FontDescriptor,
+                FontName=Name("/ExpertAudit"),
+                FontFile3=pdf.make_indirect(font_file),
+            )
+        )
+        font_dict = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type1,
+            BaseFont=Name("/ExpertAudit"),
+            FontDescriptor=descriptor,
+            FirstChar=86,
+            LastChar=86,
+        )
+
+        assert FontEmbedder(pdf)._add_tounicode_to_simple_font(font_dict, "ExpertAudit")
+        to_unicode = _resolve_indirect(font_dict.ToUnicode)
+        assert parse_tounicode_cmap(bytes(to_unicode.read_bytes()))[86] == 0xFB00
+
+    def test_type1c_selects_referenced_font_from_fontset(self) -> None:
+        """A multi-font CFF uses the FontDescriptor's referenced font."""
+        from pdftopdfa.fonts.tounicode import generate_tounicode_from_cff_program
+
+        first_encoding = [".notdef"] * 256
+        first_encoding[65] = "A"
+        builder = _make_type1c_builder(
+            [".notdef", "A", "B"],
+            first_encoding,
+            "First",
+        )
+        cff = builder.font["CFF "].cff
+        second = copy.deepcopy(cff.topDictIndex[0])
+        second_encoding = [".notdef"] * 256
+        second_encoding[66] = "B"
+        second.Encoding = second_encoding
+        cff.fontNames.append("Second")
+        cff.topDictIndex.items.append(second)
+        cff_data = builder.font.getTableData("CFF ")
+
+        assert generate_tounicode_from_cff_program(cff_data, "First") == {65: 65}
+        assert generate_tounicode_from_cff_program(cff_data, "Second") == {66: 66}
+
+        pdf = new_pdf()
+        font_file = pdf.make_stream(cff_data)
+        font_file[Name.Subtype] = Name("/Type1C")
+        descriptor = pdf.make_indirect(
+            Dictionary(
+                Type=Name.FontDescriptor,
+                FontName=Name("/Second"),
+                FontFile3=pdf.make_indirect(font_file),
+            )
+        )
+        font_dict = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type1,
+            BaseFont=Name("/Second"),
+            FontDescriptor=descriptor,
+            FirstChar=66,
+            LastChar=66,
+        )
+
+        assert FontEmbedder(pdf)._add_tounicode_to_simple_font(font_dict, "Second")
+        to_unicode = _resolve_indirect(font_dict.ToUnicode)
+        assert parse_tounicode_cmap(bytes(to_unicode.read_bytes())) == {66: 66}
+
+    def test_type1c_preserves_complete_adobe_glyph_name_sequences(self) -> None:
+        """Suffixes, components, uni/u names, and PUA names retain semantics."""
+        from pdftopdfa.fonts.tounicode import (
+            generate_tounicode_from_cff_program,
+            parse_tounicode_cmap_sequences,
+            resolve_glyph_to_unicode,
+            resolve_glyph_to_unicode_sequence,
+        )
+
+        encoding = [".notdef"] * 256
+        encoded_names = [
+            "at",
+            "A.alt",
+            "f_f",
+            "uni00410042",
+            "u100000",
+            "uniE000",
+        ]
+        for code, glyph_name in enumerate(encoded_names, 64):
+            encoding[code] = glyph_name
+        builder = _make_type1c_builder(
+            [".notdef", *encoded_names],
+            encoding,
+            "GlyphNameAudit",
+        )
+        cff_data = builder.font.getTableData("CFF ")
+
+        assert resolve_glyph_to_unicode("A.alt") == 0x41
+        assert resolve_glyph_to_unicode("f_f") is None
+        assert resolve_glyph_to_unicode_sequence("f_f") == (0x66, 0x66)
+        assert generate_tounicode_from_cff_program(cff_data, "GlyphNameAudit") == {
+            64: 0x40,
+            65: 0x41,
+            66: (0x66, 0x66),
+            67: (0x41, 0x42),
+            68: 0x100000,
+            69: 0xE000,
+        }
+
+        pdf = new_pdf()
+        font_file = pdf.make_stream(cff_data)
+        font_file[Name.Subtype] = Name("/Type1C")
+        descriptor = pdf.make_indirect(
+            Dictionary(
+                Type=Name.FontDescriptor,
+                FontName=Name("/GlyphNameAudit"),
+                FontFile3=pdf.make_indirect(font_file),
+            )
+        )
+        font_dict = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type1,
+            BaseFont=Name("/GlyphNameAudit"),
+            FontDescriptor=descriptor,
+            FirstChar=64,
+            LastChar=70,
+        )
+
+        assert FontEmbedder(pdf)._add_tounicode_to_simple_font(
+            font_dict, "GlyphNameAudit"
+        )
+        to_unicode = _resolve_indirect(font_dict.ToUnicode)
+        mapping = parse_tounicode_cmap_sequences(bytes(to_unicode.read_bytes()))
+        assert mapping[b"A"] == (0x41,)
+        assert mapping[b"B"] == (0x66, 0x66)
+        assert mapping[b"C"] == (0x41, 0x42)
+        assert mapping[b"D"] == (0x100000,)
+        assert mapping[b"E"] == (0xE000,)
+        assert mapping[b"F"] == (0xE001,)
+
+    def test_type1_uses_embedded_program_encoding(self, monkeypatch) -> None:
+        """Encoding-less Type 1 fonts retain TeX ligatures and quotes."""
+
+        class FakeT1Font:
+            def __init__(self, _path: str) -> None:
+                encoding = [".notdef"] * 256
+                encoding[0x0B] = "ff"
+                encoding[0x0C] = "fi"
+                encoding[0x0D] = "fl"
+                encoding[0x5C] = "quotedblleft"
+                self.font = {"Encoding": encoding}
+
+            def parse(self) -> None:
+                return None
+
+        monkeypatch.setattr("fontTools.t1Lib.T1Font", FakeT1Font)
+
+        pdf = new_pdf()
+        font_file = pdf.make_stream(b"%!FontType1 Test\ncurrentfile eexec\nbinary")
+        descriptor = pdf.make_indirect(
+            Dictionary(
+                Type=Name.FontDescriptor,
+                FontName=Name("/CMR12"),
+                FontFile=pdf.make_indirect(font_file),
+            )
+        )
+        font_dict = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type1,
+            BaseFont=Name("/CMR12"),
+            FontDescriptor=descriptor,
+            FirstChar=0x0B,
+            LastChar=0x5C,
+        )
+
+        embedder = FontEmbedder(pdf)
+        result = embedder._add_tounicode_to_simple_font(font_dict, "CMR12")
+
+        assert result is True
+        to_unicode = _resolve_indirect(font_dict.get("/ToUnicode"))
+        mapping = parse_tounicode_cmap(bytes(to_unicode.read_bytes()))
+        assert mapping[0x0B] == 0xFB00
+        assert mapping[0x0C] == 0xFB01
+        assert mapping[0x0D] == 0xFB02
+        assert mapping[0x5C] == 0x201C
+
+    def test_malformed_type1_descriptor_uses_standard_fallback(self) -> None:
+        """Malformed embedded-font metadata does not suppress ToUnicode."""
+        pdf = new_pdf()
+        font_dict = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type1,
+            BaseFont=Name("/TestFont"),
+            FontDescriptor=Name("/Malformed"),
+            FirstChar=0,
+            LastChar=65,
+        )
+
+        embedder = FontEmbedder(pdf)
+        result = embedder._add_tounicode_to_simple_font(font_dict, "TestFont")
+
+        assert result is True
+        to_unicode = _resolve_indirect(font_dict.get("/ToUnicode"))
+        mapping = parse_tounicode_cmap(bytes(to_unicode.read_bytes()))
+        assert mapping[0x41] == 0x0041
+        assert 0 in mapping
 
     def test_symbolic_truetype_low_codes(self):
         """Symbolic TrueType with codes 1-4 and no encoding gets full CMap."""

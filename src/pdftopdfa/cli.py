@@ -104,7 +104,15 @@ def _print_result(result: ConversionResult, quiet: bool) -> None:
     if result.success:
         if not quiet:
             if result.level is None:
-                action = "Copied unchanged" if result.skipped else "Processed"
+                conversion_skipped = result.skipped and any(
+                    warning.startswith("Conversion skipped:")
+                    for warning in result.warnings
+                )
+                action = (
+                    "Skipped"
+                    if conversion_skipped
+                    else ("Copied unchanged" if result.skipped else "Processed")
+                )
                 details = f"{result.processing_time:.2f}s"
             else:
                 action = "Skipped" if result.skipped else "Converted to PDF/A"
@@ -137,7 +145,7 @@ def _print_validation_result(
     else:
         print_error(f"Validation failed for {file_path.name}")
         for error in result.errors:
-            click.echo(f"  - {error}", err=True)
+            click.echo(_encode_for_console(f"  - {error}", err=True), err=True)
 
     if not quiet:
         for warning in result.warnings:
@@ -162,9 +170,9 @@ def _ocr_execution_provider_callback(
 @click.option(
     "-l",
     "--level",
-    type=click.Choice(["2b", "2u", "3b", "3u"]),
+    type=click.Choice(["2a", "2b", "2u", "3a", "3b", "3u"]),
     default="3b",
-    help="PDF/A conformance level: b=basic, u=Unicode (default: 3b)",
+    help=("PDF/A conformance level: a=accessible, b=basic, u=Unicode (default: 3b)"),
 )
 @click.option(
     "-v",
@@ -211,7 +219,8 @@ def _ocr_execution_provider_callback(
     default=False,
     help="Enable OCR for image-based PDFs "
     "(requires both PP-OCRv6 model-directory options; "
-    "uses language from --ocr-lang, default: en).",
+    "uses language from --ocr-lang, default: en; "
+    "disables compliant-PDF/A skip checks).",
 )
 @click.option(
     "--ocr-lang",
@@ -251,8 +260,7 @@ def _ocr_execution_provider_callback(
     is_flag=True,
     default=False,
     help="Force OCR even on pages that already contain text "
-    "(removes existing OCR layer and re-applies). Implies --ocr and "
-    "bypasses compliant-PDF/A skip checks.",
+    "(removes existing OCR layer and re-applies). Implies --ocr.",
 )
 @click.option(
     "--deskew",
@@ -350,7 +358,7 @@ def main(
                 "Please install veraPDF from https://verapdf.org/ "
                 "and ensure it is in your PATH."
             )
-            sys.exit(EXIT_GENERAL_ERROR)
+            sys.exit(EXIT_VALIDATION_FAILED)
 
     if deskew and ocr_force:
         raise click.UsageError("--deskew cannot be combined with --ocr-force")
@@ -529,9 +537,15 @@ def _convert_single_file(
 
     if not quiet:
         if pdfa:
-            click.echo(f"Converting {input_path.name} -> PDF/A-{level}...")
+            click.echo(
+                _encode_for_console(f"Converting {input_path.name} -> PDF/A-{level}...")
+            )
         else:
-            click.echo(f"Processing {input_path.name} without PDF/A conversion...")
+            click.echo(
+                _encode_for_console(
+                    f"Processing {input_path.name} without PDF/A conversion..."
+                )
+            )
 
     # Perform conversion
     result = convert_to_pdfa(
@@ -558,37 +572,42 @@ def _convert_single_file(
 
     # Note: convert_to_pdfa() raises on failure instead of returning
     # success=False, so no failure branch is needed here.
-    if result.skipped:
-        return EXIT_SUCCESS
-
     if result.validation_failed:
         return EXIT_VALIDATION_FAILED
+
+    if result.skipped and not do_validate:
+        return EXIT_SUCCESS
 
     # Optional: Validation
     if do_validate:
         if not quiet:
             click.echo("Validating output with veraPDF...")
 
+        validation_flavour = result.level if result.skipped and result.level else level
         try:
             verapdf_result = validate_with_verapdf(
                 path=output_path,
-                flavour=level,
+                flavour=validation_flavour,
                 timeout=300,
             )
         except VeraPDFError as e:
-            if not quiet:
-                click.echo(
-                    f"  Validation skipped: veraPDF not available ({e})",
+            click.echo(
+                _encode_for_console(
+                    f"Validation failed: veraPDF could not run ({e})",
                     err=True,
-                )
-            return EXIT_SUCCESS
+                ),
+                err=True,
+            )
+            return EXIT_VALIDATION_FAILED
 
         _print_validation_result(verapdf_result, output_path, quiet)
 
         if not quiet:
             click.echo(
-                f"  veraPDF: {verapdf_result.passed_rules} rules passed, "
-                f"{verapdf_result.failed_rules} failed"
+                _encode_for_console(
+                    f"  veraPDF: {verapdf_result.passed_rules} rules passed, "
+                    f"{verapdf_result.failed_rules} failed"
+                )
             )
 
         if not verapdf_result.compliant:
@@ -657,10 +676,17 @@ def _convert_directory(
     if not quiet:
         mode = "recursive" if recursive else "non-recursive"
         if pdfa:
-            click.echo(f"Converting directory {input_dir} ({mode}) -> PDF/A-{level}...")
+            click.echo(
+                _encode_for_console(
+                    f"Converting directory {input_dir} ({mode}) -> PDF/A-{level}..."
+                )
+            )
         else:
             click.echo(
-                f"Processing directory {input_dir} ({mode}) without PDF/A conversion..."
+                _encode_for_console(
+                    f"Processing directory {input_dir} ({mode}) "
+                    "without PDF/A conversion..."
+                )
             )
 
     results = convert_directory(
@@ -687,10 +713,14 @@ def _convert_directory(
     )
 
     # Output summary
-    successful = [r for r in results if r.success and not r.skipped]
-    skipped = [r for r in results if r.success and r.skipped]
-    failed = [r for r in results if not r.success]
-    validation_failures = [r for r in successful if r.validation_failed]
+    successful = [
+        r for r in results if r.success and not r.skipped and not r.validation_failed
+    ]
+    skipped = [
+        r for r in results if r.success and r.skipped and not r.validation_failed
+    ]
+    failed = [r for r in results if not r.success and not r.validation_failed]
+    validation_failures = [r for r in results if r.validation_failed]
 
     if not quiet:
         click.echo()
@@ -701,11 +731,19 @@ def _convert_directory(
             print_warning(f"{len(skipped)} file(s) skipped and copied unchanged")
             for result in skipped:
                 for warning in result.warnings:
-                    click.echo(f"  - {result.input_path.name}: {warning}")
+                    click.echo(
+                        _encode_for_console(f"  - {result.input_path.name}: {warning}")
+                    )
         if failed:
             print_error(f"{len(failed)} file(s) failed")
             for result in failed:
-                click.echo(f"  - {result.input_path.name}: {result.error}", err=True)
+                click.echo(
+                    _encode_for_console(
+                        f"  - {result.input_path.name}: {result.error}",
+                        err=True,
+                    ),
+                    err=True,
+                )
         if validation_failures:
             print_error(f"{len(validation_failures)} file(s) failed validation")
             for result in validation_failures:
@@ -713,9 +751,17 @@ def _convert_directory(
                     w for w in result.warnings if w.startswith("Validation:")
                 ]
                 for w in val_warnings:
-                    click.echo(f"  - {result.input_path.name}: {w}", err=True)
+                    click.echo(
+                        _encode_for_console(
+                            f"  - {result.input_path.name}: {w}",
+                            err=True,
+                        ),
+                        err=True,
+                    )
 
     if failed:
+        if all(result.error == "Output file already exists" for result in failed):
+            return EXIT_GENERAL_ERROR
         return EXIT_CONVERSION_FAILED
 
     if validation_failures:

@@ -39,6 +39,9 @@ from .fonts import check_font_compliance
 from .metadata import (
     _extract_existing_xmp,
     extract_pdf_info,
+    remove_pdfe_identification,
+    remove_pdfua_identification,
+    remove_pdfvt_identification,
     remove_pdfx_identification,
     sync_metadata,
 )
@@ -49,7 +52,9 @@ from .sanitizers import (
     sanitize_notdef_usage,
     sanitize_signatures,
     sanitize_structure_limits,
+    sanitize_truetype_encoding,
 )
+from .tagging import ensure_logical_structure
 from .utils import get_required_pdf_version, is_pdf_encrypted, validate_pdfa_level
 from .validator import detect_iso_standards, detect_pdfa_level
 from .verapdf import validate_with_verapdf
@@ -151,6 +156,10 @@ _SANITIZE_WARNINGS: list[tuple[str, str]] = [
     ("cidset_removed", "CIDSet entr(y/ies) removed"),
     ("type1_charset_removed", "Type1 /CharSet entr(y/ies) removed"),
     (
+        "cid_values_over_65535_fixed",
+        "CIDFont entr(y/ies) above CID 65535 removed or clipped",
+    ),
+    (
         "cid_values_over_65535_warned",
         "CIDFont(s) with CID value(s) exceeding 65535 detected (rule 6.1.13-10);"
         " cannot fix automatically",
@@ -200,6 +209,12 @@ _SANITIZE_ERRORS: list[tuple[str, str]] = [
         "jpx_failed",
         "JPEG2000 stream(s) could not be fixed. "
         "The output PDF would not be PDF/A compliant.",
+    ),
+    (
+        "pua_actualtext_warnings",
+        "PUA-mapped character(s) could not be resolved to real Unicode "
+        "without losing searchable text. The output would not satisfy "
+        "PDF/A Unicode/accessibility requirements.",
     ),
 ]
 
@@ -277,6 +292,24 @@ def _compare_pdfa_levels(detected: str, target: str) -> int:
     return 0
 
 
+def _validate_pdfa_output(
+    output_path: Path,
+    level: str,
+    warnings: list[str],
+) -> bool:
+    """Validate an output and append all reported compliance errors."""
+    try:
+        result = validate_with_verapdf(path=output_path, flavour=level)
+    except VeraPDFError as exc:
+        warnings.append(f"Validation: veraPDF could not run: {exc}")
+        return True
+    if result.compliant:
+        return False
+    for error in result.errors:
+        warnings.append(f"Validation: {error}")
+    return True
+
+
 @dataclass
 class ConversionResult:
     """Result of a PDF/A conversion.
@@ -285,14 +318,15 @@ class ConversionResult:
         success: True if the conversion was successful.
         input_path: Path to the input PDF.
         output_path: Path to the output PDF.
-        level: PDF/A conformance level used, or None when PDF/A conversion
-            was disabled.
+        level: Requested level for a converted output, detected level for a
+            validated compliant skip, or None when PDF/A conversion was
+            disabled or an unsupported input was copied unchanged.
         warnings: List of warnings during conversion.
         processing_time: Processing time in seconds.
         error: Error message if success=False.
-        validation_failed: True if the output is known not to conform to the
-            requested PDF/A level, including a failed veraPDF validation or a
-            preserved embedded PDF that could not be converted.
+        validation_failed: True if veraPDF reported non-conformance or could
+            not complete, or if a preserved embedded PDF could not be
+            converted.
         skipped: True if the original PDF was copied through unchanged.
     """
 
@@ -331,6 +365,17 @@ def generate_output_path(
     return input_path.parent / output_name
 
 
+def _path_identity(path: Path) -> tuple[object, ...]:
+    """Return a stable identity for existing files and normalized paths."""
+    try:
+        stat = path.stat()
+    except OSError:
+        stat = None
+    if stat is not None and stat.st_ino:
+        return ("file", stat.st_dev, stat.st_ino)
+    return ("path", os.path.normcase(str(path.resolve())))
+
+
 def _copy_input_to_output(input_path: Path, output_path: Path) -> None:
     """Copy the input file to the requested output location.
 
@@ -342,11 +387,45 @@ def _copy_input_to_output(input_path: Path, output_path: Path) -> None:
         input_path: Original file path.
         output_path: Destination file path.
     """
-    if input_path.resolve() == output_path.resolve():
+    if _path_identity(input_path) == _path_identity(output_path):
         return
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(str(input_path), str(output_path))
+
+
+def _copy_encrypted_input(
+    input_path: Path,
+    output_path: Path,
+    *,
+    pdfa: bool,
+    validate: bool,
+    level: str,
+    start_time: float,
+) -> ConversionResult:
+    """Copy an encrypted input unchanged and validate it when requested."""
+    warning = (
+        "Conversion skipped: PDF is encrypted and cannot be converted"
+        if pdfa
+        else "Processing skipped: PDF is encrypted and cannot be processed"
+    )
+    logger.warning("%s: %s", warning, input_path)
+    _copy_input_to_output(input_path, output_path)
+    warnings = [warning]
+    processing_time = time.perf_counter() - start_time
+    validation_failed = (
+        _validate_pdfa_output(output_path, level, warnings) if validate else False
+    )
+    return ConversionResult(
+        success=True,
+        input_path=input_path,
+        output_path=output_path,
+        level=level if validate and not validation_failed else None,
+        warnings=warnings,
+        processing_time=processing_time,
+        skipped=True,
+        validation_failed=validation_failed,
+    )
 
 
 def _get_pdfa_save_settings_for_version(required_version: str) -> dict[str, object]:
@@ -804,7 +883,8 @@ def convert_to_pdfa(
     Args:
         input_path: Path to the input PDF.
         output_path: Path for the output PDF.
-        level: PDF/A conformance level ('2b' or '3b').
+        level: PDF/A conformance level ('2a', '2b', '2u', '3a', '3b',
+            or '3u').
         pdfa: If False, skip all PDF/A-specific processing and save only the
             requested OCR processing result. PDF/A-specific options are
             ignored in this mode.
@@ -856,7 +936,6 @@ def convert_to_pdfa(
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
     if pdfa:
         level = validate_pdfa_level(level)
-    result_level = level if pdfa else None
     start_time = time.perf_counter()
     warnings: list[str] = []
     ocr_temp_file: Path | None = None
@@ -869,10 +948,7 @@ def convert_to_pdfa(
 
     if ocr_force and ocr_deskew:
         raise OCRError("Deskew cannot be combined with forced OCR")
-    force_ocr_requested = ocr_force and ocr_requested
-    explicit_ocr_processing_requested = (
-        force_ocr_requested or ocr_deskew or ocr_rotate_pages or ocr_layout
-    )
+    explicit_ocr_processing_requested = ocr_requested
 
     if pdfa:
         logger.info(
@@ -888,22 +964,17 @@ def convert_to_pdfa(
         # 0. Check if PDF is already PDF/A compliant (before OCR)
         with pikepdf.open(input_path) as check_pdf:
             if is_pdf_encrypted(check_pdf):
-                processing_time = time.perf_counter() - start_time
-                warning = (
-                    "Conversion skipped: PDF is encrypted and cannot be converted"
-                    if pdfa
-                    else "Processing skipped: PDF is encrypted and cannot be processed"
+                return _copy_encrypted_input(
+                    input_path,
+                    output_path,
+                    pdfa=pdfa,
+                    validate=validate,
+                    level=level,
+                    start_time=start_time,
                 )
-                logger.warning("%s: %s", warning, input_path)
-                _copy_input_to_output(input_path, output_path)
-                return ConversionResult(
-                    success=True,
-                    input_path=input_path,
-                    output_path=output_path,
-                    level=result_level,
-                    warnings=[warning],
-                    processing_time=processing_time,
-                    skipped=True,
+            if pdfa and len(check_pdf.pages) == 0:
+                raise UnsupportedPDFError(
+                    "PDF contains no pages and cannot be converted to PDF/A"
                 )
             if not pdfa and not ocr_requested:
                 processing_time = time.perf_counter() - start_time
@@ -933,14 +1004,21 @@ def convert_to_pdfa(
                 )
                 logger.warning("%s: %s", signature_skip_warning, input_path)
                 _copy_input_to_output(input_path, output_path)
+                branch_warnings = [signature_skip_warning]
+                validation_failed = (
+                    _validate_pdfa_output(output_path, level, branch_warnings)
+                    if validate
+                    else False
+                )
                 return ConversionResult(
                     success=True,
                     input_path=input_path,
                     output_path=output_path,
-                    level=result_level,
-                    warnings=[signature_skip_warning],
+                    level=level if validate and not validation_failed else None,
+                    warnings=branch_warnings,
                     processing_time=processing_time,
                     skipped=True,
+                    validation_failed=validation_failed,
                 )
             if signature_count > 0:
                 warnings.append(
@@ -1005,6 +1083,11 @@ def convert_to_pdfa(
                     level,
                 )
 
+        # Reject in-place processing before OCR replaces actual_input with its
+        # temporary output path.
+        if _path_identity(input_path) == _path_identity(output_path):
+            raise ConversionError(f"Input and output paths must differ: {input_path}")
+
         # 1. Optional: Perform OCR
         actual_input = input_path
         if ocr_requested:
@@ -1047,7 +1130,8 @@ def convert_to_pdfa(
                         ocr_signature_temp_file.unlink()
                     except Exception:
                         pass
-                    ocr_signature_temp_file = None
+                    else:
+                        ocr_signature_temp_file = None
 
                 # Strip annotations before OCR so they are not
                 # rasterized into page images.
@@ -1120,7 +1204,8 @@ def convert_to_pdfa(
                         ocr_clean_temp_file.unlink()
                     except Exception:
                         pass
-                    ocr_clean_temp_file = None
+                    else:
+                        ocr_clean_temp_file = None
 
                 actual_input = ocr_temp_file
                 lang_str = "+".join(effective_ocr_languages)
@@ -1142,10 +1227,6 @@ def convert_to_pdfa(
                 warnings=warnings,
                 processing_time=processing_time,
             )
-
-        # Validate that input and output are not the same file
-        if actual_input.resolve() == output_path.resolve():
-            raise ConversionError(f"Input and output paths must differ: {actual_input}")
 
         # 2. Open PDF
         logger.debug("Opening PDF: %s", actual_input)
@@ -1189,6 +1270,12 @@ def convert_to_pdfa(
                     )
 
                 warnings.extend(embed_result.warnings)
+
+            # Normalize simple-font lookup before generating ToUnicode or
+            # subsetting so all three passes select the same glyphs. The full
+            # sanitizer repeats this after subsetting because fontTools may
+            # prune cmap subtables.
+            sanitize_truetype_encoding(pdf)
 
             # 3.5. Unicode compliance — always add ToUnicode to all embedded
             # fonts (ISO 19005-2/3, rule 6.2.11.7.2).  veraPDF requires
@@ -1302,6 +1389,16 @@ def convert_to_pdfa(
                 "PDF/X identification removed from XMP metadata "
                 "(PDF/X OutputIntent not preserved)"
             )
+        if remove_pdfvt_identification(pdf):
+            warnings.append(
+                "PDF/VT identification removed from XMP metadata "
+                "(required PDF/X conformance not preserved)"
+            )
+        if remove_pdfe_identification(pdf):
+            warnings.append(
+                "PDF/E identification removed from XMP metadata "
+                "(required DocInfo identification not preserved)"
+            )
 
         # Final pass for structural limits:
         # embed_color_profiles() may materialize or rewrite ColorSpace names.
@@ -1318,6 +1415,18 @@ def convert_to_pdfa(
         count = late_notdef_result.get("notdef_usage_fixed", 0)
         if count > 0:
             warnings.append(f"{count} .notdef usage operator(s) fixed")
+
+        if level.endswith("a"):
+            tagging_result = ensure_logical_structure(pdf)
+            if tagging_result["structure_rebuilt"]:
+                warnings.append(
+                    "Tagged PDF structure generated from page content order"
+                )
+                if remove_pdfua_identification(pdf):
+                    warnings.append(
+                        "PDF/UA identification removed from XMP metadata "
+                        "(logical structure rebuilt)"
+                    )
 
         # 7. Create output directory if needed
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1341,7 +1450,7 @@ def convert_to_pdfa(
                 f"PDF version {direction} from {current_version} to {required_version}"
             )
 
-        save_pdfa(pdf, output_path, level, verify=not validate)
+        save_pdfa(pdf, output_path, level, verify=True)
         pdf.close()
         pdf = None
 
@@ -1353,17 +1462,9 @@ def convert_to_pdfa(
         )
         if validate:
             logger.debug("Validating output with veraPDF")
-            try:
-                verapdf_result = validate_with_verapdf(path=output_path, flavour=level)
-            except VeraPDFError as e:
-                logger.warning("veraPDF validation not available: %s", e)
-                warnings.append("Validation skipped: veraPDF not available")
-                verapdf_result = None
-
-            if verapdf_result is not None and not verapdf_result.compliant:
-                validation_failed = True
-                for error in verapdf_result.errors:
-                    warnings.append(f"Validation: {error}")
+            validation_failed = (
+                _validate_pdfa_output(output_path, level, warnings) or validation_failed
+            )
 
         logger.info(
             "Conversion successful: %s (%.2f seconds)",
@@ -1381,12 +1482,28 @@ def convert_to_pdfa(
             validation_failed=validation_failed,
         )
 
+    except pikepdf.PasswordError:
+        return _copy_encrypted_input(
+            input_path,
+            output_path,
+            pdfa=pdfa,
+            validate=validate,
+            level=level,
+            start_time=start_time,
+        )
+
     except pikepdf.PdfError as e:
         error_msg = f"PDF processing error: {e}"
         logger.error(error_msg)
         raise ConversionError(error_msg) from e
 
-    except (UnsupportedPDFError, FontEmbeddingError, OCRError):
+    except (
+        UnsupportedPDFError,
+        FontEmbeddingError,
+        OCRError,
+        VeraPDFError,
+        PermissionError,
+    ):
         # Re-raise specific errors unchanged
         raise
 
@@ -1503,9 +1620,22 @@ def convert_files(
     )
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
+    if pdfa:
+        level = validate_pdfa_level(level)
 
     results: list[ConversionResult] = []
     total = len(file_pairs)
+
+    input_identities = [_path_identity(input_path) for input_path, _ in file_pairs]
+    output_identities = [_path_identity(output_path) for _, output_path in file_pairs]
+    if len(set(output_identities)) != len(output_identities):
+        raise ConversionError("Output paths in a batch must be unique")
+    input_identities_set = set(input_identities)
+    for (_, output_path), output_identity in zip(file_pairs, output_identities):
+        if output_identity in input_identities_set:
+            raise ConversionError(
+                f"Batch output path overlaps an input path: {output_path}"
+            )
 
     for idx, (input_path, output_path) in enumerate(file_pairs):
         if cancel_event is not None and cancel_event.is_set():
@@ -1605,7 +1735,7 @@ def convert_directory(
         input_dir: Input directory with PDF files.
         output_dir: Optional output directory. If None, files are saved
             in the same directory as the input.
-        level: PDF/A conformance level ('2b' or '3b').
+        level: PDF/A conformance level.
         pdfa: If False, apply only requested OCR processing.
         recursive: If True, subdirectories are included.
         validate: If True, results are validated.
@@ -1652,6 +1782,8 @@ def convert_directory(
     )
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
+    if pdfa:
+        level = validate_pdfa_level(level)
 
     input_dir = input_dir.resolve()
     output_dir = output_dir.resolve() if output_dir is not None else None
@@ -1673,10 +1805,24 @@ def convert_directory(
     ):
         pdf_files = [p for p in pdf_files if not p.is_relative_to(output_dir)]
 
-    # When output goes to the same directory, exclude previous outputs for this mode.
+    # When output goes to the same directory, exclude a generated output only
+    # when its corresponding source is also present. A standalone source whose
+    # name happens to end in the output suffix remains a valid input.
     if output_dir is None or output_dir == input_dir:
         output_suffix = "_pdfa" if pdfa else "_processed"
-        pdf_files = [p for p in pdf_files if not p.stem.endswith(output_suffix)]
+        source_stems = {(path.parent, path.stem) for path in pdf_files}
+        pdf_files = [
+            path
+            for path in pdf_files
+            if not (
+                path.stem.endswith(output_suffix)
+                and (
+                    path.parent,
+                    path.stem.removesuffix(output_suffix),
+                )
+                in source_stems
+            )
+        ]
 
     if not pdf_files:
         logger.warning("No PDF files found in: %s", input_dir)

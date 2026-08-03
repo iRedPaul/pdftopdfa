@@ -133,6 +133,8 @@ def _validate_pdfa_output_intent(intent: Dictionary) -> _ValidOutputIntent | Non
         return None
     if not _validate_icc_profile(profile_data):
         return None
+    if profile_data[12:16] not in {b"mntr", b"prtr"}:
+        return None
 
     signature = profile_data[16:20]
     profile_info = _ICC_SIGNATURE_TO_COLORSPACE.get(signature)

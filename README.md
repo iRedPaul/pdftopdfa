@@ -11,7 +11,9 @@ Instead of re-rendering via Ghostscript, it modifies the PDF structure directly 
 ## Highlights
 
 - **No Ghostscript required** -- direct PDF manipulation via pikepdf/QPDF
-- **PDF/A-2b, 2u, 3b, 3u** -- supports modern PDF/A levels (ISO 19005-2 and 19005-3)
+- **PDF/A-2a, 2b, 2u, 3a, 3b, 3u** -- supports modern PDF/A levels
+  (ISO 19005-2 and ISO 19005-3), including Tagged PDF output for scanned
+  documents
 - **Automatic font embedding** -- uses policy-approved Windows system fonts or bundled replacements
 - **Font subsetting** -- reduces file size by removing unused glyphs
 - **CJK support** -- embeds Noto Sans CJK for Chinese, Japanese, and Korean text
@@ -32,7 +34,7 @@ Instead of re-rendering via Ghostscript, it modifies the PDF structure directly 
 
 pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with the PDF/A standard:
 
-1. **Pre-check** -- skips encrypted and digitally signed PDFs, then detects if the PDF is already a valid PDF/A file (skips conversion if the existing level meets or exceeds the target; optionally skips any veraPDF-compliant PDF/A via `--skip-any-pdfa`; see [Usage Guide](docs/usage.md#already-compliant-pdfs) for details)
+1. **Pre-check** -- skips encrypted and digitally signed PDFs, then detects if the PDF is already a valid PDF/A file (skips conversion if the existing level meets or exceeds the target; optionally skips any veraPDF-compliant PDF/A via `--skip-any-pdfa`; see the [Usage Guide](https://github.com/iRedPaul/pdftopdfa/blob/main/docs/usage.md#already-compliant-pdfs) for details)
 2. **OCR** (optional) -- optionally orients pages with the bundled PaddleOCR
    orientation model, straightens only scan-like raster-dominant pages, and
    recognizes text with externally supplied PP-OCRv6 Medium models; OCRmyPDF
@@ -41,7 +43,10 @@ pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with 
 4. **Sanitization** -- removes or fixes non-compliant elements (JavaScript, non-standard actions, transparency groups, annotations, optional content, etc.)
 5. **Metadata** -- synchronizes XMP metadata with the document info dictionary and sets the PDF/A conformance level
 6. **Color profiles** -- detects color spaces and embeds the required ICC profiles (sRGB, CMYK/FOGRA39, sGray)
-7. **Save** -- writes the output with the correct PDF version header
+7. **Logical structure** -- for level A, preserves an existing Tagged PDF
+   structure or creates a structure tree from the final page and annotation
+   order, including OCR-processed scans
+8. **Save** -- writes the output with the correct PDF version header
 
 ## Installation
 
@@ -93,7 +98,7 @@ the same PCI identity are listed once using their lowest index.
 OCR and table recognition do not download models at runtime. Every model must
 be obtained separately and passed through an explicit local directory on each
 public API invocation. CPU and DirectML use the same FP32 ONNX model files.
-See the [OCR guide](docs/ocr.md) for the `recognize_table()` model contract and
+See the [OCR guide](https://github.com/iRedPaul/pdftopdfa/blob/main/docs/ocr.md) for the `recognize_table()` model contract and
 typed result. Cell text and grid structure come from the table-structure model,
 while bounding boxes come from the separate cell-detection model; if the two
 models report different cell counts, cells are returned without
@@ -145,6 +150,9 @@ pdftopdfa document.pdf
 # Specific PDF/A level
 pdftopdfa -l 2b document.pdf
 
+# Accessible PDF/A output
+pdftopdfa -l 2a document.pdf
+
 # With validation (note: -v = --validate, not verbose; use --verbose for logs)
 pdftopdfa -v document.pdf
 
@@ -161,8 +169,8 @@ pdftopdfa -r ./documents/ ./output/
 DET_MODEL=/opt/pdftopdfa/models/PP-OCRv6_medium_det_onnx
 REC_MODEL=/opt/pdftopdfa/models/PP-OCRv6_medium_rec_onnx
 
-# OCR a German/English scanned PDF
-pdftopdfa --ocr-lang de+en \
+# OCR a German/English scan to tagged PDF/A-2a
+pdftopdfa -l 2a --ocr-lang de+en \
   --ocr-detection-model-dir "$DET_MODEL" \
   --ocr-recognition-model-dir "$REC_MODEL" \
   document.pdf
@@ -239,11 +247,16 @@ embedding, PDF/A sanitization, metadata synchronization, color-profile
 embedding, and PDF/A validation. The result is not validated or guaranteed to
 remain PDF/A compliant.
 
-See [docs/usage.md](docs/usage.md) for the full CLI reference, Python API documentation, and examples.
+See the [Usage Guide](https://github.com/iRedPaul/pdftopdfa/blob/main/docs/usage.md) for the full CLI reference, Python API documentation, and examples.
 
 ## Limitations
 
 - **No PDF/A-1 support** -- only PDF/A-2 and PDF/A-3 levels are supported
+- **Automatic level A semantics** -- generated tags follow page and PDF
+  content-stream order and include annotations. They provide the structural
+  basis required by PDF/A-2a and PDF/A-3a, but automatic conversion cannot
+  infer authorial semantics such as heading levels, table relationships, or
+  alternative descriptions. PDF/A level A does not imply PDF/UA conformance.
 - **Encrypted PDFs** -- password-protected PDFs cannot be converted
 - **Digitally signed PDFs** -- signed PDFs are copied unchanged by default because conversion would invalidate their signatures; use `--allow-signature-invalidation` only when an unsigned archival copy is intentional
 - **Font replacement** -- fonts without a suitable metrically compatible replacement produce a warning; the resulting file may not be fully compliant
@@ -280,10 +293,10 @@ ruff format src/ tests/  # Formatting
 
 ## Documentation
 
-Additional documentation is available in the [docs/](docs/) folder:
+Additional documentation is available in the [docs/](https://github.com/iRedPaul/pdftopdfa/tree/main/docs) folder:
 
-- [Usage Guide (CLI & Python API)](docs/usage.md)
-- [OCR Guide](docs/ocr.md)
+- [Usage Guide (CLI & Python API)](https://github.com/iRedPaul/pdftopdfa/blob/main/docs/usage.md)
+- [OCR Guide](https://github.com/iRedPaul/pdftopdfa/blob/main/docs/ocr.md)
 - [PDF/A-2/3 rules reference (veraPDF)](https://github.com/veraPDF/veraPDF-validation-profiles/wiki/PDFA-Parts-2-and-3-rules)
 
 ## Contributing

@@ -167,7 +167,7 @@ def _sanitize_next_chain(
     """Remove non-compliant actions from a /Next chain.
 
     PDF actions can reference follow-up actions via /Next (single action or
-    array).  This function recursively walks the chain and strips any
+    array).  This function walks the complete chain and strips any
     non-compliant entries so that forbidden actions cannot hide behind a
     compliant head action.
 
@@ -182,58 +182,61 @@ def _sanitize_next_chain(
         _visited = set()
 
     removed = 0
-    try:
+    pending = [action]
+    while pending:
+        action = pending.pop()
         try:
-            action = action.get_object()
-        except (AttributeError, ValueError, TypeError):
-            pass
+            try:
+                action = action.get_object()
+            except (AttributeError, ValueError, TypeError):
+                pass
 
-        try:
-            obj_key = action.objgen
-        except Exception:
-            obj_key = None
-        if obj_key is not None and obj_key != (0, 0):
-            if obj_key in _visited:
-                return 0
-            _visited.add(obj_key)
+            try:
+                obj_key = action.objgen
+            except Exception:
+                obj_key = None
+            if obj_key is not None and obj_key != (0, 0):
+                if obj_key in _visited:
+                    continue
+                _visited.add(obj_key)
 
-        next_val = action.get("/Next")
-        if next_val is None:
-            return 0
+            next_val = action.get("/Next")
+            if next_val is None:
+                continue
 
-        try:
-            next_val = next_val.get_object()
-        except (AttributeError, ValueError, TypeError):
-            pass
+            try:
+                next_val = next_val.get_object()
+            except (AttributeError, ValueError, TypeError):
+                pass
 
-        if isinstance(next_val, pikepdf.Array):
-            bad_indices: list[int] = []
-            for i, next_action in enumerate(next_val):
-                try:
-                    next_action = next_action.get_object()
-                except (AttributeError, ValueError, TypeError):
-                    pass
-                if _is_non_compliant_action(next_action):
-                    bad_indices.append(i)
+            if isinstance(next_val, pikepdf.Array):
+                bad_indices: list[int] = []
+                for i, next_action in enumerate(next_val):
+                    try:
+                        next_action = next_action.get_object()
+                    except (AttributeError, ValueError, TypeError):
+                        pass
+                    if _is_non_compliant_action(next_action):
+                        bad_indices.append(i)
+                    else:
+                        pending.append(next_action)
+
+                for i in reversed(bad_indices):
+                    del next_val[i]
+                    removed += 1
+
+                if len(next_val) == 0:
+                    del action["/Next"]
+                elif len(next_val) == 1:
+                    action["/Next"] = next_val[0]
+
+            elif isinstance(next_val, pikepdf.Dictionary):
+                if _is_non_compliant_action(next_val):
+                    del action["/Next"]
+                    removed += 1
                 else:
-                    removed += _sanitize_next_chain(next_action, _visited)
-
-            for i in reversed(bad_indices):
-                del next_val[i]
-                removed += 1
-
-            if len(next_val) == 0:
-                del action["/Next"]
-            elif len(next_val) == 1:
-                action["/Next"] = next_val[0]
-
-        elif isinstance(next_val, pikepdf.Dictionary):
-            if _is_non_compliant_action(next_val):
-                del action["/Next"]
-                removed += 1
-            else:
-                removed += _sanitize_next_chain(next_val, _visited)
-    except Exception:
-        logger.debug("Error sanitizing /Next chain", exc_info=True)
+                    pending.append(next_val)
+        except Exception:
+            logger.debug("Error sanitizing /Next chain", exc_info=True)
 
     return removed

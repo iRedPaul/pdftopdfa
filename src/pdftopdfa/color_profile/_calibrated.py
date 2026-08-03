@@ -106,103 +106,122 @@ def _replace_cal_in_colorspace_dict(
     return replaced
 
 
-def _replace_cal_in_xobjects(
-    xobjects,
-    cal_gray_icc: Array | None,
-    cal_rgb_icc: Array | None,
-    visited: set[tuple[int, int]],
-) -> int:
-    """Replace CalGray/CalRGB in Image and Form XObjects (recursive)."""
-    if xobjects is None:
-        return 0
-
-    replaced = 0
-
-    for name in xobjects.keys():
-        xobj = _resolve_indirect(xobjects[name])
-
-        objgen = xobj.objgen
-        if objgen != (0, 0):
-            if objgen in visited:
-                continue
-            visited.add(objgen)
-
-        subtype = xobj.get(Name.Subtype)
-
-        if subtype == Name.Image:
-            cs = xobj.get(Name.ColorSpace)
-            if cs is not None:
-                cs = _resolve_indirect(cs)
-                repl = _replace_cal_colorspace(cs, cal_gray_icc, cal_rgb_icc)
-                if repl is not None:
-                    xobj[Name.ColorSpace] = repl
-                    replaced += 1
-                elif isinstance(cs, Array) and len(cs) >= 2:
-                    if cs[0] == Name.Indexed:
-                        base = _resolve_indirect(cs[1])
-                        repl = _replace_cal_colorspace(base, cal_gray_icc, cal_rgb_icc)
-                        if repl is not None:
-                            cs[1] = repl
-                            replaced += 1
-
-        elif subtype == Name.Form:
-            replaced += _replace_cal_in_group_cs(xobj, cal_gray_icc, cal_rgb_icc)
-            replaced += _replace_cal_in_form_resources(
-                xobj, cal_gray_icc, cal_rgb_icc, visited
-            )
-
-    return replaced
-
-
-def _replace_cal_in_form_resources(
-    form_xobj,
-    cal_gray_icc: Array | None,
-    cal_rgb_icc: Array | None,
-    visited: set[tuple[int, int]],
-) -> int:
-    """Replace CalGray/CalRGB throughout a Form XObject's resources."""
-    resources = form_xobj.get(Name.Resources)
-    if resources is None:
-        return 0
-
-    resources = _resolve_indirect(resources)
-    return _replace_cal_in_resources(resources, cal_gray_icc, cal_rgb_icc, visited)
-
-
 def _replace_cal_in_resources(
     resources,
     cal_gray_icc: Array | None,
     cal_rgb_icc: Array | None,
     visited: set[tuple[int, int]],
 ) -> int:
-    """Replace CalGray/CalRGB in all resource sub-dictionaries."""
+    """Replace CalGray/CalRGB throughout a resource graph."""
     replaced = 0
+    pending = [_resolve_indirect(resources)]
 
-    cs_dict = resources.get("/ColorSpace")
-    if cs_dict:
-        replaced += _replace_cal_in_colorspace_dict(cs_dict, cal_gray_icc, cal_rgb_icc)
+    while pending:
+        resources = pending.pop()
 
-    xobjects = resources.get(Name.XObject)
-    if xobjects:
-        replaced += _replace_cal_in_xobjects(
-            xobjects, cal_gray_icc, cal_rgb_icc, visited
-        )
+        cs_dict = resources.get("/ColorSpace")
+        if cs_dict:
+            replaced += _replace_cal_in_colorspace_dict(
+                cs_dict, cal_gray_icc, cal_rgb_icc
+            )
 
-    patterns = resources.get("/Pattern")
-    if patterns:
-        replaced += _replace_cal_in_patterns(
-            patterns, cal_gray_icc, cal_rgb_icc, visited
-        )
+        xobjects = resources.get(Name.XObject)
+        if xobjects:
+            xobjects = _resolve_indirect(xobjects)
+            for name in xobjects.keys():
+                xobj = _resolve_indirect(xobjects[name])
 
-    shadings = resources.get("/Shading")
-    if shadings:
-        replaced += _replace_cal_in_shadings(
-            shadings, cal_gray_icc, cal_rgb_icc, visited
-        )
+                objgen = xobj.objgen
+                if objgen != (0, 0):
+                    if objgen in visited:
+                        continue
+                    visited.add(objgen)
 
-    replaced += _replace_cal_in_type3_fonts(
-        resources, cal_gray_icc, cal_rgb_icc, visited
-    )
+                subtype = xobj.get(Name.Subtype)
+                if subtype == Name.Image:
+                    cs = xobj.get(Name.ColorSpace)
+                    if cs is not None:
+                        cs = _resolve_indirect(cs)
+                        repl = _replace_cal_colorspace(cs, cal_gray_icc, cal_rgb_icc)
+                        if repl is not None:
+                            xobj[Name.ColorSpace] = repl
+                            replaced += 1
+                        elif isinstance(cs, Array) and len(cs) >= 2:
+                            if cs[0] == Name.Indexed:
+                                base = _resolve_indirect(cs[1])
+                                repl = _replace_cal_colorspace(
+                                    base, cal_gray_icc, cal_rgb_icc
+                                )
+                                if repl is not None:
+                                    cs[1] = repl
+                                    replaced += 1
+                elif subtype == Name.Form:
+                    replaced += _replace_cal_in_group_cs(
+                        xobj, cal_gray_icc, cal_rgb_icc
+                    )
+                    form_resources = xobj.get(Name.Resources)
+                    if form_resources is not None:
+                        pending.append(_resolve_indirect(form_resources))
+
+        patterns = resources.get("/Pattern")
+        if patterns:
+            patterns = _resolve_indirect(patterns)
+            for name in patterns.keys():
+                try:
+                    pattern = _resolve_indirect(patterns[name])
+
+                    objgen = pattern.objgen
+                    if objgen != (0, 0):
+                        if objgen in visited:
+                            continue
+                        visited.add(objgen)
+
+                    pattern_type = pattern.get("/PatternType")
+                    if pattern_type == 1:
+                        pattern_resources = pattern.get("/Resources")
+                        if pattern_resources is not None:
+                            pending.append(_resolve_indirect(pattern_resources))
+                    elif pattern_type == 2:
+                        shading = pattern.get("/Shading")
+                        if shading is None:
+                            continue
+                        shading = _resolve_indirect(shading)
+                        shading_objgen = shading.objgen
+                        if shading_objgen != (0, 0):
+                            if shading_objgen in visited:
+                                continue
+                            visited.add(shading_objgen)
+                        cs = shading.get(Name.ColorSpace)
+                        if cs is not None:
+                            cs = _resolve_indirect(cs)
+                            repl = _replace_cal_colorspace(
+                                cs, cal_gray_icc, cal_rgb_icc
+                            )
+                            if repl is not None:
+                                shading[Name.ColorSpace] = repl
+                                replaced += 1
+                            elif isinstance(cs, Array) and len(cs) >= 2:
+                                if cs[0] == Name.Indexed:
+                                    base = _resolve_indirect(cs[1])
+                                    repl = _replace_cal_colorspace(
+                                        base, cal_gray_icc, cal_rgb_icc
+                                    )
+                                    if repl is not None:
+                                        cs[1] = repl
+                                        replaced += 1
+                except (AttributeError, KeyError, TypeError, ValueError) as e:
+                    logger.debug("Error replacing Cal* in pattern %s: %s", name, e)
+
+        shadings = resources.get("/Shading")
+        if shadings:
+            replaced += _replace_cal_in_shadings(
+                shadings, cal_gray_icc, cal_rgb_icc, visited
+            )
+
+        for _font_name, font in _iter_type3_fonts(resources, visited):
+            font_resources = font.get("/Resources")
+            if font_resources is not None:
+                pending.append(_resolve_indirect(font_resources))
 
     return replaced
 
@@ -246,91 +265,6 @@ def _replace_cal_in_shadings(
                             replaced += 1
         except (AttributeError, KeyError, TypeError, ValueError) as e:
             logger.debug("Error replacing Cal* in shading %s: %s", name, e)
-
-    return replaced
-
-
-def _replace_cal_in_patterns(
-    patterns,
-    cal_gray_icc: Array | None,
-    cal_rgb_icc: Array | None,
-    visited: set[tuple[int, int]],
-) -> int:
-    """Replace CalGray/CalRGB in Pattern resources."""
-    patterns = _resolve_indirect(patterns)
-    replaced = 0
-
-    for name in patterns.keys():
-        try:
-            pattern = _resolve_indirect(patterns[name])
-
-            obj_key = pattern.objgen
-            if obj_key != (0, 0):
-                if obj_key in visited:
-                    continue
-                visited.add(obj_key)
-
-            pattern_type = pattern.get("/PatternType")
-
-            if pattern_type == 1:
-                # Tiling pattern: recurse into resources
-                pat_resources = pattern.get("/Resources")
-                if pat_resources is not None:
-                    pat_resources = _resolve_indirect(pat_resources)
-                    replaced += _replace_cal_in_resources(
-                        pat_resources, cal_gray_icc, cal_rgb_icc, visited
-                    )
-
-            elif pattern_type == 2:
-                # Shading pattern: replace in /Shading/ColorSpace
-                shading = pattern.get("/Shading")
-                if shading is not None:
-                    shading = _resolve_indirect(shading)
-                    sh_objgen = shading.objgen
-                    if sh_objgen != (0, 0):
-                        if sh_objgen in visited:
-                            continue
-                        visited.add(sh_objgen)
-                    cs = shading.get(Name.ColorSpace)
-                    if cs is not None:
-                        cs = _resolve_indirect(cs)
-                        repl = _replace_cal_colorspace(cs, cal_gray_icc, cal_rgb_icc)
-                        if repl is not None:
-                            shading[Name.ColorSpace] = repl
-                            replaced += 1
-                        elif isinstance(cs, Array) and len(cs) >= 2:
-                            if cs[0] == Name.Indexed:
-                                base = _resolve_indirect(cs[1])
-                                repl = _replace_cal_colorspace(
-                                    base, cal_gray_icc, cal_rgb_icc
-                                )
-                                if repl is not None:
-                                    cs[1] = repl
-                                    replaced += 1
-
-        except (AttributeError, KeyError, TypeError, ValueError) as e:
-            logger.debug("Error replacing Cal* in pattern %s: %s", name, e)
-
-    return replaced
-
-
-def _replace_cal_in_type3_fonts(
-    resources,
-    cal_gray_icc: Array | None,
-    cal_rgb_icc: Array | None,
-    visited: set[tuple[int, int]],
-) -> int:
-    """Replace CalGray/CalRGB in Type3 font resources."""
-    replaced = 0
-
-    for _font_name, font in _iter_type3_fonts(resources, visited):
-        font_resources = font.get("/Resources")
-        if font_resources is None:
-            continue
-        font_resources = _resolve_indirect(font_resources)
-        replaced += _replace_cal_in_resources(
-            font_resources, cal_gray_icc, cal_rgb_icc, visited
-        )
 
     return replaced
 
@@ -380,9 +314,11 @@ def _replace_cal_in_ap_entry(
             visited.add(objgen)
 
         replaced += _replace_cal_in_group_cs(ap_value, cal_gray_icc, cal_rgb_icc)
-        replaced += _replace_cal_in_form_resources(
-            ap_value, cal_gray_icc, cal_rgb_icc, visited
-        )
+        resources = ap_value.get(Name.Resources)
+        if resources is not None:
+            replaced += _replace_cal_in_resources(
+                resources, cal_gray_icc, cal_rgb_icc, visited
+            )
 
     elif isinstance(ap_value, Dictionary):
         for key in ap_value.keys():
@@ -397,9 +333,11 @@ def _replace_cal_in_ap_entry(
                 replaced += _replace_cal_in_group_cs(
                     sub_stream, cal_gray_icc, cal_rgb_icc
                 )
-                replaced += _replace_cal_in_form_resources(
-                    sub_stream, cal_gray_icc, cal_rgb_icc, visited
-                )
+                resources = sub_stream.get(Name.Resources)
+                if resources is not None:
+                    replaced += _replace_cal_in_resources(
+                        resources, cal_gray_icc, cal_rgb_icc, visited
+                    )
 
     return replaced
 

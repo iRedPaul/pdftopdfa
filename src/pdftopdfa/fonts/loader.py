@@ -30,6 +30,20 @@ logger = logging.getLogger(__name__)
 _WINDOWS_ALLOWED_SYSTEM_FONT_NAMES = frozenset(
     name.replace(" ", "").lower() for name in WINDOWS_SYSTEM_FONT_POSTSCRIPT_NAMES
 )
+_WINDOWS_SYSTEM_FONT_ALIASES = {
+    "arial": "arialmt",
+    "arial,bold": "arial-boldmt",
+    "arial,italic": "arial-italicmt",
+    "arial,bolditalic": "arial-bolditalicmt",
+    "timesnewroman": "timesnewromanpsmt",
+    "timesnewroman,bold": "timesnewromanps-boldmt",
+    "timesnewroman,italic": "timesnewromanps-italicmt",
+    "timesnewroman,bolditalic": "timesnewromanps-bolditalicmt",
+    "couriernew": "couriernewpsmt",
+    "couriernew,bold": "couriernewps-boldmt",
+    "couriernew,italic": "couriernewps-italicmt",
+    "couriernew,bolditalic": "couriernewps-bolditalicmt",
+}
 
 # Process-wide cache of the scanned system font index, keyed by the fonts
 # directory. Building the index walks every font file under %WINDIR%\Fonts
@@ -111,6 +125,11 @@ class FontLoader:
         if use_fallback:
             return self.load_fallback_font()
         return self.load_standard14_font(font_name)
+
+    def is_fallback_font(self, tt_font: "TTFont") -> bool:
+        """Return whether ``tt_font`` is this loader's bundled fallback."""
+        cached = self._font_cache.get("__fallback__")
+        return cached is not None and cached[1] is tt_font
 
     def load_fallback_font(self) -> tuple[bytes, "TTFont"]:
         """Loads the fallback font (LiberationSans) for unknown fonts.
@@ -252,7 +271,7 @@ class FontLoader:
             return None
 
         actual_ps_name = self._extract_postscript_name(tt_font)
-        if not self._is_windows_font_request_allowed(actual_ps_name):
+        if not self._is_windows_postscript_name_allowed(actual_ps_name):
             logger.warning(
                 "Ignoring system font '%s' because resolved PostScript name "
                 "'%s' is not allowlisted",
@@ -311,6 +330,12 @@ class FontLoader:
     @classmethod
     def _normalize_font_lookup_name(cls, font_name: str) -> str:
         """Normalize font names for exact-ish system lookup."""
+        normalized = font_name.lstrip("/").replace(" ", "").rstrip("*").lower()
+        return _WINDOWS_SYSTEM_FONT_ALIASES.get(normalized, normalized)
+
+    @staticmethod
+    def _normalize_system_postscript_name(font_name: str) -> str:
+        """Normalize an internal PostScript name without applying aliases."""
         return font_name.lstrip("/").replace(" ", "").lower()
 
     def _build_system_font_index(self) -> dict[str, tuple[Path, int | None]]:
@@ -349,7 +374,9 @@ class FontLoader:
                             candidate = self._extract_postscript_name(tt_font)
                             if candidate is None:
                                 continue
-                            normalized = self._normalize_font_lookup_name(candidate)
+                            normalized = self._normalize_system_postscript_name(
+                                candidate
+                            )
                             if normalized in _WINDOWS_ALLOWED_SYSTEM_FONT_NAMES:
                                 index.setdefault(normalized, (font_path, font_number))
                     finally:
@@ -360,7 +387,7 @@ class FontLoader:
                         candidate = self._extract_postscript_name(tt_font)
                         if candidate is None:
                             continue
-                        normalized = self._normalize_font_lookup_name(candidate)
+                        normalized = self._normalize_system_postscript_name(candidate)
                         if normalized in _WINDOWS_ALLOWED_SYSTEM_FONT_NAMES:
                             index.setdefault(normalized, (font_path, None))
                     finally:
@@ -435,10 +462,19 @@ class FontLoader:
 
     @classmethod
     def _is_windows_font_request_allowed(cls, font_name: str | None) -> bool:
-        """Check whether a requested or resolved PostScript name is allowlisted."""
+        """Check whether a requested font name maps to the allowlist."""
         if not cls._is_windows_platform() or not font_name:
             return False
         return cls._normalize_font_lookup_name(font_name) in (
+            _WINDOWS_ALLOWED_SYSTEM_FONT_NAMES
+        )
+
+    @classmethod
+    def _is_windows_postscript_name_allowed(cls, font_name: str | None) -> bool:
+        """Check an internal PostScript name against the strict allowlist."""
+        if not cls._is_windows_platform() or not font_name:
+            return False
+        return cls._normalize_system_postscript_name(font_name) in (
             _WINDOWS_ALLOWED_SYSTEM_FONT_NAMES
         )
 

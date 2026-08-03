@@ -387,6 +387,56 @@ class TestEnsureCatalogLang:
         assert ensure_catalog_lang(pdf) is False
         assert str(pdf.Root["/Lang"]) == "de-DE"
 
+    @pytest.mark.parametrize("language", ["x", "abcdefgh", "I-KLINGON"])
+    def test_pdfa_rfc3066_language_tags_are_preserved(self, language):
+        """PDF/A accepts one-to-eight-letter primary language subtags."""
+        pdf = new_pdf()
+        pdf.Root["/Lang"] = pikepdf.String(language)
+
+        assert ensure_catalog_lang(pdf) is False
+        assert str(pdf.Root["/Lang"]) == language
+
+    def test_invalid_existing_lang_is_repaired(self):
+        """An invalid existing /Lang is replaced with a valid fallback."""
+        pdf = new_pdf()
+        pdf.Root["/Lang"] = pikepdf.String("not a valid tag!")
+
+        assert ensure_catalog_lang(pdf) is True
+        assert str(pdf.Root["/Lang"]) == "und"
+
+    def test_empty_existing_lang_is_repaired(self):
+        """Enterprise output expresses unknown language explicitly as ``und``."""
+        pdf = new_pdf()
+        pdf.Root["/Lang"] = pikepdf.String("")
+
+        assert ensure_catalog_lang(pdf) is True
+        assert str(pdf.Root["/Lang"]) == "und"
+
+    def test_empty_existing_lang_uses_xmp_language(self):
+        """A declared XMP language takes priority over the ``und`` fallback."""
+        pdf = new_pdf()
+        pdf.Root["/Lang"] = pikepdf.String("")
+        xmp = (
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/">'
+            b"<dc:language><rdf:Bag><rdf:li>de-DE</rdf:li>"
+            b"</rdf:Bag></dc:language>"
+            b"</rdf:Description></rdf:RDF></x:xmpmeta>"
+        )
+        pdf.Root["/Metadata"] = pdf.make_stream(xmp)
+
+        assert ensure_catalog_lang(pdf) is True
+        assert str(pdf.Root["/Lang"]) == "de-DE"
+
+    def test_existing_lang_whitespace_is_removed(self):
+        """Whitespace around a valid language tag is not preserved."""
+        pdf = new_pdf()
+        pdf.Root["/Lang"] = pikepdf.String(" de-DE ")
+
+        assert ensure_catalog_lang(pdf) is True
+        assert str(pdf.Root["/Lang"]) == "de-DE"
+
     def test_no_xmp_sets_und(self):
         """/Lang is set to 'und' when no XMP metadata exists."""
         pdf = new_pdf()
@@ -482,6 +532,9 @@ class TestIsValidBcp47:
         "tag",
         [
             "en",
+            "e",
+            "a",
+            "abcdefgh",
             "fr",
             "de",
             "und",
@@ -512,7 +565,6 @@ class TestIsValidBcp47:
         "tag",
         [
             "",
-            "e",
             "toolonglanguage",
             "en_US",
             "en US",
@@ -521,7 +573,7 @@ class TestIsValidBcp47:
             "-en",
             "not a valid tag!",
             "en--US",
-            "a",
+            "de\n",
         ],
     )
     def test_invalid_tags(self, tag):
@@ -635,6 +687,30 @@ class TestEnsureMarkInfo:
         pdf = new_pdf()
         pdf.Root["/MarkInfo"] = pikepdf.Dictionary(Marked=False)
         assert ensure_mark_info(pdf) is False
+
+    @pytest.mark.parametrize("level", ["2a", "3a"])
+    def test_level_a_sets_marked_true(self, level):
+        """Level A creates /MarkInfo with /Marked true."""
+        pdf = new_pdf()
+
+        assert ensure_mark_info(pdf, level) is True
+        assert bool(pdf.Root["/MarkInfo"]["/Marked"]) is True
+
+    def test_level_a_upgrades_marked_false(self):
+        """Level A changes an existing /Marked false to true."""
+        pdf = new_pdf()
+        pdf.Root["/MarkInfo"] = pikepdf.Dictionary(Marked=False)
+
+        assert ensure_mark_info(pdf, "2a") is True
+        assert bool(pdf.Root["/MarkInfo"]["/Marked"]) is True
+
+    def test_level_a_replaces_malformed_markinfo(self):
+        """Level A replaces a non-dictionary /MarkInfo."""
+        pdf = new_pdf()
+        pdf.Root["/MarkInfo"] = pikepdf.Name("/Invalid")
+
+        assert ensure_mark_info(pdf, "2a") is True
+        assert bool(pdf.Root["/MarkInfo"]["/Marked"]) is True
 
     def test_preserves_other_markinfo_keys(self):
         """/MarkInfo with other keys but no /Marked -> /Marked added, others kept."""

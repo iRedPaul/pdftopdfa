@@ -5,6 +5,7 @@
 """Unit tests for converter.py."""
 
 import logging
+import os
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,8 +28,19 @@ from pdftopdfa.converter import (
     get_pdfa_save_settings,
     save_pdfa,
 )
-from pdftopdfa.exceptions import ConversionError, OCRError, VeraPDFError
-from pdftopdfa.verapdf import VeraPDFResult
+from pdftopdfa.exceptions import (
+    ConversionError,
+    OCRError,
+    UnsupportedPDFError,
+    VeraPDFError,
+)
+from pdftopdfa.metadata import NAMESPACES, embed_xmp_metadata
+from pdftopdfa.validator import detect_iso_standards
+from pdftopdfa.verapdf import (
+    VeraPDFResult,
+    is_verapdf_available,
+    validate_with_verapdf,
+)
 
 _DETECTION_MODEL_DIR = Path("paddle-detection")
 _RECOGNITION_MODEL_DIR = Path("paddle-recognition")
@@ -200,7 +212,14 @@ class TestPdfaSaveSettings:
 
     @pytest.mark.parametrize(
         ("level", "expected_version"),
-        [("2b", "1.7"), ("2u", "1.7"), ("3b", "1.7"), ("3u", "1.7")],
+        [
+            ("2a", "1.7"),
+            ("2b", "1.7"),
+            ("2u", "1.7"),
+            ("3a", "1.7"),
+            ("3b", "1.7"),
+            ("3u", "1.7"),
+        ],
     )
     def test_get_pdfa_save_settings(self, level: str, expected_version: str) -> None:
         """PDF/A save settings keep the existing final output behavior."""
@@ -241,6 +260,19 @@ class TestPdfaSaveSettings:
 
 class TestConvertToPdfa:
     """Tests for convert_to_pdfa."""
+
+    @pytest.mark.parametrize("level", ["2a", "3a"])
+    def test_rejects_document_without_pages(self, level: str, tmp_dir: Path) -> None:
+        """A page-less input cannot produce a valid PDF/A document."""
+        input_path = tmp_dir / "empty.pdf"
+        output_path = tmp_dir / f"empty-{level}.pdf"
+        with Pdf.new() as pdf:
+            pdf.save(input_path)
+
+        with pytest.raises(UnsupportedPDFError, match="contains no pages"):
+            convert_to_pdfa(input_path, output_path, level=level)
+
+        assert not output_path.exists()
 
     def test_convert_simple_pdf(self, sample_pdf: Path, tmp_dir: Path) -> None:
         """Simple conversion with success check."""
@@ -290,6 +322,24 @@ class TestConvertToPdfa:
 
         with pytest.raises(ConversionError, match="validation cannot be used"):
             api(*args, pdfa=False, validate=True)
+
+    def test_no_pdfa_batch_apis_ignore_level_for_empty_inputs(
+        self, tmp_dir: Path
+    ) -> None:
+        """Processing-only batch APIs do not apply the PDF/A level option."""
+        empty_dir = tmp_dir / "empty"
+        empty_dir.mkdir()
+
+        assert convert_files([], pdfa=False, level="invalid") == []
+        assert (
+            convert_directory(
+                empty_dir,
+                pdfa=False,
+                level="invalid",
+                show_progress=False,
+            )
+            == []
+        )
 
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=False)
     def test_no_pdfa_fails_when_requested_ocr_is_unavailable(
@@ -460,9 +510,33 @@ class TestConvertToPdfa:
 
         assert result.success is True
         assert result.skipped is True
+        assert result.level is None
         assert any("encrypted" in w for w in result.warnings)
         assert output_path.exists()
         assert output_path.read_bytes() == encrypted_pdf.read_bytes()
+
+    @pytest.mark.parametrize("pdfa", [True, False])
+    def test_password_encrypted_pdf_is_copied_unchanged(
+        self,
+        password_encrypted_pdf: Path,
+        tmp_dir: Path,
+        pdfa: bool,
+    ) -> None:
+        """A non-empty user password does not turn a safe skip into failure."""
+        output_path = tmp_dir / "output.pdf"
+
+        result = convert_to_pdfa(
+            password_encrypted_pdf,
+            output_path,
+            level="3a",
+            pdfa=pdfa,
+        )
+
+        assert result.success is True
+        assert result.skipped is True
+        assert result.level is None
+        assert any("encrypted" in warning for warning in result.warnings)
+        assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
 
     def test_no_pdfa_encrypted_pdf_is_copied_unchanged(
         self, encrypted_pdf: Path, tmp_dir: Path
@@ -478,7 +552,7 @@ class TestConvertToPdfa:
         assert output_path.read_bytes() == encrypted_pdf.read_bytes()
         assert any("encrypted" in warning for warning in result.warnings)
 
-    @pytest.mark.parametrize("level", ["2b", "2u", "3b", "3u"])
+    @pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
     def test_convert_all_levels(
         self, sample_pdf: Path, tmp_dir: Path, level: str
     ) -> None:
@@ -489,6 +563,336 @@ class TestConvertToPdfa:
         assert result.success is True
         assert result.level == level
         assert output_path.exists()
+
+    @pytest.mark.parametrize("level", ["2a", "3a"])
+    def test_convert_level_a_preserves_tagged_structure(
+        self, tagged_pdf: Path, tmp_dir: Path, level: str
+    ) -> None:
+        """Level A converts an already tagged PDF without replacing its tags."""
+        output_path = tmp_dir / f"output_{level}.pdf"
+
+        result = convert_to_pdfa(tagged_pdf, output_path, level=level)
+
+        assert result.success is True
+        assert result.level == level
+        with Pdf.open(output_path) as pdf:
+            assert bool(pdf.Root.MarkInfo.Marked) is True
+            assert pdf.Root.StructTreeRoot.Type == Name.StructTreeRoot
+            assert len(pdf.Root.StructTreeRoot.K) == 1
+
+    @pytest.mark.parametrize("level", ["2a", "3a"])
+    def test_convert_level_a_tags_scanned_input(
+        self, pdf_with_image: Path, tmp_dir: Path, level: str
+    ) -> None:
+        """Level A creates logical structure for an image-only scan."""
+        output_path = tmp_dir / f"output_{level}.pdf"
+
+        result = convert_to_pdfa(pdf_with_image, output_path, level=level)
+
+        assert result.success is True
+        with Pdf.open(output_path) as pdf:
+            assert bool(pdf.Root.MarkInfo.Marked) is True
+            assert pdf.Root.StructTreeRoot.Type == Name.StructTreeRoot
+            assert "/ParentTree" in pdf.Root.StructTreeRoot
+            assert int(pdf.pages[0].StructParents) == 0
+            assert bytes(pdf.pages[0].Contents[0].read_bytes()).startswith(b"/Div ")
+
+    @pytest.mark.parametrize("level", ["2a", "3a"])
+    def test_convert_level_a_removes_pdfua_claim_when_rebuilding_tags(
+        self, sample_pdf: Path, tmp_dir: Path, level: str
+    ) -> None:
+        """A rebuilt technical tag tree must not retain a PDF/UA claim."""
+        input_path = tmp_dir / f"claimed_pdfua_{level}.pdf"
+        output_path = tmp_dir / f"rebuilt_{level}.pdf"
+        xmp = f"""\
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}"
+           xmlns:pdfuaid="{NAMESPACES["pdfuaid"]}">
+    <rdf:Description rdf:about="">
+      <pdfuaid:part>1</pdfuaid:part>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>""".encode()
+
+        with Pdf.open(sample_pdf) as pdf:
+            embed_xmp_metadata(pdf, xmp)
+            pdf.save(input_path)
+
+        result = convert_to_pdfa(input_path, output_path, level=level)
+
+        assert result.success is True
+        assert any(
+            "PDF/UA identification removed" in warning for warning in result.warnings
+        )
+        with Pdf.open(output_path) as pdf:
+            assert all(
+                standard.standard != "PDF/UA" for standard in detect_iso_standards(pdf)
+            )
+
+    @pytest.mark.parametrize("level", ["2a", "3a"])
+    def test_convert_level_a_removes_pdfvt_claim_with_pdfx(
+        self, sample_pdf: Path, tmp_dir: Path, level: str
+    ) -> None:
+        """Dropping PDF/X also drops its dependent PDF/VT claim."""
+        input_path = tmp_dir / f"claimed_pdfvt_{level}.pdf"
+        output_path = tmp_dir / f"without_pdfvt_{level}.pdf"
+        xmp = f"""\
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}"
+           xmlns:pdfxid="{NAMESPACES["pdfxid"]}"
+           xmlns:pdfvtid="{NAMESPACES["pdfvtid"]}"
+           xmlns:pdfe="{NAMESPACES["pdfeid"]}">
+    <rdf:Description rdf:about="">
+      <pdfxid:GTS_PDFXVersion>PDF/X-4</pdfxid:GTS_PDFXVersion>
+      <pdfvtid:GTS_PDFVTVersion>PDF/VT-1</pdfvtid:GTS_PDFVTVersion>
+      <pdfe:ISO_PDFEVersion>PDF/E-1</pdfe:ISO_PDFEVersion>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>""".encode()
+
+        with Pdf.open(sample_pdf) as pdf:
+            embed_xmp_metadata(pdf, xmp)
+            pdf.save(input_path)
+
+        result = convert_to_pdfa(input_path, output_path, level=level)
+
+        assert result.success is True
+        assert any(
+            "PDF/VT identification removed" in warning for warning in result.warnings
+        )
+        with Pdf.open(output_path) as pdf:
+            standards = {standard.standard for standard in detect_iso_standards(pdf)}
+            assert "PDF/X" not in standards
+            assert "PDF/VT" not in standards
+            assert "PDF/E" not in standards
+
+    @pytest.mark.parametrize("level", ["2a", "3a"])
+    def test_convert_level_a_removes_pdfvt_claim_without_pdfx(
+        self, sample_pdf: Path, tmp_dir: Path, level: str
+    ) -> None:
+        """A stale PDF/VT claim is removed even when PDF/X ID is already absent."""
+        input_path = tmp_dir / f"pdfvt_without_pdfx_{level}.pdf"
+        output_path = tmp_dir / f"without_pdfvt_{level}.pdf"
+        xmp = f"""\
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}"
+           xmlns:pdfvtid="{NAMESPACES["pdfvtid"]}">
+    <rdf:Description rdf:about="">
+      <pdfvtid:GTS_PDFVTVersion>PDF/VT-1</pdfvtid:GTS_PDFVTVersion>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>""".encode()
+
+        with Pdf.open(sample_pdf) as pdf:
+            embed_xmp_metadata(pdf, xmp)
+            pdf.save(input_path)
+
+        result = convert_to_pdfa(input_path, output_path, level=level)
+
+        assert result.success is True
+        assert any(
+            "PDF/VT identification removed" in warning for warning in result.warnings
+        )
+        with Pdf.open(output_path) as pdf:
+            assert all(
+                standard.standard != "PDF/VT" for standard in detect_iso_standards(pdf)
+            )
+
+    @pytest.mark.parametrize("level", ["2a", "3a"])
+    def test_convert_level_a_removes_pdfe_claim_after_docinfo_cleanup(
+        self, sample_pdf: Path, tmp_dir: Path, level: str
+    ) -> None:
+        """Dropping PDF/E's required DocInfo marker also drops its XMP claim."""
+        input_path = tmp_dir / f"claimed_pdfe_{level}.pdf"
+        output_path = tmp_dir / f"without_pdfe_{level}.pdf"
+        xmp = f"""\
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}"
+           xmlns:pdfe="{NAMESPACES["pdfeid"]}">
+    <rdf:Description rdf:about=""
+                     pdfe:ISO_PDFEVersion="PDF/E-1"/>
+  </rdf:RDF>
+</x:xmpmeta>""".encode()
+
+        with Pdf.open(sample_pdf) as pdf:
+            embed_xmp_metadata(pdf, xmp)
+            pdf.docinfo["/ISO_PDFEVersion"] = "PDF/E-1"
+            pdf.save(input_path)
+
+        result = convert_to_pdfa(input_path, output_path, level=level)
+
+        assert result.success is True
+        assert any(
+            "PDF/E identification removed" in warning for warning in result.warnings
+        )
+        with Pdf.open(output_path) as pdf:
+            assert "/ISO_PDFEVersion" not in pdf.docinfo
+            assert all(
+                standard.standard != "PDF/E" for standard in detect_iso_standards(pdf)
+            )
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_convert_level_a_preserves_tags_after_noop_ocr(
+        self,
+        _mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        tagged_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """A no-op OCR pass must not replace valid semantic tags."""
+        import shutil
+
+        def copy_ocr_output(
+            input_path: Path,
+            output_path: Path,
+            _languages: list[str],
+            **_kwargs: object,
+        ) -> Path:
+            shutil.copy2(input_path, output_path)
+            return output_path
+
+        mock_apply_ocr.side_effect = copy_ocr_output
+        output_path = tmp_dir / "ocr_output_2a.pdf"
+
+        result = convert_to_pdfa(
+            tagged_pdf,
+            output_path,
+            level="2a",
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        )
+
+        assert result.success is True
+        assert not any(
+            "Tagged PDF structure generated" in item for item in result.warnings
+        )
+        with Pdf.open(output_path) as pdf:
+            document = pdf.Root.StructTreeRoot.K[0]
+            assert document.S == Name.Document
+            assert document.K[0].S == Name.P
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_convert_level_a_rebuilds_tags_after_ocr_changes_content(
+        self,
+        _mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        tagged_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Changed untagged OCR content invalidates and rebuilds stale tags."""
+
+        def add_untagged_ocr_content(
+            input_path: Path,
+            output_path: Path,
+            _languages: list[str],
+            **_kwargs: object,
+        ) -> Path:
+            with Pdf.open(input_path) as pdf:
+                page = pdf.pages[0]
+                page.obj.Contents.append(pdf.make_stream(b"0 0 10 10 re f"))
+                pdf.save(output_path)
+            return output_path
+
+        mock_apply_ocr.side_effect = add_untagged_ocr_content
+        output_path = tmp_dir / "ocr_changed_2a.pdf"
+
+        result = convert_to_pdfa(
+            tagged_pdf,
+            output_path,
+            level="2a",
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        )
+
+        assert result.success is True
+        assert any("Tagged PDF structure generated" in item for item in result.warnings)
+        with Pdf.open(output_path) as pdf:
+            document = pdf.Root.StructTreeRoot.K
+            assert document.S == Name.Document
+            assert document.K[0].S == Name.Div
+
+    @pytest.mark.parametrize("pdfa", [True, False])
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_ocr_rejects_same_input_and_output_without_modifying_source(
+        self,
+        _mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        sample_pdf: Path,
+        pdfa: bool,
+    ) -> None:
+        """OCR cannot bypass the conversion's in-place write protection."""
+        original = sample_pdf.read_bytes()
+
+        with pytest.raises(ConversionError, match="Input and output paths must differ"):
+            convert_to_pdfa(
+                sample_pdf,
+                sample_pdf,
+                pdfa=pdfa,
+                ocr_languages=["en"],
+                ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            )
+
+        assert sample_pdf.read_bytes() == original
+        mock_apply_ocr.assert_not_called()
+
+    @pytest.mark.parametrize("pdfa", [True, False])
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_ocr_rejects_hard_link_output_without_modifying_source(
+        self,
+        _mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        pdfa: bool,
+    ) -> None:
+        """OCR rejects a distinct output path that aliases the input file."""
+        input_path = tmp_dir / "hard-link-input.pdf"
+        output_path = tmp_dir / "hard-link-output.pdf"
+        input_path.write_bytes(sample_pdf.read_bytes())
+        original = input_path.read_bytes()
+        try:
+            os.link(input_path, output_path)
+        except OSError as exc:
+            pytest.skip(f"Hard links are not supported: {exc}")
+
+        with pytest.raises(ConversionError, match="Input and output paths must differ"):
+            convert_to_pdfa(
+                input_path,
+                output_path,
+                pdfa=pdfa,
+                ocr_languages=["en"],
+                ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            )
+
+        assert input_path.read_bytes() == original
+        assert output_path.read_bytes() == original
+        mock_apply_ocr.assert_not_called()
+
+    @pytest.mark.skipif(
+        not is_verapdf_available(),
+        reason="veraPDF is not installed",
+    )
+    @pytest.mark.parametrize("level", ["2a", "3a"])
+    def test_convert_scanned_level_a_passes_verapdf(
+        self, pdf_with_image: Path, tmp_dir: Path, level: str
+    ) -> None:
+        """An image-only scan passes the exact veraPDF level A profile."""
+        output_path = tmp_dir / f"validated_{level}.pdf"
+
+        convert_to_pdfa(pdf_with_image, output_path, level=level)
+        validation = validate_with_verapdf(output_path, flavour=level)
+
+        assert validation.compliant is True
+        assert validation.flavour == level
+        assert validation.failed_rules == 0
 
     def test_convert_with_validation_flag(
         self, sample_pdf: Path, tmp_dir: Path
@@ -518,6 +922,46 @@ class TestConvertToPdfa:
         assert result.success is True
         assert result.validation_failed is True
         assert any("Validation: Rule 6.1.2 failed" in w for w in result.warnings)
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_convert_with_unavailable_validation_fails_closed(
+        self,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """An explicit validation request reports an unavailable validator."""
+        mock_verapdf.side_effect = VeraPDFError("veraPDF crashed")
+        output_path = tmp_dir / "output.pdf"
+
+        result = convert_to_pdfa(sample_pdf, output_path, validate=True)
+
+        assert result.success is True
+        assert result.validation_failed is True
+        assert "Validation: veraPDF could not run: veraPDF crashed" in result.warnings
+        assert output_path.exists()
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_encrypted_skip_is_still_validated_when_requested(
+        self,
+        mock_verapdf: MagicMock,
+        encrypted_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Explicit validation does not silently bypass encrypted skip output."""
+        mock_verapdf.return_value = VeraPDFResult(
+            compliant=False,
+            flavour="3b",
+            errors=["Encryption is not permitted"],
+        )
+        output_path = tmp_dir / "output.pdf"
+
+        result = convert_to_pdfa(encrypted_pdf, output_path, validate=True)
+
+        assert result.skipped is True
+        assert result.validation_failed is True
+        assert "Validation: Encryption is not permitted" in result.warnings
+        mock_verapdf.assert_called_once_with(path=output_path, flavour="3b")
 
     @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_with_ocr_language_fails_when_unavailable(
@@ -907,6 +1351,79 @@ class TestConvertToPdfa:
         assert leftovers == []
 
     @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_convert_retries_transient_inline_ocr_temp_cleanup_failures(
+        self,
+        _mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """The final cleanup retries transient Windows-style file locks."""
+        import shutil
+        import tempfile
+        from collections import Counter
+
+        annotated_pdf = tmp_dir / "annotated.pdf"
+        with Pdf.open(sample_pdf) as pdf:
+            annot = pdf.make_indirect(
+                Dictionary(
+                    Type=Name.Annot,
+                    Subtype=Name.Text,
+                    Rect=Array([10, 10, 30, 30]),
+                )
+            )
+            pdf.pages[0].obj["/Annots"] = Array([annot])
+            pdf.save(annotated_pdf)
+
+        def copy_ocr_output(
+            input_path: Path, output_path: Path, *_args: object, **_kwargs: object
+        ) -> Path:
+            return Path(shutil.copy2(input_path, output_path))
+
+        mock_apply_ocr.side_effect = copy_ocr_output
+        created: list[Path] = []
+        real_mkstemp = tempfile.mkstemp
+        real_unlink = Path.unlink
+        unlink_attempts: Counter[Path] = Counter()
+
+        def tracking_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+            fd, path = real_mkstemp(*args, **kwargs)
+            created.append(Path(path))
+            return fd, path
+
+        def transient_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            retry_inline = "_sig_" in path.name or "_clean_" in path.name
+            unlink_attempts[path] += 1
+            if retry_inline and unlink_attempts[path] == 1:
+                raise PermissionError("temporary Windows file lock")
+            real_unlink(path, *args, **kwargs)
+
+        output_path = tmp_dir / "output.pdf"
+        with (
+            patch(
+                "pdftopdfa.converter.tempfile.mkstemp",
+                side_effect=tracking_mkstemp,
+            ),
+            patch("pathlib.Path.unlink", new=transient_unlink),
+        ):
+            result = convert_to_pdfa(
+                annotated_pdf,
+                output_path,
+                ocr_languages=["en"],
+                ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            )
+
+        assert result.success is True
+        retried = [
+            path for path in created if "_sig_" in path.name or "_clean_" in path.name
+        ]
+        assert len(retried) == 2
+        assert all(unlink_attempts[path] == 2 for path in retried)
+        assert all(not path.exists() for path in created)
+
+    @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_with_ocr_adds_warning_message(
         self,
@@ -1101,6 +1618,46 @@ class TestConvertToPdfa:
         mock_apply_ocr.assert_called_once()
         mock_verapdf.assert_not_called()
 
+    @pytest.mark.parametrize("skip_any_pdfa", [False, True])
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    @patch("pdftopdfa.converter.detect_pdfa_level")
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_requested_ocr_bypasses_compliant_pdfa_skip(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        mock_detect: MagicMock,
+        mock_verapdf: MagicMock,
+        skip_any_pdfa: bool,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Normal OCR still runs for a compliant but potentially image-only PDF/A."""
+        import shutil
+
+        mock_is_ocr_available.return_value = True
+        mock_detect.return_value = "2a"
+        mock_verapdf.return_value = VeraPDFResult(compliant=True, flavour="2a")
+        mock_apply_ocr.side_effect = lambda inp, out, *a, **kw: (
+            shutil.copy(inp, out) or out
+        )
+
+        result = convert_to_pdfa(
+            sample_pdf,
+            tmp_dir / "ocr.pdf",
+            level="2a",
+            skip_any_pdfa=skip_any_pdfa,
+            ocr_languages=["de"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        )
+
+        assert result.success is True
+        assert result.skipped is False
+        mock_apply_ocr.assert_called_once()
+        mock_verapdf.assert_not_called()
+
     @pytest.mark.parametrize("processing_option", ["ocr_deskew", "ocr_rotate_pages"])
     @patch("pdftopdfa.converter.validate_with_verapdf")
     @patch("pdftopdfa.converter.detect_pdfa_level")
@@ -1244,10 +1801,40 @@ class TestConvertToPdfa:
 
         assert result.success is True
         assert result.skipped is True
+        assert result.level is None
         assert any("digital signatures" in warning for warning in result.warnings)
         assert output_path.read_bytes() == signed_input.read_bytes()
         mock_is_ocr_available.assert_not_called()
         mock_apply_ocr.assert_not_called()
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_signed_skip_is_still_validated_when_requested(
+        self,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Explicit validation does not silently bypass signed skip output."""
+        signed_input = tmp_dir / "signed_input.pdf"
+        _write_signed_pdf(sample_pdf, signed_input)
+        mock_verapdf.return_value = VeraPDFResult(
+            compliant=False,
+            flavour="3b",
+            errors=["The output is not PDF/A-3b"],
+        )
+        output_path = tmp_dir / "output.pdf"
+
+        result = convert_to_pdfa(
+            signed_input,
+            output_path,
+            level="3b",
+            validate=True,
+        )
+
+        assert result.skipped is True
+        assert result.validation_failed is True
+        assert "Validation: The output is not PDF/A-3b" in result.warnings
+        mock_verapdf.assert_called_once_with(path=output_path, flavour="3b")
 
     def test_signed_pdf_can_be_converted_with_explicit_invalidation(
         self,
@@ -1665,6 +2252,19 @@ class TestConvertToPdfa:
         with pytest.raises(ConversionError, match="PDF processing error"):
             convert_to_pdfa(corrupt_path, output_path)
 
+    @patch(
+        "pdftopdfa.converter.save_pdfa", side_effect=PermissionError("access denied")
+    )
+    def test_output_permission_error_is_not_wrapped(
+        self,
+        _mock_save: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Output permission failures remain distinguishable to API callers."""
+        with pytest.raises(PermissionError, match="access denied"):
+            convert_to_pdfa(sample_pdf, tmp_dir / "output.pdf")
+
     def test_convert_with_calibrated_false(
         self, sample_pdf: Path, tmp_dir: Path
     ) -> None:
@@ -1893,6 +2493,16 @@ class TestConvertDirectory:
 
         results = convert_directory(empty_dir, show_progress=False)
         assert results == []
+
+    def test_convert_directory_rejects_invalid_level_when_empty(
+        self, tmp_dir: Path
+    ) -> None:
+        """A global PDF/A configuration error fails before file discovery."""
+        empty_dir = tmp_dir / "empty"
+        empty_dir.mkdir()
+
+        with pytest.raises(ConversionError, match="Invalid PDF/A level"):
+            convert_directory(empty_dir, level="4b", show_progress=False)
 
     def test_convert_directory_nonexistent(self, tmp_dir: Path) -> None:
         """Non-existent directory raises ConversionError."""
@@ -2125,10 +2735,10 @@ class TestConvertDirectory:
         )
 
         file_pairs = mock_convert_files.call_args.kwargs["file_pairs"]
-        expected_inputs = (
-            [source] if output_location == "same" else [source, previous_output]
-        )
-        assert [input_path for input_path, _ in file_pairs] == expected_inputs
+        assert [input_path for input_path, _ in file_pairs] == [
+            source,
+            previous_output,
+        ]
 
     def test_convert_directory_skips_pdfa_files(
         self, tmp_dir: Path, sample_pdf_bytes: bytes
@@ -2154,7 +2764,7 @@ class TestConvertDirectory:
         input_dir.mkdir()
         source = input_dir / "doc.pdf"
         source.write_bytes(sample_pdf_bytes)
-        (input_dir / "old_processed.pdf").write_bytes(sample_pdf_bytes)
+        (input_dir / "doc_processed.pdf").write_bytes(sample_pdf_bytes)
         mock_convert_files.return_value = []
 
         convert_directory(input_dir, pdfa=False, show_progress=False)
@@ -2163,6 +2773,57 @@ class TestConvertDirectory:
             (source, input_dir / "doc_processed.pdf")
         ]
         assert mock_convert_files.call_args.kwargs["pdfa"] is False
+
+    @pytest.mark.parametrize(
+        ("pdfa", "source_name", "output_name"),
+        [
+            (True, "archive_pdfa.pdf", "archive_pdfa_pdfa.pdf"),
+            (False, "archive_processed.pdf", "archive_processed_processed.pdf"),
+        ],
+    )
+    @patch("pdftopdfa.converter.convert_files")
+    def test_convert_directory_processes_standalone_output_suffix_source(
+        self,
+        mock_convert_files: MagicMock,
+        pdfa: bool,
+        source_name: str,
+        output_name: str,
+        tmp_dir: Path,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """A suffix-like filename is input unless its corresponding source exists."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        source = input_dir / source_name
+        source.write_bytes(sample_pdf_bytes)
+        mock_convert_files.return_value = []
+
+        convert_directory(input_dir, pdfa=pdfa, show_progress=False)
+
+        assert mock_convert_files.call_args.kwargs["file_pairs"] == [
+            (source, input_dir / output_name)
+        ]
+
+    @patch("pdftopdfa.converter.convert_files")
+    def test_convert_directory_skips_output_for_uppercase_pdf_source(
+        self,
+        mock_convert_files: MagicMock,
+        tmp_dir: Path,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """Generated output matching an uppercase-extension source is skipped."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        source = input_dir / "document.PDF"
+        source.write_bytes(sample_pdf_bytes)
+        (input_dir / "document_pdfa.pdf").write_bytes(sample_pdf_bytes)
+        mock_convert_files.return_value = []
+
+        convert_directory(input_dir, show_progress=False)
+
+        assert mock_convert_files.call_args.kwargs["file_pairs"] == [
+            (source, input_dir / "document_pdfa.pdf")
+        ]
 
     @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_directory_with_ocr_languages(
@@ -2260,6 +2921,78 @@ class TestConvertDirectory:
 class TestConvertFiles:
     """Tests for convert_files."""
 
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_convert_files_reports_validator_runtime_failure(
+        self,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Batch results preserve conversion context if veraPDF cannot run."""
+        mock_verapdf.side_effect = VeraPDFError("validator crashed")
+        output_path = tmp_dir / "output.pdf"
+
+        results = convert_files(
+            [(sample_pdf, output_path)],
+            level="2a",
+            validate=True,
+        )
+
+        assert len(results) == 1
+        result = results[0]
+        assert result.success is True
+        assert result.validation_failed is True
+        assert result.skipped is False
+        assert result.level == "2a"
+        assert "Validation: veraPDF could not run: validator crashed" in result.warnings
+        assert output_path.exists()
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_convert_files_preserves_encrypted_skip_on_validator_failure(
+        self,
+        mock_verapdf: MagicMock,
+        password_encrypted_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """An unavailable validator does not erase encrypted-skip context."""
+        mock_verapdf.side_effect = VeraPDFError("validator crashed")
+        output_path = tmp_dir / "output.pdf"
+
+        results = convert_files(
+            [(password_encrypted_pdf, output_path)],
+            level="3a",
+            validate=True,
+        )
+
+        assert len(results) == 1
+        result = results[0]
+        assert result.success is True
+        assert result.validation_failed is True
+        assert result.skipped is True
+        assert result.level is None
+        assert any("PDF is encrypted" in warning for warning in result.warnings)
+        assert "Validation: veraPDF could not run: validator crashed" in result.warnings
+        assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
+
+    def test_convert_files_copies_password_encrypted_input(
+        self,
+        password_encrypted_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Batch conversion preserves a password-protected input unchanged."""
+        output_path = tmp_dir / "output.pdf"
+
+        results = convert_files(
+            [(password_encrypted_pdf, output_path)],
+            level="2a",
+        )
+
+        assert len(results) == 1
+        assert results[0].success is True
+        assert results[0].skipped is True
+        assert results[0].level is None
+        assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
+
     @patch("pdftopdfa.converter.convert_to_pdfa")
     def test_convert_files_passes_no_pdfa(
         self, mock_convert_to_pdfa: MagicMock, tmp_dir: Path
@@ -2298,6 +3031,79 @@ class TestConvertFiles:
         assert len(results) == 3
         assert all(r.success for r in results)
         assert all(r.output_path.exists() for r in results)
+
+    @patch("pdftopdfa.converter.convert_to_pdfa")
+    def test_convert_files_rejects_duplicate_outputs_before_conversion(
+        self,
+        mock_convert_to_pdfa: MagicMock,
+        tmp_dir: Path,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """Two batch entries cannot silently overwrite the same output."""
+        first_input = tmp_dir / "first.pdf"
+        second_input = tmp_dir / "second.pdf"
+        output_path = tmp_dir / "output.pdf"
+        first_input.write_bytes(sample_pdf_bytes)
+        second_input.write_bytes(sample_pdf_bytes)
+
+        with pytest.raises(
+            ConversionError, match="Output paths in a batch must be unique"
+        ):
+            convert_files(
+                [(first_input, output_path), (second_input, output_path)],
+                force_overwrite=True,
+            )
+
+        mock_convert_to_pdfa.assert_not_called()
+
+    @patch("pdftopdfa.converter.convert_to_pdfa")
+    def test_convert_files_rejects_output_overlapping_later_input(
+        self,
+        mock_convert_to_pdfa: MagicMock,
+        tmp_dir: Path,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """An earlier output cannot replace a later batch input."""
+        first_input = tmp_dir / "first.pdf"
+        second_input = tmp_dir / "second.pdf"
+        final_output = tmp_dir / "final.pdf"
+        first_input.write_bytes(sample_pdf_bytes)
+        second_input.write_bytes(sample_pdf_bytes)
+
+        with pytest.raises(ConversionError, match="overlaps an input path"):
+            convert_files(
+                [(first_input, second_input), (second_input, final_output)],
+                force_overwrite=True,
+            )
+
+        mock_convert_to_pdfa.assert_not_called()
+
+    @patch("pdftopdfa.converter.convert_to_pdfa")
+    def test_convert_files_rejects_hard_link_output_overlapping_input(
+        self,
+        mock_convert_to_pdfa: MagicMock,
+        tmp_dir: Path,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """Batch overlap detection follows file identity through hard links."""
+        first_input = tmp_dir / "first.pdf"
+        second_input = tmp_dir / "second.pdf"
+        linked_output = tmp_dir / "linked-output.pdf"
+        final_output = tmp_dir / "final.pdf"
+        first_input.write_bytes(sample_pdf_bytes)
+        second_input.write_bytes(sample_pdf_bytes)
+        try:
+            os.link(second_input, linked_output)
+        except OSError as exc:
+            pytest.skip(f"Hard links are not supported: {exc}")
+
+        with pytest.raises(ConversionError, match="overlaps an input path"):
+            convert_files(
+                [(first_input, linked_output), (second_input, final_output)],
+                force_overwrite=True,
+            )
+
+        mock_convert_to_pdfa.assert_not_called()
 
     def test_convert_files_skip_existing_without_force(
         self, tmp_dir: Path, sample_pdf_bytes: bytes
@@ -2511,6 +3317,29 @@ class TestConvertFiles:
         """Empty file list returns empty results."""
         results = convert_files([])
         assert results == []
+
+    def test_convert_files_rejects_invalid_level_when_empty(self) -> None:
+        """A global PDF/A configuration error fails before iteration."""
+        with pytest.raises(ConversionError, match="Invalid PDF/A level"):
+            convert_files([], level="4b")
+
+    @patch("pdftopdfa.converter.convert_to_pdfa")
+    def test_convert_files_normalizes_level_before_forwarding(
+        self, mock_convert_to_pdfa: MagicMock, tmp_dir: Path
+    ) -> None:
+        """The batch API forwards one normalized level to every conversion."""
+        input_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "output.pdf"
+        mock_convert_to_pdfa.return_value = ConversionResult(
+            success=True,
+            input_path=input_path,
+            output_path=output_path,
+            level="2a",
+        )
+
+        convert_files([(input_path, output_path)], level="2A")
+
+        assert mock_convert_to_pdfa.call_args.kwargs["level"] == "2a"
 
 
 class TestVerifyFileStructure:

@@ -11,6 +11,7 @@ import pikepdf
 from conftest import new_pdf
 from pikepdf import Array, Dictionary, Name, Pdf, String
 
+from pdftopdfa.fonts.tounicode import parse_tounicode_cmap_sequences
 from pdftopdfa.sanitizers import notdef_usage as notdef_usage_mod
 from pdftopdfa.sanitizers.notdef_usage import (
     _NotdefCodes,
@@ -41,6 +42,35 @@ def _make_ttfont_bytes(glyph_names, cmap=None):
     buf = io.BytesIO()
     fb.font.save(buf)
     return buf.getvalue()
+
+
+def _make_symbolic_ttfont_bytes(offset=0xF000):
+    """Create a TrueType font whose byte 0x41 selects .notdef."""
+    from fontTools.ttLib import TTFont
+    from fontTools.ttLib.tables._c_m_a_p import cmap_format_4, table__c_m_a_p
+
+    tt_font = TTFont(io.BytesIO(_make_ttfont_bytes(["B"], {0x42: "B"})))
+    cmap = table__c_m_a_p()
+    cmap.tableVersion = 0
+    symbol = cmap_format_4(4)
+    symbol.platformID = 3
+    symbol.platEncID = 0
+    symbol.language = 0
+    symbol.cmap = {
+        offset + 0x41: ".notdef",
+        offset + 0x42: "B",
+    }
+    unicode = cmap_format_4(4)
+    unicode.platformID = 3
+    unicode.platEncID = 1
+    unicode.language = 0
+    unicode.cmap = {0x42: "B"}
+    cmap.tables = [symbol, unicode]
+    tt_font["cmap"] = cmap
+    output = io.BytesIO()
+    tt_font.save(output)
+    tt_font.close()
+    return output.getvalue()
 
 
 def _make_simple_font(
@@ -195,8 +225,8 @@ class TestFullyStrippedOperator:
         assert "'" not in ops
         assert "T*" in ops
 
-    def test_quote_operator_partial_strip_keeps_operator(self):
-        """' with remaining text keeps the operator itself."""
+    def test_quote_operator_partial_strip_preserves_line_advance(self):
+        """' with removed text preserves its line and glyph advances."""
         pdf = new_pdf()
         font = _make_simple_font(pdf)
         content = b"BT /F1 12 Tf 14 TL (\x00A) ' ET"
@@ -206,14 +236,22 @@ class TestFullyStrippedOperator:
 
         assert result["notdef_usage_fixed"] == 1
         instructions = list(pikepdf.parse_content_stream(stream))
-        quote_ops = [
+        text_ops = [
             i
             for i in instructions
             if isinstance(i, pikepdf.ContentStreamInstruction)
-            and str(i.operator) == "'"
+            and str(i.operator) == "Tj"
         ]
-        assert len(quote_ops) == 1
-        assert bytes(quote_ops[0].operands[0]) == b"A"
+        assert len(text_ops) == 1
+        assert bytes(text_ops[0].operands[0]) == b"A"
+        assert any(
+            isinstance(i, pikepdf.ContentStreamInstruction) and str(i.operator) == "T*"
+            for i in instructions
+        )
+        assert any(
+            isinstance(i, pikepdf.ContentStreamInstruction) and str(i.operator) == "TJ"
+            for i in instructions
+        )
 
     def test_doublequote_fully_stripped_keeps_spacing_and_tstar(self):
         """Emptied " keeps its word/char spacing and line advance."""
@@ -272,6 +310,46 @@ class TestTJArray:
         assert b"A" in strings
         assert b"BC" in strings
 
+    def test_symbolic_program_notdef_preserves_tj_advance(self):
+        """A program byte-cmap .notdef is removed with its exact advance."""
+        pdf = new_pdf()
+        font_data = _make_symbolic_ttfont_bytes()
+        descriptor = Dictionary(
+            Type=Name.FontDescriptor,
+            FontName=Name("/TestSymbol"),
+            Flags=4,
+            MissingWidth=500,
+            FontFile2=pdf.make_stream(font_data),
+        )
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/TestSymbol"),
+            FirstChar=0x41,
+            LastChar=0x42,
+            Widths=Array([600, 700]),
+            FontDescriptor=descriptor,
+        )
+        stream = _make_page_with_font_and_content(
+            pdf,
+            font,
+            b"BT /F1 10 Tf [<41> 25 <42>] TJ ET",
+        )
+
+        result = sanitize_notdef_usage(pdf)
+
+        tj = next(
+            instruction
+            for instruction in pikepdf.parse_content_stream(stream)
+            if isinstance(instruction, pikepdf.ContentStreamInstruction)
+            and str(instruction.operator) == "TJ"
+        )
+        assert result["notdef_usage_fixed"] == 1
+        assert [
+            bytes(item) if isinstance(item, String) else float(item)
+            for item in tj.operands[0]
+        ] == [-600.0, 25.0, b"B"]
+
 
 class TestNoChanges:
     """Tests for PDFs that don't need .notdef usage fixes."""
@@ -324,9 +402,9 @@ class TestNoChanges:
             if isinstance(i, pikepdf.ContentStreamInstruction)
             and str(i.operator) == "Tj"
         ]
-        assert len(tj_ops) == 2
-        assert bytes(tj_ops[0].operands[0]) == b"AB"
-        assert bytes(tj_ops[1].operands[0]) == b"A\x96B"
+        assert len(tj_ops) == 3
+        assert b"".join(bytes(op.operands[0]) for op in tj_ops[:2]) == b"AB"
+        assert bytes(tj_ops[2].operands[0]) == b"A\x96B"
 
 
 class TestCIDFont:
@@ -384,6 +462,233 @@ class TestCIDFont:
         assert len(tj_ops) == 1
         # Only CID 65 (\x00\x41) should remain
         assert bytes(tj_ops[0].operands[0]) == b"\x00\x41"
+
+    def test_invisible_ocr_cid_zero_is_remapped_without_text_loss(self):
+        """Rendering mode 3 text gets a real CID and keeps its Unicode."""
+        from fontTools.ttLib import TTFont
+        from fontTools.ttLib.tables._c_m_a_p import (
+            cmap_format_4,
+            table__c_m_a_p,
+        )
+
+        source_font = TTFont(io.BytesIO(_make_ttfont_bytes(["A"], {0x41: "A"})))
+        cmap_table = table__c_m_a_p()
+        cmap_table.tableVersion = 0
+        cmap_table.tables = []
+        for platform_id, encoding_id, mapping in (
+            (3, 10, {0x42: "A"}),
+            (3, 1, {0x41: "A"}),
+        ):
+            subtable = cmap_format_4(4)
+            subtable.platformID = platform_id
+            subtable.platEncID = encoding_id
+            subtable.language = 0
+            subtable.cmap = mapping
+            cmap_table.tables.append(subtable)
+        source_font["cmap"] = cmap_table
+        buffer = io.BytesIO()
+        source_font.save(buffer)
+        source_font.close()
+
+        pdf = new_pdf()
+        font_stream = pdf.make_stream(buffer.getvalue())
+        cidfont = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.CIDFontType2,
+            BaseFont=Name("/TestCIDFont"),
+            CIDToGIDMap=Name.Identity,
+            CIDSystemInfo=Dictionary(
+                Registry=String(b"Adobe"),
+                Ordering=String(b"Identity"),
+                Supplement=0,
+            ),
+            FontDescriptor=Dictionary(
+                Type=Name.FontDescriptor,
+                FontName=Name("/TestCIDFont"),
+                FontFile2=font_stream,
+            ),
+            DW=500,
+        )
+        tounicode = pdf.make_stream(
+            b"begincmap\n"
+            b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n"
+            b"1 beginbfchar\n<0000> <0041>\nendbfchar\n"
+            b"endcmap\n"
+        )
+        type0_font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCIDFont"),
+            Encoding=Name("/Identity-H"),
+            DescendantFonts=Array([cidfont]),
+            ToUnicode=tounicode,
+        )
+        stream = _make_page_with_font_and_content(
+            pdf,
+            type0_font,
+            b"BT /F1 12 Tf 3 Tr <0000> Tj ET",
+        )
+
+        result = sanitize_notdef_usage(pdf)
+
+        shown = [
+            item
+            for instruction in pikepdf.parse_content_stream(stream)
+            if isinstance(instruction, pikepdf.ContentStreamInstruction)
+            for item in instruction.operands
+            if isinstance(item, String)
+        ]
+        assert result["notdef_usage_fixed"] == 1
+        assert [bytes(item) for item in shown] == [b"\x00\x01"]
+        assert parse_tounicode_cmap_sequences(tounicode.read_bytes())[b"\x00\x01"] == (
+            0x41,
+        )
+
+    def test_invisible_unmapped_cid_zero_preserves_advance_without_text(self):
+        """Unmapped invisible .notdef keeps its advance without invented text."""
+        pdf = new_pdf()
+        cidfont = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.CIDFontType0,
+            BaseFont=Name("/TestCIDFont"),
+            CIDSystemInfo=Dictionary(
+                Registry=String(b"Adobe"),
+                Ordering=String(b"Japan1"),
+                Supplement=4,
+            ),
+            DW=1000,
+        )
+        tounicode = pdf.make_stream(
+            b"begincmap\n"
+            b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n"
+            b"1 beginbfchar\n<0001> <0020>\nendbfchar\n"
+            b"endcmap\n"
+        )
+        type0_font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCIDFont"),
+            Encoding=Name("/Identity-H"),
+            DescendantFonts=Array([cidfont]),
+            ToUnicode=tounicode,
+        )
+        stream = _make_page_with_font_and_content(
+            pdf,
+            type0_font,
+            b"BT /F1 1 Tf 3 Tr -0.006 Tc <0000> Tj ET",
+        )
+
+        result = sanitize_notdef_usage(pdf)
+
+        instructions = list(pikepdf.parse_content_stream(stream))
+        text_operators = [
+            instruction
+            for instruction in instructions
+            if isinstance(instruction, pikepdf.ContentStreamInstruction)
+            and str(instruction.operator) in {"Tj", "TJ"}
+        ]
+        mappings = parse_tounicode_cmap_sequences(tounicode.read_bytes())
+        assert result["notdef_usage_fixed"] == 1
+        assert len(text_operators) == 1
+        assert str(text_operators[0].operator) == "TJ"
+        assert [float(item) for item in text_operators[0].operands[0]] == [-994.0]
+        assert b"\x00\x00" not in mappings
+        assert mappings[b"\x00\x01"] == (0x20,)
+
+    def test_invisible_unmapped_cid_in_tj_array_keeps_existing_adjustment(self):
+        """TJ cleanup combines preserved advance with existing positioning."""
+        pdf = new_pdf()
+        cidfont = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.CIDFontType0,
+            BaseFont=Name("/TestCIDFont"),
+            CIDSystemInfo=Dictionary(
+                Registry=String(b"Adobe"),
+                Ordering=String(b"Identity"),
+                Supplement=0,
+            ),
+            DW=500,
+        )
+        type0_font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCIDFont"),
+            Encoding=Name("/Identity-H"),
+            DescendantFonts=Array([cidfont]),
+        )
+        stream = _make_page_with_font_and_content(
+            pdf,
+            type0_font,
+            b"BT /F1 10 Tf 3 Tr 0.02 Tc [<0000> 25] TJ ET",
+        )
+
+        result = sanitize_notdef_usage(pdf)
+
+        instructions = list(pikepdf.parse_content_stream(stream))
+        tj = next(
+            instruction
+            for instruction in instructions
+            if isinstance(instruction, pikepdf.ContentStreamInstruction)
+            and str(instruction.operator) == "TJ"
+        )
+        assert result["notdef_usage_fixed"] == 1
+        assert [float(item) for item in tj.operands[0]] == [-477.0]
+
+    def test_embedded_cmap_character_codes_are_mapped_to_cids(self):
+        """Custom CMap codes are translated before .notdef filtering."""
+        pdf = new_pdf()
+        encoding = pdf.make_stream(
+            b"""
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+2 begincidchar
+<3F00> 0
+<0041> 65
+endcidchar
+"""
+        )
+        cidfont = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.CIDFontType2,
+            BaseFont=Name("/TestCIDFont"),
+            CIDToGIDMap=Name.Identity,
+            CIDSystemInfo=Dictionary(
+                Registry=String(b"Adobe"),
+                Ordering=String(b"Identity"),
+                Supplement=0,
+            ),
+        )
+        type0_font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCIDFont"),
+            Encoding=encoding,
+            DescendantFonts=Array([cidfont]),
+        )
+        stream = pdf.make_stream(b"BT /F1 12 Tf <3F000041> Tj ET")
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 200, 200]),
+                Resources=Dictionary(Font=Dictionary(F1=type0_font)),
+                Contents=stream,
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result["notdef_usage_fixed"] == 1
+        tj = next(
+            instruction
+            for instruction in pikepdf.parse_content_stream(stream)
+            if (
+                isinstance(instruction, pikepdf.ContentStreamInstruction)
+                and str(instruction.operator) == "Tj"
+            )
+        )
+        assert bytes(tj.operands[0]) == b"\x00A"
 
     def test_cidfont_type0_keeps_valid_nonsequential_cids(self, monkeypatch):
         """CIDFontType0 keeps valid charset CIDs even when they are high values."""
@@ -581,27 +886,27 @@ class TestCIDOddLengthString:
         pdf.pages.append(page)
         return stream
 
-    def test_odd_length_string_without_notdef_untouched(self):
-        """Odd-length string with only valid CIDs is not counted as fix."""
+    def test_incomplete_character_code_is_removed(self):
+        """A trailing byte outside the two-byte codespace is .notdef."""
         pdf = new_pdf()
-        # CID 87 (valid) + trailing lone byte
-        stream = self._make_page(pdf, b"BT /F1 12 Tf <005700> Tj ET")
+        stream = self._make_page(pdf, b"BT /F1 12 Tf (#) Tj ET")
 
         result = sanitize_notdef_usage(pdf)
 
-        assert result["notdef_usage_fixed"] == 0
+        assert result["notdef_usage_fixed"] == 1
         instructions = list(pikepdf.parse_content_stream(stream))
-        tj_ops = [
+        text_ops = [
             i
             for i in instructions
             if isinstance(i, pikepdf.ContentStreamInstruction)
-            and str(i.operator) == "Tj"
+            and str(i.operator) in {"Tj", "TJ"}
         ]
-        assert len(tj_ops) == 1
-        assert bytes(tj_ops[0].operands[0]) == b"\x00\x57\x00"
+        assert len(text_ops) == 1
+        assert str(text_ops[0].operator) == "TJ"
+        assert list(text_ops[0].operands[0]) == [-1000]
 
-    def test_odd_length_string_with_notdef_keeps_trailing_byte(self):
-        """Filtering .notdef CIDs preserves the trailing lone byte."""
+    def test_odd_length_string_removes_notdef_and_trailing_byte(self):
+        """Both explicit and incomplete .notdef codes are removed."""
         pdf = new_pdf()
         # CID 0 (.notdef) + CID 87 (valid) + trailing lone byte
         stream = self._make_page(pdf, b"BT /F1 12 Tf <0000005700> Tj ET")
@@ -610,14 +915,28 @@ class TestCIDOddLengthString:
 
         assert result["notdef_usage_fixed"] == 1
         instructions = list(pikepdf.parse_content_stream(stream))
-        tj_ops = [
+        text_ops = [
             i
             for i in instructions
             if isinstance(i, pikepdf.ContentStreamInstruction)
-            and str(i.operator) == "Tj"
+            and str(i.operator) in {"Tj", "TJ"}
         ]
-        assert len(tj_ops) == 1
-        assert bytes(tj_ops[0].operands[0]) == b"\x00\x57\x00"
+        shown = b"".join(
+            bytes(item)
+            for instruction in text_ops
+            for operand in instruction.operands
+            for item in (operand if isinstance(operand, pikepdf.Array) else [operand])
+            if isinstance(item, pikepdf.String)
+        )
+        adjustments = [
+            float(item)
+            for instruction in text_ops
+            for operand in instruction.operands
+            for item in (operand if isinstance(operand, pikepdf.Array) else [operand])
+            if isinstance(item, (int, float))
+        ]
+        assert shown == b"\x00\x57"
+        assert adjustments == [-1000.0, -1000.0]
 
 
 class TestMultipleFonts:
@@ -1207,7 +1526,7 @@ class TestCIDFontBeyondNumGlyphs:
             DescendantFonts=Array([cidfont]),
         )
 
-        # CID 0 → GID 1 (valid), CID 1 → GID 99 (beyond numGlyphs=3)
+        # CID 0 is always .notdef; CID 1 → GID 99 is beyond numGlyphs=3.
         content = b"BT /F1 12 Tf <00000001> Tj ET"
         stream = pdf.make_stream(content)
         page = pikepdf.Page(
@@ -1232,9 +1551,15 @@ class TestCIDFontBeyondNumGlyphs:
             if isinstance(i, pikepdf.ContentStreamInstruction)
             and str(i.operator) == "Tj"
         ]
-        assert len(tj_ops) == 1
-        # Only CID 0 (→ GID 1, valid) should remain
-        assert bytes(tj_ops[0].operands[0]) == b"\x00\x00"
+        assert len(tj_ops) == 0
+        numeric_tj = [
+            i
+            for i in instructions
+            if isinstance(i, pikepdf.ContentStreamInstruction)
+            and str(i.operator) == "TJ"
+        ]
+        assert len(numeric_tj) == 1
+        assert float(numeric_tj[0].operands[0][0]) == -2000
 
 
 class TestTilingPattern:

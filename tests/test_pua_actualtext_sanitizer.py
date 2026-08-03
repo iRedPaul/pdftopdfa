@@ -4,9 +4,13 @@
 
 """Tests for PUA ActualText sanitizer (rule 6.2.11.7.3-1)."""
 
+from io import BytesIO
+
 import pikepdf
+import pytest
 from conftest import new_pdf
-from pikepdf import Array, Dictionary, Name
+from fontTools.ttLib import TTFont
+from pikepdf import Array, Dictionary, Name, NumberTree, String
 
 from pdftopdfa.sanitizers import sanitize_for_pdfa
 from pdftopdfa.sanitizers.pua_actualtext import (
@@ -180,6 +184,40 @@ def _find_bdc_actualtext(page):
     return results
 
 
+def _install_structural_actualtext(
+    pdf,
+    page,
+    text,
+    *,
+    mcid=0,
+    on_ancestor=False,
+):
+    """Install a valid structure reference with structure-level ActualText."""
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    document = pdf.make_indirect(
+        Dictionary(Type=Name.StructElem, S=Name.Document, P=root)
+    )
+    element = pdf.make_indirect(
+        Dictionary(
+            Type=Name.StructElem,
+            S=Name.Span,
+            P=document,
+            Pg=page.obj,
+            K=mcid,
+        )
+    )
+    (document if on_ancestor else element)[Name.ActualText] = String(text)
+    document[Name.K] = element
+    root[Name.K] = document
+    parent_tree = NumberTree.new(pdf)
+    parent_tree[0] = Array([None] * mcid + [element])
+    root[Name.ParentTree] = parent_tree.obj
+    root[Name.ParentTreeNextKey] = 1
+    pdf.Root[Name.StructTreeRoot] = root
+    page.obj[Name.StructParents] = 0
+    return root, element
+
+
 # ---------------------------------------------------------------------------
 # TestIsPua
 # ---------------------------------------------------------------------------
@@ -325,7 +363,8 @@ class TestSimpleFontWrapping:
 class TestCIDFontWrapping:
     """Tests for CIDFont (Type0) PUA wrapping with 2-byte codes."""
 
-    def test_cidfont_pua_wrapped(self):
+    def test_unresolvable_cidfont_pua_is_preserved(self):
+        """Unknown symbol semantics must preserve the original searchable text."""
         pdf = new_pdf()
         # CID 0x00E0 → U+E000 (PUA)
         mapping = {0x0041: 0x0041, 0x00E0: 0xE000}
@@ -335,10 +374,14 @@ class TestCIDFontWrapping:
         page = _make_page_with_font_and_content(pdf, font, content)
 
         result = sanitize_pua_actualtext(pdf)
-        assert result["pua_actualtext_added"] == 1
+        assert result == {
+            "pua_actualtext_added": 1,
+            "pua_actualtext_warnings": 0,
+        }
 
         ops = _get_operators(page)
         assert ops == ["BT", "Tf", "BDC", "Tj", "EMC", "ET"]
+        assert _find_bdc_actualtext(page) == [b"\xfe\xff\xe0\x00"]
 
     def test_cidfont_non_pua_unchanged(self):
         pdf = new_pdf()
@@ -352,6 +395,271 @@ class TestCIDFontWrapping:
 
         ops = _get_operators(page)
         assert "BDC" not in ops
+
+    def test_unresolvable_type0_one_byte_codespace_is_preserved(self):
+        """Type0 character widths come from the CMap instead of a 2-byte guess."""
+        pdf = new_pdf()
+        encoding = pdf.make_stream(
+            b"begincmap\n"
+            b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+            b"1 begincidchar\n<01> 1\nendcidchar\nendcmap"
+        )
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCIDFont"),
+            Encoding=encoding,
+            DescendantFonts=Array([]),
+            ToUnicode=pdf.make_stream(_make_tounicode_cmap_8bit({1: 0xE000})),
+        )
+        page = _make_page_with_font_and_content(
+            pdf,
+            font,
+            b"BT /F1 12 Tf <01> Tj ET",
+        )
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result == {
+            "pua_actualtext_added": 1,
+            "pua_actualtext_warnings": 0,
+        }
+        assert _get_operators(page) == ["BT", "Tf", "BDC", "Tj", "EMC", "ET"]
+        assert _find_bdc_actualtext(page) == [b"\xfe\xff\xe0\x00"]
+
+    def test_embedded_type0_font_resolves_pua_through_gid(self):
+        """Type0 code -> CID -> GID -> font cmap produces real ActualText."""
+        from importlib import resources
+
+        font_data = (
+            resources.files("pdftopdfa")
+            / "resources"
+            / "fonts"
+            / "LiberationSans-Regular.ttf"
+        ).read_bytes()
+        tt_font = TTFont(BytesIO(font_data))
+        try:
+            glyph_name = tt_font.getBestCmap()[ord("A")]
+            gid = tt_font.getGlyphID(glyph_name)
+        finally:
+            tt_font.close()
+
+        pdf = new_pdf()
+        descriptor = Dictionary(
+            Type=Name.FontDescriptor,
+            FontName=Name("/EmbeddedSans"),
+            FontFile2=pdf.make_stream(font_data),
+        )
+        descendant = Dictionary(
+            Type=Name.Font,
+            Subtype=Name("/CIDFontType2"),
+            BaseFont=Name("/EmbeddedSans"),
+            CIDToGIDMap=Name.Identity,
+            FontDescriptor=descriptor,
+        )
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/EmbeddedSans"),
+            Encoding=Name("/Identity-H"),
+            DescendantFonts=Array([descendant]),
+            ToUnicode=pdf.make_stream(_make_tounicode_cmap_16bit({gid: 0xE000})),
+        )
+        page = _make_page_with_font_and_content(
+            pdf,
+            font,
+            f"BT /F1 12 Tf <{gid:04X}> Tj ET".encode(),
+        )
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result == {
+            "pua_actualtext_added": 1,
+            "pua_actualtext_warnings": 0,
+        }
+        assert _find_bdc_actualtext(page) == [b"\xfe\xff\x00A"]
+
+    def test_cff_cidfont_uses_collection_mapping_and_ignores_cidtogidmap(
+        self,
+        monkeypatch,
+    ):
+        """CID-keyed CFF composes its charset with the Adobe collection map."""
+
+        class FakeCffFont:
+            def getGlyphOrder(self):  # noqa: N802 - fontTools API
+                return [".notdef", "cid00041"]
+
+            def get(self, _key, default=None):
+                return default
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            "fontTools.ttLib.TTFont", lambda *_args, **_kwargs: FakeCffFont()
+        )
+
+        pdf = new_pdf()
+        cff_stream = pdf.make_stream(b"synthetic CFF")
+        cff_stream[Name.Subtype] = Name("/CIDFontType0C")
+        descriptor = Dictionary(
+            Type=Name.FontDescriptor,
+            FontName=Name("/EmbeddedCff"),
+            FontFile3=cff_stream,
+        )
+        descendant = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.CIDFontType0,
+            BaseFont=Name("/EmbeddedCff"),
+            CIDSystemInfo=Dictionary(
+                Registry=String("Adobe"),
+                Ordering=String("Japan1"),
+                Supplement=6,
+            ),
+            CIDToGIDMap=Name("/Bogus"),
+            FontDescriptor=descriptor,
+        )
+        encoding = pdf.make_stream(
+            b"begincmap\n"
+            b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+            b"1 begincidchar\n<01> 41\nendcidchar\nendcmap"
+        )
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/EmbeddedCff"),
+            Encoding=encoding,
+            DescendantFonts=Array([descendant]),
+            ToUnicode=pdf.make_stream(_make_tounicode_cmap_8bit({1: 0xE000})),
+        )
+        page = _make_page_with_font_and_content(
+            pdf,
+            font,
+            b"BT /F1 12 Tf <01> Tj ET",
+        )
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result == {
+            "pua_actualtext_added": 1,
+            "pua_actualtext_warnings": 0,
+        }
+        assert _find_bdc_actualtext(page) == [b"\xfe\xff\x00H"]
+
+    def test_code39_type0_pua_uses_conventional_ascii_assignment(self):
+        """Code 39 U+F0xx assignments are recovered without font cmap data."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_tounicode(pdf, {0x002A: 0xF02A})
+        font.BaseFont = Name("/ABCDEF+Bar-Code 39")
+        font.DescendantFonts[0].BaseFont = Name("/ABCDEF+Bar-Code 39")
+        page = _make_page_with_font_and_content(
+            pdf,
+            font,
+            b"BT /F1 12 Tf <002A> Tj ET",
+        )
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result == {
+            "pua_actualtext_added": 1,
+            "pua_actualtext_warnings": 0,
+        }
+        assert _find_bdc_actualtext(page) == [b"\xfe\xff\x00*"]
+
+    @pytest.mark.parametrize(
+        ("font_name", "pua_value", "unicode_value"),
+        [
+            ("Wingdings-Regular", 0xF028, 0x1F57F),
+            ("Wingdings-Regular", 0xF128, 0x1F57F),
+            ("Wingdings-Regular", 0xF228, 0x1F57F),
+            ("Wingdings-Regular", 0xF02A, 0x1F582),
+            ("Wingdings-Regular", 0xF06E, 0x25FC),
+            ("SymbolMT", 0xF0B7, 0x2022),
+            ("SymbolMT", 0xF1B7, 0x2022),
+            ("SymbolMT", 0xF2B7, 0x2022),
+            ("SymbolMT", 0xF020, 0x0020),
+        ],
+    )
+    def test_known_symbol_fonts_use_documented_unicode(
+        self,
+        font_name,
+        pua_value,
+        unicode_value,
+    ):
+        """Known Wingdings and Adobe Symbol slots have authoritative mappings."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_tounicode(pdf, {1: pua_value})
+        font.BaseFont = Name(f"/ABCDEF+{font_name}")
+        font.DescendantFonts[0].BaseFont = Name(f"/ABCDEF+{font_name}")
+        page = _make_page_with_font_and_content(
+            pdf,
+            font,
+            b"BT /F1 12 Tf <0001> Tj ET",
+        )
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result == {
+            "pua_actualtext_added": 1,
+            "pua_actualtext_warnings": 0,
+        }
+        expected = b"\xfe\xff" + chr(unicode_value).encode("utf-16-be")
+        assert _find_bdc_actualtext(page) == [expected]
+
+    def test_unicode_pua_key_does_not_invent_cp1252_semantics(self):
+        """A Unicode U+F095 entry alone does not prove a CP1252 bullet."""
+        from importlib import resources
+
+        font_data = (
+            resources.files("pdftopdfa")
+            / "resources"
+            / "fonts"
+            / "LiberationSans-Regular.ttf"
+        ).read_bytes()
+        tt_font = TTFont(BytesIO(font_data))
+        try:
+            bullet_glyph = tt_font.getBestCmap()[0x2022]
+            tt_font["cmap"].tables = [
+                table
+                for table in tt_font["cmap"].tables
+                if (table.platformID, table.platEncID) not in ((1, 0), (3, 0))
+            ]
+            for table in tt_font["cmap"].tables:
+                if table.isUnicode():
+                    table.cmap[0xF095] = bullet_glyph
+            output = BytesIO()
+            tt_font.save(output)
+        finally:
+            tt_font.close()
+
+        pdf = new_pdf()
+        descriptor = Dictionary(
+            Type=Name.FontDescriptor,
+            FontName=Name("/Calibri-Bold"),
+            FontFile2=pdf.make_stream(output.getvalue()),
+        )
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/Calibri-Bold"),
+            FirstChar=0,
+            LastChar=255,
+            FontDescriptor=descriptor,
+            ToUnicode=pdf.make_stream(_make_tounicode_cmap_8bit({0x95: 0xE000})),
+        )
+        page = _make_page_with_font_and_content(
+            pdf,
+            font,
+            b"BT /F1 12 Tf <95> Tj ET",
+        )
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result == {
+            "pua_actualtext_added": 1,
+            "pua_actualtext_warnings": 0,
+        }
+        assert _find_bdc_actualtext(page) == [b"\xfe\xff\xe0\x00"]
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +741,113 @@ class TestQuoteOperators:
 class TestExistingActualText:
     """Tests that existing /ActualText BDC scopes prevent double-wrapping."""
 
+    @pytest.mark.parametrize("on_ancestor", [False, True])
+    def test_structural_actualtext_is_not_double_wrapped(self, on_ancestor):
+        """A valid StructElem or ancestor ActualText covers its MCID."""
+        pdf = new_pdf()
+        font = _make_simple_font_with_tounicode(pdf, {0x41: 0xE000})
+        content = b"BT /F1 12 Tf /Span <</MCID 0>> BDC <41> Tj EMC ET"
+        page = _make_page_with_font_and_content(pdf, font, content)
+        _install_structural_actualtext(
+            pdf,
+            page,
+            "A",
+            on_ancestor=on_ancestor,
+        )
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result["pua_actualtext_added"] == 0
+        assert bytes(page.Contents.read_bytes()) == content
+
+    def test_structural_actualtext_resolves_named_mcid_property(self):
+        """A named BDC property list participates in structure lookup."""
+        pdf = new_pdf()
+        font = _make_simple_font_with_tounicode(pdf, {0x41: 0xE000})
+        content = b"BT /F1 12 Tf /Span /P1 BDC <41> Tj EMC ET"
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Resources=Dictionary(
+                    Font=Dictionary(F1=font),
+                    Properties=Dictionary(P1=Dictionary(MCID=0)),
+                ),
+                Contents=pdf.make_stream(content),
+            )
+        )
+        pdf.pages.append(page)
+        _install_structural_actualtext(pdf, page, "A")
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result["pua_actualtext_added"] == 0
+        assert bytes(page.Contents.read_bytes()) == content
+
+    def test_repairable_parent_tree_preserves_structural_actualtext(self):
+        """An orphan parent-tree slot is pruned before PUA processing."""
+        pdf = new_pdf()
+        font = _make_simple_font_with_tounicode(pdf, {0x41: 0xE000})
+        content = b"BT /F1 12 Tf /Span <</MCID 0>> BDC <41> Tj EMC ET"
+        page = _make_page_with_font_and_content(
+            pdf,
+            font,
+            content,
+        )
+        root, element = _install_structural_actualtext(pdf, page, "A")
+        NumberTree(root[Name.ParentTree])[0] = Array([element, element])
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result["pua_actualtext_added"] == 0
+        assert bytes(page.Contents.read_bytes()) == content
+        assert len(NumberTree(root[Name.ParentTree])[0]) == 1
+
+    def test_irreparable_structure_does_not_suppress_wrapper(self):
+        """A structure reference to a missing content MCID fails closed."""
+        pdf = new_pdf()
+        font = _make_simple_font_with_tounicode(pdf, {0x41: 0xE000})
+        page = _make_page_with_font_and_content(
+            pdf,
+            font,
+            b"BT /F1 12 Tf /Span <</MCID 0>> BDC <41> Tj EMC ET",
+        )
+        root, element = _install_structural_actualtext(pdf, page, "A")
+        element[Name.K] = 1
+        NumberTree(root[Name.ParentTree])[0] = Array([None, element])
+        old_parent_tree = root[Name.ParentTree].objgen
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result["pua_actualtext_added"] == 1
+        assert _find_bdc_actualtext(page) == [b"\xfe\xff\x00A"]
+        assert root[Name.ParentTree].objgen == old_parent_tree
+
+    def test_named_actualtext_property_is_not_double_wrapped(self):
+        """A BDC property-list resource is resolved through /Properties."""
+        pdf = new_pdf()
+        font = _make_simple_font_with_tounicode(pdf, {0xE0: 0xE000})
+        content = b"BT /F1 12 Tf /Span /P1 BDC <E0> Tj EMC ET"
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Resources=Dictionary(
+                    Font=Dictionary(F1=font),
+                    Properties=Dictionary(
+                        P1=Dictionary(ActualText=String("A")),
+                    ),
+                ),
+                Contents=pdf.make_stream(content),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result["pua_actualtext_added"] == 0
+        assert bytes(page.Contents.read_bytes()) == content
+
     def test_already_inside_actualtext_not_double_wrapped(self):
         pdf = new_pdf()
         mapping = {0xE0: 0xE000}
@@ -444,6 +859,27 @@ class TestExistingActualText:
 
         result = sanitize_pua_actualtext(pdf)
         assert result["pua_actualtext_added"] == 0
+
+    @pytest.mark.parametrize("actualtext", [b"", b"\xfe\xff"])
+    def test_empty_actualtext_is_not_overwritten(self, actualtext):
+        """An intentionally empty replacement remains authoritative."""
+        pdf = new_pdf()
+        font = _make_simple_font_with_tounicode(pdf, {0xE0: 0xE000})
+        content = (
+            b"BT /F1 12 Tf /Span <</ActualText <"
+            + actualtext.hex().encode("ascii")
+            + b">>> BDC <E0> Tj EMC ET"
+        )
+        page = _make_page_with_font_and_content(
+            pdf,
+            font,
+            content,
+        )
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result["pua_actualtext_added"] == 0
+        assert bytes(page.Contents.read_bytes()) == content
 
     def test_bdc_without_actualtext_still_wrapped(self):
         pdf = new_pdf()
@@ -481,6 +917,98 @@ class TestExistingActualText:
 class TestActualTextResolution:
     """Tests for ActualText content and encoding."""
 
+    @pytest.mark.parametrize("offset", [0, 0xF000, 0xF100, 0xF200])
+    def test_simple_symbol_program_range_resolves_actualtext(self, offset):
+        """Every valid Microsoft Symbol range recovers the program glyph."""
+        from importlib import resources
+
+        from fontTools.ttLib.tables._c_m_a_p import cmap_format_4
+
+        font_data = (
+            resources.files("pdftopdfa")
+            / "resources"
+            / "fonts"
+            / "LiberationSans-Regular.ttf"
+        ).read_bytes()
+        tt_font = TTFont(BytesIO(font_data))
+        try:
+            glyph_name = tt_font.getBestCmap()[0x41]
+            tt_font["cmap"].tables = [
+                table
+                for table in tt_font["cmap"].tables
+                if (table.platformID, table.platEncID) not in ((1, 0), (3, 0))
+            ]
+            symbol = cmap_format_4(4)
+            symbol.platformID = 3
+            symbol.platEncID = 0
+            symbol.language = 0
+            symbol.cmap = {offset + 0x41: glyph_name}
+            tt_font["cmap"].tables.append(symbol)
+            output = BytesIO()
+            tt_font.save(output)
+        finally:
+            tt_font.close()
+
+        pdf = new_pdf()
+        descriptor = Dictionary(
+            Type=Name.FontDescriptor,
+            FontName=Name("/SymbolProgram"),
+            Flags=4,
+            FontFile2=pdf.make_stream(output.getvalue()),
+        )
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/SymbolProgram"),
+            FirstChar=0x41,
+            LastChar=0x41,
+            FontDescriptor=descriptor,
+            ToUnicode=pdf.make_stream(_make_tounicode_cmap_8bit({0x41: 0xE000})),
+        )
+        page = _make_page_with_font_and_content(
+            pdf,
+            font,
+            b"BT /F1 12 Tf (A) Tj ET",
+        )
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result == {
+            "pua_actualtext_added": 1,
+            "pua_actualtext_warnings": 0,
+        }
+        assert _find_bdc_actualtext(page) == [b"\xfe\xff\x00A"]
+
+    def test_pua_inside_unicode_sequence_preserves_other_text(self):
+        """A multi-code-point mapping is preserved without partial data loss."""
+        pdf = new_pdf()
+        cmap = _make_tounicode_cmap_8bit({0x41: 0xE000}).replace(
+            b"<41> <E000>",
+            b"<41> <0066E000>",
+        )
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/TestFont"),
+            FirstChar=0,
+            LastChar=255,
+            ToUnicode=pdf.make_stream(cmap),
+        )
+        page = _make_page_with_font_and_content(
+            pdf,
+            font,
+            b"BT /F1 12 Tf (A) Tj ET",
+        )
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result == {
+            "pua_actualtext_added": 1,
+            "pua_actualtext_warnings": 0,
+        }
+        assert _find_bdc_actualtext(page) == [b"\xfe\xff\x00f\xe0\x00"]
+        assert _get_operators(page) == ["BT", "Tf", "BDC", "Tj", "EMC", "ET"]
+
     def test_actualtext_utf16be_with_bom(self):
         pdf = new_pdf()
         # Code 0xE0 → U+E000 (PUA), code 0x41 → U+0041
@@ -514,10 +1042,9 @@ class TestActualTextResolution:
         text = raw[2:].decode("utf-16-be")
         assert "A" in text
 
-    def test_unresolvable_pua_warning(self):
+    def test_unmapped_code_beside_pua_fails_closed(self):
         pdf = new_pdf()
         mapping = {0xE0: 0xE000}
-        # Font without /Encoding — PUA can't be resolved
         cmap_data = _make_tounicode_cmap_8bit(mapping)
         tounicode = pdf.make_stream(cmap_data)
         font = Dictionary(
@@ -528,12 +1055,17 @@ class TestActualTextResolution:
             LastChar=255,
             ToUnicode=tounicode,
         )
-        content = b"BT /F1 12 Tf <E0> Tj ET"
-        _make_page_with_font_and_content(pdf, font, content)
+        content = b"BT /F1 12 Tf <E041> Tj ET"
+        page = _make_page_with_font_and_content(pdf, font, content)
 
         result = sanitize_pua_actualtext(pdf)
-        # Font has no encoding to resolve PUA
-        assert result["pua_actualtext_warnings"] >= 1
+
+        assert result == {
+            "pua_actualtext_added": 0,
+            "pua_actualtext_warnings": 1,
+        }
+        assert _find_bdc_actualtext(page) == []
+        assert _get_operators(page) == ["BT", "Tf", "Tj", "ET"]
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +1105,35 @@ class TestTraversal:
 
         result = sanitize_pua_actualtext(pdf)
         assert result["pua_actualtext_added"] == 1
+
+    def test_form_inherits_single_effective_font(self):
+        """A Form may inherit an unambiguous caller Tf graphics state."""
+        pdf = new_pdf()
+        font = _make_simple_font_with_tounicode(pdf, {0xE0: 0xE000})
+        form = pdf.make_stream(b"BT <E0> Tj ET")
+        form[Name.Subtype] = Name.Form
+        form[Name.BBox] = Array([0, 0, 100, 100])
+        form[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Resources=Dictionary(
+                    Font=Dictionary(F1=font),
+                    XObject=Dictionary(Fm=form),
+                ),
+                Contents=pdf.make_stream(b"BT /F1 12 Tf ET /Fm Do"),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result == {
+            "pua_actualtext_added": 1,
+            "pua_actualtext_warnings": 0,
+        }
+        assert b"/ActualText" in bytes(form.read_bytes())
 
     def test_annotation_ap_stream(self):
         pdf = new_pdf()
@@ -641,6 +1202,36 @@ class TestTraversal:
 
         result = sanitize_pua_actualtext(pdf)
         assert result["pua_actualtext_added"] == 1
+
+    def test_soft_mask_group_stream(self):
+        """PUA text inside an ExtGState soft-mask group is wrapped."""
+        pdf = new_pdf()
+        font = _make_simple_font_with_tounicode(pdf, {0xE0: 0xE000})
+        group = pdf.make_stream(b"BT /F1 12 Tf <E0> Tj ET")
+        group[Name.Type] = Name.XObject
+        group[Name.Subtype] = Name.Form
+        group[Name.BBox] = Array([0, 0, 10, 10])
+        resources = Dictionary(
+            Font=Dictionary(F1=font),
+            ExtGState=Dictionary(
+                GS=Dictionary(
+                    SMask=Dictionary(
+                        S=Name("/Luminosity"),
+                        G=group,
+                    )
+                )
+            ),
+        )
+        _make_page_with_font_and_content(
+            pdf,
+            font,
+            b"/GS gs",
+        ).Resources = resources
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result["pua_actualtext_added"] == 1
+        assert b"/ActualText" in bytes(group.read_bytes())
 
     def test_type3_charproc_stream(self):
         pdf = new_pdf()
@@ -739,6 +1330,31 @@ class TestTraversal:
 class TestEdgeCases:
     """Tests for edge cases and error conditions."""
 
+    def test_font_state_continues_across_page_content_streams(self):
+        """Page content arrays retain text state across stream boundaries."""
+        pdf = new_pdf()
+        font = _make_simple_font_with_tounicode(pdf, {0xE0: 0xE000})
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Resources=Dictionary(Font=Dictionary(F1=font)),
+                Contents=Array(
+                    [
+                        pdf.make_stream(b"BT /F1 12 Tf"),
+                        pdf.make_stream(b"<E0> Tj ET"),
+                    ]
+                ),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_pua_actualtext(pdf)
+
+        assert result["pua_actualtext_added"] == 1
+        assert len(page.Contents) == 2
+        assert b"/ActualText" in bytes(page.Contents[1].read_bytes())
+
     def test_empty_pdf_no_pages(self):
         pdf = new_pdf()
         result = sanitize_pua_actualtext(pdf)
@@ -795,7 +1411,7 @@ class TestEdgeCases:
         assert result["pua_actualtext_added"] == 0
 
     def test_text_without_tf(self):
-        """Text operator without preceding Tf should not crash."""
+        """Potential PUA text without a font state must fail closed."""
         pdf = new_pdf()
         mapping = {0xE0: 0xE000}
         font = _make_simple_font_with_tounicode(pdf, mapping)
@@ -805,14 +1421,15 @@ class TestEdgeCases:
 
         result = sanitize_pua_actualtext(pdf)
         assert result["pua_actualtext_added"] == 0
+        assert result["pua_actualtext_warnings"] == 1
 
     def test_page_with_array_contents(self):
-        """Page with Contents as Array of streams."""
+        """ActualText scopes can span streams in a page content array."""
         pdf = new_pdf()
         mapping = {0xE0: 0xE000}
         font = _make_simple_font_with_tounicode(pdf, mapping)
-        stream1 = pdf.make_stream(b"BT /F1 12 Tf")
-        stream2 = pdf.make_stream(b"<E0> Tj ET")
+        stream1 = pdf.make_stream(b"BT /F1 12 Tf /Span <</ActualText <FEFF0041>>> BDC")
+        stream2 = pdf.make_stream(b"<E0> Tj EMC ET")
         page = pikepdf.Page(
             Dictionary(
                 Type=Name.Page,
@@ -823,12 +1440,11 @@ class TestEdgeCases:
         )
         pdf.pages.append(page)
 
-        # Each stream is processed independently; stream2 has Tj but
-        # no Tf, so the font context carries from the parser perspective
-        # only within a single stream. This should not crash.
         result = sanitize_pua_actualtext(pdf)
-        # May or may not wrap depending on font tracking across streams
-        assert isinstance(result["pua_actualtext_added"], int)
+
+        assert result["pua_actualtext_added"] == 0
+        assert len(page.Contents) == 2
+        assert bytes(page.Contents[1].read_bytes()) == b"<E0> Tj EMC ET"
 
 
 # ---------------------------------------------------------------------------
@@ -839,24 +1455,26 @@ class TestEdgeCases:
 class TestIntegration:
     """Integration tests with sanitize_for_pdfa()."""
 
-    def test_runs_at_2u(self):
+    @pytest.mark.parametrize("level", ["2a", "2u"])
+    def test_runs_at_pdfa2_unicode_levels(self, level):
         pdf = new_pdf()
         mapping = {0x41: 0x0041, 0xE0: 0xE000}
         font = _make_simple_font_with_tounicode(pdf, mapping)
         content = b"BT /F1 12 Tf <E0> Tj ET"
         _make_page_with_font_and_content(pdf, font, content)
 
-        result = sanitize_for_pdfa(pdf, level="2u")
+        result = sanitize_for_pdfa(pdf, level=level)
         assert result["pua_actualtext_added"] >= 1
 
-    def test_runs_at_3u(self):
+    @pytest.mark.parametrize("level", ["3a", "3u"])
+    def test_runs_at_pdfa3_unicode_levels(self, level):
         pdf = new_pdf()
         mapping = {0x41: 0x0041, 0xE0: 0xE000}
         font = _make_simple_font_with_tounicode(pdf, mapping)
         content = b"BT /F1 12 Tf <E0> Tj ET"
         _make_page_with_font_and_content(pdf, font, content)
 
-        result = sanitize_for_pdfa(pdf, level="3u")
+        result = sanitize_for_pdfa(pdf, level=level)
         assert result["pua_actualtext_added"] >= 1
 
     def test_does_not_run_at_2b(self):

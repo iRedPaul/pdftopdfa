@@ -5,6 +5,7 @@
 """Tests for structural implementation-limit sanitization."""
 
 from decimal import Decimal
+from io import BytesIO
 
 import pikepdf
 import pytest
@@ -13,7 +14,11 @@ from pikepdf import Array, Dictionary, Name, Pdf
 
 from pdftopdfa.exceptions import UnsupportedPDFError
 from pdftopdfa.sanitizers import sanitize_for_pdfa
-from pdftopdfa.sanitizers.structure_limits import sanitize_structure_limits
+from pdftopdfa.sanitizers.structure_limits import (
+    _operands_contain_parse_placeholders,
+    _sanitize_operand,
+    sanitize_structure_limits,
+)
 
 _INT_MAX = 2_147_483_647
 
@@ -180,6 +185,118 @@ class TestStructureLimitsSanitizer:
 
         assert _max_q_depth(pdf.pages[0].Contents) <= 28
         assert result["q_nesting_rebalanced"] == 2
+        xobjects = pdf.pages[0].Resources.XObject
+        assert len(xobjects) == 1
+        form = next(iter(xobjects.values()))
+        assert _max_q_depth(form) <= 28
+
+    def test_q_q_form_bbox_accounts_for_current_transformation(self) -> None:
+        """A repair Form does not clip content under an existing CTM."""
+        content = (
+            b"0.1 0 0 0.1 0 0 cm "
+            + (b"q " * 29)
+            + b"1000 1000 100 100 re f "
+            + (b"Q " * 29)
+        )
+        pdf = _make_page_pdf(content)
+
+        sanitize_structure_limits(pdf)
+
+        xobjects = pdf.pages[0].Resources.XObject
+        name, form = next(iter(xobjects.items()))
+        assert list(form.BBox) == [0, 0, 2000, 2000]
+        form_xobjects = form.Resources.get("/XObject")
+        assert form_xobjects is None or form_xobjects.get(name) is None
+
+    def test_q_q_across_page_content_streams_is_repaired_as_one_sequence(
+        self,
+    ) -> None:
+        """Page Contents arrays share one graphics-state stack."""
+        pdf = _make_page_pdf(b"")
+        pdf.pages[0].obj[Name.Contents] = Array(
+            [
+                pdf.make_stream(b"q " * 29),
+                pdf.make_stream(b"0 0 10 10 re f " + (b"Q " * 29)),
+            ]
+        )
+
+        result = sanitize_structure_limits(pdf)
+
+        assert isinstance(pdf.pages[0].Contents, pikepdf.Stream)
+        assert _max_q_depth(pdf.pages[0].Contents) <= 28
+        assert result["q_nesting_rebalanced"] == 2
+
+    def test_rebalances_form_stream_with_inherited_resources(self) -> None:
+        """A Form stream's own BBox is available for safe q/Q repair."""
+        pdf = new_pdf()
+        form = pdf.make_stream((b"q " * 30) + b"0 0 10 10 re f " + (b"Q " * 30))
+        form[Name.Type] = Name.XObject
+        form[Name.Subtype] = Name.Form
+        form[Name.BBox] = Array([0, 0, 1000, 1000])
+        resources = Dictionary(XObject=Dictionary(X0=form))
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 500, 500]),
+                Resources=resources,
+                Contents=pdf.make_stream(b"/X0 Do"),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_structure_limits(pdf)
+
+        assert _max_q_depth(form) <= 28
+        assert result["q_nesting_rebalanced"] == 2
+        assert form.get("/Resources") is None
+        assert len(resources.XObject) == 2
+
+    def test_repairs_1200_q_levels_without_python_recursion(self) -> None:
+        """Deep graphics-state repair uses an iterative post-order walk."""
+        pdf = _make_page_pdf((b"q " * 1200) + b"0 0 10 10 re f " + (b"Q " * 1200))
+
+        result = sanitize_structure_limits(pdf)
+
+        pending = [pdf.pages[0].Contents]
+        seen: set[tuple[int, int]] = set()
+        while pending:
+            stream = pending.pop()
+            assert _max_q_depth(stream) <= 28
+            resources = stream.get("/Resources")
+            if not isinstance(resources, Dictionary):
+                resources = pdf.pages[0].Resources
+            xobjects = resources.get("/XObject")
+            if not isinstance(xobjects, Dictionary):
+                continue
+            for candidate in xobjects.values():
+                if not isinstance(candidate, pikepdf.Stream):
+                    continue
+                if candidate.objgen in seen:
+                    continue
+                seen.add(candidate.objgen)
+                pending.append(candidate)
+
+        assert result["q_nesting_rebalanced"] > 0
+
+    @pytest.mark.parametrize(
+        ("prefix", "suffix"),
+        [
+            (b"BT ", b" ET"),
+            (b"/Span BMC ", b" EMC"),
+            (b"BX ", b" EX"),
+        ],
+    )
+    def test_q_q_repair_rejects_crossing_operator_scopes(
+        self,
+        prefix: bytes,
+        suffix: bytes,
+    ) -> None:
+        """Unsafe Form boundaries fail instead of silently changing semantics."""
+        content = prefix + (b"q " * 29) + (b"Q " * 29) + suffix
+        pdf = _make_page_pdf(content)
+
+        with pytest.raises(UnsupportedPDFError, match="Cannot safely reduce q/Q"):
+            sanitize_structure_limits(pdf)
 
     def test_shortens_long_name_keys_values_and_operands(self) -> None:
         pdf = new_pdf()
@@ -313,7 +430,7 @@ class TestStructureLimitsSanitizer:
         # At least 4 fixes: 2 object-graph + 2 content-stream operands
         assert result["reals_normalized"] >= 4
 
-    def test_rejects_cmap_cid_overflow(self) -> None:
+    def test_remaps_used_cmap_cid_overflow_to_notdef(self) -> None:
         pdf = new_pdf()
         cmap_data = b"""
 /CIDInit /ProcSet findresource begin
@@ -347,8 +464,50 @@ end
         )
         pdf.pages.append(page)
 
-        with pytest.raises(UnsupportedPDFError, match="CID values greater than 65535"):
-            sanitize_structure_limits(pdf)
+        result = sanitize_structure_limits(pdf)
+        cmap_text = encoding_stream.read_bytes().decode("latin-1")
+
+        assert "<3F00> 0" in cmap_text
+        assert "65791" not in cmap_text
+        assert result["cid_overflow_entries_repaired"] == 1
+
+    def test_remaps_used_overflow_part_of_cid_range(self) -> None:
+        pdf = new_pdf()
+        encoding_stream = pdf.make_stream(
+            b"""
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+1 begincidrange
+<3F00> <3FFF> 65536
+endcidrange
+"""
+        )
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type0,
+                BaseFont=Name("/TestCID"),
+                Encoding=encoding_stream,
+                DescendantFonts=Array([]),
+            )
+        )
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 200, 200]),
+                Resources=Dictionary(Font=Dictionary(F1=font)),
+                Contents=pdf.make_stream(b"BT /F1 12 Tf <3F00> Tj ET"),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_structure_limits(pdf)
+        cmap_text = encoding_stream.read_bytes().decode("latin-1")
+
+        assert "<3F00> 0" in cmap_text
+        assert "65536" not in cmap_text
+        assert result["cid_overflow_entries_repaired"] == 1
 
     def test_removes_unused_cmap_cid_overflow_range(self) -> None:
         pdf = new_pdf()
@@ -394,6 +553,49 @@ end
         assert "<3F00> <3FFF> 65536" not in cmap_text
         assert result["cid_overflow_entries_repaired"] == 1
 
+    def test_splits_mixed_overflow_range_and_preserves_block_count(self) -> None:
+        pdf = new_pdf()
+        encoding_stream = pdf.make_stream(
+            b"""
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+1 begincidrange
+% the comment is not a mapping entry
+
+<0000> <0002> 65534
+endcidrange
+"""
+        )
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type0,
+                BaseFont=Name("/TestCID"),
+                Encoding=encoding_stream,
+                DescendantFonts=Array([]),
+            )
+        )
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 200, 200]),
+                Resources=Dictionary(Font=Dictionary(F1=font)),
+                Contents=pdf.make_stream(b"BT /F1 12 Tf <00000002> Tj ET"),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_structure_limits(pdf)
+        cmap_text = encoding_stream.read_bytes().decode("latin-1")
+
+        assert "<0000> <0001> 65534" in cmap_text
+        assert "<0002> 0" in cmap_text
+        assert "% the comment is not a mapping entry" in cmap_text
+        assert cmap_text.count("1 begincidrange") == 1
+        assert cmap_text.count("1 begincidchar") == 1
+        assert result["cid_overflow_entries_repaired"] == 1
+
     def test_pipeline_fixes_non_hex_text_stream(self) -> None:
         pdf = _make_page_pdf(b"BT <48G5> Tj ET")
 
@@ -437,3 +639,72 @@ end
         result = sanitize_structure_limits(pdf)
 
         assert result["hex_odd_fixed"] == 0
+
+    def test_sanitizes_deep_form_object_graph_without_recursion_error(self) -> None:
+        pdf = new_pdf()
+        form = pdf.make_stream(b"q Q")
+        form["/Type"] = Name.XObject
+        form["/Subtype"] = Name.Form
+        form["/BBox"] = Array([0, 0, 10, 10])
+        form["/Resources"] = Dictionary()
+        form["/DeepValue"] = _INT_MAX + 1
+        for _ in range(1200):
+            parent = pdf.make_stream(b"/Fm Do")
+            parent["/Type"] = Name.XObject
+            parent["/Subtype"] = Name.Form
+            parent["/BBox"] = Array([0, 0, 10, 10])
+            parent["/Resources"] = Dictionary(XObject=Dictionary(Fm=form))
+            form = parent
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 200, 200]),
+                Resources=Dictionary(XObject=Dictionary(Fm=form)),
+                Contents=pdf.make_stream(b"/Fm Do"),
+            )
+        )
+        pdf.pages.append(page)
+        buffer = BytesIO()
+        pdf.save(buffer)
+        buffer.seek(0)
+
+        with Pdf.open(buffer) as reopened:
+            result = sanitize_structure_limits(reopened)
+            deep_form = next(
+                item
+                for item in reopened.objects
+                if isinstance(item, pikepdf.Stream) and "/DeepValue" in item
+            )
+
+            assert int(deep_form["/DeepValue"]) == _INT_MAX
+            assert result["integers_clamped"] == 1
+
+    def test_sanitizes_deep_array_operand_without_recursion_error(self) -> None:
+        operand: object = _INT_MAX + 1
+        for _ in range(1200):
+            operand = Array([operand])
+        stats = {
+            "names_shortened": 0,
+            "utf8_names_fixed": 0,
+            "strings_truncated": 0,
+            "integers_clamped": 0,
+            "reals_normalized": 0,
+        }
+
+        sanitized, changed = _sanitize_operand(operand, stats)
+
+        current = sanitized
+        for _ in range(1200):
+            assert isinstance(current, Array)
+            current = current[0]
+        assert int(current) == _INT_MAX
+        assert changed is True
+        assert stats["integers_clamped"] == 1
+
+    def test_detects_placeholder_in_1200_deep_array_operand(self) -> None:
+        """Invalid parsed hex placeholders are detected without recursion."""
+        operand: object = None
+        for _ in range(1200):
+            operand = Array([operand])
+
+        assert _operands_contain_parse_placeholders(operand) is True

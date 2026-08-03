@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pikepdf
+import pytest
 from conftest import new_pdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
@@ -269,8 +270,8 @@ class TestIsPdfaCompliantEmbeddedVeraPDF:
         ):
             assert _is_pdfa_compliant_embedded(filespec) is False
 
-    def test_verapdf_not_available_falls_back_to_xmp(self) -> None:
-        """veraPDF not available -> falls back to XMP (True for valid XMP)."""
+    def test_verapdf_not_available_does_not_trust_xmp(self) -> None:
+        """An XMP claim is unverified when veraPDF is unavailable."""
         pdf_data = _create_pdfa_pdf_bytes("2b")
         host = _make_pdf_with_embedded(pdf_data)
         names_array = host.Root.Names.EmbeddedFiles.Names
@@ -280,11 +281,11 @@ class TestIsPdfaCompliantEmbeddedVeraPDF:
             patch(_VERAPDF_AVAILABLE, return_value=False),
             patch(_VERAPDF_VALIDATE) as mock_validate,
         ):
-            assert _is_pdfa_compliant_embedded(filespec) is True
+            assert _is_pdfa_compliant_embedded(filespec) is False
             mock_validate.assert_not_called()
 
-    def test_verapdf_error_falls_back_to_xmp(self) -> None:
-        """veraPDF raises exception -> falls back to XMP result (True)."""
+    def test_verapdf_error_does_not_trust_xmp(self) -> None:
+        """A veraPDF execution failure leaves the XMP claim unverified."""
         pdf_data = _create_pdfa_pdf_bytes("1b")
         host = _make_pdf_with_embedded(pdf_data)
         names_array = host.Root.Names.EmbeddedFiles.Names
@@ -297,7 +298,7 @@ class TestIsPdfaCompliantEmbeddedVeraPDF:
                 side_effect=RuntimeError("veraPDF crashed"),
             ),
         ):
-            assert _is_pdfa_compliant_embedded(filespec) is True
+            assert _is_pdfa_compliant_embedded(filespec) is False
 
 
 # --- Tests for remove_non_compliant_embedded_files ---
@@ -422,6 +423,26 @@ _TRY_CONVERT = "pdftopdfa.sanitizers.files._try_convert_embedded_pdf_to_pdfa2"
 
 class TestConvertNonCompliantEmbeddedFiles:
     """Tests for the convert-before-remove path (rule 6.8-5)."""
+
+    def test_unverified_pdfa_claim_uses_conversion_path(self) -> None:
+        """An XMP-only PDF/A claim cannot bypass attachment conversion."""
+        pdf_data = _create_pdfa_pdf_bytes("2b")
+        pdf = _make_pdf_with_embedded(pdf_data, "claimed-pdfa.pdf")
+        converted_bytes = b"%PDF-1.4 verified conversion"
+
+        with (
+            patch(_VERAPDF_AVAILABLE, return_value=False),
+            patch(_TRY_CONVERT, return_value=converted_bytes) as mock_convert,
+        ):
+            result = remove_non_compliant_embedded_files(pdf)
+
+        mock_convert.assert_called_once_with(pdf_data)
+        assert result == {
+            "removed": 0,
+            "kept": 0,
+            "converted": 1,
+            "conversion_failed": 0,
+        }
 
     def test_converts_non_compliant_pdf_to_pdfa2(self) -> None:
         """Non-compliant embedded PDF is converted to PDF/A-2b instead of removed."""
@@ -754,6 +775,15 @@ class TestSanitizeForPdfaEmbeddedFiles:
         assert result["files_removed"] == 1
         assert result["embedded_files_kept"] == 0
 
+    def test_level_2a_removes_non_compliant(self) -> None:
+        """Level 2a applies the PDF/A-2 embedded-file restrictions."""
+        pdf = _make_pdf_with_embedded(b"Not a PDF", "bad.txt")
+
+        result = sanitize_for_pdfa(pdf, level="2a")
+
+        assert result["files_removed"] == 1
+        assert result["embedded_files_kept"] == 0
+
     def test_level_3b_behavior_unchanged(self) -> None:
         """Level 3b keeps all embedded files (no selective removal)."""
         pdf = _make_pdf_with_embedded(b"Not a PDF", "any.txt")
@@ -774,12 +804,57 @@ class TestSanitizeForPdfaEmbeddedFiles:
         assert result["embedded_files_kept"] == 0
         assert "/EmbeddedFiles" in pdf.Root.Names
 
+    def test_level_3a_behavior_unchanged(self) -> None:
+        """Level 3a keeps arbitrary embedded files."""
+        pdf = _make_pdf_with_embedded(b"Not a PDF", "any.txt")
+
+        result = sanitize_for_pdfa(pdf, level="3a")
+
+        assert result["files_removed"] == 0
+        assert result["embedded_files_kept"] == 0
+        assert "/EmbeddedFiles" in pdf.Root.Names
+
+    def test_level_2a_does_not_reassociate_removed_indirect_filespec(self) -> None:
+        """Level 2a does not rebuild /Root/AF from a removed FileSpec object."""
+        pdf = _make_pdf_with_embedded(b"Not a PDF", "bad.txt")
+        buffer = BytesIO()
+        pdf.save(buffer)
+        buffer.seek(0)
+
+        with pikepdf.open(buffer) as reopened:
+            result = sanitize_for_pdfa(reopened, level="2a")
+
+            assert result["files_removed"] == 1
+            assert "/EmbeddedFiles" not in reopened.Root.Names
+            assert "/AF" not in reopened.Root
+
+    def test_level_a_attachment_policy_end_to_end(self, tmp_path: Path) -> None:
+        """2a removes arbitrary attachments while 3a preserves them."""
+        input_path = tmp_path / "attached.pdf"
+        pdf = new_pdf()
+        pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
+        pdf.attachments["payload.txt"] = b"enterprise payload"
+        pdf.save(input_path)
+
+        output_2a = tmp_path / "attached-2a.pdf"
+        convert_to_pdfa(input_path, output_2a, level="2a")
+        with pikepdf.open(output_2a) as converted:
+            assert "/EmbeddedFiles" not in converted.Root.Names
+            assert "/AF" not in converted.Root
+
+        output_3a = tmp_path / "attached-3a.pdf"
+        convert_to_pdfa(input_path, output_3a, level="3a")
+        with pikepdf.open(output_3a) as converted:
+            assert list(converted.attachments) == ["payload.txt"]
+            assert len(converted.Root.AF) == 1
+            assert "/EF" in _resolve_indirect(converted.Root.AF[0])
+
     def test_embedded_files_kept_key_in_result(self) -> None:
         """Result dict always contains embedded_files_kept key."""
         pdf = new_pdf()
         pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
 
-        for lvl in ("2b", "2u", "3b", "3u"):
+        for lvl in ("2a", "2b", "2u", "3a", "3b", "3u"):
             result = sanitize_for_pdfa(pdf, level=lvl)
             assert "embedded_files_kept" in result
             assert isinstance(result["embedded_files_kept"], int)
@@ -1436,22 +1511,95 @@ class TestNameTreeTraversal:
         values = list(_iter_name_tree_values(node))
         assert values == []
 
-    def test_depth_limit_prevents_runaway(self) -> None:
-        """Depth limit prevents infinite recursion on circular references."""
+    def test_tree_beyond_python_recursion_limit(self) -> None:
+        """An exceptionally deep tree is traversed completely."""
         pdf = new_pdf()
         pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
 
-        # Create a chain of 40 nodes (exceeds _MAX_NAME_TREE_DEPTH=32)
         leaf = pdf.make_indirect(
             Dictionary(Names=Array(["deep.txt", Dictionary(F="deep.txt")]))
         )
         current = leaf
-        for _ in range(40):
+        for _ in range(1200):
             current = pdf.make_indirect(Dictionary(Kids=Array([current])))
 
-        # Should not raise, just stop at depth limit
         values = list(_iter_name_tree_values(current))
-        assert len(values) == 0  # Leaf is beyond depth limit
+        assert len(values) == 1
+        assert str(values[0].get("/F")) == "deep.txt"
+
+    def test_indirect_cycle_is_traversed_once(self) -> None:
+        """A cyclic Kids array terminates without yielding duplicates."""
+        pdf = new_pdf()
+        node = pdf.make_indirect(Dictionary())
+        node["/Kids"] = Array([node])
+
+        assert list(_iter_name_tree_values(node)) == []
+        assert list(_iter_name_tree_pairs(node)) == []
+
+    def test_cyclic_tree_is_flattened_and_serializable(self) -> None:
+        """A cyclic name tree is replaced by one valid flat leaf."""
+        pdf = _make_pdf_with_embedded(b"payload", "payload.txt")
+        embedded = pdf.make_indirect(pdf.Root.Names.EmbeddedFiles)
+        embedded["/Kids"] = Array([embedded])
+
+        assert ensure_af_relationships(pdf) == 1
+
+        normalized = _resolve_indirect(pdf.Root.Names.EmbeddedFiles)
+        assert "/Kids" not in normalized
+        assert [str(item) for item in normalized.Names[::2]] == ["payload.txt"]
+        output = BytesIO()
+        pdf.save(output)
+        with pikepdf.open(BytesIO(output.getvalue())) as reopened:
+            assert "/Kids" not in reopened.Root.Names.EmbeddedFiles
+            assert len(reopened.Root.Names.EmbeddedFiles.Names) == 2
+
+    def test_direct_cycle_is_removed_and_terminates(self) -> None:
+        """A direct self-cycle is removed instead of hanging traversal."""
+        pdf = new_pdf()
+        pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
+        embedded = Dictionary()
+        embedded["/Kids"] = Array([embedded])
+        pdf.Root.Names = Dictionary(EmbeddedFiles=embedded)
+
+        assert ensure_af_relationships(pdf) == 0
+        assert "/EmbeddedFiles" not in pdf.Root.Names
+
+    def test_malformed_tree_is_filtered_sorted_and_deduplicated(self) -> None:
+        """Invalid pairs and duplicate keys are removed while flattening."""
+        pdf = new_pdf()
+        pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
+        first = Dictionary(Type=Name.Filespec, F="first.txt", UF="first.txt")
+        duplicate = Dictionary(Type=Name.Filespec, F="duplicate.txt")
+        second = Dictionary(Type=Name.Filespec, F="second.txt", UF="second.txt")
+        leaf = pdf.make_indirect(
+            Dictionary(
+                Names=Array(
+                    [
+                        "z.txt",
+                        second,
+                        Name.Invalid,
+                        first,
+                        "a.txt",
+                        first,
+                        "a.txt",
+                        duplicate,
+                        "invalid-value",
+                        42,
+                        "orphan",
+                    ]
+                )
+            )
+        )
+        root = pdf.make_indirect(Dictionary(Kids=leaf, Limits=Array(["x", "z"])))
+        pdf.Root.Names = Dictionary(EmbeddedFiles=root)
+
+        assert ensure_af_relationships(pdf) == 2
+
+        normalized = _resolve_indirect(pdf.Root.Names.EmbeddedFiles)
+        assert "/Kids" not in normalized
+        assert "/Limits" not in normalized
+        assert [str(item) for item in normalized.Names[::2]] == ["a.txt", "z.txt"]
+        assert len(pdf.Root.AF) == 2
 
     def test_odd_length_names_no_crash(self) -> None:
         """Malformed /Names array with odd length doesn't crash."""
@@ -1861,6 +2009,90 @@ class TestFullScanFindsFilespecs:
         resolved = _resolve_indirect(results[0])
         assert str(resolved.get("/F")) == "root_af.pdf"
 
+    @pytest.mark.parametrize("owner_kind", ["root", "page", "annotation"])
+    def test_finds_type_only_filespec_in_reachable_af(self, owner_kind: str) -> None:
+        """Reachable associated FileSpecs do not need an embedded-file stream."""
+        pdf = new_pdf()
+        page = pikepdf.Page(Dictionary(Type=Name.Page))
+        pdf.pages.append(page)
+        file_spec = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Filespec,
+                F="external.dat",
+                UF="external.dat",
+            )
+        )
+
+        if owner_kind == "root":
+            pdf.Root["/AF"] = Array([file_spec])
+        elif owner_kind == "page":
+            page["/AF"] = Array([file_spec])
+        else:
+            annotation = pdf.make_indirect(
+                Dictionary(
+                    Type=Name.Annot,
+                    Subtype=Name.Text,
+                    Rect=Array([0, 0, 10, 10]),
+                    AF=Array([file_spec]),
+                )
+            )
+            page["/Annots"] = Array([annotation])
+
+        results = list(_iter_all_filespecs(pdf))
+
+        assert len(results) == 1
+        assert _resolve_indirect(results[0]).objgen == file_spec.objgen
+        assert ensure_af_relationships(pdf) == 1
+        assert str(file_spec["/AFRelationship"]) == "/Unspecified"
+
+    def test_ignores_unreachable_type_only_filespec(self) -> None:
+        """A stale type-only object is not revived as an associated file."""
+        pdf = new_pdf()
+        pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
+        pdf.make_indirect(
+            Dictionary(
+                Type=Name.Filespec,
+                F="stale.dat",
+                UF="stale.dat",
+            )
+        )
+
+        assert list(_iter_all_filespecs(pdf)) == []
+
+    def test_normalizes_dictionary_af_and_filters_invalid_entries(self) -> None:
+        """A dictionary /AF becomes an array and invalid entries are discarded."""
+        pdf = new_pdf()
+        pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
+        filespec = Dictionary(
+            Type=Name.Filespec,
+            F="external.txt",
+            UF="external.txt",
+        )
+        pdf.pages[0]["/AF"] = filespec
+
+        assert ensure_af_relationships(pdf) == 1
+
+        page_af = pdf.pages[0].AF
+        assert isinstance(page_af, Array)
+        assert len(page_af) == 1
+        assert page_af[0].objgen != (0, 0)
+
+        page_af.append(42)
+        page_af.append(Dictionary(Type=Name.Filespec))
+        page_af.append(Dictionary(Type=Name.Action, F="not-a-filespec"))
+        assert ensure_af_relationships(pdf) == 0
+        assert len(pdf.pages[0].AF) == 1
+
+    def test_removes_invalid_dictionary_af(self) -> None:
+        """A dictionary that is not a FileSpec is removed from /AF."""
+        pdf = new_pdf()
+        pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
+        pdf.pages[0]["/AF"] = Dictionary(Foo="bar")
+
+        assert ensure_af_relationships(pdf) == 0
+        assert "/AF" not in pdf.pages[0]
+        assert "/AF" not in pdf.Root
+
 
 # --- Tests for ensure_filespec_uf_entries with missing /F ---
 
@@ -1999,6 +2231,89 @@ class TestRemoveNonCompliantOrphanFilespecs:
 
         # Should be exactly 1 removal, not 2
         assert result["removed"] == 1
+
+    @pytest.mark.parametrize("owner_kind", ["root", "page", "annotation"])
+    def test_removes_direct_filespec_from_associated_file_arrays(
+        self, owner_kind: str
+    ) -> None:
+        """Direct FileSpecs reachable only through /AF are removed for PDF/A-2."""
+        pdf = new_pdf()
+        page = pikepdf.Page(Dictionary(Type=Name.Page))
+        pdf.pages.append(page)
+        stream = pdf.make_stream(b"not a PDF")
+        filespec = Dictionary(
+            Type=Name.Filespec,
+            F="payload.bin",
+            UF="payload.bin",
+            EF=Dictionary(F=stream, UF=stream),
+        )
+        if owner_kind == "root":
+            owner = pdf.Root
+        elif owner_kind == "page":
+            owner = page
+        else:
+            owner = pdf.make_indirect(
+                Dictionary(
+                    Type=Name.Annot,
+                    Subtype=Name.Text,
+                    Rect=Array([0, 0, 10, 10]),
+                )
+            )
+            page["/Annots"] = Array([owner])
+        owner["/AF"] = filespec
+
+        result = remove_non_compliant_embedded_files(pdf)
+
+        assert result == {
+            "removed": 1,
+            "kept": 0,
+            "converted": 0,
+            "conversion_failed": 0,
+        }
+        assert "/AF" not in owner
+        assert "/AF" not in pdf.Root
+        assert "/EF" not in filespec
+
+    def test_removes_direct_fileattachment_filespec(self) -> None:
+        """A direct non-PDF FileAttachment /FS is removed without double count."""
+        pdf = new_pdf()
+        page = pikepdf.Page(Dictionary(Type=Name.Page))
+        pdf.pages.append(page)
+        stream = pdf.make_stream(b"not a PDF")
+        filespec = Dictionary(
+            Type=Name.Filespec,
+            F="payload.bin",
+            UF="payload.bin",
+            EF=Dictionary(F=stream, UF=stream),
+        )
+        annotation = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name.FileAttachment,
+                Rect=Array([0, 0, 10, 10]),
+                FS=filespec,
+            )
+        )
+        page["/Annots"] = Array([annotation])
+
+        result = remove_non_compliant_embedded_files(pdf)
+
+        assert result["removed"] == 1
+        assert "/Annots" not in page
+        assert "/EF" not in filespec
+
+    def test_deduplicates_direct_filespec_across_name_tree_and_af(self) -> None:
+        """One shared direct FileSpec is processed once across all references."""
+        pdf = _make_pdf_with_embedded(b"not a PDF", "payload.bin")
+        filespec = pdf.Root.Names.EmbeddedFiles.Names[1]
+        pdf.pages[0]["/AF"] = filespec
+
+        result = remove_non_compliant_embedded_files(pdf)
+
+        assert result["removed"] == 1
+        assert "/EmbeddedFiles" not in pdf.Root.Names
+        assert "/AF" not in pdf.pages[0]
+        assert "/AF" not in pdf.Root
 
 
 # --- Tests for fix functions with scan-found FileSpecs ---

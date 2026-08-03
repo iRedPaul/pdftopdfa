@@ -6,11 +6,13 @@
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass, field
+from io import BytesIO
 from typing import TYPE_CHECKING
 
 import pikepdf
-from fontTools.agl import AGL2UV, UV2AGL
+from fontTools.agl import AGL2UV, LEGACY_AGL2UV, UV2AGL
 from pikepdf import Array, Dictionary, Name, Stream
 
 from ..exceptions import FontEmbeddingError
@@ -31,12 +33,19 @@ from .constants import FONT_REPLACEMENTS, SYMBOL_FONTS, resolve_standard14_alias
 from .constants import UTF16_ENCODING_NAMES as _UTF16_ENCODING_NAMES
 from .encodings import SYMBOL_ENCODING, ZAPFDINGBATS_ENCODING
 from .glyph_mapping import SYMBOL_GLYPH_TO_UNICODE, ZAPFDINGBATS_GLYPH_TO_UNICODE
+from .glyph_usage import CharacterCode, collect_font_usage
 from .loader import FontLoader
 from .metrics import FontMetricsExtractor
-from .subsetter import FontSubsetter, SubsettingResult
+from .subsetter import (
+    FontSubsetter,
+    SubsettingResult,
+    _get_unicode_cmap,
+    _resolve_truetype_font_encoding,
+)
 from .tounicode import (
     build_identity_unicode_mapping,
     fill_tounicode_gaps_with_pua,
+    filter_invalid_unicode_values,
     generate_cidfont_tounicode_cmap,
     generate_to_unicode_for_simple_font,
     generate_tounicode_cmap_data,
@@ -44,10 +53,17 @@ from .tounicode import (
     generate_tounicode_for_standard_encoding,
     generate_tounicode_for_type3_font,
     generate_tounicode_for_winansi,
+    generate_tounicode_from_cff_program,
     generate_tounicode_from_encoding_dict,
+    generate_tounicode_from_type1_program,
+    get_font_code_space_ranges,
+    get_type0_cid_encoding_map,
     parse_cidtogidmap_stream,
     parse_tounicode_cmap,
+    parse_tounicode_cmap_sequences,
+    resolve_glyph_to_unicode,
     resolve_symbol_glyph_to_unicode,
+    validate_tounicode_cmap,
 )
 from .traversal import iter_acroform_dr_fonts, iter_all_page_fonts
 from .utils import get_encoding_name as _get_encoding_name
@@ -93,23 +109,32 @@ _CJK_CIDFONT_NAME_HINTS = (
 
 def _is_agl_glyph_name(glyph_name: str) -> bool:
     """Return True when a glyph name is explicitly listed in Adobe Glyph List."""
-    return glyph_name == ".notdef" or glyph_name in AGL2UV
+    return (
+        glyph_name == ".notdef" or glyph_name in AGL2UV or glyph_name in LEGACY_AGL2UV
+    )
+
+
+def _is_non_pua_unicode_scalar(value: int) -> bool:
+    """Return whether a value is a usable non-private Unicode scalar."""
+    return (
+        0 <= value <= 0x10FFFF
+        and not 0xD800 <= value <= 0xDFFF
+        and not 0xE000 <= value <= 0xF8FF
+        and not 0xF0000 <= value <= 0xFFFFD
+        and not 0x100000 <= value <= 0x10FFFD
+    )
 
 
 def _cidfont_replacement_warning(base_name: str) -> str:
     """Build the warning issued when a non-embedded CIDFont is replaced.
 
-    Content streams of Identity-encoded CIDFonts reference glyph IDs of the
-    original font. After substituting a different font program, the same
-    glyph IDs point to different (or missing) glyphs, so rendering of the
-    affected text is unreliable even though text extraction stays correct
-    via the preserved ToUnicode CMap.
+    A substitute font can preserve the source character mapping but cannot
+    reproduce a missing proprietary font program's exact glyph design.
     """
     return (
         f"Non-embedded CIDFont '{base_name}' was replaced with a substitute "
-        "font: its glyph IDs do not match the original font, so affected text "
-        "may render incorrectly or invisibly (text extraction and copy/paste "
-        "remain intact)"
+        "font; its rendered glyph design and metrics may differ from the "
+        "unavailable original font"
     )
 
 
@@ -126,6 +151,116 @@ def _is_utf16_encoding(encoding_name: str) -> bool:
         True if the encoding is a UTF-16/UCS-2 CMap.
     """
     return encoding_name in _UTF16_ENCODING_NAMES
+
+
+def _find_unicode_cmap_name(encoding: pikepdf.Object) -> str:
+    """Find a predefined Unicode CMap in an encoding's /UseCMap chain."""
+    current = _resolve_indirect(encoding)
+    seen: set[tuple[int, int] | tuple[str, int]] = set()
+
+    while True:
+        if isinstance(current, pikepdf.Name):
+            name = _get_encoding_name(current)
+            return name if _is_utf16_encoding(name) else ""
+        if not isinstance(current, pikepdf.Stream):
+            return ""
+
+        objgen = current.objgen
+        key: tuple[int, int] | tuple[str, int] = (
+            objgen if objgen != (0, 0) else ("direct", id(current))
+        )
+        if key in seen:
+            return ""
+        seen.add(key)
+
+        name = _get_encoding_name(current)
+        if _is_utf16_encoding(name):
+            return name
+
+        usecmap = current.get("/UseCMap")
+        if usecmap is not None:
+            current = _resolve_indirect(usecmap)
+            continue
+
+        try:
+            data = bytes(current.read_bytes())
+        except Exception:
+            return ""
+        data = re.sub(rb"%[^\r\n]*", b"", data)
+        match = re.search(rb"/([^\s/]+)\s+usecmap\b", data)
+        if match is None:
+            return ""
+        name = match.group(1).decode("latin-1")
+        return name if _is_utf16_encoding(name) else ""
+
+
+def _generate_unicode_type0_tounicode(
+    code_to_unicode: dict[bytes, int],
+    code_space_ranges: tuple[tuple[bytes, bytes], ...],
+) -> bytes:
+    """Generate a ToUnicode CMap without collapsing variable-width codes."""
+    filtered = filter_invalid_unicode_values(code_to_unicode)
+    mappings = {
+        code: unicode_value
+        for code, unicode_value in filtered.items()
+        if isinstance(code, bytes)
+        and isinstance(unicode_value, int)
+        and code
+        and 0 <= unicode_value <= 0x10FFFF
+    }
+    ranges = [
+        (lower, upper)
+        for lower, upper in code_space_ranges
+        if lower and len(lower) == len(upper) and lower <= upper
+    ]
+    for code in mappings:
+        if not any(
+            len(lower) == len(code) and lower <= code <= upper
+            for lower, upper in ranges
+        ):
+            ranges.append((code, code))
+    ranges = list(dict.fromkeys(ranges))
+
+    lines = [
+        "/CIDInit /ProcSet findresource begin",
+        "12 dict begin",
+        "begincmap",
+        "/CIDSystemInfo <<",
+        "  /Registry (Adobe)",
+        "  /Ordering (UCS)",
+        "  /Supplement 0",
+        ">> def",
+        "/CMapName /Adobe-Identity-UCS def",
+        "/CMapType 2 def",
+    ]
+    for offset in range(0, len(ranges), 100):
+        chunk = ranges[offset : offset + 100]
+        lines.append(f"{len(chunk)} begincodespacerange")
+        lines.extend(
+            f"<{lower.hex().upper()}> <{upper.hex().upper()}>" for lower, upper in chunk
+        )
+        lines.append("endcodespacerange")
+
+    codes = sorted(mappings, key=lambda code: (len(code), code))
+    for offset in range(0, len(codes), 100):
+        chunk = codes[offset : offset + 100]
+        lines.append(f"{len(chunk)} beginbfchar")
+        for code in chunk:
+            destination = chr(mappings[code]).encode("utf-16-be")
+            lines.append(f"<{code.hex().upper()}> <{destination.hex().upper()}>")
+        lines.append("endbfchar")
+
+    lines.extend(
+        [
+            "endcmap",
+            "CMapName currentdict /CMap defineresource pop",
+            "end",
+            "end",
+        ]
+    )
+    result = "\n".join(lines).encode("ascii")
+    validate_tounicode_cmap(result)
+    return result
 
 
 @dataclass
@@ -200,6 +335,7 @@ class FontEmbedder:
         processed_fonts: set[str] = set()
         preserved_fonts: set[str] = set()
         processed_font_ids: set[tuple[int, int]] = set()
+        font_usage: dict[tuple[int, int], set[CharacterCode]] | None = None
 
         for font_key, font_obj in self._iter_unique_fonts(processed_font_ids):
             try:
@@ -222,17 +358,22 @@ class FontEmbedder:
                 font_type = get_font_type(font_obj)
                 use_fallback = False
                 if font_type == "CIDFont":
+                    if font_usage is None:
+                        font_usage = collect_font_usage(self.pdf)
                     # Preserve encoding (Identity-H or Identity-V)
                     encoding = self._get_cidfont_encoding(font_obj)
                     success = self._embed_cidfont(
-                        font_obj, base_name, encoding=encoding
+                        font_obj,
+                        base_name,
+                        encoding=encoding,
+                        used_codes=font_usage.get(font_obj.objgen, set()),
                     )
                 else:
                     # Replace font (use fallback for unknown fonts)
                     use_fallback = (
                         resolve_standard14_alias(base_name) not in FONT_REPLACEMENTS
                     )
-                    success = self._replace_simple_font(
+                    success, used_fallback = self._replace_simple_font(
                         font_obj,
                         base_name,
                         use_fallback=use_fallback,
@@ -251,7 +392,7 @@ class FontEmbedder:
                     warning = _cidfont_replacement_warning(base_name)
                     result.warnings.append(warning)
                     logger.warning(warning)
-                elif use_fallback:
+                elif used_fallback:
                     warning = (
                         f"No specific replacement for font '{base_name}',"
                         f" using LiberationSans as fallback"
@@ -432,7 +573,7 @@ class FontEmbedder:
                     if font_type not in {"TrueType", "Type1", "MMType1"}:
                         continue
 
-                    success = self._replace_simple_font(
+                    success, _used_fallback = self._replace_simple_font(
                         font_obj,
                         base_name,
                         preserve_existing_encoding=True,
@@ -571,7 +712,7 @@ class FontEmbedder:
             prev = code
 
         encoding_dict = Dictionary(Type=Name.Encoding, Differences=Array(differences))
-        if differences and base_encoding is not None:
+        if base_encoding is not None:
             encoding_dict[Name("/BaseEncoding")] = base_encoding
         return encoding_dict
 
@@ -627,9 +768,24 @@ class FontEmbedder:
         """
         encoding = font_obj.get("/Encoding")
         if encoding is not None:
-            enc_str = _safe_str(encoding)
-            if "Identity-V" in enc_str:
+            encoding_name = _find_unicode_cmap_name(encoding) or _get_encoding_name(
+                encoding
+            )
+            if encoding_name.endswith("-V"):
                 return "Identity-V"
+            encoding = _resolve_indirect(encoding)
+            if isinstance(encoding, pikepdf.Stream):
+                try:
+                    if int(encoding.get("/WMode", 0)) == 1:
+                        return "Identity-V"
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    data = re.sub(rb"%[^\r\n]*", b"", bytes(encoding.read_bytes()))
+                    if re.search(rb"/WMode\s+1\b", data):
+                        return "Identity-V"
+                except Exception:
+                    pass
         return "Identity-H"
 
     def _get_cidfont_ordering(self, font_obj: pikepdf.Object) -> str:
@@ -681,12 +837,142 @@ class FontEmbedder:
                 use_fallback=use_fallback,
             )
 
+    @staticmethod
+    def _character_code_bytes(
+        code: CharacterCode,
+        code_space_ranges: tuple[tuple[bytes, bytes], ...],
+    ) -> bytes | None:
+        """Return the original byte representation of a Type 0 character code."""
+        if isinstance(code, bytes):
+            return code
+        for lower, upper in code_space_ranges:
+            try:
+                candidate = code.to_bytes(len(lower), "big")
+            except OverflowError:
+                continue
+            if lower <= candidate <= upper:
+                return candidate
+        return None
+
+    @staticmethod
+    def _unicode_cidfont_replacement_maps(
+        font_obj: pikepdf.Object,
+        tt_font: "TTFont",
+        encoding_name: str,
+        used_codes: set[CharacterCode],
+        authoritative_unicode: dict[bytes, tuple[int, ...]] | None = None,
+        collection_unicode: dict[int, int] | None = None,
+    ) -> (
+        tuple[
+            dict[int, int],
+            dict[bytes, int],
+            tuple[tuple[bytes, bytes], ...],
+        ]
+        | None
+    ):
+        """Map Unicode character codes through the source CMap to replacement GIDs."""
+        cid_encoding = get_type0_cid_encoding_map(font_obj)
+        if cid_encoding is None or not used_codes:
+            return None
+
+        try:
+            cmap = tt_font.getBestCmap() or {}
+        except KeyError:
+            cmap = {}
+
+        glyph_name_to_gid = {
+            glyph_name: gid for gid, glyph_name in enumerate(tt_font.getGlyphOrder())
+        }
+        fallback_gid = 0
+        for fallback_unicode in (0xFFFD, 0x25A1, 0x003F):
+            fallback_name = cmap.get(fallback_unicode)
+            candidate = glyph_name_to_gid.get(fallback_name) if fallback_name else None
+            if candidate:
+                fallback_gid = candidate
+                break
+        code_space_ranges = get_font_code_space_ranges(font_obj)
+        cid_to_gid: dict[int, int] = {}
+        exact_cids: set[int] = set()
+        code_to_unicode: dict[bytes, int] = {}
+        has_semantic_mapping = False
+
+        for code in sorted(
+            used_codes,
+            key=lambda value: (
+                0 if isinstance(value, bytes) else 1,
+                value if isinstance(value, bytes) else str(value).encode("ascii"),
+            ),
+        ):
+            raw = FontEmbedder._character_code_bytes(code, code_space_ranges)
+            if raw is None:
+                continue
+            cid = cid_encoding.map_code(raw)
+            if not 0 <= cid <= 0xFFFF:
+                continue
+
+            unicode_value = None
+            sequence = (
+                authoritative_unicode.get(raw)
+                if authoritative_unicode is not None
+                else None
+            )
+            if sequence is not None:
+                has_semantic_mapping = True
+                if len(sequence) == 1:
+                    unicode_value = sequence[0]
+            elif _is_utf16_encoding(encoding_name):
+                try:
+                    if "-UCS2-" in encoding_name:
+                        unicode_value = (
+                            int.from_bytes(raw, "big") if len(raw) == 2 else 0xFFFD
+                        )
+                        if 0xD800 <= unicode_value <= 0xDFFF:
+                            unicode_value = 0xFFFD
+                    else:
+                        decoded = raw.decode("utf-16-be")
+                        unicode_value = ord(decoded) if len(decoded) == 1 else 0xFFFD
+                    has_semantic_mapping = True
+                except UnicodeDecodeError:
+                    unicode_value = 0xFFFD
+                    has_semantic_mapping = True
+            elif collection_unicode is not None:
+                unicode_value = collection_unicode.get(cid, 0xFFFD)
+                has_semantic_mapping = True
+
+            gid = fallback_gid
+            exact = False
+            if unicode_value is not None:
+                code_to_unicode[raw] = unicode_value
+                glyph_name = cmap.get(unicode_value)
+                exact_gid = glyph_name_to_gid.get(glyph_name) if glyph_name else None
+                if exact_gid:
+                    gid = exact_gid
+                    exact = True
+
+            previous_gid = cid_to_gid.get(cid)
+            if previous_gid is None or (exact and cid not in exact_cids):
+                cid_to_gid[cid] = gid
+                if exact:
+                    exact_cids.add(cid)
+            elif exact and previous_gid != gid:
+                logger.debug(
+                    "Unicode CMap maps multiple used characters to CID %d; "
+                    "keeping replacement GID %d",
+                    cid,
+                    previous_gid,
+                )
+
+        if not cid_to_gid or not has_semantic_mapping:
+            return None
+        return cid_to_gid, code_to_unicode, code_space_ranges
+
     def _embed_cidfont(
         self,
         font_obj: pikepdf.Object,
         font_name: str,
         *,
         encoding: str = "Identity-H",
+        used_codes: set[CharacterCode] | None = None,
     ) -> bool:
         """Embeds CIDFont with Noto Sans CJK.
 
@@ -697,13 +983,49 @@ class FontEmbedder:
             font_obj: The font object.
             font_name: Base name of the font (without subset prefix).
             encoding: CIDFont encoding ('Identity-H' or 'Identity-V').
+            used_codes: Character codes shown with this font in content streams.
 
         Returns:
             True if successful, False on errors.
         """
         try:
             ordering = self._get_cidfont_ordering(font_obj)
+            original_encoding = font_obj.get("/Encoding")
+            encoding_name = (
+                _find_unicode_cmap_name(original_encoding)
+                or _get_encoding_name(original_encoding)
+                if original_encoding is not None
+                else ""
+            )
             original_tounicode = font_obj.get("/ToUnicode")
+            authoritative_unicode = None
+            if original_tounicode is not None:
+                try:
+                    tounicode_stream = _resolve_indirect(original_tounicode)
+                    if isinstance(tounicode_stream, pikepdf.Stream):
+                        authoritative_unicode = parse_tounicode_cmap_sequences(
+                            bytes(tounicode_stream.read_bytes())
+                        )
+                except Exception:
+                    pass
+            original_cid_system_info = None
+            original_w2 = None
+            original_dw2 = None
+            original_descendants = font_obj.get("/DescendantFonts")
+            if original_descendants is not None and len(original_descendants) > 0:
+                original_descendant = _resolve_indirect(original_descendants[0])
+                original_cid_system_info = original_descendant.get("/CIDSystemInfo")
+                original_w2 = original_descendant.get("/W2")
+                original_dw2 = original_descendant.get("/DW2")
+            collection_unicode = None
+            if isinstance(original_cid_system_info, pikepdf.Dictionary):
+                try:
+                    registry = _safe_str(original_cid_system_info.get("/Registry"))
+                    supplement = int(original_cid_system_info.get("/Supplement", -1))
+                    if registry == "Adobe" and supplement >= 0:
+                        collection_unicode = get_cid_to_unicode(ordering)
+                except (TypeError, ValueError):
+                    pass
             use_cjk_replacement = (
                 ordering != "Identity" or self._looks_like_cjk_cidfont(font_name)
             )
@@ -719,11 +1041,64 @@ class FontEmbedder:
                 # as the descendant CIDFont instead of substituting a CJK font.
                 font_data, tt_font = self._load_identity_cidfont_replacement(font_name)
 
+            unicode_maps = None
+            if (
+                _is_utf16_encoding(encoding_name)
+                or authoritative_unicode
+                or collection_unicode is not None
+            ):
+                unicode_maps = self._unicode_cidfont_replacement_maps(
+                    font_obj,
+                    tt_font,
+                    encoding_name,
+                    used_codes or set(),
+                    authoritative_unicode,
+                    collection_unicode,
+                )
+
             # Build complete CIDFont structure
             new_font = self._cidfont_builder.build_structure(
                 font_name, tt_font, font_data, encoding=encoding
             )
-            if original_tounicode is not None:
+            if unicode_maps is not None and original_encoding is not None:
+                cid_to_gid, code_to_unicode, code_space_ranges = unicode_maps
+                new_font[Name.Encoding] = original_encoding
+                new_descendant = _resolve_indirect(new_font["/DescendantFonts"][0])
+                if original_cid_system_info is not None:
+                    new_descendant[Name.CIDSystemInfo] = original_cid_system_info
+                if original_w2 is not None:
+                    new_descendant[Name.W2] = original_w2
+                if original_dw2 is not None:
+                    new_descendant[Name.DW2] = original_dw2
+
+                max_cid = max(cid_to_gid)
+                cidtogid_data = bytearray((max_cid + 1) * 2)
+                for cid, gid in cid_to_gid.items():
+                    offset = cid * 2
+                    cidtogid_data[offset : offset + 2] = gid.to_bytes(2, "big")
+                new_descendant[Name.CIDToGIDMap] = self.pdf.make_indirect(
+                    Stream(self.pdf, bytes(cidtogid_data))
+                )
+
+                w_array = self._metrics.build_cidfont_w_array(
+                    tt_font,
+                    cid_to_gid,
+                )
+                new_descendant[Name.W] = Array(
+                    Array(item) if isinstance(item, list) else item for item in w_array
+                )
+
+                if original_tounicode is not None:
+                    new_font[Name.ToUnicode] = original_tounicode
+                else:
+                    tounicode_data = _generate_unicode_type0_tounicode(
+                        code_to_unicode,
+                        code_space_ranges,
+                    )
+                    new_font[Name.ToUnicode] = self.pdf.make_indirect(
+                        Stream(self.pdf, tounicode_data)
+                    )
+            elif original_tounicode is not None:
                 new_font[Name.ToUnicode] = original_tounicode
 
             # Update the font object with the new structure
@@ -814,7 +1189,7 @@ class FontEmbedder:
         *,
         use_fallback: bool = False,
         preserve_existing_encoding: bool = False,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         """Replaces a non-embedded simple font with an embedded one.
 
         The font object is rewritten in place, so all pages and resources
@@ -829,7 +1204,7 @@ class FontEmbedder:
                 code-to-Unicode mapping (used when refreshing subset fonts).
 
         Returns:
-            True if successful, False on errors.
+            A pair of success and whether the bundled fallback font was used.
         """
         try:
             # Load replacement font
@@ -837,6 +1212,7 @@ class FontEmbedder:
                 font_name,
                 use_fallback=use_fallback,
             )
+            used_fallback = self._loader.is_fallback_font(tt_font)
 
             # Check if symbol font
             is_symbol = font_name in SYMBOL_FONTS
@@ -845,7 +1221,7 @@ class FontEmbedder:
             metrics = self._metrics.extract_metrics(tt_font, is_symbol=is_symbol)
             if metrics is None:
                 logger.error("Font '%s' missing head/OS2 tables", font_name)
-                return False
+                return False, used_fallback
 
             encoding_name: Name | None = None
             encoding_dict: Dictionary | None = None
@@ -902,18 +1278,18 @@ class FontEmbedder:
             to_unicode_stream = Stream(self.pdf, to_unicode_data)
             font_obj[Name.ToUnicode] = self.pdf.make_indirect(to_unicode_stream)
 
-            return True
+            return True, used_fallback
 
         except FontEmbeddingError as e:
             logger.error("Error embedding font '%s': %s", font_name, e)
-            return False
+            return False, False
         except Exception as e:
             logger.error(
                 "Unexpected error embedding font '%s': %s",
                 font_name,
                 e,
             )
-            return False
+            return False, False
 
     def _build_preserved_simple_font_encoding(
         self,
@@ -1143,15 +1519,77 @@ class FontEmbedder:
             True if successful, False otherwise.
         """
         encoding = font_obj.get("/Encoding")
-        code_to_unicode: dict[int, int] = {}
+        code_to_unicode: dict[int, int | tuple[int, ...]] = {}
+        subtype = font_obj.get("/Subtype")
+        subtype_name = _safe_str(subtype) if subtype is not None else ""
 
-        if encoding is None:
-            # No encoding specified — per PDF spec, the implicit encoding
-            # for non-symbolic Type1 fonts is StandardEncoding.
-            # For symbolic fonts, StandardEncoding has gaps (codes 0-31,
-            # 128-160, etc.), so fill gaps with PUA codepoints to ensure
-            # complete ToUnicode coverage for PDF/A compliance.
-            code_to_unicode = generate_tounicode_for_standard_encoding()
+        if subtype_name == "/TrueType" and (
+            encoding is None or is_symbolic_font(font_obj)
+        ):
+            code_to_unicode = self._tounicode_from_truetype_program(font_obj)
+            first_char = 0
+            last_char = 255
+            try:
+                first_char = int(font_obj.get("/FirstChar", first_char))
+            except (TypeError, ValueError):
+                pass
+            try:
+                last_char = int(font_obj.get("/LastChar", last_char))
+            except (TypeError, ValueError):
+                pass
+            code_to_unicode = fill_tounicode_gaps_with_pua(
+                code_to_unicode,
+                first_char,
+                last_char,
+            )
+        elif encoding is None:
+            # Encoding-less Type1 fonts use the Encoding in their embedded
+            # program. StandardEncoding remains the fallback for fonts whose
+            # program is unavailable or cannot be parsed. Fill any remaining
+            # gaps with PUA codepoints for complete PDF/A coverage.
+            if subtype_name in ("/Type1", "/MMType1"):
+                descriptor = font_obj.get("/FontDescriptor")
+                if descriptor is not None:
+                    descriptor = _resolve_indirect(descriptor)
+                    if isinstance(descriptor, Dictionary):
+                        font_file = descriptor.get("/FontFile")
+                        if font_file is not None:
+                            font_file = _resolve_indirect(font_file)
+                            if isinstance(font_file, Stream):
+                                try:
+                                    code_to_unicode = (
+                                        generate_tounicode_from_type1_program(
+                                            bytes(font_file.read_bytes())
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+                        font_file3 = descriptor.get("/FontFile3")
+                        if not code_to_unicode and font_file3 is not None:
+                            font_file3 = _resolve_indirect(font_file3)
+                            if (
+                                isinstance(font_file3, Stream)
+                                and _safe_str(font_file3.get("/Subtype")) == "/Type1C"
+                            ):
+                                try:
+                                    cff_font_name = descriptor.get("/FontName")
+                                    if cff_font_name is None:
+                                        cff_font_name = font_obj.get("/BaseFont")
+                                    selected_name = (
+                                        _safe_str(cff_font_name).removeprefix("/")
+                                        if cff_font_name is not None
+                                        else None
+                                    )
+                                    code_to_unicode = (
+                                        generate_tounicode_from_cff_program(
+                                            bytes(font_file3.read_bytes()),
+                                            selected_name,
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+            if not code_to_unicode:
+                code_to_unicode = generate_tounicode_for_standard_encoding()
             first_char = 0
             last_char = 255
             try:
@@ -1205,6 +1643,86 @@ class FontEmbedder:
         font_obj[Name.ToUnicode] = self.pdf.make_indirect(tounicode_stream)
 
         return True
+
+    def _tounicode_from_truetype_program(
+        self,
+        font_obj: pikepdf.Object,
+    ) -> dict[int, int]:
+        """Resolve an encoding-less or symbolic TrueType font through its cmap."""
+        descriptor = font_obj.get("/FontDescriptor")
+        if descriptor is None:
+            return {}
+        descriptor = _resolve_indirect(descriptor)
+        if not isinstance(descriptor, Dictionary):
+            return {}
+
+        font_file = descriptor.get("/FontFile2")
+        if font_file is None:
+            font_file = descriptor.get("/FontFile3")
+        if font_file is None:
+            return {}
+        font_file = _resolve_indirect(font_file)
+        if not isinstance(font_file, Stream):
+            return {}
+        font_data = bytes(font_file.read_bytes())
+
+        byte_to_glyph = _resolve_truetype_font_encoding(
+            font_obj,
+            font_data,
+            pdfa_normalized=True,
+        )
+        if not byte_to_glyph:
+            return {}
+
+        from fontTools.ttLib import TTFont
+
+        tt_font = TTFont(BytesIO(font_data))
+        try:
+            unicode_cmap = _get_unicode_cmap(tt_font)
+        finally:
+            tt_font.close()
+
+        unicode_by_glyph: dict[str, set[int]] = {}
+        for unicode_value, glyph_name in unicode_cmap.items():
+            if _is_non_pua_unicode_scalar(unicode_value):
+                unicode_by_glyph.setdefault(glyph_name, set()).add(unicode_value)
+
+        base_name = get_base_font_name(get_font_name(font_obj))
+        result: dict[int, int] = {}
+        for code, glyph_name in byte_to_glyph.items():
+            candidates = unicode_by_glyph.get(glyph_name, set())
+            if len(candidates) == 1:
+                result[code] = next(iter(candidates))
+                continue
+
+            preferred = resolve_symbol_glyph_to_unicode(glyph_name)
+            if preferred is None:
+                preferred = ZAPFDINGBATS_GLYPH_TO_UNICODE.get(glyph_name)
+            if preferred is None:
+                preferred = resolve_glyph_to_unicode(glyph_name)
+            if (
+                preferred is not None
+                and _is_non_pua_unicode_scalar(preferred)
+                and (not candidates or preferred in candidates)
+            ):
+                result[code] = preferred
+                continue
+
+            if candidates:
+                continue
+
+            if base_name == "Symbol":
+                encoded_name = SYMBOL_ENCODING.get(code)
+                if encoded_name is not None:
+                    preferred = resolve_symbol_glyph_to_unicode(encoded_name)
+            elif base_name == "ZapfDingbats":
+                encoded_name = ZAPFDINGBATS_ENCODING.get(code)
+                if encoded_name is not None:
+                    preferred = ZAPFDINGBATS_GLYPH_TO_UNICODE.get(encoded_name)
+            if preferred is not None and _is_non_pua_unicode_scalar(preferred):
+                result[code] = preferred
+
+        return result
 
     def _add_tounicode_to_type3_font(
         self,

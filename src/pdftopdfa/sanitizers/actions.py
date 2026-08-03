@@ -161,42 +161,43 @@ def _remove_actions_from_outlines(
         _visited = set()
 
     removed_count = 0
-    item = outline_root.get("/First")
-    while item is not None:
-        try:
-            item = _resolve_indirect(item)
-        except Exception:
-            break
-
-        try:
-            item_key = item.objgen
-        except Exception:
-            item_key = None
-        if item_key is not None and item_key != (0, 0):
-            if item_key in _visited:
+    pending_roots = [outline_root]
+    while pending_roots:
+        item = pending_roots.pop().get("/First")
+        while item is not None:
+            try:
+                item = _resolve_indirect(item)
+            except Exception:
                 break
-            _visited.add(item_key)
 
-        try:
-            if "/A" in item:
-                if _is_non_compliant_action(item.A):
-                    del item["/A"]
-                    removed_count += 1
-                else:
-                    removed_count += _sanitize_next_chain(item.A)
+            try:
+                item_key = item.objgen
+            except Exception:
+                item_key = None
+            if item_key is not None and item_key != (0, 0):
+                if item_key in _visited:
+                    break
+                _visited.add(item_key)
 
-            # Recurse into children
-            if "/First" in item:
-                removed_count += _remove_actions_from_outlines(item, _visited)
-        except Exception as e:
-            log_suppressed_error(
-                logger, e, "Error processing outline item action: %s", e
-            )
+            try:
+                if "/A" in item:
+                    if _is_non_compliant_action(item.A):
+                        del item["/A"]
+                        removed_count += 1
+                    else:
+                        removed_count += _sanitize_next_chain(item.A)
 
-        try:
-            item = item.get("/Next")
-        except Exception:
-            break
+                if "/First" in item:
+                    pending_roots.append(item)
+            except Exception as e:
+                log_suppressed_error(
+                    logger, e, "Error processing outline item action: %s", e
+                )
+
+            try:
+                item = item.get("/Next")
+            except Exception:
+                break
 
     return removed_count
 
@@ -218,8 +219,9 @@ def _remove_actions_from_fields(
         _visited = set()
 
     removed_count = 0
-
-    for field in fields:
+    pending = list(reversed(fields))
+    while pending:
+        field = pending.pop()
         try:
             field = _resolve_indirect(field)
 
@@ -241,10 +243,9 @@ def _remove_actions_from_fields(
                 del field["/AA"]
                 removed_count += 1
 
-            # Recursively process children
             kids = field.get("/Kids")
             if kids is not None:
-                removed_count += _remove_actions_from_fields(kids, _visited)
+                pending.extend(reversed(kids))
         except Exception as e:
             log_suppressed_error(logger, e, "Error processing form field action: %s", e)
 
@@ -302,29 +303,42 @@ def _collect_named_destinations(pdf: Pdf) -> set[str]:
 
 
 def _collect_from_name_tree(node: pikepdf.Dictionary, names: set[str]) -> None:
-    """Recursively collects keys from a PDF name tree node."""
-    try:
-        if "/Names" in node:
-            arr = node.Names
-            # Name trees have alternating key/value pairs
-            for i in range(0, len(arr) - 1, 2):
-                try:
-                    names.add(str(arr[i]))
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    """Collects keys from a PDF name tree node."""
+    pending = [node]
+    visited: set[tuple[int, int]] = set()
+    while pending:
+        node = pending.pop()
+        try:
+            node = _resolve_indirect(node)
+            node_key = node.objgen
+            if node_key != (0, 0):
+                if node_key in visited:
+                    continue
+                visited.add(node_key)
+        except Exception:
+            pass
 
-    try:
-        if "/Kids" in node:
-            for kid in node.Kids:
-                try:
-                    kid = _resolve_indirect(kid)
-                    _collect_from_name_tree(kid, names)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+        try:
+            if "/Names" in node:
+                arr = node.Names
+                # Name trees have alternating key/value pairs
+                for i in range(0, len(arr) - 1, 2):
+                    try:
+                        names.add(str(arr[i]))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            if "/Kids" in node:
+                for kid in node.Kids:
+                    try:
+                        pending.append(_resolve_indirect(kid))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
 
 def _is_invalid_destination(
@@ -485,61 +499,57 @@ def _validate_outline_destinations(
         _visited = set()
 
     removed = 0
-    item = outline_root.get("/First")
-    while item is not None:
-        try:
-            item = _resolve_indirect(item)
-        except Exception:
-            break
-
-        try:
-            item_key = item.objgen
-        except Exception:
-            item_key = None
-        if item_key is not None and item_key != (0, 0):
-            if item_key in _visited:
+    pending_roots = [outline_root]
+    while pending_roots:
+        item = pending_roots.pop().get("/First")
+        while item is not None:
+            try:
+                item = _resolve_indirect(item)
+            except Exception:
                 break
-            _visited.add(item_key)
 
-        # GoTo action with /D
-        try:
-            if "/A" in item:
-                action = _resolve_indirect(item.A)
-                if _is_goto_action(action):
-                    dest = action.get("/D")
-                    if dest is not None and _is_invalid_destination(
-                        dest, valid_objgens, named_dests
-                    ):
-                        del item["/A"]
-                        removed += 1
-        except Exception as e:
-            log_suppressed_error(
-                logger, e, "Error validating outline action dest: %s", e
-            )
+            try:
+                item_key = item.objgen
+            except Exception:
+                item_key = None
+            if item_key is not None and item_key != (0, 0):
+                if item_key in _visited:
+                    break
+                _visited.add(item_key)
 
-        # Direct /Dest on outline item
-        try:
-            if "/Dest" in item:
-                dest = item.Dest
-                if _is_invalid_destination(dest, valid_objgens, named_dests):
-                    del item["/Dest"]
-                    removed += 1
-        except Exception as e:
-            log_suppressed_error(logger, e, "Error validating outline /Dest: %s", e)
-
-        # Recurse into children
-        try:
-            if "/First" in item:
-                removed += _validate_outline_destinations(
-                    item, valid_objgens, named_dests, _visited
+            # GoTo action with /D
+            try:
+                if "/A" in item:
+                    action = _resolve_indirect(item.A)
+                    if _is_goto_action(action):
+                        dest = action.get("/D")
+                        if dest is not None and _is_invalid_destination(
+                            dest, valid_objgens, named_dests
+                        ):
+                            del item["/A"]
+                            removed += 1
+            except Exception as e:
+                log_suppressed_error(
+                    logger, e, "Error validating outline action dest: %s", e
                 )
-        except Exception:
-            pass
 
-        try:
-            item = item.get("/Next")
-        except Exception:
-            break
+            # Direct /Dest on outline item
+            try:
+                if "/Dest" in item:
+                    dest = item.Dest
+                    if _is_invalid_destination(dest, valid_objgens, named_dests):
+                        del item["/Dest"]
+                        removed += 1
+            except Exception as e:
+                log_suppressed_error(logger, e, "Error validating outline /Dest: %s", e)
+
+            if "/First" in item:
+                pending_roots.append(item)
+
+            try:
+                item = item.get("/Next")
+            except Exception:
+                break
 
     return removed
 
@@ -613,35 +623,47 @@ def _prune_name_tree_node(
 ) -> int:
     """Removes invalid entries from a name tree node."""
     removed = 0
+    pending = [node]
+    visited: set[tuple[int, int]] = set()
+    while pending:
+        node = pending.pop()
+        try:
+            node = _resolve_indirect(node)
+            node_key = node.objgen
+            if node_key != (0, 0):
+                if node_key in visited:
+                    continue
+                visited.add(node_key)
+        except Exception:
+            pass
 
-    try:
-        if "/Names" in node:
-            arr = node.Names
-            indices_to_remove = []
-            for i in range(0, len(arr) - 1, 2):
-                try:
-                    val = _resolve_indirect(arr[i + 1])
-                    if _is_dest_entry_invalid(val, valid_objgens):
+        try:
+            if "/Names" in node:
+                arr = node.Names
+                indices_to_remove = []
+                for i in range(0, len(arr) - 1, 2):
+                    try:
+                        val = _resolve_indirect(arr[i + 1])
+                        if _is_dest_entry_invalid(val, valid_objgens):
+                            indices_to_remove.append(i)
+                    except Exception:
                         indices_to_remove.append(i)
-                except Exception:
-                    indices_to_remove.append(i)
-            # Remove in reverse order to keep indices valid
-            for i in reversed(indices_to_remove):
-                del arr[i + 1]
-                del arr[i]
-                removed += 1
-    except Exception:
-        pass
+                # Remove in reverse order to keep indices valid
+                for i in reversed(indices_to_remove):
+                    del arr[i + 1]
+                    del arr[i]
+                    removed += 1
+        except Exception:
+            pass
 
-    try:
-        if "/Kids" in node:
-            for kid in node.Kids:
-                try:
-                    kid = _resolve_indirect(kid)
-                    removed += _prune_name_tree_node(kid, valid_objgens)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+        try:
+            if "/Kids" in node:
+                for kid in node.Kids:
+                    try:
+                        pending.append(_resolve_indirect(kid))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     return removed

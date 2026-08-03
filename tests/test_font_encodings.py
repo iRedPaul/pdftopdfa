@@ -5,6 +5,7 @@
 """Tests for fonts/encodings.py — encoding handling and fixes."""
 
 from io import BytesIO
+from types import SimpleNamespace
 
 import pikepdf
 import pytest
@@ -579,7 +580,10 @@ class TestEnsureEncoding:
     # --- FM1: Non-symbolic TrueType encoding fixes ---
 
     def test_truetype_wrong_encoding_replaced(self):
-        """Non-symbolic TrueType with StandardEncoding gets WinAnsiEncoding."""
+        """StandardEncoding is rebased without changing its glyph lookup."""
+        from pdftopdfa.fonts.subsetter import _resolve_simple_font_encoding
+        from pdftopdfa.fonts.tounicode import parse_tounicode_cmap_sequences
+
         pdf = new_pdf()
         font_dict = self._make_embedded_font(
             pdf,
@@ -591,10 +595,24 @@ class TestEnsureEncoding:
 
         sanitize_truetype_encoding(pdf)
 
-        assert font_dict.get("/Encoding") == Name.WinAnsiEncoding
+        encoding = _resolve_indirect(font_dict.get("/Encoding"))
+        assert encoding.get("/BaseEncoding") == Name.WinAnsiEncoding
+        resolved = _resolve_simple_font_encoding(font_dict, pdfa_normalized=True)
+        assert resolved is not None
+        assert resolved[0x27] == "quoteright"
+        assert resolved[0x60] == "quoteleft"
+        assert resolved[0xA4] == "fraction"
+        assert resolved.get(0x80, ".notdef") == ".notdef"
+        assert FontEmbedder(pdf)._add_tounicode_to_simple_font(font_dict, "TestFont")
+        tounicode = parse_tounicode_cmap_sequences(font_dict.ToUnicode.read_bytes())
+        assert tounicode[b"\x27"] == (0x2019,)
+        assert tounicode[b"\x60"] == (0x2018,)
+        assert tounicode[b"\xa4"] == (0x2044,)
 
     def test_truetype_encoding_dict_wrong_base_fixed(self):
-        """TrueType with encoding dict having wrong BaseEncoding gets fixed."""
+        """A StandardEncoding base is rebased without losing its mapping."""
+        from pdftopdfa.fonts.subsetter import _resolve_simple_font_encoding
+
         pdf = new_pdf()
         enc_dict = pdf.make_indirect(
             Dictionary(
@@ -614,6 +632,36 @@ class TestEnsureEncoding:
 
         enc = _resolve_indirect(font_dict.get("/Encoding"))
         assert enc.get("/BaseEncoding") == Name.WinAnsiEncoding
+        resolved = _resolve_simple_font_encoding(font_dict, pdfa_normalized=True)
+        assert resolved is not None
+        assert resolved[0x27] == "quoteright"
+        assert resolved[0x60] == "quoteleft"
+        assert resolved[0xA4] == "fraction"
+
+    def test_standard_encoding_valid_differences_survive_rebase(self):
+        """Valid overrides compose with StandardEncoding before rebasing."""
+        from pdftopdfa.fonts.subsetter import _resolve_simple_font_encoding
+
+        pdf = new_pdf()
+        encoding = Dictionary(
+            Type=Name.Encoding,
+            BaseEncoding=Name.StandardEncoding,
+            Differences=Array([0x41, Name("/B")]),
+        )
+        font = self._make_embedded_font(
+            pdf,
+            subtype="/TrueType",
+            flags=32,
+            encoding=encoding,
+        )
+        self._build_pdf_with_font(pdf, font)
+
+        sanitize_truetype_encoding(pdf)
+
+        resolved = _resolve_simple_font_encoding(font, pdfa_normalized=True)
+        assert resolved is not None
+        assert resolved[0x41] == "B"
+        assert resolved[0x27] == "quoteright"
 
     def test_truetype_encoding_dict_non_agl_differences_removed(self):
         """TrueType with non-AGL glyph names in Differences gets them removed."""
@@ -699,6 +747,33 @@ class TestEnsureEncoding:
 
         assert encoding.get("/BaseEncoding") == Name.WinAnsiEncoding
         assert list(encoding.get("/Differences")) == [128, Name("/Adieresis")]
+
+    def test_build_encoding_dictionary_keeps_base_without_differences(self):
+        """An exact base mapping still declares the base encoding."""
+        from pdftopdfa.fonts.subsetter import _resolve_simple_font_encoding
+
+        pdf = new_pdf()
+        embedder = FontEmbedder(pdf)
+
+        encoding = embedder._build_encoding_dictionary(
+            {65: "A", 66: "B", 0xE4: "adieresis"},
+            base_encoding=Name.WinAnsiEncoding,
+        )
+
+        font = self._make_embedded_font(
+            pdf,
+            subtype="/TrueType",
+            flags=32,
+            encoding=pdf.make_indirect(encoding),
+        )
+        self._build_pdf_with_font(pdf, font)
+        sanitize_truetype_encoding(pdf)
+
+        assert encoding.get("/BaseEncoding") == Name.WinAnsiEncoding
+        assert list(encoding.get("/Differences")) == []
+        assert _resolve_simple_font_encoding(font, pdfa_normalized=True)[0xE4] == (
+            "adieresis"
+        )
 
     # --- FM2: Symbolic TrueType encoding removal ---
 
@@ -834,6 +909,268 @@ class TestEnsureEncoding:
         result_data = bytes(ff2.read_bytes())
         assert result_data == tt_data
 
+    def test_symbolic_named_encoding_does_not_shadow_mac_cmap(self):
+        """A bare invalid Encoding does not replace a symbolic Mac byte cmap."""
+        tt_data = self._make_ttfont_data(
+            [
+                (1, 0, {65: "A", 66: "B"}),
+            ]
+        )
+        pdf = new_pdf()
+        font_dict = self._make_embedded_font_with_ttdata(pdf, tt_data, flags=4)
+        font_dict[Name.Encoding] = Name.WinAnsiEncoding
+        self._build_pdf_with_font(pdf, font_dict)
+
+        sanitize_truetype_encoding(pdf)
+
+        assert font_dict.get("/Encoding") is None
+        fd = _resolve_indirect(font_dict.get("/FontDescriptor"))
+        ff2 = _resolve_indirect(fd.get("/FontFile2"))
+        assert bytes(ff2.read_bytes()) == tt_data
+
+    def test_symbolic_zapf_difference_migrates_to_program_glyph(self):
+        """Zapf /a20 becomes a Microsoft Symbol heavy-check-mark mapping."""
+        from importlib import resources
+
+        from fontTools.ttLib import TTFont
+
+        font_path = (
+            resources.files("pdftopdfa")
+            / "resources"
+            / "fonts"
+            / "NotoSansSymbols2-Regular.ttf"
+        )
+        pdf = new_pdf()
+        font_dict = self._make_embedded_font_with_ttdata(
+            pdf,
+            font_path.read_bytes(),
+            flags=4,
+        )
+        font_dict[Name.Encoding] = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Encoding,
+                Differences=Array([52, Name("/a20")]),
+            )
+        )
+        self._build_pdf_with_font(pdf, font_dict)
+
+        sanitize_truetype_encoding(pdf)
+
+        assert font_dict.get("/Encoding") is None
+        fd = _resolve_indirect(font_dict.get("/FontDescriptor"))
+        ff2 = _resolve_indirect(fd.get("/FontFile2"))
+        tt_font = TTFont(BytesIO(bytes(ff2.read_bytes())))
+        try:
+            unicode_cmap = tt_font.getBestCmap()
+            assert unicode_cmap is not None
+            expected_glyph = unicode_cmap[0x2714]
+            symbol_cmap = next(
+                table
+                for table in tt_font["cmap"].tables
+                if table.platformID == 3 and table.platEncID == 0
+            )
+            assert symbol_cmap.cmap[0xF034] == expected_glyph
+        finally:
+            tt_font.close()
+
+    def test_symbolic_difference_does_not_override_ms_symbol_cmap(self):
+        """A Microsoft Symbol cmap is authoritative over PDF Differences."""
+        from fontTools.ttLib import TTFont
+
+        tt_data = self._make_ttfont_data(
+            [
+                (3, 0, {0xF041: "A"}),
+                (3, 1, {65: "A"}),
+            ]
+        )
+        pdf = new_pdf()
+        font_dict = self._make_embedded_font_with_ttdata(pdf, tt_data, flags=4)
+        font_dict[Name.Encoding] = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Encoding,
+                Differences=Array([99, Name("/A")]),
+            )
+        )
+        self._build_pdf_with_font(pdf, font_dict)
+
+        result = sanitize_truetype_encoding(pdf)
+
+        assert font_dict.get("/Encoding") is None
+        assert result["tt_symbolic_cmap_added"] == 0
+        fd = _resolve_indirect(font_dict.get("/FontDescriptor"))
+        ff2 = _resolve_indirect(fd.get("/FontFile2"))
+        tt_font = TTFont(BytesIO(bytes(ff2.read_bytes())))
+        try:
+            symbol_cmap = next(
+                table
+                for table in tt_font["cmap"].tables
+                if table.platformID == 3 and table.platEncID == 0
+            )
+            assert symbol_cmap.cmap[0xF041] == "A"
+            assert 0xF063 not in symbol_cmap.cmap
+        finally:
+            tt_font.close()
+
+    def test_symbolic_f1_cmap_is_authoritative(self):
+        """The valid F100 Microsoft Symbol range maps to PDF bytes."""
+        from fontTools.ttLib import TTFont
+
+        tt_data = self._make_ttfont_data(
+            [
+                (3, 0, {0xF141: "A"}),
+                (3, 1, {65: "A"}),
+            ]
+        )
+        pdf = new_pdf()
+        font_dict = self._make_embedded_font_with_ttdata(pdf, tt_data, flags=4)
+        font_dict[Name.Encoding] = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Encoding,
+                Differences=Array([99, Name("/A")]),
+            )
+        )
+        self._build_pdf_with_font(pdf, font_dict)
+
+        sanitize_truetype_encoding(pdf)
+
+        fd = _resolve_indirect(font_dict.get("/FontDescriptor"))
+        ff2 = _resolve_indirect(fd.get("/FontFile2"))
+        tt_font = TTFont(BytesIO(bytes(ff2.read_bytes())))
+        try:
+            symbol_cmap = next(
+                table
+                for table in tt_font["cmap"].tables
+                if table.platformID == 3 and table.platEncID == 0
+            )
+            assert symbol_cmap.cmap[0xF141] == "A"
+            assert 0xF063 not in symbol_cmap.cmap
+        finally:
+            tt_font.close()
+
+    def test_symbolic_difference_uses_all_unicode_cmaps(self):
+        """Lower-priority Unicode cmaps can resolve an explicit Difference."""
+        from fontTools.ttLib import TTFont
+
+        tt_data = self._make_ttfont_data(
+            [
+                (3, 10, {66: "B"}),
+                (3, 1, {0x2714: "A"}),
+            ]
+        )
+        pdf = new_pdf()
+        font_dict = self._make_embedded_font_with_ttdata(pdf, tt_data, flags=4)
+        font_dict[Name.Encoding] = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Encoding,
+                Differences=Array([52, Name("/a20")]),
+            )
+        )
+        self._build_pdf_with_font(pdf, font_dict)
+
+        sanitize_truetype_encoding(pdf)
+
+        fd = _resolve_indirect(font_dict.get("/FontDescriptor"))
+        ff2 = _resolve_indirect(fd.get("/FontFile2"))
+        tt_font = TTFont(BytesIO(bytes(ff2.read_bytes())))
+        try:
+            symbol_cmap = next(
+                table
+                for table in tt_font["cmap"].tables
+                if table.platformID == 3 and table.platEncID == 0
+            )
+            assert symbol_cmap.cmap[0xF034] == "A"
+        finally:
+            tt_font.close()
+
+    def test_symbolic_difference_creates_missing_cmap_table(self):
+        """A directly named Difference is retained even without a cmap table."""
+        from fontTools.ttLib import TTFont
+
+        tt_font = TTFont(BytesIO(self._make_ttfont_data([])))
+        del tt_font["cmap"]
+        buffer = BytesIO()
+        tt_font.save(buffer)
+        tt_font.close()
+
+        pdf = new_pdf()
+        font_dict = self._make_embedded_font_with_ttdata(
+            pdf,
+            buffer.getvalue(),
+            flags=4,
+        )
+        font_dict[Name.Encoding] = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Encoding,
+                Differences=Array([65, Name("/A")]),
+            )
+        )
+        self._build_pdf_with_font(pdf, font_dict)
+
+        result = sanitize_truetype_encoding(pdf)
+
+        assert font_dict.get("/Encoding") is None
+        assert result["tt_symbolic_cmap_added"] == 1
+        fd = _resolve_indirect(font_dict.get("/FontDescriptor"))
+        ff2 = _resolve_indirect(fd.get("/FontFile2"))
+        tt_font = TTFont(BytesIO(bytes(ff2.read_bytes())))
+        try:
+            symbol_cmap = next(
+                table
+                for table in tt_font["cmap"].tables
+                if table.platformID == 3 and table.platEncID == 0
+            )
+            assert symbol_cmap.cmap[0xF041] == "A"
+        finally:
+            tt_font.close()
+
+    @pytest.mark.parametrize(
+        ("unicode_mapping", "expected_mapping"),
+        [
+            ({65: "A", 66: "B"}, {0xF041: "A"}),
+            ({}, {0xF041: "A"}),
+        ],
+        ids=["fallback-remains", "empty-fallback"],
+    )
+    def test_symbolic_notdef_difference_does_not_override_program_mapping(
+        self,
+        unicode_mapping,
+        expected_mapping,
+    ):
+        """A symbolic font ignores an explicit .notdef Difference."""
+        from fontTools.ttLib import TTFont
+
+        tt_data = self._make_ttfont_data(
+            [
+                (3, 0, {0xF041: "A"}),
+                (3, 1, unicode_mapping),
+            ]
+        )
+        pdf = new_pdf()
+        font_dict = self._make_embedded_font_with_ttdata(pdf, tt_data, flags=4)
+        font_dict[Name.Encoding] = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Encoding,
+                Differences=Array([65, Name("/.notdef")]),
+            )
+        )
+        self._build_pdf_with_font(pdf, font_dict)
+
+        sanitize_truetype_encoding(pdf)
+
+        assert font_dict.get("/Encoding") is None
+        fd = _resolve_indirect(font_dict.get("/FontDescriptor"))
+        ff2 = _resolve_indirect(fd.get("/FontFile2"))
+        tt_font = TTFont(BytesIO(bytes(ff2.read_bytes())))
+        try:
+            symbol_cmap = next(
+                table
+                for table in tt_font["cmap"].tables
+                if table.platformID == 3 and table.platEncID == 0
+            )
+            assert symbol_cmap.cmap == expected_mapping
+        finally:
+            tt_font.close()
+
     def test_symbolic_truetype_cmap_with_ms_symbol_ok(self):
         """Symbolic TrueType with MS Symbol (3,0) cmap is not modified."""
         tt_data = self._make_ttfont_data(
@@ -955,6 +1292,43 @@ class TestEnsureEncoding:
             raise AssertionError("Expected (3,1) MS Unicode cmap subtable")
         tt.close()
 
+    @pytest.mark.parametrize("remove_cmap_table", [False, True])
+    def test_nonsymbolic_truetype_empty_cmap_rebuilt_from_glyph_names(
+        self,
+        remove_cmap_table,
+    ):
+        """An empty or absent cmap is rebuilt from final encoding glyph names."""
+        from fontTools.ttLib import TTFont
+
+        tt_data = self._make_ttfont_data([])
+        if remove_cmap_table:
+            tt_font = TTFont(BytesIO(tt_data))
+            del tt_font["cmap"]
+            buffer = BytesIO()
+            tt_font.save(buffer)
+            tt_font.close()
+            tt_data = buffer.getvalue()
+
+        pdf = new_pdf()
+        font_dict = self._make_embedded_font_with_ttdata(pdf, tt_data, flags=32)
+        self._build_pdf_with_font(pdf, font_dict)
+
+        result = sanitize_truetype_encoding(pdf)
+
+        assert result["tt_nonsymbolic_cmap_added"] == 1
+        fd = _resolve_indirect(font_dict.get("/FontDescriptor"))
+        ff2 = _resolve_indirect(fd.get("/FontFile2"))
+        tt_font = TTFont(BytesIO(bytes(ff2.read_bytes())))
+        try:
+            unicode_cmap = next(
+                table
+                for table in tt_font["cmap"].tables
+                if table.platformID == 3 and table.platEncID == 1
+            )
+            assert unicode_cmap.cmap[0x41] == "A"
+        finally:
+            tt_font.close()
+
     def test_symbolic_truetype_cmap_no_cmap_table(self):
         """Symbolic TrueType with no cmap table at all is not modified."""
         pdf = new_pdf()
@@ -1030,3 +1404,293 @@ class TestEnsureEncoding:
         found_30 = any(st.platformID == 3 and st.platEncID == 0 for st in cmap.tables)
         assert found_30, "Expected (3,0) MS Symbol cmap subtable after subset + fix"
         tt.close()
+
+
+class TestTrueTypeClassification:
+    """Tests for normalization of contradictory TrueType classification."""
+
+    def _make_pdf(self, *, flags, cmaps, encoding=None):
+        helper = TestEnsureEncoding()
+        pdf = new_pdf()
+        font = helper._make_embedded_font_with_ttdata(
+            pdf,
+            helper._make_ttfont_data(cmaps),
+            flags=flags,
+        )
+        if encoding is not None:
+            font[Name.Encoding] = encoding
+        helper._build_pdf_with_font(pdf, font)
+        return pdf, font
+
+    def test_explicit_encoding_wins_when_flags_are_missing(self):
+        """Flags=0 does not turn an explicitly encoded font into Symbolic."""
+        pdf, font = self._make_pdf(
+            flags=0,
+            cmaps=[
+                (3, 0, {0xF041: "B"}),
+                (3, 1, {0x41: "A"}),
+            ],
+            encoding=Name.WinAnsiEncoding,
+        )
+
+        sanitize_truetype_encoding(pdf)
+
+        assert int(font.FontDescriptor.Flags) & (4 | 32) == 32
+        assert font.Encoding == Name.WinAnsiEncoding
+
+    def test_conflicting_flags_choose_nonsymbolic_for_unicode_font(self):
+        """Flags=36 with a Unicode cmap and Encoding normalizes to Nonsymbolic."""
+        pdf, font = self._make_pdf(
+            flags=36,
+            cmaps=[(3, 1, {0x41: "A"})],
+            encoding=Name.WinAnsiEncoding,
+        )
+
+        sanitize_truetype_encoding(pdf)
+
+        assert int(font.FontDescriptor.Flags) & (4 | 32) == 32
+        assert font.Encoding == Name.WinAnsiEncoding
+
+    def test_conflicting_flags_without_encoding_keep_symbol_byte_lookup(self):
+        """Flags=36 without Encoding preserves a Microsoft Symbol cmap."""
+        pdf, font = self._make_pdf(
+            flags=36,
+            cmaps=[(3, 0, {0xF141: "A"})],
+        )
+
+        sanitize_truetype_encoding(pdf)
+
+        assert int(font.FontDescriptor.Flags) & (4 | 32) == 4
+        assert font.get("/Encoding") is None
+
+    def test_conflicting_flags_with_encoding_keep_mac_byte_lookup(self):
+        """Flags=36 preserves the effective Macintosh program lookup."""
+        pdf, font = self._make_pdf(
+            flags=36,
+            cmaps=[(1, 0, {0x41: "B"})],
+            encoding=Name.WinAnsiEncoding,
+        )
+
+        sanitize_truetype_encoding(pdf)
+
+        assert int(font.FontDescriptor.Flags) & (4 | 32) == 4
+        assert font.get("/Encoding") is None
+
+        from fontTools.ttLib import TTFont
+
+        tt_font = TTFont(BytesIO(font.FontDescriptor.FontFile2.read_bytes()))
+        try:
+            mac_cmap = next(
+                table
+                for table in tt_font["cmap"].tables
+                if (table.platformID, table.platEncID) == (1, 0)
+            )
+            assert mac_cmap.cmap[0x41] == "B"
+        finally:
+            tt_font.close()
+
+    def test_mac_byte_lookup_survives_subsetting_pipeline(self):
+        """Early flag repair and subsetting preserve the selected program glyph."""
+        from fontTools.ttLib import TTFont
+
+        from pdftopdfa.fonts.utils import get_truetype_byte_encoding
+
+        pdf, font = self._make_pdf(
+            flags=36,
+            cmaps=[
+                (1, 0, {0x41: "B"}),
+                (3, 1, {0x41: "A", 0x42: "B"}),
+            ],
+            encoding=Name.WinAnsiEncoding,
+        )
+        pdf.pages[0].Contents.write(b"BT /F1 12 Tf (A) Tj ET")
+
+        sanitize_truetype_encoding(pdf)
+        FontEmbedder(pdf).subset_embedded_fonts()
+        sanitize_truetype_encoding(pdf)
+
+        tt_font = TTFont(BytesIO(font.FontDescriptor.FontFile2.read_bytes()))
+        try:
+            byte_encoding = get_truetype_byte_encoding(tt_font)
+            assert byte_encoding is not None
+            assert byte_encoding[0] in {(1, 0), (3, 0)}
+            assert byte_encoding[2][0x41] == "B"
+        finally:
+            tt_font.close()
+
+    def test_missing_encoding_with_mac_cmap_keeps_raw_byte_lookup(self):
+        """A raw Macintosh byte cmap remains authoritative without Encoding."""
+        pdf, font = self._make_pdf(
+            flags=32,
+            cmaps=[(1, 0, {0x80: "A"})],
+        )
+
+        sanitize_truetype_encoding(pdf)
+
+        assert int(font.FontDescriptor.Flags) & (4 | 32) == 4
+        assert font.get("/Encoding") is None
+
+    def test_ambiguous_symbol_cmap_is_not_augmented(self):
+        """An invalid mixed-range cmap is not reported as repaired."""
+        from fontTools.ttLib import TTFont
+
+        pdf, font = self._make_pdf(
+            flags=4,
+            cmaps=[
+                (3, 0, {0xF141: "A", 0xF241: "A"}),
+                (3, 1, {0x41: "A"}),
+            ],
+            encoding=Dictionary(
+                Type=Name.Encoding,
+                Differences=Array([0x63, Name("/A")]),
+            ),
+        )
+
+        result = sanitize_truetype_encoding(pdf)
+
+        assert result["tt_symbolic_cmap_added"] == 0
+        tt_font = TTFont(BytesIO(font.FontDescriptor.FontFile2.read_bytes()))
+        try:
+            symbol_cmap = next(
+                table
+                for table in tt_font["cmap"].tables
+                if (table.platformID, table.platEncID) == (3, 0)
+            )
+            assert symbol_cmap.cmap == {0xF141: "A", 0xF241: "A"}
+        finally:
+            tt_font.close()
+
+    def test_full_adobe_glyph_list_difference_is_preserved(self):
+        """A legacy AGL name is not mistaken for a non-AGL Difference."""
+        from pdftopdfa.fonts.subsetter import _resolve_simple_font_encoding
+
+        pdf, font = self._make_pdf(
+            flags=32,
+            cmaps=[(3, 1, {0x0410: "A"})],
+            encoding=Dictionary(
+                Type=Name.Encoding,
+                BaseEncoding=Name.WinAnsiEncoding,
+                Differences=Array([0x41, Name("/afii10017")]),
+            ),
+        )
+
+        sanitize_truetype_encoding(pdf)
+
+        assert font.Encoding.get("/Differences") is not None
+        resolved = _resolve_simple_font_encoding(font, pdfa_normalized=True)
+        assert resolved is not None
+        assert resolved[0x41] == "afii10017"
+
+    @pytest.mark.parametrize("offset", [0, 0xF000, 0xF100, 0xF200])
+    def test_symbol_program_cmap_drives_tounicode(self, offset):
+        """ToUnicode follows every valid Microsoft Symbol byte range."""
+        pdf, font = self._make_pdf(
+            flags=4,
+            cmaps=[
+                (3, 0, {offset + 0x41: "A"}),
+                (3, 1, {0x0391: "A"}),
+            ],
+        )
+        font.FirstChar = 0x41
+        font.LastChar = 0x41
+
+        assert FontEmbedder(pdf)._add_tounicode_to_simple_font(font, "TestFont")
+
+        cmap = font.ToUnicode.read_bytes().decode("ascii")
+        assert "<41> <0391>" in cmap
+
+    def test_malformed_character_bounds_do_not_block_tounicode(self):
+        """Malformed FirstChar/LastChar values fall back to the byte range."""
+        pdf, font = self._make_pdf(
+            flags=4,
+            cmaps=[
+                (3, 0, {0xF041: "A"}),
+                (3, 1, {0x0041: "A"}),
+            ],
+        )
+        font.FirstChar = Name("/Invalid")
+        font.LastChar = Name("/Invalid")
+
+        assert FontEmbedder(pdf)._add_tounicode_to_simple_font(font, "TestFont")
+        assert "<41> <0041>" in font.ToUnicode.read_bytes().decode("ascii")
+
+
+class TestTrueTypeByteEncoding:
+    """Tests for TrueType program byte-cmap resolution."""
+
+    @pytest.mark.parametrize("offset", [0, 0xF000, 0xF100, 0xF200])
+    def test_accepts_each_standard_symbol_range(self, offset):
+        """Each ISO Microsoft Symbol range resolves to the same PDF byte."""
+        from fontTools.ttLib import TTFont
+
+        from pdftopdfa.fonts.utils import get_truetype_byte_encoding
+
+        font_data = TestEnsureEncoding._make_ttfont_data([(3, 0, {offset + 0x41: "A"})])
+        tt_font = TTFont(BytesIO(font_data))
+        try:
+            assert get_truetype_byte_encoding(tt_font) == (
+                (3, 0),
+                offset,
+                {0x41: "A"},
+            )
+        finally:
+            tt_font.close()
+
+    @pytest.mark.parametrize(
+        "mapping",
+        [
+            {0xF041: "A", 0xF141: "A"},
+            {0xF041: "A", 0xF141: "B"},
+            {0xF041: "A", 0x1041: "B"},
+        ],
+    )
+    def test_rejects_ambiguous_or_invalid_symbol_ranges(self, mapping):
+        """Mixed or out-of-range Microsoft Symbol keys are unresolved."""
+        from fontTools.ttLib import TTFont
+
+        from pdftopdfa.fonts.utils import get_truetype_byte_encoding
+
+        font_data = TestEnsureEncoding._make_ttfont_data([(3, 0, mapping)])
+        tt_font = TTFont(BytesIO(font_data))
+        try:
+            assert get_truetype_byte_encoding(tt_font) is None
+        finally:
+            tt_font.close()
+
+    def test_rejects_conflicting_symbol_subtables(self):
+        """Two different Microsoft Symbol subtables are ambiguous."""
+        from fontTools.ttLib import TTFont
+        from fontTools.ttLib.tables._c_m_a_p import cmap_format_4
+
+        from pdftopdfa.fonts.utils import get_truetype_byte_encoding
+
+        font_data = TestEnsureEncoding._make_ttfont_data([(3, 0, {0xF041: "A"})])
+        tt_font = TTFont(BytesIO(font_data))
+        try:
+            conflicting = cmap_format_4(4)
+            conflicting.platformID = 3
+            conflicting.platEncID = 0
+            conflicting.language = 1
+            conflicting.cmap = {0xF041: "B"}
+            tt_font["cmap"].tables.append(conflicting)
+            assert get_truetype_byte_encoding(tt_font) is None
+        finally:
+            tt_font.close()
+
+    def test_get_any_cmap_skips_format_14_without_cmap_attribute(self):
+        """A variation-selector subtable cannot crash cmap fallback."""
+        from pdftopdfa.fonts.utils import get_any_cmap
+
+        class FakeFont(dict):
+            def getBestCmap(self):  # noqa: N802 - fontTools API
+                raise KeyError("no Unicode cmap")
+
+        variation = SimpleNamespace(platformID=0, platEncID=5)
+        symbol = SimpleNamespace(
+            platformID=3,
+            platEncID=0,
+            cmap={0xF041: "A"},
+        )
+        font = FakeFont(cmap=SimpleNamespace(tables=[variation, symbol]))
+
+        assert get_any_cmap(font) == {0xF041: "A"}

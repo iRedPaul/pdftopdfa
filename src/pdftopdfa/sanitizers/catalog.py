@@ -26,7 +26,7 @@ the document /Names dictionary.
 
 Rule 6.10 forbids /PresSteps entries in Page dictionaries.
 
-ISO 19005-2, clause 6.7.3 recommends the /Lang key in the Document
+ISO 19005-2, clause 6.7.4 defines the /Lang key in the Document
 Catalog for accessibility and structural compliance.
 """
 
@@ -42,32 +42,13 @@ logger = logging.getLogger(__name__)
 
 _SECURE_XML_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
 
-# BCP 47 language tag pattern (RFC 5646).
-# Covers: language[-extlang][-script][-region][-variant][-extension][-privateuse],
-# privateuse-only tags (x-...), and grandfathered tags.
-_GRANDFATHERED = (
-    "en-GB-oed|i-ami|i-bnn|i-default|i-enochian|i-hak|i-klingon|"
-    "i-lux|i-mingo|i-navajo|i-no|i-pwn|i-tao|i-tay|i-tsu|"
-    "sgn-BE-FR|sgn-BE-NL|sgn-CH-DE|"
-    "art-lojban|cel-gaulish|no-bok|no-nyn|"
-    "zh-guoyu|zh-hakka|zh-min|zh-min-nan|zh-xiang"
-)
-_BCP47_RE = re.compile(
-    r"^(?:"
-    r"[A-Za-z]{2,3}(?:-[A-Za-z]{3}){0,3}"  # language [-extlang]
-    r"(?:-[A-Za-z]{4})?"  # [-script]
-    r"(?:-(?:[A-Za-z]{2}|[0-9]{3}))?"  # [-region]
-    r"(?:-(?:[A-Za-z0-9]{5,8}|[0-9][A-Za-z0-9]{3}))*"  # [-variant]
-    r"(?:-[A-Za-z0-9](?:-[A-Za-z0-9]{2,8})+)*"  # [-extension]
-    r"(?:-x(?:-[A-Za-z0-9]{1,8})+)?"  # [-privateuse]
-    r"|x(?:-[A-Za-z0-9]{1,8})+"  # privateuse
-    r"|" + _GRANDFATHERED + r")$"
-)
+# PDF/A-2 and PDF/A-3 validate language tags with the RFC 3066 syntax.
+_BCP47_RE = re.compile(r"[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*")
 
 
 def _is_valid_bcp47(tag: str) -> bool:
-    """Check whether *tag* is a syntactically valid BCP 47 language tag."""
-    return bool(_BCP47_RE.match(tag))
+    """Check whether *tag* follows the language-tag syntax required by PDF/A."""
+    return bool(_BCP47_RE.fullmatch(tag))
 
 
 # Catalog keys forbidden by ISO 19005-2, clauses 6.1.10–6.1.13,
@@ -479,40 +460,51 @@ def _extract_lang_from_xmp(pdf: Pdf) -> str | None:
     return None
 
 
-def ensure_mark_info(pdf: Pdf) -> bool:
+def ensure_mark_info(pdf: Pdf, level: str = "3b") -> bool:
     """Ensure /MarkInfo is present in the Document Catalog.
 
     ISO 19005-2, §6.7.1 requires /MarkInfo with /Marked true for "a"
     levels.  For "b"/"u" levels, best practice is to include /MarkInfo
     with /Marked false.  Several PDF/A validators warn about its absence.
 
-    If /MarkInfo does not exist, it is created with ``/Marked false``.
-    If /MarkInfo exists but has no /Marked key, ``/Marked false`` is added.
-    An existing ``/Marked true`` is never changed to false (the PDF may
-    be tagged).
+    For level A, /Marked is set to true. Otherwise, a missing /MarkInfo or
+    /Marked entry is created with /Marked false. An existing /Marked true is
+    never changed to false (the PDF may be tagged).
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
+        level: Target PDF/A conformance level.
 
     Returns:
         True if /MarkInfo was created or /Marked was added, False if
         no change was needed.
     """
+    marked = level.lower().endswith("a")
+
     try:
         mark_info = pdf.Root.get("/MarkInfo")
     except Exception:
         mark_info = None
 
     if mark_info is None:
-        pdf.Root["/MarkInfo"] = Dictionary(Marked=False)
-        logger.info("Added /MarkInfo with /Marked false to catalog")
+        pdf.Root["/MarkInfo"] = Dictionary(Marked=marked)
+        logger.info("Added /MarkInfo with /Marked %s to catalog", marked)
         return True
 
     mark_info = _resolve_indirect(mark_info)
+    if not isinstance(mark_info, Dictionary):
+        pdf.Root["/MarkInfo"] = Dictionary(Marked=marked)
+        logger.info("Replaced malformed /MarkInfo with /Marked %s", marked)
+        return True
 
     if "/Marked" not in mark_info:
-        mark_info["/Marked"] = False
-        logger.info("Added /Marked false to existing /MarkInfo")
+        mark_info["/Marked"] = marked
+        logger.info("Added /Marked %s to existing /MarkInfo", marked)
+        return True
+
+    if marked and not bool(mark_info.get("/Marked")):
+        mark_info["/Marked"] = True
+        logger.info("Set /Marked true in existing /MarkInfo")
         return True
 
     logger.debug("/MarkInfo already has /Marked key: %s", mark_info.get("/Marked"))
@@ -522,21 +514,32 @@ def ensure_mark_info(pdf: Pdf) -> bool:
 def ensure_catalog_lang(pdf: Pdf) -> bool:
     """Ensure the /Lang key is present in the Document Catalog.
 
-    If /Lang already exists it is kept unchanged.  Otherwise the language
-    is extracted from existing XMP metadata (``dc:language``).  If that is
-    also absent the BCP 47 code ``"und"`` (undetermined) is used as
-    fallback.
+    If a valid /Lang already exists it is kept unchanged. Otherwise the
+    language is extracted from existing XMP metadata (``dc:language``). If
+    that is absent or invalid, the BCP 47 code ``"und"`` (undetermined) is
+    used as fallback.
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
 
     Returns:
-        True if /Lang was set by this function, False if it was already
-        present.
+        True if /Lang was set or repaired by this function, False if a valid
+        value was already present.
     """
     if "/Lang" in pdf.Root:
-        logger.debug("/Lang already present in catalog: %s", pdf.Root["/Lang"])
-        return False
+        try:
+            existing_lang = str(pdf.Root["/Lang"])
+        except Exception:
+            existing_lang = None
+        if existing_lang is not None and _is_valid_bcp47(existing_lang):
+            logger.debug("/Lang already present in catalog: %s", existing_lang)
+            return False
+        stripped_lang = existing_lang.strip() if existing_lang is not None else None
+        if stripped_lang and _is_valid_bcp47(stripped_lang):
+            pdf.Root["/Lang"] = String(stripped_lang)
+            logger.info("Normalized catalog /Lang to %r", stripped_lang)
+            return True
+        logger.warning("Invalid /Lang value %r; replacing it", existing_lang)
 
     lang = _extract_lang_from_xmp(pdf)
     if lang and not _is_valid_bcp47(lang):

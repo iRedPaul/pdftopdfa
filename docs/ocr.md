@@ -12,6 +12,10 @@ DirectML inference is available explicitly on Windows 11. OCRmyPDF is used for
 page rasterization, searchable text-layer generation, page merging, and PDF
 geometry.
 
+PDF/A-2a and PDF/A-3a are supported for scans. The final OCR page content is
+tagged after OCR and linked into the document structure tree in page and
+content-stream order.
+
 The recognition models are supplied explicitly by the application. There is no
 automatic model resolution, runtime download, or secondary recognition engine.
 Document orientation uses a separate `PP-LCNet_x1_0_doc_ori` model bundled
@@ -396,10 +400,10 @@ pdftopdfa --ocr-force --ocr-lang de \
   scan.pdf
 ```
 
-Python uses `ocr_force=True`. Force mode:
+Python uses `ocr_force=True`. Requesting any OCR processing bypasses the
+document-level already-compliant PDF/A skip path. Force mode additionally:
 
 - replaces existing OCR text layers;
-- bypasses the already-compliant PDF/A skip path;
 - does not bypass signed-PDF protection;
 - cannot be combined with `--deskew` or `ocr_deskew=True`.
 

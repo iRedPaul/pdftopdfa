@@ -5,8 +5,10 @@
 """Unit tests for sanitizers/font_widths.py (font width sanitizer)."""
 
 from io import BytesIO
+from pathlib import Path
 
 import pikepdf
+import pytest
 from conftest import new_pdf, open_pdf, resolve
 from fontTools.ttLib import TTFont
 from pikepdf import Array, Dictionary, Name, Pdf
@@ -84,11 +86,11 @@ def _make_minimal_ttfont(
     return font_data, tt_font
 
 
-def _make_symbolic_ttfont_with_conflicting_cmps() -> bytes:
+def _make_symbolic_ttfont_with_conflicting_cmps(offset: int = 0xF000) -> bytes:
     """Creates a symbolic TrueType font whose symbolic cmap conflicts
     with a Unicode cmap for the same low byte code.
 
-    Code 52 maps through the Microsoft Symbol cmap (3,0) to ``uni2834``
+    Code 52 maps through a valid Microsoft Symbol cmap (3,0) range to ``uni2834``
     with width 700, while the Unicode cmap (3,1) maps 0x0034 to ``four``
     with width 1102. This mirrors the real corpus regression where veraPDF
     follows the symbolic cmap when /Encoding is absent.
@@ -132,8 +134,8 @@ def _make_symbolic_ttfont_with_conflicting_cmps() -> bytes:
     subtable30.length = 0
     subtable30.language = 0
     subtable30.cmap = {
-        0xF020: "space",
-        0xF034: "uni2834",
+        offset + 0x20: "space",
+        offset + 0x34: "uni2834",
     }
 
     subtable31 = cmap_format_4(4)
@@ -2012,7 +2014,11 @@ class TestNameBasedWidthLookup:
 class TestSymbolicTrueTypeWithoutEncoding:
     """Tests for symbolic TrueType fonts that rely on their own cmap."""
 
-    def test_symbolic_truetype_without_encoding_uses_symbolic_cmap(self) -> None:
+    @pytest.mark.parametrize("offset", [0, 0xF000, 0xF100, 0xF200])
+    def test_symbolic_truetype_without_encoding_uses_symbolic_cmap(
+        self,
+        offset: int,
+    ) -> None:
         """Widths for symbolic TrueType fonts follow the (3,0) cmap.
 
         The font intentionally has a conflicting Unicode cmap entry for
@@ -2020,7 +2026,7 @@ class TestSymbolicTrueTypeWithoutEncoding:
         when /Encoding is absent, so the sanitizer must correct /Widths[52]
         to 700 rather than leave the mismatched value in place.
         """
-        font_data = _make_symbolic_ttfont_with_conflicting_cmps()
+        font_data = _make_symbolic_ttfont_with_conflicting_cmps(offset)
         pdf = new_pdf()
 
         font_stream = pdf.make_stream(font_data)
@@ -2068,6 +2074,87 @@ class TestSymbolicTrueTypeWithoutEncoding:
         assert corrected[52] == 700, (
             f"Code 52 width should be 700 from the symbolic cmap, got {corrected[52]}"
         )
+
+
+class TestType1ProgramEncoding:
+    """Type1 widths follow the embedded program's matrix and Encoding."""
+
+    def test_incomplete_pfa_uses_program_encoding_and_font_matrix(
+        self, monkeypatch
+    ) -> None:
+        """A compact Type1 program can omit its clear-text trailer in a PDF."""
+
+        class FakeCharString:
+            def __init__(self, width: int) -> None:
+                self.program = [0, width, "hsbw", "endchar"]
+
+            def decompile(self) -> None:
+                return None
+
+        class FakeT1Font:
+            def __init__(self, path: str) -> None:
+                prepared = Path(path).read_bytes()
+                header = prepared.partition(b"eexec")[0]
+                assert all(value < 128 for value in header)
+                assert b"cleartomark" in prepared
+                encoding = [".notdef"] * 256
+                encoding[32] = "A"
+                self.font = {
+                    "FontMatrix": [0.0005, 0, 0, 0.0005, 0, 0],
+                    "Encoding": encoding,
+                }
+
+            def parse(self) -> None:
+                return None
+
+            def getGlyphSet(self):  # noqa: N802
+                return {
+                    ".notdef": FakeCharString(1000),
+                    "space": FakeCharString(500),
+                    "A": FakeCharString(1400),
+                }
+
+        monkeypatch.setattr("fontTools.t1Lib.T1Font", FakeT1Font)
+
+        pdf = new_pdf()
+        font_data = b"%!FontType1 Test \xc3\xb6\ncurrentfile eexec\nbinary"
+        font_stream = pdf.make_stream(font_data)
+        font_stream[Name.Length1] = 42
+        font_stream[Name.Length2] = len(font_data) - 42
+        font_stream[Name.Length3] = 0
+        descriptor = pdf.make_indirect(
+            Dictionary(
+                Type=Name.FontDescriptor,
+                FontName=Name("/TestType1"),
+                Flags=4,
+                FontBBox=Array([0, -200, 1000, 800]),
+                ItalicAngle=0,
+                Ascent=800,
+                Descent=-200,
+                CapHeight=700,
+                StemV=80,
+                FontFile=pdf.make_indirect(font_stream),
+            )
+        )
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type1,
+                BaseFont=Name("/TestType1"),
+                FontDescriptor=descriptor,
+                FirstChar=32,
+                LastChar=32,
+                Widths=Array([999]),
+            )
+        )
+        _build_pdf_with_font(pdf, font)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["simple_font_widths_fixed"] == 1
+        corrected = resolve(pdf.pages[0].Resources.Font["/F1"])
+        # Code 32 maps to A in the program, and 1400 * 0.0005 * 1000 = 700.
+        assert int(resolve(corrected.Widths)[0]) == 700
 
 
 class TestAcroFormDefaultResourceFonts:

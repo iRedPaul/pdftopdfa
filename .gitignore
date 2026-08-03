@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.coverage
+.coverage*
 .pytest_cache/
 
 # Build
@@ -24,7 +24,8 @@ AGENTS.md
 
 # Test data
 veraPDF-corpus-staging/
-run_corpus_test.py
+corpus_test_results/
+tmp/
 
 # Local sample/output PDFs
 *.pdf

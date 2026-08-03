@@ -332,19 +332,32 @@ def _sanitize_rbgroups(config, registered_objgens: set) -> int:
 
 
 def _collect_order_objgens(order_array, objgens: set) -> None:
-    """Recursively collect objgen tuples of OCG references in an /Order array.
+    """Collect objgen tuples of OCG references in an /Order array.
 
     The /Order array may contain indirect OCG references and nested arrays
     (for layer groups).  Text strings used as labels are skipped.
     """
-    for item in order_array:
-        if isinstance(item, Array):
-            _collect_order_objgens(item, objgens)
-        else:
-            try:
-                objgens.add(item.objgen)
-            except Exception:
-                pass
+    pending = [order_array]
+    visited: set[tuple[int, int]] = set()
+    while pending:
+        current = pending.pop()
+        try:
+            objgen = current.objgen
+        except Exception:
+            objgen = (0, 0)
+        if objgen != (0, 0):
+            if objgen in visited:
+                continue
+            visited.add(objgen)
+
+        for item in current:
+            if isinstance(item, Array):
+                pending.append(item)
+            else:
+                try:
+                    objgens.add(item.objgen)
+                except Exception:
+                    pass
 
 
 def _sync_order_array(config, ocgs_array) -> int:

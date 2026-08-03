@@ -13,6 +13,7 @@ from pdftopdfa.color_profile import (
     ColorSpaceAnalysis,
     ColorSpaceType,
     _analyze_colorspace,
+    _apply_default_colorspaces,
     _apply_defaults_to_ap_entry,
     _convert_calibrated_colorspaces,
     _create_icc_colorspace,
@@ -319,6 +320,35 @@ class TestColorSpaceDetection:
         assert analysis.device_rgb_used is True
         assert analysis.device_cmyk_used is False
 
+    def test_detects_color_through_1200_nested_forms(self):
+        """Deep Form resource graphs are traversed without Python recursion."""
+        pdf = new_pdf()
+        nested = pdf.make_stream(b"1 0 0 rg 0 0 1 1 re f")
+        nested[Name.Type] = Name.XObject
+        nested[Name.Subtype] = Name.Form
+        nested[Name.BBox] = Array([0, 0, 1, 1])
+        nested[Name.Resources] = Dictionary()
+
+        for _ in range(1200):
+            parent = pdf.make_stream(b"/Nested Do")
+            parent[Name.Type] = Name.XObject
+            parent[Name.Subtype] = Name.Form
+            parent[Name.BBox] = Array([0, 0, 1, 1])
+            parent[Name.Resources] = Dictionary(XObject=Dictionary(Nested=nested))
+            nested = parent
+
+        page = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 1, 1]),
+            Resources=Dictionary(XObject=Dictionary(Nested=nested)),
+            Contents=pdf.make_stream(b"/Nested Do"),
+        )
+        pdf.pages.append(pikepdf.Page(page))
+
+        analysis = detect_color_spaces(pdf)
+
+        assert analysis.device_rgb_used is True
+
     def test_detect_empty_pdf(self, sample_pdf_obj: Pdf):
         """Empty PDF has no detected color spaces."""
         analysis = detect_color_spaces(sample_pdf_obj)
@@ -624,7 +654,7 @@ class TestEmbedColorProfiles:
 
         PDF/A allows only a single OutputIntent with S=GTS_PDFA1.
         Priority: CMYK > RGB > Gray.
-        Non-dominant spaces get Default entries + image replacement.
+        Non-dominant RGB/CMYK spaces get Default entries.
         """
         pdf = new_pdf()
 
@@ -667,20 +697,13 @@ class TestEmbedColorProfiles:
         assert len(output_intents) == 1
         assert output_intents[0]["/DestOutputProfile"]["/N"] == 3  # RGB
 
-        # DefaultGray added to page resources (non-dominant)
+        # DeviceGray is covered by the presence of the OutputIntent.
         page_res = pdf.pages[0]["/Resources"]
-        cs_dict = page_res["/ColorSpace"]
-        assert Name.DefaultGray in cs_dict
-        default_gray = cs_dict[Name.DefaultGray]
-        assert default_gray[0] == Name.ICCBased
-        assert default_gray[1]["/N"] == 1
+        assert Name.ColorSpace not in page_res
 
-        # Gray image replaced with ICCBased
+        # Device names stay context-dependent instead of overriding Defaults.
         gray_img = page_res["/XObject"]["/Im0"]
-        img_cs = gray_img["/ColorSpace"]
-        assert isinstance(img_cs, Array)
-        assert img_cs[0] == Name.ICCBased
-        assert img_cs[1]["/N"] == 1
+        assert gray_img["/ColorSpace"] == Name.DeviceGray
 
         # RGB image untouched (dominant space)
         rgb_img = page_res["/XObject"]["/Im1"]
@@ -812,6 +835,32 @@ class TestEmbedColorProfiles:
         assert str(replacement["/OutputConditionIdentifier"]) == "sRGB"
         assert replacement_profile != bytes(broken_profile)
         assert replacement_profile[36:40] == b"acsp"
+
+    def test_scanner_profile_output_intent_is_replaced(self) -> None:
+        """PDF/A OutputIntents accept only monitor or printer profiles."""
+        pdf = new_pdf()
+        scanner_profile = _make_icc_profile(device_class=b"scnr")
+        stream = pdf.make_stream(scanner_profile)
+        stream[Name.N] = 3
+        pdf.Root.OutputIntents = Array(
+            [
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.GTS_PDFA1,
+                    OutputConditionIdentifier=pikepdf.String("Scanner"),
+                    DestOutputProfile=stream,
+                )
+            ]
+        )
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        replacement = pdf.Root.OutputIntents[0]
+        replacement_profile = bytes(replacement["/DestOutputProfile"].read_bytes())
+        assert str(replacement["/OutputConditionIdentifier"]) == "sRGB"
+        assert replacement_profile[12:16] == b"mntr"
 
     def test_conflicting_pdfa_output_intents_are_replaced(self) -> None:
         """Conflicting PDF/A OutputIntents fall back to generated dominant intent."""
@@ -1118,10 +1167,10 @@ class TestEmbedColorProfiles:
 
 
 class TestDefaultColorSpaces:
-    """Tests for Default color space entries and image replacement."""
+    """Tests for context-dependent Default color space entries."""
 
-    def test_mixed_rgb_gray_adds_default_gray(self) -> None:
-        """RGB dominant + Gray non-dominant → DefaultGray in page resources."""
+    def test_mixed_rgb_gray_needs_no_default_gray(self) -> None:
+        """Any PDF/A OutputIntent covers DeviceGray without DefaultGray."""
         pdf = new_pdf()
 
         page_dict = Dictionary(
@@ -1144,15 +1193,8 @@ class TestDefaultColorSpaces:
         # OutputIntent is RGB (dominant)
         assert pdf.Root.OutputIntents[0]["/DestOutputProfile"]["/N"] == 3
 
-        # DefaultGray added
-        cs_dict = pdf.pages[0]["/Resources"]["/ColorSpace"]
-        assert Name.DefaultGray in cs_dict
-        default_gray = cs_dict[Name.DefaultGray]
-        assert default_gray[0] == Name.ICCBased
-        assert default_gray[1]["/N"] == 1
-
-        # No DefaultRGB (RGB is dominant, covered by OutputIntent)
-        assert Name.DefaultRGB not in cs_dict
+        resources = pdf.pages[0].get(Name.Resources)
+        assert resources is None or Name.ColorSpace not in resources
 
     def test_mixed_cmyk_rgb_adds_default_rgb(self) -> None:
         """CMYK dominant + RGB non-dominant → DefaultRGB in page resources."""
@@ -1181,8 +1223,8 @@ class TestDefaultColorSpaces:
         assert Name.DefaultRGB in cs_dict
         assert Name.DefaultCMYK not in cs_dict
 
-    def test_image_replacement_gray_with_rgb_dominant(self) -> None:
-        """Gray image with RGB dominant → image gets [/ICCBased <N=1>]."""
+    def test_gray_image_uses_output_intent_with_rgb_dominant(self) -> None:
+        """A Gray image remains DeviceGray when a PDF/A OutputIntent exists."""
         pdf = new_pdf()
 
         # RGB content stream + Gray image
@@ -1209,13 +1251,11 @@ class TestDefaultColorSpaces:
         embed_color_profiles(pdf, "2b")
 
         img = pdf.pages[0]["/Resources"]["/XObject"]["/Im0"]
-        img_cs = img["/ColorSpace"]
-        assert isinstance(img_cs, Array)
-        assert img_cs[0] == Name.ICCBased
-        assert img_cs[1]["/N"] == 1
+        assert img["/ColorSpace"] == Name.DeviceGray
+        assert Name.ColorSpace not in pdf.pages[0]["/Resources"]
 
-    def test_indexed_image_base_colorspace_replaced(self) -> None:
-        """Indexed image with DeviceRGB base → base replaced with ICCBased."""
+    def test_indexed_image_base_uses_default_rgb(self) -> None:
+        """An Indexed DeviceRGB base stays contextual and uses DefaultRGB."""
         pdf = new_pdf()
 
         # Create a 1-pixel indexed image: [/Indexed /DeviceRGB 255 <lookup>]
@@ -1251,14 +1291,13 @@ class TestDefaultColorSpaces:
         # Still an Indexed array
         assert isinstance(img_cs, Array)
         assert img_cs[0] == Name.Indexed
-        # Base is now [/ICCBased <stream>] with N=3
-        base = img_cs[1]
-        assert isinstance(base, Array)
-        assert base[0] == Name.ICCBased
-        assert base[1]["/N"] == 3
+        assert img_cs[1] == Name.DeviceRGB
         # hival and lookup remain intact
         assert int(img_cs[2]) == 255
         assert img_cs[3].objgen == lookup_stream.objgen
+        default_rgb = pdf.pages[0][Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
+        assert default_rgb[1][Name.N] == 3
 
     def test_iccbased_image_not_touched(self) -> None:
         """Image already using ICCBased is not modified."""
@@ -1327,11 +1366,11 @@ class TestDefaultColorSpaces:
                 assert Name.DefaultCMYK not in cs_dict
 
     def test_form_xobject_gets_default_colorspace(self) -> None:
-        """Form XObject with Gray operators gets DefaultGray in its resources."""
+        """Form XObject with RGB operators gets DefaultRGB in its resources."""
         pdf = new_pdf()
 
-        # Create a Form XObject that uses Gray operators
-        form_content = b"0.5 g 10 10 80 80 re f"
+        # Create a Form XObject that uses RGB operators
+        form_content = b"1 0 0 rg 10 10 80 80 re f"
         form_stream = pdf.make_stream(form_content)
         form_stream[Name.Type] = Name.XObject
         form_stream[Name.Subtype] = Name.Form
@@ -1343,22 +1382,69 @@ class TestDefaultColorSpaces:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(XObject=Dictionary(Fm0=form_stream)),
         )
-        # Page uses RGB
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f q /Fm0 Do Q")
+        # Page uses CMYK, so RGB requires a DefaultRGB entry.
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f q /Fm0 Do Q")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
 
         embed_color_profiles(pdf, "2b")
 
-        # Form XObject resources should have DefaultGray
+        # Form XObject resources should have DefaultRGB
         form = pdf.pages[0]["/Resources"]["/XObject"]["/Fm0"]
         form_res = form["/Resources"]
         cs_dict = form_res["/ColorSpace"]
-        assert Name.DefaultGray in cs_dict
-        default_gray = cs_dict[Name.DefaultGray]
-        assert default_gray[0] == Name.ICCBased
-        assert default_gray[1]["/N"] == 1
+        assert Name.DefaultRGB in cs_dict
+        default_rgb = cs_dict[Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
+        assert default_rgb[1]["/N"] == 3
+
+    def test_defaults_traverse_1200_nested_forms_iteratively(self) -> None:
+        """Deep Form resource graphs get defaults without mutating images."""
+        pdf = new_pdf()
+        image = pdf.make_stream(b"\x80")
+        image[Name.Type] = Name.XObject
+        image[Name.Subtype] = Name.Image
+        image[Name.Width] = 1
+        image[Name.Height] = 1
+        image[Name.ColorSpace] = Name.DeviceGray
+        image[Name.BitsPerComponent] = 8
+
+        nested = pdf.make_stream(b"/Image Do")
+        nested[Name.Type] = Name.XObject
+        nested[Name.Subtype] = Name.Form
+        nested[Name.BBox] = Array([0, 0, 1, 1])
+        nested[Name.Resources] = Dictionary(XObject=Dictionary(Image=image))
+        leaf = nested
+
+        for _ in range(1200):
+            parent = pdf.make_stream(b"/Nested Do")
+            parent[Name.Type] = Name.XObject
+            parent[Name.Subtype] = Name.Form
+            parent[Name.BBox] = Array([0, 0, 1, 1])
+            parent[Name.Resources] = Dictionary(XObject=Dictionary(Nested=nested))
+            nested = parent
+
+        page = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 1, 1]),
+            Resources=Dictionary(XObject=Dictionary(Nested=nested)),
+            Contents=pdf.make_stream(b"/Nested Do"),
+        )
+        pdf.pages.append(pikepdf.Page(page))
+
+        defaults_added, images_replaced = _apply_default_colorspaces(
+            pdf,
+            {ColorSpaceType.DEVICE_GRAY},
+            {},
+        )
+
+        assert defaults_added == 1202
+        assert images_replaced == 0
+        assert (
+            leaf[Name.Resources][Name.ColorSpace][Name.DefaultGray][0] == Name.ICCBased
+        )
+        assert image[Name.ColorSpace] == Name.DeviceGray
 
     def test_all_three_spaces_cmyk_dominant(self) -> None:
         """CMYK + RGB + Gray → OutputIntent=CMYK, DefaultRGB + DefaultGray added."""
@@ -1406,23 +1492,21 @@ class TestDefaultColorSpaces:
         # OutputIntent is CMYK
         assert pdf.Root.OutputIntents[0]["/DestOutputProfile"]["/N"] == 4
 
-        # DefaultRGB and DefaultGray added
+        # DeviceGray is covered by the OutputIntent; RGB needs DefaultRGB.
         cs_dict = pdf.pages[0]["/Resources"]["/ColorSpace"]
         assert Name.DefaultRGB in cs_dict
-        assert Name.DefaultGray in cs_dict
+        assert Name.DefaultGray not in cs_dict
         assert Name.DefaultCMYK not in cs_dict
 
-        # Both images replaced
+        # Both images keep their context-dependent Device names.
         gray_img = pdf.pages[0]["/Resources"]["/XObject"]["/Im0"]
-        assert isinstance(gray_img["/ColorSpace"], Array)
-        assert gray_img["/ColorSpace"][1]["/N"] == 1
+        assert gray_img["/ColorSpace"] == Name.DeviceGray
 
         rgb_img = pdf.pages[0]["/Resources"]["/XObject"]["/Im1"]
-        assert isinstance(rgb_img["/ColorSpace"], Array)
-        assert rgb_img["/ColorSpace"][1]["/N"] == 3
+        assert rgb_img["/ColorSpace"] == Name.DeviceRGB
 
     def test_existing_default_preserved(self) -> None:
-        """Pre-existing DefaultGray entry is not overwritten."""
+        """A pre-existing DefaultGray remains authoritative for an image."""
         pdf = new_pdf()
 
         # Create a custom ICCBased array for DefaultGray
@@ -1434,14 +1518,25 @@ class TestDefaultColorSpaces:
         cs_dict = Dictionary()
         cs_dict[Name.DefaultGray] = custom_cs
 
+        gray_image = pdf.make_stream(b"\x80")
+        gray_image[Name.Type] = Name.XObject
+        gray_image[Name.Subtype] = Name.Image
+        gray_image[Name.Width] = 1
+        gray_image[Name.Height] = 1
+        gray_image[Name.ColorSpace] = Name.DeviceGray
+        gray_image[Name.BitsPerComponent] = 8
+
         page_dict = Dictionary(
             Type=Name.Page,
             MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(ColorSpace=cs_dict),
+            Resources=Dictionary(
+                ColorSpace=cs_dict,
+                XObject=Dictionary(Im0=gray_image),
+            ),
         )
         # Both RGB and Gray operators
         content = pdf.make_stream(
-            b"1 0 0 rg 100 100 200 300 re f 0.5 g 50 50 100 100 re f"
+            b"1 0 0 rg 100 100 200 300 re f 0.5 g 50 50 100 100 re f /Im0 Do"
         )
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
@@ -1455,6 +1550,83 @@ class TestDefaultColorSpaces:
         assert default_gray[0] == Name.ICCBased
         # Verify it's the same stream object (not replaced)
         assert default_gray[1].objgen == custom_stream.objgen
+        assert gray_image[Name.ColorSpace] == Name.DeviceGray
+
+    def test_shared_image_preserves_contextual_defaults(self) -> None:
+        """A shared image keeps the DefaultRGB of each resource context."""
+        pdf = new_pdf()
+        image = pdf.make_stream(b"\xff\x00\x00")
+        image[Name.Type] = Name.XObject
+        image[Name.Subtype] = Name.Image
+        image[Name.Width] = 1
+        image[Name.Height] = 1
+        image[Name.ColorSpace] = Name.DeviceRGB
+        image[Name.BitsPerComponent] = 8
+
+        defaults = []
+        for _ in range(2):
+            profile = pdf.make_stream(get_srgb_profile())
+            profile[Name.N] = 3
+            default_rgb = Array([Name.ICCBased, profile])
+            defaults.append(profile)
+            pdf.pages.append(
+                pikepdf.Page(
+                    Dictionary(
+                        Type=Name.Page,
+                        MediaBox=Array([0, 0, 10, 10]),
+                        Resources=Dictionary(
+                            ColorSpace=Dictionary(DefaultRGB=default_rgb),
+                            XObject=Dictionary(Im0=image),
+                        ),
+                        Contents=pdf.make_stream(b"/Im0 Do"),
+                    )
+                )
+            )
+
+        _apply_default_colorspaces(pdf, {ColorSpaceType.DEVICE_RGB}, {})
+
+        assert image[Name.ColorSpace] == Name.DeviceRGB
+        for page, profile in zip(pdf.pages, defaults, strict=True):
+            default_rgb = page[Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+            assert default_rgb[1].objgen == profile.objgen
+
+    def test_shared_shading_preserves_contextual_defaults(self) -> None:
+        """A shared shading keeps the DefaultRGB of each resource context."""
+        pdf = new_pdf()
+        shading = pdf.make_indirect(
+            Dictionary(
+                ShadingType=2,
+                ColorSpace=Name.DeviceRGB,
+                Coords=Array([0, 0, 10, 10]),
+            )
+        )
+
+        defaults = []
+        for _ in range(2):
+            profile = pdf.make_stream(get_srgb_profile())
+            profile[Name.N] = 3
+            default_rgb = Array([Name.ICCBased, profile])
+            defaults.append(profile)
+            pdf.pages.append(
+                pikepdf.Page(
+                    Dictionary(
+                        Type=Name.Page,
+                        MediaBox=Array([0, 0, 10, 10]),
+                        Resources=Dictionary(
+                            ColorSpace=Dictionary(DefaultRGB=default_rgb),
+                            Shading=Dictionary(Sh0=shading),
+                        ),
+                        Contents=pdf.make_stream(b"/Sh0 sh"),
+                    )
+                )
+            )
+
+        _apply_default_colorspaces(pdf, {ColorSpaceType.DEVICE_RGB}, {})
+
+        assert shading[Name.ColorSpace] == Name.DeviceRGB
+        for page, profile in zip(pdf.pages, defaults, strict=True):
+            default_rgb = page[Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+            assert default_rgb[1].objgen == profile.objgen
 
 
 class TestAnnotationAPColorSpaceDetection:
@@ -1772,11 +1944,11 @@ class TestAnnotationAPDefaultColorSpaces:
     """Tests for applying default color spaces to annotation AP streams."""
 
     def test_ap_stream_gets_default_colorspace(self) -> None:
-        """AP Form XObject resources get DefaultGray entry."""
+        """AP Form XObject resources get a required DefaultRGB entry."""
         pdf = new_pdf()
 
-        # AP stream with DeviceGray operator
-        ap_stream = pdf.make_stream(b"0.5 g 50 50 100 100 re f")
+        # AP stream with DeviceRGB operator
+        ap_stream = pdf.make_stream(b"1 0 0 rg 50 50 100 100 re f")
         ap_stream[Name.Type] = Name.XObject
         ap_stream[Name.Subtype] = Name.Form
         ap_stream[Name.BBox] = Array([0, 0, 200, 200])
@@ -1791,12 +1963,12 @@ class TestAnnotationAPDefaultColorSpaces:
             )
         )
 
-        # Page with RGB content so Gray becomes non-dominant
+        # Page with CMYK content so RGB requires a DefaultRGB entry.
         page_dict = Dictionary(
             Type=Name.Page,
             MediaBox=Array([0, 0, 612, 792]),
         )
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
@@ -1804,26 +1976,26 @@ class TestAnnotationAPDefaultColorSpaces:
 
         embed_color_profiles(pdf, "2b")
 
-        # AP stream resources should have DefaultGray
+        # AP stream resources should have DefaultRGB
         ap_res = ap_stream.get(Name.Resources)
         assert ap_res is not None
         cs_dict = ap_res.get(Name.ColorSpace)
         assert cs_dict is not None
-        default_gray = cs_dict.get(Name.DefaultGray)
-        assert default_gray is not None
-        assert default_gray[0] == Name.ICCBased
+        default_rgb = cs_dict.get(Name.DefaultRGB)
+        assert default_rgb is not None
+        assert default_rgb[0] == Name.ICCBased
 
-    def test_ap_image_replaced_with_icc(self) -> None:
-        """Image XObject in AP stream gets DeviceGray replaced with ICCBased."""
+    def test_ap_image_uses_contextual_default(self) -> None:
+        """An AP image keeps DeviceRGB and uses the AP's DefaultRGB."""
         pdf = new_pdf()
 
-        # Image with DeviceGray
-        image = pdf.make_stream(b"\x80")
+        # Image with DeviceRGB
+        image = pdf.make_stream(b"\xff\x00\x00")
         image[Name.Type] = Name.XObject
         image[Name.Subtype] = Name.Image
         image[Name.Width] = 1
         image[Name.Height] = 1
-        image[Name.ColorSpace] = Name.DeviceGray
+        image[Name.ColorSpace] = Name.DeviceRGB
         image[Name.BitsPerComponent] = 8
 
         # AP stream referencing the image
@@ -1844,12 +2016,12 @@ class TestAnnotationAPDefaultColorSpaces:
             )
         )
 
-        # Page with RGB content so Gray becomes non-dominant
+        # Page with CMYK content so RGB requires a DefaultRGB entry.
         page_dict = Dictionary(
             Type=Name.Page,
             MediaBox=Array([0, 0, 612, 792]),
         )
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
@@ -1857,12 +2029,10 @@ class TestAnnotationAPDefaultColorSpaces:
 
         embed_color_profiles(pdf, "2b")
 
-        # Image color space should now be ICCBased array
-        img_cs = image[Name.ColorSpace]
-        assert isinstance(img_cs, Array)
-        assert img_cs[0] == Name.ICCBased
-        # N=1 for gray
-        assert img_cs[1][Name.N] == 1
+        assert image[Name.ColorSpace] == Name.DeviceRGB
+        default_rgb = ap_stream[Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
+        assert default_rgb[1][Name.N] == 3
 
 
 class TestPatternColorSpaceDetection:
@@ -2217,18 +2387,18 @@ class TestPatternDefaultColorSpaces:
         return pat
 
     def test_tiling_pattern_gets_default_colorspace(self) -> None:
-        """Tiling pattern with Gray operator gets DefaultGray in resources."""
+        """Tiling pattern with RGB operator gets DefaultRGB in resources."""
         pdf = new_pdf()
 
-        pattern = self._make_tiling_pattern(pdf, b"0.5 g 0 0 10 10 re f")
+        pattern = self._make_tiling_pattern(pdf, b"1 0 0 rg 0 0 10 10 re f")
 
         page_dict = Dictionary(
             Type=Name.Page,
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(Pattern=Dictionary(P0=pattern)),
         )
-        # RGB on page makes Gray non-dominant
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        # CMYK on page makes RGB non-dominant.
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
@@ -2239,21 +2409,21 @@ class TestPatternDefaultColorSpaces:
         assert pat_res is not None
         cs_dict = pat_res.get(Name.ColorSpace)
         assert cs_dict is not None
-        default_gray = cs_dict.get(Name.DefaultGray)
-        assert default_gray is not None
-        assert default_gray[0] == Name.ICCBased
-        assert default_gray[1]["/N"] == 1
+        default_rgb = cs_dict.get(Name.DefaultRGB)
+        assert default_rgb is not None
+        assert default_rgb[0] == Name.ICCBased
+        assert default_rgb[1]["/N"] == 3
 
-    def test_tiling_pattern_image_replaced_with_icc(self) -> None:
-        """Image in tiling pattern: DeviceGray replaced with ICCBased."""
+    def test_tiling_pattern_image_uses_contextual_default(self) -> None:
+        """An image in a tiling pattern uses that pattern's DefaultRGB."""
         pdf = new_pdf()
 
-        image = pdf.make_stream(b"\x80")
+        image = pdf.make_stream(b"\xff\x00\x00")
         image[Name.Type] = Name.XObject
         image[Name.Subtype] = Name.Image
         image[Name.Width] = 1
         image[Name.Height] = 1
-        image[Name.ColorSpace] = Name.DeviceGray
+        image[Name.ColorSpace] = Name.DeviceRGB
         image[Name.BitsPerComponent] = 8
 
         pattern = self._make_tiling_pattern(
@@ -2267,23 +2437,23 @@ class TestPatternDefaultColorSpaces:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(Pattern=Dictionary(P0=pattern)),
         )
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
 
         embed_color_profiles(pdf, "2b")
 
-        img_cs = image[Name.ColorSpace]
-        assert isinstance(img_cs, Array)
-        assert img_cs[0] == Name.ICCBased
-        assert img_cs[1]["/N"] == 1
+        assert image[Name.ColorSpace] == Name.DeviceRGB
+        default_rgb = pattern[Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
+        assert default_rgb[1][Name.N] == 3
 
     def test_tiling_pattern_in_form_xobject_gets_defaults(self) -> None:
-        """Tiling pattern inside a Form XObject gets DefaultGray."""
+        """Tiling pattern inside a Form XObject gets DefaultRGB."""
         pdf = new_pdf()
 
-        pattern = self._make_tiling_pattern(pdf, b"0.5 g 0 0 10 10 re f")
+        pattern = self._make_tiling_pattern(pdf, b"1 0 0 rg 0 0 10 10 re f")
 
         form_stream = pdf.make_stream(b"")
         form_stream[Name.Type] = Name.XObject
@@ -2298,7 +2468,7 @@ class TestPatternDefaultColorSpaces:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(XObject=Dictionary(Fm0=form_stream)),
         )
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f q /Fm0 Do Q")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f q /Fm0 Do Q")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
@@ -2309,15 +2479,15 @@ class TestPatternDefaultColorSpaces:
         assert pat_res is not None
         cs_dict = pat_res.get(Name.ColorSpace)
         assert cs_dict is not None
-        default_gray = cs_dict.get(Name.DefaultGray)
-        assert default_gray is not None
-        assert default_gray[0] == Name.ICCBased
+        default_rgb = cs_dict.get(Name.DefaultRGB)
+        assert default_rgb is not None
+        assert default_rgb[0] == Name.ICCBased
 
     def test_tiling_pattern_in_ap_stream_gets_defaults(self) -> None:
-        """Tiling pattern inside an AP stream gets DefaultGray."""
+        """Tiling pattern inside an AP stream gets DefaultRGB."""
         pdf = new_pdf()
 
-        pattern = self._make_tiling_pattern(pdf, b"0.5 g 0 0 10 10 re f")
+        pattern = self._make_tiling_pattern(pdf, b"1 0 0 rg 0 0 10 10 re f")
 
         ap_stream = pdf.make_stream(b"")
         ap_stream[Name.Type] = Name.XObject
@@ -2340,7 +2510,7 @@ class TestPatternDefaultColorSpaces:
             Type=Name.Page,
             MediaBox=Array([0, 0, 612, 792]),
         )
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
@@ -2352,18 +2522,18 @@ class TestPatternDefaultColorSpaces:
         assert pat_res is not None
         cs_dict = pat_res.get(Name.ColorSpace)
         assert cs_dict is not None
-        default_gray = cs_dict.get(Name.DefaultGray)
-        assert default_gray is not None
-        assert default_gray[0] == Name.ICCBased
+        default_rgb = cs_dict.get(Name.DefaultRGB)
+        assert default_rgb is not None
+        assert default_rgb[0] == Name.ICCBased
 
     def test_nested_tiling_pattern_gets_defaults(self) -> None:
-        """Nested tiling patterns both get DefaultGray."""
+        """Nested tiling patterns both get DefaultRGB."""
         pdf = new_pdf()
 
-        inner_pattern = self._make_tiling_pattern(pdf, b"0.5 g 0 0 5 5 re f")
+        inner_pattern = self._make_tiling_pattern(pdf, b"1 0 0 rg 0 0 5 5 re f")
         outer_pattern = self._make_tiling_pattern(
             pdf,
-            b"0.5 g 0 0 10 10 re f",
+            b"1 0 0 rg 0 0 10 10 re f",
             resources=Dictionary(Pattern=Dictionary(P1=inner_pattern)),
         )
 
@@ -2372,33 +2542,33 @@ class TestPatternDefaultColorSpaces:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(Pattern=Dictionary(P0=outer_pattern)),
         )
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
 
         embed_color_profiles(pdf, "2b")
 
-        # Outer pattern gets DefaultGray
+        # Outer pattern gets DefaultRGB
         outer_res = outer_pattern.get(Name.Resources)
         assert outer_res is not None
         outer_cs = outer_res.get(Name.ColorSpace)
         assert outer_cs is not None
-        assert Name.DefaultGray in outer_cs
+        assert Name.DefaultRGB in outer_cs
 
-        # Inner pattern gets DefaultGray
+        # Inner pattern gets DefaultRGB
         inner_res = inner_pattern.get(Name.Resources)
         assert inner_res is not None
         inner_cs = inner_res.get(Name.ColorSpace)
         assert inner_cs is not None
-        assert Name.DefaultGray in inner_cs
+        assert Name.DefaultRGB in inner_cs
 
     def test_tiling_pattern_without_resources_gets_defaults(self) -> None:
-        """Tiling pattern with no /Resources gets DefaultGray created."""
+        """Tiling pattern with no /Resources gets DefaultRGB created."""
         pdf = new_pdf()
 
         # Create a tiling pattern stream WITHOUT setting /Resources
-        pat = pdf.make_stream(b"0.5 g 0 0 10 10 re f")
+        pat = pdf.make_stream(b"1 0 0 rg 0 0 10 10 re f")
         pat[Name.Type] = Name.Pattern
         pat[Name("/PatternType")] = 1
         pat[Name("/PaintType")] = 1
@@ -2413,7 +2583,7 @@ class TestPatternDefaultColorSpaces:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(Pattern=Dictionary(P0=pat)),
         )
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
@@ -2424,19 +2594,19 @@ class TestPatternDefaultColorSpaces:
         assert pat_res is not None
         cs_dict = pat_res.get(Name.ColorSpace)
         assert cs_dict is not None
-        default_gray = cs_dict.get(Name.DefaultGray)
-        assert default_gray is not None
-        assert default_gray[0] == Name.ICCBased
-        assert default_gray[1]["/N"] == 1
+        default_rgb = cs_dict.get(Name.DefaultRGB)
+        assert default_rgb is not None
+        assert default_rgb[0] == Name.ICCBased
+        assert default_rgb[1]["/N"] == 3
 
-    def test_shading_pattern_replaced(self) -> None:
-        """PatternType=2 (shading) has non-dominant DeviceGray replaced."""
+    def test_shading_pattern_uses_contextual_default(self) -> None:
+        """A PatternType 2 shading keeps DeviceRGB and uses DefaultRGB."""
         pdf = new_pdf()
 
         shading_dict = pdf.make_indirect(
             Dictionary(
                 ShadingType=2,
-                ColorSpace=Name.DeviceGray,
+                ColorSpace=Name.DeviceRGB,
                 Coords=Array([0, 0, 100, 100]),
             )
         )
@@ -2454,31 +2624,30 @@ class TestPatternDefaultColorSpaces:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(Pattern=Dictionary(P0=pattern)),
         )
-        # RGB on page — makes RGB dominant, Gray non-dominant
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        # CMYK on page makes RGB non-dominant.
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
 
         embed_color_profiles(pdf, "2b")
 
-        # Shading's ColorSpace should be replaced with ICCBased
-        cs = shading_dict.get(Name.ColorSpace)
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
+        assert shading_dict[Name.ColorSpace] == Name.DeviceRGB
+        default_rgb = pdf.pages[0][Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
 
 
-class TestShadingColorSpaceReplacement:
-    """Tests for replacing Device color spaces in Shading dictionaries."""
+class TestShadingDefaultColorSpaces:
+    """Tests for contextual Default color spaces used by shadings."""
 
-    def test_shading_dict_non_dominant_replaced(self) -> None:
-        """Page /Resources/Shading with non-dominant DeviceGray is replaced."""
+    def test_shading_dict_uses_page_default(self) -> None:
+        """A page shading keeps DeviceRGB and uses the page DefaultRGB."""
         pdf = new_pdf()
 
         shading = pdf.make_indirect(
             Dictionary(
                 ShadingType=2,
-                ColorSpace=Name.DeviceGray,
+                ColorSpace=Name.DeviceRGB,
                 Coords=Array([0, 0, 100, 100]),
             )
         )
@@ -2488,26 +2657,26 @@ class TestShadingColorSpaceReplacement:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(Shading=Dictionary(Sh0=shading)),
         )
-        # RGB content makes RGB dominant, Gray non-dominant
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
 
         embed_color_profiles(pdf, "2b")
 
-        cs = shading.get(Name.ColorSpace)
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
+        assert shading[Name.ColorSpace] == Name.DeviceRGB
+        default_rgb = pdf.pages[0][Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
+        assert default_rgb[1][Name.N] == 3
 
-    def test_shading_pattern_type2_replaced(self) -> None:
-        """PatternType 2 with non-dominant DeviceGray shading is replaced."""
+    def test_shading_pattern_type2_uses_page_default(self) -> None:
+        """A PatternType 2 shading uses its page's DefaultRGB."""
         pdf = new_pdf()
 
         shading_dict = pdf.make_indirect(
             Dictionary(
                 ShadingType=2,
-                ColorSpace=Name.DeviceGray,
+                ColorSpace=Name.DeviceRGB,
                 Coords=Array([0, 0, 100, 100]),
             )
         )
@@ -2525,16 +2694,16 @@ class TestShadingColorSpaceReplacement:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(Pattern=Dictionary(P0=pattern)),
         )
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
 
         embed_color_profiles(pdf, "2b")
 
-        cs = shading_dict.get(Name.ColorSpace)
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
+        assert shading_dict[Name.ColorSpace] == Name.DeviceRGB
+        default_rgb = pdf.pages[0][Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
 
     def test_shading_dominant_not_replaced(self) -> None:
         """Shading using dominant color space is left as bare Name."""
@@ -2601,14 +2770,14 @@ class TestShadingColorSpaceReplacement:
         assert isinstance(cs, Array)
         assert cs[0] == Name.Separation
 
-    def test_shading_in_form_xobject_replaced(self) -> None:
-        """Shading inside a Form XObject's resources is replaced."""
+    def test_shading_in_form_xobject_uses_form_default(self) -> None:
+        """A Form shading uses the Form's DefaultRGB."""
         pdf = new_pdf()
 
         shading = pdf.make_indirect(
             Dictionary(
                 ShadingType=2,
-                ColorSpace=Name.DeviceGray,
+                ColorSpace=Name.DeviceRGB,
                 Coords=Array([0, 0, 100, 100]),
             )
         )
@@ -2626,25 +2795,25 @@ class TestShadingColorSpaceReplacement:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(XObject=Dictionary(Fm0=form_stream)),
         )
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f q /Fm0 Do Q")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f q /Fm0 Do Q")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
 
         embed_color_profiles(pdf, "2b")
 
-        cs = shading.get(Name.ColorSpace)
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
+        assert shading[Name.ColorSpace] == Name.DeviceRGB
+        default_rgb = form_stream[Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
 
-    def test_shading_in_tiling_pattern_replaced(self) -> None:
-        """Shading inside a tiling pattern's resources is replaced."""
+    def test_shading_in_tiling_pattern_uses_pattern_default(self) -> None:
+        """A tiling-pattern shading uses the pattern's DefaultRGB."""
         pdf = new_pdf()
 
         shading = pdf.make_indirect(
             Dictionary(
                 ShadingType=2,
-                ColorSpace=Name.DeviceGray,
+                ColorSpace=Name.DeviceRGB,
                 Coords=Array([0, 0, 100, 100]),
             )
         )
@@ -2666,24 +2835,24 @@ class TestShadingColorSpaceReplacement:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(Pattern=Dictionary(P0=pat)),
         )
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
 
         embed_color_profiles(pdf, "2b")
 
-        cs = shading.get(Name.ColorSpace)
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
+        assert shading[Name.ColorSpace] == Name.DeviceRGB
+        default_rgb = pat[Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
 
-    def test_indexed_shading_base_replaced(self) -> None:
-        """Indexed shading with DeviceGray base → base replaced with ICCBased."""
+    def test_indexed_shading_base_uses_page_default(self) -> None:
+        """An Indexed DeviceRGB base remains contextual to DefaultRGB."""
         pdf = new_pdf()
 
-        lookup_data = bytes(range(256))  # 256 entries × 1 component
+        lookup_data = bytes(range(256)) * 3
         lookup_stream = pdf.make_stream(lookup_data)
-        indexed_cs = Array([Name.Indexed, Name.DeviceGray, 255, lookup_stream])
+        indexed_cs = Array([Name.Indexed, Name.DeviceRGB, 255, lookup_stream])
 
         shading = pdf.make_indirect(
             Dictionary(
@@ -2698,8 +2867,7 @@ class TestShadingColorSpaceReplacement:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(Shading=Dictionary(Sh0=shading)),
         )
-        # RGB content makes RGB dominant, Gray non-dominant
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
@@ -2709,22 +2877,19 @@ class TestShadingColorSpaceReplacement:
         cs = shading.get(Name.ColorSpace)
         assert isinstance(cs, Array)
         assert cs[0] == Name.Indexed
-        # Base is now [/ICCBased <stream>] with N=1
-        base = cs[1]
-        assert isinstance(base, Array)
-        assert base[0] == Name.ICCBased
-        assert base[1]["/N"] == 1
-        # hival and lookup remain intact
+        assert cs[1] == Name.DeviceRGB
         assert int(cs[2]) == 255
         assert cs[3].objgen == lookup_stream.objgen
+        default_rgb = pdf.pages[0][Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
 
-    def test_indexed_shading_pattern_type2_replaced(self) -> None:
-        """PatternType 2 with Indexed DeviceGray shading → base replaced."""
+    def test_indexed_shading_pattern_type2_uses_page_default(self) -> None:
+        """An Indexed shading pattern uses its page's DefaultRGB."""
         pdf = new_pdf()
 
-        lookup_data = bytes(range(256))  # 256 entries × 1 component
+        lookup_data = bytes(range(256)) * 3
         lookup_stream = pdf.make_stream(lookup_data)
-        indexed_cs = Array([Name.Indexed, Name.DeviceGray, 255, lookup_stream])
+        indexed_cs = Array([Name.Indexed, Name.DeviceRGB, 255, lookup_stream])
 
         shading_dict = pdf.make_indirect(
             Dictionary(
@@ -2747,7 +2912,7 @@ class TestShadingColorSpaceReplacement:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(Pattern=Dictionary(P0=pattern)),
         )
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
@@ -2757,23 +2922,20 @@ class TestShadingColorSpaceReplacement:
         cs = shading_dict.get(Name.ColorSpace)
         assert isinstance(cs, Array)
         assert cs[0] == Name.Indexed
-        # Base is now [/ICCBased <stream>] with N=1
-        base = cs[1]
-        assert isinstance(base, Array)
-        assert base[0] == Name.ICCBased
-        assert base[1]["/N"] == 1
-        # hival and lookup remain intact
+        assert cs[1] == Name.DeviceRGB
         assert int(cs[2]) == 255
         assert cs[3].objgen == lookup_stream.objgen
+        default_rgb = pdf.pages[0][Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
 
-    def test_shading_in_type3_font_replaced(self) -> None:
-        """Shading inside Type3 font /Resources gets Device CS replaced."""
+    def test_shading_in_type3_font_uses_font_default(self) -> None:
+        """A Type3-font shading uses the font's DefaultRGB."""
         pdf = new_pdf()
 
         shading = pdf.make_indirect(
             Dictionary(
                 ShadingType=2,
-                ColorSpace=Name.DeviceGray,
+                ColorSpace=Name.DeviceRGB,
                 Coords=Array([0, 0, 100, 100]),
             )
         )
@@ -2798,22 +2960,22 @@ class TestShadingColorSpaceReplacement:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(Font=Dictionary(F1=font)),
         )
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
 
         embed_color_profiles(pdf, "2b")
 
-        cs = shading.get(Name.ColorSpace)
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
+        assert shading[Name.ColorSpace] == Name.DeviceRGB
+        default_rgb = font[Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
 
-    def test_pattern_in_type3_font_replaced(self) -> None:
+    def test_pattern_in_type3_font_gets_default(self) -> None:
         """Tiling pattern inside Type3 font /Resources gets defaults."""
         pdf = new_pdf()
 
-        tiling_stream = pdf.make_stream(b"0.5 g 0 0 10 10 re f")
+        tiling_stream = pdf.make_stream(b"1 0 0 rg 0 0 10 10 re f")
         tiling_stream[Name.Type] = Name.Pattern
         tiling_stream[Name.PatternType] = 1
         tiling_stream[Name.PaintType] = 1
@@ -2844,7 +3006,7 @@ class TestShadingColorSpaceReplacement:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(Font=Dictionary(F1=font)),
         )
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
@@ -2853,16 +3015,16 @@ class TestShadingColorSpaceReplacement:
 
         tiling_res = tiling.get(Name.Resources)
         assert tiling_res is not None
-        assert Name("/DefaultGray") in tiling_res.get("/ColorSpace", {})
+        assert Name.DefaultRGB in tiling_res.get(Name.ColorSpace, {})
 
-    def test_shading_pattern_type2_in_type3_font_replaced(self) -> None:
-        """PatternType 2 shading in Type3 font gets Device CS replaced."""
+    def test_shading_pattern_type2_in_type3_font_uses_font_default(self) -> None:
+        """A Type3 shading pattern uses the font's DefaultRGB."""
         pdf = new_pdf()
 
         shading_dict = pdf.make_indirect(
             Dictionary(
                 ShadingType=2,
-                ColorSpace=Name.DeviceGray,
+                ColorSpace=Name.DeviceRGB,
                 Coords=Array([0, 0, 100, 100]),
             )
         )
@@ -2895,16 +3057,16 @@ class TestShadingColorSpaceReplacement:
             MediaBox=Array([0, 0, 612, 792]),
             Resources=Dictionary(Font=Dictionary(F1=font)),
         )
-        content = pdf.make_stream(b"1 0 0 rg 100 100 200 300 re f")
+        content = pdf.make_stream(b"0 1 0 0 k 100 100 200 300 re f")
         page_dict[Name.Contents] = content
         page = pikepdf.Page(page_dict)
         pdf.pages.append(page)
 
         embed_color_profiles(pdf, "2b")
 
-        cs = shading_dict.get(Name.ColorSpace)
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
+        assert shading_dict[Name.ColorSpace] == Name.DeviceRGB
+        default_rgb = font[Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
 
 
 class TestCalibratedColorSpaces:
@@ -2932,6 +3094,17 @@ class TestCalibratedColorSpaces:
         cs_type, alternate = _parse_colorspace_array(cs)
         assert cs_type == "Lab"
         assert alternate is None
+
+    def test_parse_1200_nested_indexed_arrays_without_recursion(self):
+        """Malformed deep Indexed bases cannot exhaust the Python stack."""
+        cs = Array([Name.DeviceRGB])
+        for _ in range(1200):
+            cs = Array([Name.Indexed, cs])
+
+        cs_type, alternate = _parse_colorspace_array(cs)
+
+        assert cs_type == "Indexed"
+        assert alternate == "Indexed"
 
     # --- _analyze_colorspace tests ---
 
@@ -3385,6 +3558,81 @@ class TestCalibratedConversion:
         assert isinstance(cs, Array)
         assert cs[0] == Name.ICCBased
         assert int(cs[1][Name.N]) == 3
+
+    def test_cal_rgb_through_1200_alternating_resource_owners(self):
+        """Deep Form, Pattern, and Type3 resource graphs are iterative."""
+        pdf = new_pdf()
+        leaf_colorspaces = Dictionary(Deep=self._make_cal_rgb())
+        resources = Dictionary(ColorSpace=leaf_colorspaces)
+
+        for depth in range(1200):
+            owner_type = depth % 3
+            if owner_type == 0:
+                owner = pdf.make_stream(b"")
+                owner[Name.Type] = Name.XObject
+                owner[Name.Subtype] = Name.Form
+                owner[Name.BBox] = Array([0, 0, 1, 1])
+                owner[Name.Resources] = resources
+                resources = Dictionary(XObject=Dictionary(Node=owner))
+            elif owner_type == 1:
+                owner = pdf.make_stream(b"")
+                owner[Name.Type] = Name.Pattern
+                owner[Name.PatternType] = 1
+                owner[Name.Resources] = resources
+                resources = Dictionary(Pattern=Dictionary(Node=owner))
+            else:
+                owner = pdf.make_indirect(
+                    Dictionary(
+                        Type=Name.Font,
+                        Subtype=Name.Type3,
+                        Resources=resources,
+                    )
+                )
+                resources = Dictionary(Font=Dictionary(Node=owner))
+
+        page = pdf.add_blank_page()
+        page[Name.Resources] = resources
+
+        cache: dict[ColorSpaceType, pikepdf.Stream] = {}
+        replaced = _convert_calibrated_colorspaces(pdf, cache)
+
+        assert replaced == 1
+        assert leaf_colorspaces[Name.Deep][0] == Name.ICCBased
+
+    def test_alternating_resource_owner_cycle(self):
+        """Form, Pattern, and Type3 resource cycles terminate."""
+        pdf = new_pdf()
+        form = pdf.make_stream(b"")
+        form[Name.Type] = Name.XObject
+        form[Name.Subtype] = Name.Form
+        form[Name.BBox] = Array([0, 0, 1, 1])
+
+        pattern = pdf.make_stream(b"")
+        pattern[Name.Type] = Name.Pattern
+        pattern[Name.PatternType] = 1
+
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type3,
+            )
+        )
+        leaf_colorspaces = Dictionary(Deep=self._make_cal_rgb())
+        form[Name.Resources] = Dictionary(Pattern=Dictionary(Node=pattern))
+        pattern[Name.Resources] = Dictionary(Font=Dictionary(Node=font))
+        font[Name.Resources] = Dictionary(
+            ColorSpace=leaf_colorspaces,
+            XObject=Dictionary(Node=form),
+        )
+
+        page = pdf.add_blank_page()
+        page[Name.Resources] = Dictionary(XObject=Dictionary(Node=form))
+
+        cache: dict[ColorSpaceType, pikepdf.Stream] = {}
+        replaced = _convert_calibrated_colorspaces(pdf, cache)
+
+        assert replaced == 1
+        assert leaf_colorspaces[Name.Deep][0] == Name.ICCBased
 
     def test_integration_convert_to_pdfa(self, tmp_path):
         """Integration: convert_calibrated=True converts CalRGB via convert_to_pdfa."""
@@ -3918,8 +4166,8 @@ class TestSMaskGFormDefaultColorSpaces:
         cs = form_resources.get(Name.ColorSpace)
         assert Name.DefaultRGB in cs
 
-    def test_smask_g_form_images_replaced(self):
-        """Images inside SMask /G Form XObject get color spaces replaced."""
+    def test_smask_g_form_image_uses_contextual_default(self):
+        """An image in an SMask Form uses the Form's DefaultGray."""
         pdf = new_pdf()
         icc_arrays = self._make_icc_arrays(pdf)
         non_dominant = {ColorSpaceType.DEVICE_GRAY}
@@ -3958,20 +4206,21 @@ class TestSMaskGFormDefaultColorSpaces:
         )
 
         visited = set()
-        _, images_replaced = _apply_defaults_to_smask_groups(
+        defaults_added, replacements = _apply_defaults_to_smask_groups(
             pdf.pages[0].Resources,
             non_dominant,
             icc_arrays,
             visited,
         )
 
-        assert images_replaced == 1
-        replaced_cs = img.get(Name.ColorSpace)
-        assert isinstance(replaced_cs, Array)
-        assert replaced_cs[0] == Name.ICCBased
+        assert defaults_added == 1
+        assert replacements == 0
+        assert img[Name.ColorSpace] == Name.DeviceGray
+        default_gray = g_form[Name.Resources][Name.ColorSpace][Name.DefaultGray]
+        assert default_gray[0] == Name.ICCBased
 
-    def test_embed_color_profiles_covers_smask_g(self):
-        """End-to-end: embed_color_profiles covers SMask /G form."""
+    def test_output_intent_covers_smask_gray(self):
+        """Any PDF/A OutputIntent covers DeviceGray inside an SMask Form."""
         pdf = new_pdf()
 
         g_form = pdf.make_stream(b"0.5 g")
@@ -3997,11 +4246,8 @@ class TestSMaskGFormDefaultColorSpaces:
 
         embed_color_profiles(pdf, "3b")
 
-        # Verify the /G form got default color spaces
-        form_resources = g_form.get(Name.Resources)
-        assert form_resources is not None
-        cs = form_resources.get(Name.ColorSpace)
-        assert Name.DefaultGray in cs
+        assert len(pdf.Root[Name.OutputIntents]) == 1
+        assert g_form.get(Name.Resources) is None
 
     def test_pdfx_dest_output_profile_ref_removed(self):
         """Rule 6.2.3-3: DestOutputProfileRef removed from PDF/X intents."""

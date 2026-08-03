@@ -156,9 +156,12 @@ def _parse_colorspace_array(cs) -> tuple[str | None, str | None]:
 
         elif cs_type == "/Indexed" and len(cs) >= 2:
             # [/Indexed baseColorSpace hival lookup]
-            base = cs[1]
-            base_type, base_alt = _parse_colorspace_array(base)
-            return "Indexed", base_type
+            base = _resolve_indirect(cs[1])
+            if isinstance(base, Name):
+                return "Indexed", str(base).lstrip("/")
+            if isinstance(base, Array) and len(base) > 0:
+                return "Indexed", str(base[0]).lstrip("/")
+            return "Indexed", None
 
         elif cs_type == "/ICCBased":
             return "ICCBased", None
@@ -355,97 +358,175 @@ def _process_colorspace_resources(
             logger.debug("Error processing color space %s: %s", name, e)
 
 
+def _process_resource_graph(
+    tasks: list[tuple[str, object, str]],
+    analysis: ColorSpaceAnalysis,
+    visited: set[tuple[int, int]],
+) -> None:
+    """Process nested XObject, Pattern, and Type3 resource graphs iteratively."""
+    stack = list(tasks)
+
+    while stack:
+        kind, value, location_prefix = stack.pop()
+        try:
+            value = _resolve_indirect(value)
+
+            if kind == "resources":
+                if not isinstance(value, Dictionary):
+                    continue
+
+                colorspaces = value.get("/ColorSpace")
+                if colorspaces is not None:
+                    _process_colorspace_resources(
+                        colorspaces,
+                        analysis,
+                        location_prefix,
+                    )
+
+                shadings = value.get("/Shading")
+                if shadings is not None:
+                    _process_shadings(shadings, analysis, location_prefix)
+
+                type3_fonts = value.get("/Font")
+                if type3_fonts is not None:
+                    stack.append(("type3", value, location_prefix))
+
+                patterns = value.get("/Pattern")
+                if patterns is not None:
+                    stack.append(("patterns", patterns, location_prefix))
+
+                xobjects = value.get("/XObject")
+                if xobjects is not None:
+                    stack.append(("xobjects", xobjects, location_prefix))
+                continue
+
+            if kind == "type3":
+                if not isinstance(value, Dictionary):
+                    continue
+                for font_name, font in _iter_type3_fonts(value, visited):
+                    charprocs = font.get("/CharProcs")
+                    if charprocs is None:
+                        continue
+                    charprocs = _resolve_indirect(charprocs)
+                    if not isinstance(charprocs, Dictionary):
+                        continue
+
+                    font_location = f"{location_prefix}/Font/{font_name}"
+                    for charproc_name in list(charprocs.keys()):
+                        try:
+                            charproc = _resolve_indirect(charprocs[charproc_name])
+                            if isinstance(charproc, Stream):
+                                _detect_colors_in_content_stream(charproc, analysis)
+                        except (AttributeError, KeyError, TypeError, ValueError) as e:
+                            logger.debug(
+                                "Error processing Type3 CharProc %s: %s",
+                                charproc_name,
+                                e,
+                            )
+
+                    font_resources = font.get("/Resources")
+                    if font_resources is not None:
+                        stack.append(
+                            (
+                                "resources",
+                                font_resources,
+                                f"{font_location}/Resources",
+                            )
+                        )
+                continue
+
+            if not isinstance(value, Dictionary):
+                continue
+
+            if kind == "xobjects":
+                for name in reversed(list(value.keys())):
+                    try:
+                        xobject = _resolve_indirect(value[name])
+                        object_key = xobject.objgen
+                        if object_key != (0, 0):
+                            if object_key in visited:
+                                continue
+                            visited.add(object_key)
+
+                        subtype = xobject.get("/Subtype")
+                        object_location = f"{location_prefix}/XObject/{name}"
+                        if subtype == Name.Image:
+                            _analyze_colorspace(
+                                xobject.get("/ColorSpace"),
+                                analysis,
+                                object_location,
+                                xobject,
+                            )
+                        elif subtype == Name.Form:
+                            _detect_colors_in_content_stream(xobject, analysis)
+                            resources = xobject.get("/Resources")
+                            if resources is not None:
+                                stack.append(
+                                    (
+                                        "resources",
+                                        resources,
+                                        f"{object_location}/Resources",
+                                    )
+                                )
+                    except (AttributeError, KeyError, TypeError, ValueError) as e:
+                        logger.debug("Error processing XObject %s: %s", name, e)
+                continue
+
+            if kind == "patterns":
+                for name in reversed(list(value.keys())):
+                    try:
+                        pattern = _resolve_indirect(value[name])
+                        object_key = pattern.objgen
+                        if object_key != (0, 0):
+                            if object_key in visited:
+                                continue
+                            visited.add(object_key)
+
+                        pattern_type = pattern.get("/PatternType")
+                        pattern_location = f"{location_prefix}/Pattern/{name}"
+                        if pattern_type == 1:
+                            _detect_colors_in_content_stream(pattern, analysis)
+                            resources = pattern.get("/Resources")
+                            if resources is not None:
+                                stack.append(
+                                    (
+                                        "resources",
+                                        resources,
+                                        f"{pattern_location}/Resources",
+                                    )
+                                )
+                        elif pattern_type == 2:
+                            shading = pattern.get("/Shading")
+                            if shading is not None:
+                                shading = _resolve_indirect(shading)
+                                colorspace = shading.get("/ColorSpace")
+                                if colorspace is not None:
+                                    _analyze_colorspace(
+                                        _resolve_indirect(colorspace),
+                                        analysis,
+                                        f"{pattern_location}/Shading",
+                                        shading,
+                                    )
+                    except (AttributeError, KeyError, TypeError, ValueError) as e:
+                        logger.debug("Error processing pattern %s: %s", name, e)
+        except (AttributeError, TypeError, ValueError) as e:
+            logger.debug("Error processing %s resource graph: %s", kind, e)
+
+
 def _process_xobjects(
     xobjects,
     analysis: ColorSpaceAnalysis,
     visited: set[tuple[int, int]] | None = None,
     location_prefix: str = "",
 ) -> None:
-    """
-    Process XObjects including Form XObjects recursively.
-
-    Checks Image XObjects for their color space and recursively processes
-    Form XObjects for color operators in their content streams.
-
-    Args:
-        xobjects: Dictionary of XObjects from page resources.
-        analysis: ColorSpaceAnalysis to update with detected color spaces.
-        visited: Set of already visited XObject objgen tuples to prevent cycles.
-        location_prefix: Prefix for location descriptions.
-    """
+    """Process images and nested Form XObjects without Python recursion."""
     if visited is None:
         visited = set()
-
-    for name in xobjects.keys():
-        xobj = _resolve_indirect(xobjects[name])
-
-        obj_key = xobj.objgen
-        if obj_key != (0, 0):
-            if obj_key in visited:
-                continue
-            visited.add(obj_key)
-
-        subtype = xobj.get("/Subtype")
-
-        if subtype == Name.Image:
-            cs = xobj.get("/ColorSpace")
-            location = f"{location_prefix}/XObject/{name}"
-            _analyze_colorspace(cs, analysis, location, xobj)
-
-        elif subtype == Name.Form:
-            # Parse Form XObject content stream
-            _detect_colors_in_content_stream(xobj, analysis)
-
-            # Process nested resources
-            form_resources = xobj.get("/Resources")
-            if form_resources:
-                form_resources = _resolve_indirect(form_resources)
-
-                # Process ColorSpace dictionary in form resources
-                form_cs = form_resources.get("/ColorSpace")
-                if form_cs:
-                    _process_colorspace_resources(
-                        form_cs,
-                        analysis,
-                        f"{location_prefix}/XObject/{name}/Resources",
-                    )
-
-                # Process nested XObjects
-                nested_xobjects = form_resources.get("/XObject")
-                if nested_xobjects:
-                    _process_xobjects(
-                        nested_xobjects,
-                        analysis,
-                        visited,
-                        f"{location_prefix}/XObject/{name}/Resources",
-                    )
-
-                # Process patterns in form resources
-                form_patterns = form_resources.get("/Pattern")
-                if form_patterns:
-                    _process_patterns(
-                        form_patterns,
-                        analysis,
-                        visited,
-                        f"{location_prefix}/XObject/{name}/Resources",
-                    )
-
-                # Process shadings in form resources
-                form_shadings = form_resources.get("/Shading")
-                if form_shadings:
-                    _process_shadings(
-                        form_shadings,
-                        analysis,
-                        f"{location_prefix}/XObject/{name}/Resources",
-                    )
-
-                # Process Type3 font CharProcs in form resources
-                _process_type3_charprocs_colors(
-                    form_resources,
-                    analysis,
-                    visited,
-                    f"{location_prefix}/XObject/{name}/Resources",
-                )
+    _process_resource_graph(
+        [("xobjects", xobjects, location_prefix)],
+        analysis,
+        visited,
+    )
 
 
 def _process_shadings(
@@ -483,71 +564,12 @@ def _process_type3_charprocs_colors(
     visited: set[tuple[int, int]],
     location_prefix: str,
 ) -> None:
-    """Detect color spaces used inside Type3 font CharProcs streams.
-
-    Type3 fonts define glyphs via ``/CharProcs`` content streams that may
-    contain Device color operators.  This function parses each CharProc
-    and also checks the font's own ``/Resources`` for ColorSpace,
-    XObjects, Patterns, and Shadings.
-
-    Args:
-        resources: A resolved Resources dictionary (page or form).
-        analysis: ColorSpaceAnalysis to update.
-        visited: Set of ``(obj_num, gen)`` tuples for cycle detection.
-        location_prefix: Prefix for location descriptions.
-    """
-    for font_name, font in _iter_type3_fonts(resources, visited):
-        charprocs = font.get("/CharProcs")
-        if charprocs is None:
-            continue
-        charprocs = _resolve_indirect(charprocs)
-        if not isinstance(charprocs, Dictionary):
-            continue
-
-        font_loc = f"{location_prefix}/Font/{font_name}"
-
-        # Parse each CharProc content stream
-        for cp_name in charprocs.keys():
-            cp_stream = _resolve_indirect(charprocs[cp_name])
-            if isinstance(cp_stream, Stream):
-                _detect_colors_in_content_stream(cp_stream, analysis)
-
-        # Check font-level resources
-        font_resources = font.get("/Resources")
-        if font_resources is not None:
-            font_resources = _resolve_indirect(font_resources)
-
-            cs_dict = font_resources.get("/ColorSpace")
-            if cs_dict:
-                _process_colorspace_resources(
-                    cs_dict, analysis, f"{font_loc}/Resources"
-                )
-
-            nested_xobjects = font_resources.get("/XObject")
-            if nested_xobjects:
-                _process_xobjects(
-                    nested_xobjects,
-                    analysis,
-                    visited,
-                    f"{font_loc}/Resources",
-                )
-
-            font_patterns = font_resources.get("/Pattern")
-            if font_patterns:
-                _process_patterns(
-                    font_patterns,
-                    analysis,
-                    visited,
-                    f"{font_loc}/Resources",
-                )
-
-            font_shadings = font_resources.get("/Shading")
-            if font_shadings:
-                _process_shadings(
-                    font_shadings,
-                    analysis,
-                    f"{font_loc}/Resources",
-                )
+    """Detect colors in Type3 CharProcs and their resource graphs."""
+    _process_resource_graph(
+        [("type3", resources, location_prefix)],
+        analysis,
+        visited,
+    )
 
 
 def _process_patterns(
@@ -556,92 +578,12 @@ def _process_patterns(
     visited: set[tuple[int, int]],
     location_prefix: str,
 ) -> None:
-    """Process Pattern dictionary from page or form resources.
-
-    Handles both pattern types:
-    - PatternType 1 (Tiling): Has own content stream and resources that
-      may contain Device color spaces.
-    - PatternType 2 (Shading): Contains a /Shading entry whose
-      /ColorSpace is analyzed.
-
-    Args:
-        patterns: Pattern dictionary from resources.
-        analysis: ColorSpaceAnalysis to update.
-        visited: Set of already visited objgen tuples to prevent cycles.
-        location_prefix: Prefix for location description.
-    """
-    patterns = _resolve_indirect(patterns)
-
-    for name in patterns.keys():
-        try:
-            pattern = _resolve_indirect(patterns[name])
-
-            # Cycle detection using objgen
-            obj_key = pattern.objgen
-            if obj_key != (0, 0):
-                if obj_key in visited:
-                    continue
-                visited.add(obj_key)
-
-            pattern_type = pattern.get("/PatternType")
-            pat_prefix = f"{location_prefix}/Pattern/{name}"
-
-            if pattern_type == 1:
-                # Tiling pattern: has content stream and own resources
-                _detect_colors_in_content_stream(pattern, analysis)
-
-                pat_resources = pattern.get("/Resources")
-                if pat_resources:
-                    pat_resources = _resolve_indirect(pat_resources)
-
-                    pat_cs = pat_resources.get("/ColorSpace")
-                    if pat_cs:
-                        _process_colorspace_resources(
-                            pat_cs, analysis, f"{pat_prefix}/Resources"
-                        )
-
-                    pat_xobjects = pat_resources.get("/XObject")
-                    if pat_xobjects:
-                        _process_xobjects(
-                            pat_xobjects,
-                            analysis,
-                            visited,
-                            f"{pat_prefix}/Resources",
-                        )
-
-                    pat_patterns = pat_resources.get("/Pattern")
-                    if pat_patterns:
-                        _process_patterns(
-                            pat_patterns,
-                            analysis,
-                            visited,
-                            f"{pat_prefix}/Resources",
-                        )
-
-                    pat_shadings = pat_resources.get("/Shading")
-                    if pat_shadings:
-                        _process_shadings(
-                            pat_shadings,
-                            analysis,
-                            f"{pat_prefix}/Resources",
-                        )
-
-            elif pattern_type == 2:
-                # Shading pattern: has /Shading entry with /ColorSpace
-                shading = pattern.get("/Shading")
-                if shading is not None:
-                    shading = _resolve_indirect(shading)
-                    cs = shading.get("/ColorSpace")
-                    if cs is not None:
-                        cs = _resolve_indirect(cs)
-                        _analyze_colorspace(
-                            cs,
-                            analysis,
-                            f"{pat_prefix}/Shading",
-                            shading,
-                        )
-        except (AttributeError, KeyError, TypeError, ValueError) as e:
-            logger.debug("Error processing pattern %s: %s", name, e)
+    """Process tiling and shading patterns without Python recursion."""
+    _process_resource_graph(
+        [("patterns", patterns, location_prefix)],
+        analysis,
+        visited,
+    )
 
 
 def _detect_colors_in_ap_entry(

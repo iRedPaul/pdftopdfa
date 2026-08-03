@@ -59,6 +59,7 @@ _PADDLE_OCR_PLUGIN = "pdftopdfa.ocr_paddle"
 _ROTATION_FIX_PLUGIN = "pdftopdfa.ocr_rotation_fix"
 _SCAN_IMAGE_AREA_RATIO = 0.8
 _FULL_PAGE_IMAGE_AREA_RATIO = 1.0
+_ObjectKey = tuple[int, int] | tuple[str, bytes]
 _PADDLE_LANGUAGE_TAGS = {
     "ch": "zh-Hans",
     "chinese_cht": "zh-Hant",
@@ -212,6 +213,30 @@ class _PagePaintAnalysis:
     unsafe: bool = False
 
 
+@dataclass
+class _ContentAnalysisFrame:
+    """Mutable state for one content stream in the iterative paint walk."""
+
+    instructions: list[object]
+    resources: "pikepdf.Object | None"
+    ctm: "pikepdf.Matrix"
+    render_mode: int
+    font_is_type3: bool | None
+    fill_alpha: float
+    stroke_alpha: float
+    blend_mode: object
+    soft_mask: object
+    overprint: bool
+    clip_unknown: bool
+    text_clip: bool
+    optional_content_depth: int
+    transparency_group: bool
+    active_form_key: _ObjectKey | None = None
+    index: int = 0
+    state_stack: list[tuple[object, ...]] = field(default_factory=list)
+    marked_content_stack: list[bool] = field(default_factory=list)
+
+
 @dataclass(frozen=True)
 class _DeskewPlan:
     deskew_pages: tuple[int, ...]
@@ -219,13 +244,19 @@ class _DeskewPlan:
     strip_text_pages: tuple[int, ...]
 
 
-def _object_key(value: "pikepdf.Object") -> tuple[int, int] | int:
+def _object_key(value: "pikepdf.Object") -> _ObjectKey:
     """Return a recursion key for an indirect or direct PDF object."""
     try:
         objgen = value.objgen
     except Exception:
         objgen = (0, 0)
-    return objgen if objgen != (0, 0) else id(value)
+    if objgen != (0, 0):
+        return objgen
+    try:
+        serialized = value.unparse()
+    except Exception:
+        serialized = repr(value).encode("utf-8", errors="backslashreplace")
+    return ("direct", serialized)
 
 
 def _matrix_from_operands(operands: object) -> "pikepdf.Matrix":
@@ -298,71 +329,77 @@ def _image_color_space_marks(
     aliases: set[str] | None = None,
 ) -> bool:
     """Return whether an image color space is known to paint page content."""
-    if value is None:
-        return False
+    aliases = set() if aliases is None else aliases
+    seen_complex: set[_ObjectKey] = set()
+    while value is not None:
+        name = str(value)
+        device_default = {
+            "/DeviceGray": "/DefaultGray",
+            "/DeviceRGB": "/DefaultRGB",
+            "/DeviceCMYK": "/DefaultCMYK",
+        }.get(name)
+        if device_default is not None:
+            try:
+                color_spaces = resources.get("/ColorSpace") if resources else None
+                resolved = (
+                    color_spaces.get(device_default)
+                    if color_spaces is not None
+                    else None
+                )
+            except (AttributeError, TypeError, ValueError):
+                return False
+            if resolved is None:
+                return True
+            if device_default in aliases:
+                return False
+            aliases.add(device_default)
+            value = resolved
+            continue
+        if name.startswith("/"):
+            if name in aliases:
+                return False
+            try:
+                color_spaces = resources.get("/ColorSpace") if resources else None
+                resolved = color_spaces.get(value) if color_spaces is not None else None
+            except (AttributeError, TypeError, ValueError):
+                return False
+            if resolved is None:
+                return False
+            aliases.add(name)
+            value = resolved
+            continue
 
-    name = str(value)
-    device_default = {
-        "/DeviceGray": "/DefaultGray",
-        "/DeviceRGB": "/DefaultRGB",
-        "/DeviceCMYK": "/DefaultCMYK",
-    }.get(name)
-    if device_default is not None:
+        key = _object_key(value)  # type: ignore[arg-type]
+        if key in seen_complex:
+            return False
+        seen_complex.add(key)
         try:
-            color_spaces = resources.get("/ColorSpace") if resources else None
-            resolved = (
-                color_spaces.get(device_default) if color_spaces is not None else None
-            )
-        except (AttributeError, TypeError, ValueError):
-            return False
-        if resolved is None:
-            return True
-        aliases = set() if aliases is None else aliases
-        if device_default in aliases:
-            return False
-        aliases.add(device_default)
-        return _image_color_space_marks(resolved, resources, aliases)
-    if name.startswith("/"):
-        aliases = set() if aliases is None else aliases
-        if name in aliases:
-            return False
-        try:
-            color_spaces = resources.get("/ColorSpace") if resources else None
-            resolved = color_spaces.get(value) if color_spaces is not None else None
-        except (AttributeError, TypeError, ValueError):
-            return False
-        if resolved is None:
-            return False
-        aliases.add(name)
-        return _image_color_space_marks(resolved, resources, aliases)
-
-    try:
-        values = list(value)  # type: ignore[call-overload]
-    except TypeError:
-        return False
-    if not values:
-        return False
-
-    family = str(values[0])
-    if family == "/Separation":
-        return len(values) >= 4 and str(values[1]) != "/None"
-    if family == "/DeviceN":
-        if len(values) < 4:
-            return False
-        try:
-            colorants = list(values[1])
+            values = list(value)  # type: ignore[call-overload]
         except TypeError:
             return False
-        return bool(colorants) and any(
-            str(colorant) != "/None" for colorant in colorants
-        )
-    if family == "/Indexed":
-        return len(values) >= 4 and _image_color_space_marks(
-            values[1],
-            resources,
-            aliases,
-        )
-    return family in {"/CalGray", "/CalRGB", "/Lab", "/ICCBased"}
+        if not values:
+            return False
+
+        family = str(values[0])
+        if family == "/Separation":
+            return len(values) >= 4 and str(values[1]) != "/None"
+        if family == "/DeviceN":
+            if len(values) < 4:
+                return False
+            try:
+                colorants = list(values[1])
+            except TypeError:
+                return False
+            return bool(colorants) and any(
+                str(colorant) != "/None" for colorant in colorants
+            )
+        if family == "/Indexed":
+            if len(values) < 4:
+                return False
+            value = values[1]
+            continue
+        return family in {"/CalGray", "/CalRGB", "/Lab", "/ICCBased"}
+    return False
 
 
 def _uses_jpx_decode(value: object) -> bool:
@@ -450,337 +487,398 @@ def _analyze_content(
     text_clip: bool = False,
     optional_content: bool = False,
     transparency_group: bool = False,
-    active_forms: set[tuple[int, int] | int],
+    active_forms: set[_ObjectKey],
 ) -> None:
     """Walk a content stream in paint order and collect conservative page facts."""
     import pikepdf
 
-    state_stack: list[
-        tuple[
-            pikepdf.Matrix,
-            int,
-            bool | None,
-            float,
-            float,
-            object,
-            object,
-            bool,
-            bool,
-            bool,
-        ]
-    ] = []
-    marked_content_stack: list[bool] = []
-    optional_content_depth = int(optional_content)
     text_show_operators = frozenset({"Tj", "TJ", "'", '"'})
     path_paint_operators = frozenset({"S", "s", "f", "F", "f*", "B", "B*", "b", "b*"})
+    frames = [
+        _ContentAnalysisFrame(
+            list(pikepdf.parse_content_stream(container)),
+            resources,
+            ctm,
+            render_mode,
+            font_is_type3,
+            fill_alpha,
+            stroke_alpha,
+            blend_mode,
+            soft_mask,
+            overprint,
+            clip_unknown,
+            text_clip,
+            int(optional_content),
+            transparency_group,
+        )
+    ]
 
-    for operands, operator in pikepdf.parse_content_stream(container):
-        operator_name = str(operator)
-        if operator_name == "q":
-            state_stack.append(
-                (
-                    ctm,
-                    render_mode,
-                    font_is_type3,
-                    fill_alpha,
-                    stroke_alpha,
-                    blend_mode,
-                    soft_mask,
-                    overprint,
-                    clip_unknown,
-                    text_clip,
-                )
-            )
-        elif operator_name == "Q":
-            if not state_stack:
-                analysis.unsafe = True
-                return
-            (
-                ctm,
-                render_mode,
-                font_is_type3,
-                fill_alpha,
-                stroke_alpha,
-                blend_mode,
-                soft_mask,
-                overprint,
-                clip_unknown,
-                text_clip,
-            ) = state_stack.pop()
-        elif operator_name == "cm":
-            try:
-                ctm = _matrix_from_operands(operands) @ ctm
-            except (TypeError, ValueError):
-                analysis.unsafe = True
-                return
-        elif operator_name == "Tr":
-            try:
-                render_mode = int(operands[0])
-            except (IndexError, TypeError, ValueError):
-                analysis.unsafe = True
-                return
-            if render_mode not in range(8):
-                analysis.unsafe = True
-                return
-        elif operator_name == "Tf":
-            try:
-                if len(operands) != 2 or not math.isfinite(float(operands[1])):
-                    raise ValueError("Invalid Tf operands")
-                fonts = resources.get("/Font") if resources else None
-                font = fonts.get(operands[0]) if fonts is not None else None
-                if font is None:
-                    raise ValueError("Missing font")
-                font_is_type3 = _font_is_type3(font)
-            except (IndexError, TypeError, ValueError):
-                analysis.unsafe = True
-                return
-        elif operator_name == "gs":
-            try:
-                extgstates = resources.get("/ExtGState") if resources else None
-                graphics_state = (
-                    extgstates.get(operands[0]) if extgstates is not None else None
-                )
-                if graphics_state is None:
-                    raise ValueError("Missing ExtGState")
-                fill_alpha = float(graphics_state.get("/ca", fill_alpha))
-                stroke_alpha = float(graphics_state.get("/CA", stroke_alpha))
-                blend_mode = graphics_state.get("/BM", blend_mode)
-                soft_mask = graphics_state.get("/SMask", soft_mask)
-                font_setting = graphics_state.get("/Font")
-                if font_setting is not None:
-                    font_values = list(font_setting)
-                    if len(font_values) != 2 or not math.isfinite(
-                        float(font_values[1])
-                    ):
-                        raise ValueError("Invalid ExtGState font")
-                    font_is_type3 = _font_is_type3(font_values[0])
-                overprint = bool(
-                    graphics_state.get("/OP", overprint)
-                    or graphics_state.get("/op", overprint)
-                )
-                if not (
-                    math.isfinite(fill_alpha)
-                    and math.isfinite(stroke_alpha)
-                    and 0 <= fill_alpha <= 1
-                    and 0 <= stroke_alpha <= 1
-                ):
-                    raise ValueError("Invalid alpha")
-            except (IndexError, TypeError, ValueError):
-                analysis.unsafe = True
-                return
-        elif operator_name in text_show_operators:
-            analysis.event += 1
-            if font_is_type3 is not False:
-                analysis.unsafe = True
-                return
-            if _text_is_visible(
-                render_mode,
-                fill_alpha,
-                stroke_alpha,
-                soft_mask,
-            ):
-                if optional_content_depth:
-                    analysis.unsafe = True
-                    return
-                analysis.visible_text.append(analysis.event)
-            if render_mode in {4, 5, 6, 7}:
-                if optional_content_depth:
-                    analysis.unsafe = True
-                    return
-                clip_unknown = True
-                text_clip = True
-        elif operator_name in {"BMC", "BDC"}:
-            if not operands:
-                analysis.unsafe = True
-                return
-            enters_optional_content = str(operands[0]) == "/OC"
-            marked_content_stack.append(enters_optional_content)
-            optional_content_depth += int(enters_optional_content)
-        elif operator_name == "EMC":
-            if not marked_content_stack:
-                analysis.unsafe = True
-                return
-            optional_content_depth -= int(marked_content_stack.pop())
-        elif operator_name in {"W", "W*"}:
-            clip_unknown = True
-        elif operator_name in path_paint_operators or operator_name == "sh":
-            if optional_content_depth:
-                analysis.unsafe = True
-                return
-            analysis.has_vector = True
-        elif operator_name == "INLINE IMAGE":
-            if optional_content_depth or text_clip:
-                analysis.unsafe = True
-                return
-            if (
-                soft_mask is not None
-                and str(soft_mask) != "/None"
-                and not _soft_mask_hides_all(soft_mask)
-                and fill_alpha > 0
-            ):
-                analysis.unsafe = True
-                return
-            try:
-                inline_image = operands[0]
-                if bool(inline_image.image_mask):
-                    analysis.unsafe = True
-                    return
-                analysis.event += 1
-                image_is_opaque = (
-                    int(inline_image.width) > 0
-                    and int(inline_image.height) > 0
-                    and _image_color_space_marks(
-                        inline_image.obj.get("/ColorSpace"),
-                        resources,
-                    )
-                    and fill_alpha == 1.0
-                    and _normal_blend_mode(blend_mode)
-                    and (soft_mask is None or str(soft_mask) == "/None")
-                    and not overprint
-                    and not transparency_group
-                    and not clip_unknown
-                )
-            except (AttributeError, IndexError, TypeError, ValueError):
-                analysis.unsafe = True
-                return
-            if image_is_opaque:
-                coverage = _rect_coverage(ctm, media_box)
-                if coverage >= _SCAN_IMAGE_AREA_RATIO:
-                    analysis.image_candidates.append((coverage, analysis.event))
-        elif operator_name == "Do":
-            try:
-                xobjects = resources.get("/XObject") if resources else None
-                xobject = xobjects.get(operands[0]) if xobjects is not None else None
-                if xobject is None:
-                    raise ValueError("Missing XObject")
-                try:
-                    xobject = xobject.get_object()
-                except (AttributeError, TypeError, ValueError):
-                    pass
-                subtype = str(xobject.get("/Subtype"))
-                xobject_has_optional_content = xobject.get("/OC") is not None
-            except (IndexError, TypeError, ValueError):
-                analysis.unsafe = True
-                return
+    def finish_frame() -> None:
+        frame = frames.pop()
+        if frame.active_form_key is not None:
+            active_forms.remove(frame.active_form_key)
 
-            if subtype == "/Image":
-                if optional_content_depth or xobject_has_optional_content or text_clip:
+    try:
+        while frames:
+            frame = frames[-1]
+            if frame.index >= len(frame.instructions):
+                if frame.state_stack or frame.marked_content_stack:
                     analysis.unsafe = True
-                    return
-                if (
-                    soft_mask is not None
-                    and str(soft_mask) != "/None"
-                    and not _soft_mask_hides_all(soft_mask)
-                    and fill_alpha > 0
-                ):
-                    analysis.unsafe = True
-                    return
-                try:
-                    if bool(xobject.get("/ImageMask", False)):
-                        analysis.unsafe = True
-                        return
-                    analysis.event += 1
-                    width = int(xobject.get("/Width", 0))
-                    height = int(xobject.get("/Height", 0))
-                    image_color_space = xobject.get("/ColorSpace")
-                    color_space_marks = (
-                        _image_color_space_marks(image_color_space, resources)
-                        if image_color_space is not None
-                        else _uses_jpx_decode(xobject.get("/Filter"))
-                    )
-                except (TypeError, ValueError):
-                    width = height = 0
-                    color_space_marks = False
-                image_is_opaque = (
-                    width > 0
-                    and height > 0
-                    and xobject.get("/Mask") is None
-                    and xobject.get("/SMask") is None
-                    and not bool(xobject.get("/SMaskInData", False))
-                    and xobject.get("/OC") is None
-                    and color_space_marks
-                    and fill_alpha == 1.0
-                    and _normal_blend_mode(blend_mode)
-                    and (soft_mask is None or str(soft_mask) == "/None")
-                    and not overprint
-                    and not transparency_group
-                    and not clip_unknown
-                )
-                if image_is_opaque:
-                    coverage = _rect_coverage(ctm, media_box)
-                    if coverage >= _SCAN_IMAGE_AREA_RATIO:
-                        analysis.image_candidates.append((coverage, analysis.event))
+                finish_frame()
                 continue
 
-            if subtype != "/Form":
-                analysis.unsafe = True
-                return
-            key = _object_key(xobject)
-            if key in active_forms:
-                analysis.unsafe = True
-                return
-            active_forms.add(key)
-            try:
-                form_matrix = xobject.get("/Matrix")
-                form_ctm = (
-                    _matrix_from_operands(form_matrix) @ ctm
-                    if form_matrix is not None
-                    else ctm
+            operands, operator = frame.instructions[frame.index]  # type: ignore[misc]
+            frame.index += 1
+            operator_name = str(operator)
+            if operator_name == "q":
+                frame.state_stack.append(
+                    (
+                        frame.ctm,
+                        frame.render_mode,
+                        frame.font_is_type3,
+                        frame.fill_alpha,
+                        frame.stroke_alpha,
+                        frame.blend_mode,
+                        frame.soft_mask,
+                        frame.overprint,
+                        frame.clip_unknown,
+                        frame.text_clip,
+                    )
                 )
-                form_clip_unknown = clip_unknown
-                form_box = xobject.get("/BBox")
-                if form_box is None:
-                    raise ValueError("Missing Form BBox")
-                box_values = [float(value) for value in form_box]
-                if len(box_values) != 4:
-                    raise ValueError("Invalid Form BBox")
-                box_matrix = pikepdf.Matrix(
-                    box_values[2] - box_values[0],
-                    0,
-                    0,
-                    box_values[3] - box_values[1],
-                    box_values[0],
-                    box_values[1],
-                )
-                if (
-                    _rect_coverage(box_matrix @ form_ctm, media_box)
-                    < _FULL_PAGE_IMAGE_AREA_RATIO
+            elif operator_name == "Q":
+                if not frame.state_stack:
+                    analysis.unsafe = True
+                    finish_frame()
+                    continue
+                (
+                    frame.ctm,
+                    frame.render_mode,
+                    frame.font_is_type3,
+                    frame.fill_alpha,
+                    frame.stroke_alpha,
+                    frame.blend_mode,
+                    frame.soft_mask,
+                    frame.overprint,
+                    frame.clip_unknown,
+                    frame.text_clip,
+                ) = frame.state_stack.pop()
+            elif operator_name == "cm":
+                try:
+                    frame.ctm = _matrix_from_operands(operands) @ frame.ctm
+                except (TypeError, ValueError):
+                    analysis.unsafe = True
+                    finish_frame()
+            elif operator_name == "Tr":
+                try:
+                    frame.render_mode = int(operands[0])
+                except (IndexError, TypeError, ValueError):
+                    analysis.unsafe = True
+                    finish_frame()
+                    continue
+                if frame.render_mode not in range(8):
+                    analysis.unsafe = True
+                    finish_frame()
+            elif operator_name == "Tf":
+                try:
+                    if len(operands) != 2 or not math.isfinite(float(operands[1])):
+                        raise ValueError("Invalid Tf operands")
+                    fonts = frame.resources.get("/Font") if frame.resources else None
+                    font = fonts.get(operands[0]) if fonts is not None else None
+                    if font is None:
+                        raise ValueError("Missing font")
+                    frame.font_is_type3 = _font_is_type3(font)
+                except (IndexError, TypeError, ValueError):
+                    analysis.unsafe = True
+                    finish_frame()
+            elif operator_name == "gs":
+                try:
+                    extgstates = (
+                        frame.resources.get("/ExtGState") if frame.resources else None
+                    )
+                    graphics_state = (
+                        extgstates.get(operands[0]) if extgstates is not None else None
+                    )
+                    if graphics_state is None:
+                        raise ValueError("Missing ExtGState")
+                    frame.fill_alpha = float(
+                        graphics_state.get("/ca", frame.fill_alpha)
+                    )
+                    frame.stroke_alpha = float(
+                        graphics_state.get("/CA", frame.stroke_alpha)
+                    )
+                    frame.blend_mode = graphics_state.get("/BM", frame.blend_mode)
+                    frame.soft_mask = graphics_state.get("/SMask", frame.soft_mask)
+                    font_setting = graphics_state.get("/Font")
+                    if font_setting is not None:
+                        font_values = list(font_setting)
+                        if len(font_values) != 2 or not math.isfinite(
+                            float(font_values[1])
+                        ):
+                            raise ValueError("Invalid ExtGState font")
+                        frame.font_is_type3 = _font_is_type3(font_values[0])
+                    frame.overprint = bool(
+                        graphics_state.get("/OP", frame.overprint)
+                        or graphics_state.get("/op", frame.overprint)
+                    )
+                    if not (
+                        math.isfinite(frame.fill_alpha)
+                        and math.isfinite(frame.stroke_alpha)
+                        and 0 <= frame.fill_alpha <= 1
+                        and 0 <= frame.stroke_alpha <= 1
+                    ):
+                        raise ValueError("Invalid alpha")
+                except (IndexError, TypeError, ValueError):
+                    analysis.unsafe = True
+                    finish_frame()
+            elif operator_name in text_show_operators:
+                analysis.event += 1
+                if frame.font_is_type3 is not False:
+                    analysis.unsafe = True
+                    finish_frame()
+                    continue
+                if _text_is_visible(
+                    frame.render_mode,
+                    frame.fill_alpha,
+                    frame.stroke_alpha,
+                    frame.soft_mask,
                 ):
-                    form_clip_unknown = True
-                form_resources = xobject.get("/Resources", resources)
-                group = xobject.get("/Group")
-                if group is not None and str(group.get("/S")) != "/Transparency":
-                    raise ValueError("Invalid Form Group")
-                _analyze_content(
-                    xobject,
-                    form_resources,
-                    media_box,
-                    analysis,
-                    ctm=form_ctm,
-                    render_mode=render_mode,
-                    font_is_type3=font_is_type3,
-                    fill_alpha=fill_alpha,
-                    stroke_alpha=stroke_alpha,
-                    blend_mode=blend_mode,
-                    soft_mask=soft_mask,
-                    overprint=overprint,
-                    clip_unknown=form_clip_unknown,
-                    text_clip=text_clip,
-                    optional_content=bool(
-                        optional_content_depth or xobject_has_optional_content
-                    ),
-                    transparency_group=transparency_group
-                    or (group is not None and str(group.get("/S")) == "/Transparency"),
-                    active_forms=active_forms,
-                )
-            except (TypeError, ValueError):
-                analysis.unsafe = True
-                return
-            finally:
-                active_forms.remove(key)
+                    if frame.optional_content_depth:
+                        analysis.unsafe = True
+                        finish_frame()
+                        continue
+                    analysis.visible_text.append(analysis.event)
+                if frame.render_mode in {4, 5, 6, 7}:
+                    if frame.optional_content_depth:
+                        analysis.unsafe = True
+                        finish_frame()
+                        continue
+                    frame.clip_unknown = True
+                    frame.text_clip = True
+            elif operator_name in {"BMC", "BDC"}:
+                if not operands:
+                    analysis.unsafe = True
+                    finish_frame()
+                    continue
+                enters_optional_content = str(operands[0]) == "/OC"
+                frame.marked_content_stack.append(enters_optional_content)
+                frame.optional_content_depth += int(enters_optional_content)
+            elif operator_name == "EMC":
+                if not frame.marked_content_stack:
+                    analysis.unsafe = True
+                    finish_frame()
+                    continue
+                frame.optional_content_depth -= int(frame.marked_content_stack.pop())
+            elif operator_name in {"W", "W*"}:
+                frame.clip_unknown = True
+            elif operator_name in path_paint_operators or operator_name == "sh":
+                if frame.optional_content_depth:
+                    analysis.unsafe = True
+                    finish_frame()
+                    continue
+                analysis.has_vector = True
+            elif operator_name == "INLINE IMAGE":
+                if frame.optional_content_depth or frame.text_clip:
+                    analysis.unsafe = True
+                    finish_frame()
+                    continue
+                if (
+                    frame.soft_mask is not None
+                    and str(frame.soft_mask) != "/None"
+                    and not _soft_mask_hides_all(frame.soft_mask)
+                    and frame.fill_alpha > 0
+                ):
+                    analysis.unsafe = True
+                    finish_frame()
+                    continue
+                try:
+                    inline_image = operands[0]
+                    if bool(inline_image.image_mask):
+                        analysis.unsafe = True
+                        finish_frame()
+                        continue
+                    analysis.event += 1
+                    image_is_opaque = (
+                        int(inline_image.width) > 0
+                        and int(inline_image.height) > 0
+                        and _image_color_space_marks(
+                            inline_image.obj.get("/ColorSpace"),
+                            frame.resources,
+                        )
+                        and frame.fill_alpha == 1.0
+                        and _normal_blend_mode(frame.blend_mode)
+                        and (frame.soft_mask is None or str(frame.soft_mask) == "/None")
+                        and not frame.overprint
+                        and not frame.transparency_group
+                        and not frame.clip_unknown
+                    )
+                except (AttributeError, IndexError, TypeError, ValueError):
+                    analysis.unsafe = True
+                    finish_frame()
+                    continue
+                if image_is_opaque:
+                    coverage = _rect_coverage(frame.ctm, media_box)
+                    if coverage >= _SCAN_IMAGE_AREA_RATIO:
+                        analysis.image_candidates.append((coverage, analysis.event))
+            elif operator_name == "Do":
+                try:
+                    xobjects = (
+                        frame.resources.get("/XObject") if frame.resources else None
+                    )
+                    xobject = (
+                        xobjects.get(operands[0]) if xobjects is not None else None
+                    )
+                    if xobject is None:
+                        raise ValueError("Missing XObject")
+                    try:
+                        xobject = xobject.get_object()
+                    except (AttributeError, TypeError, ValueError):
+                        pass
+                    subtype = str(xobject.get("/Subtype"))
+                    xobject_has_optional_content = xobject.get("/OC") is not None
+                except (IndexError, TypeError, ValueError):
+                    analysis.unsafe = True
+                    finish_frame()
+                    continue
 
-    if state_stack or marked_content_stack:
-        analysis.unsafe = True
+                if subtype == "/Image":
+                    if (
+                        frame.optional_content_depth
+                        or xobject_has_optional_content
+                        or frame.text_clip
+                    ):
+                        analysis.unsafe = True
+                        finish_frame()
+                        continue
+                    if (
+                        frame.soft_mask is not None
+                        and str(frame.soft_mask) != "/None"
+                        and not _soft_mask_hides_all(frame.soft_mask)
+                        and frame.fill_alpha > 0
+                    ):
+                        analysis.unsafe = True
+                        finish_frame()
+                        continue
+                    try:
+                        if bool(xobject.get("/ImageMask", False)):
+                            analysis.unsafe = True
+                            finish_frame()
+                            continue
+                        analysis.event += 1
+                        width = int(xobject.get("/Width", 0))
+                        height = int(xobject.get("/Height", 0))
+                        image_color_space = xobject.get("/ColorSpace")
+                        color_space_marks = (
+                            _image_color_space_marks(image_color_space, frame.resources)
+                            if image_color_space is not None
+                            else _uses_jpx_decode(xobject.get("/Filter"))
+                        )
+                    except (TypeError, ValueError):
+                        width = height = 0
+                        color_space_marks = False
+                    image_is_opaque = (
+                        width > 0
+                        and height > 0
+                        and xobject.get("/Mask") is None
+                        and xobject.get("/SMask") is None
+                        and not bool(xobject.get("/SMaskInData", False))
+                        and xobject.get("/OC") is None
+                        and color_space_marks
+                        and frame.fill_alpha == 1.0
+                        and _normal_blend_mode(frame.blend_mode)
+                        and (frame.soft_mask is None or str(frame.soft_mask) == "/None")
+                        and not frame.overprint
+                        and not frame.transparency_group
+                        and not frame.clip_unknown
+                    )
+                    if image_is_opaque:
+                        coverage = _rect_coverage(frame.ctm, media_box)
+                        if coverage >= _SCAN_IMAGE_AREA_RATIO:
+                            analysis.image_candidates.append((coverage, analysis.event))
+                    continue
+
+                if subtype != "/Form":
+                    analysis.unsafe = True
+                    finish_frame()
+                    continue
+                key = _object_key(xobject)
+                if key in active_forms:
+                    analysis.unsafe = True
+                    finish_frame()
+                    continue
+                active_forms.add(key)
+                try:
+                    form_matrix = xobject.get("/Matrix")
+                    form_ctm = (
+                        _matrix_from_operands(form_matrix) @ frame.ctm
+                        if form_matrix is not None
+                        else frame.ctm
+                    )
+                    form_clip_unknown = frame.clip_unknown
+                    form_box = xobject.get("/BBox")
+                    if form_box is None:
+                        raise ValueError("Missing Form BBox")
+                    box_values = [float(value) for value in form_box]
+                    if len(box_values) != 4:
+                        raise ValueError("Invalid Form BBox")
+                    box_matrix = pikepdf.Matrix(
+                        box_values[2] - box_values[0],
+                        0,
+                        0,
+                        box_values[3] - box_values[1],
+                        box_values[0],
+                        box_values[1],
+                    )
+                    if (
+                        _rect_coverage(box_matrix @ form_ctm, media_box)
+                        < _FULL_PAGE_IMAGE_AREA_RATIO
+                    ):
+                        form_clip_unknown = True
+                    form_resources = xobject.get("/Resources", frame.resources)
+                    group = xobject.get("/Group")
+                    if group is not None and str(group.get("/S")) != "/Transparency":
+                        raise ValueError("Invalid Form Group")
+                    instructions = list(pikepdf.parse_content_stream(xobject))
+                except (TypeError, ValueError):
+                    active_forms.remove(key)
+                    analysis.unsafe = True
+                    finish_frame()
+                    continue
+                except BaseException:
+                    active_forms.remove(key)
+                    raise
+
+                frames.append(
+                    _ContentAnalysisFrame(
+                        instructions,
+                        form_resources,
+                        form_ctm,
+                        frame.render_mode,
+                        frame.font_is_type3,
+                        frame.fill_alpha,
+                        frame.stroke_alpha,
+                        frame.blend_mode,
+                        frame.soft_mask,
+                        frame.overprint,
+                        form_clip_unknown,
+                        frame.text_clip,
+                        int(
+                            bool(
+                                frame.optional_content_depth
+                                or xobject_has_optional_content
+                            )
+                        ),
+                        frame.transparency_group
+                        or (
+                            group is not None
+                            and str(group.get("/S")) == "/Transparency"
+                        ),
+                        key,
+                    )
+                )
+    finally:
+        for frame in frames:
+            if frame.active_form_key is not None:
+                active_forms.discard(frame.active_form_key)
 
 
 def _page_paint_analysis(page: "pikepdf.Page") -> _PagePaintAnalysis:
@@ -938,61 +1036,89 @@ def _strip_text_show_operators(
     pdf: "pikepdf.Pdf",
     container: "pikepdf.Object",
     resources: "pikepdf.Object",
-    active_forms: set[tuple[int, int] | int],
+    active_forms: set[_ObjectKey],
     *,
     is_page: bool = False,
 ) -> None:
     """Remove text-show operators, cloning referenced Forms before editing."""
     import pikepdf
 
+    operations: list[tuple[object, ...]] = [("process", container, resources, is_page)]
+    added_forms: list[_ObjectKey] = []
     try:
-        instructions = list(pikepdf.parse_content_stream(container))
-    except (pikepdf.PdfError, TypeError, ValueError) as exc:
-        raise OCRError("Could not remove the existing OCR text layer") from exc
+        while operations:
+            operation = operations.pop()
+            action = operation[0]
+            if action == "leave":
+                _, key, xobjects, name, form = operation
+                xobjects[name] = form  # type: ignore[index]
+                active_forms.remove(key)  # type: ignore[arg-type]
+                added_forms.pop()
+                continue
+            if action == "rewrite":
+                _, current, instructions, current_is_page = operation
+                rewritten = pikepdf.unparse_content_stream(
+                    [
+                        instruction
+                        for instruction in instructions  # type: ignore[union-attr]
+                        if str(instruction[1]) not in {"Tj", "TJ", "'", '"'}
+                    ]
+                )
+                if current_is_page:
+                    current.obj[pikepdf.Name.Contents] = pdf.make_stream(  # type: ignore[union-attr]
+                        rewritten
+                    )
+                else:
+                    current.write(rewritten)  # type: ignore[union-attr]
+                continue
+            if action == "enter":
+                _, inherited_resources, xobjects, name = operation
+                xobject = xobjects.get(name)  # type: ignore[union-attr]
+                if xobject is None:
+                    continue
+                try:
+                    xobject = xobject.get_object()
+                except (AttributeError, TypeError, ValueError):
+                    pass
+                if str(xobject.get("/Subtype")) != "/Form":
+                    continue
 
-    xobjects = resources.get("/XObject")
-    for operands, operator in instructions:
-        if str(operator) != "Do" or xobjects is None or not operands:
-            continue
-        xobject = xobjects.get(operands[0])
-        if xobject is None:
-            continue
-        try:
-            xobject = xobject.get_object()
-        except (AttributeError, TypeError, ValueError):
-            pass
-        if str(xobject.get("/Subtype")) != "/Form":
-            continue
+                key = _object_key(xobject)
+                if key in active_forms:
+                    raise OCRError("Could not remove the existing OCR text layer")
+                active_forms.add(key)
+                added_forms.append(key)
+                form = copy.copy(xobject)
+                form_resources = _private_resources(
+                    xobject.get("/Resources", inherited_resources)
+                )
+                form[pikepdf.Name.Resources] = form_resources
+                operations.append(("leave", key, xobjects, name, form))
+                operations.append(("process", form, form_resources, False))
+                continue
 
-        key = _object_key(xobject)
-        if key in active_forms:
-            raise OCRError("Could not remove the existing OCR text layer")
-        active_forms.add(key)
-        try:
-            form = copy.copy(xobject)
-            form_resources = _private_resources(xobject.get("/Resources", resources))
-            form[pikepdf.Name.Resources] = form_resources
-            _strip_text_show_operators(
-                pdf,
-                form,
-                form_resources,
-                active_forms,
+            _, current, current_resources, current_is_page = operation
+            try:
+                instructions = list(pikepdf.parse_content_stream(current))
+            except (pikepdf.PdfError, TypeError, ValueError) as exc:
+                raise OCRError("Could not remove the existing OCR text layer") from exc
+
+            operations.append(("rewrite", current, instructions, current_is_page))
+            xobjects = current_resources.get("/XObject")
+            if xobjects is None:
+                continue
+            form_calls = [
+                operands[0]
+                for operands, operator in instructions
+                if str(operator) == "Do" and operands
+            ]
+            operations.extend(
+                ("enter", current_resources, xobjects, name)
+                for name in reversed(form_calls)
             )
-            xobjects[operands[0]] = form
-        finally:
-            active_forms.remove(key)
-
-    rewritten = pikepdf.unparse_content_stream(
-        [
-            instruction
-            for instruction in instructions
-            if str(instruction[1]) not in {"Tj", "TJ", "'", '"'}
-        ]
-    )
-    if is_page:
-        container.obj[pikepdf.Name.Contents] = pdf.make_stream(rewritten)
-    else:
-        container.write(rewritten)
+    finally:
+        for key in reversed(added_forms):
+            active_forms.discard(key)
 
 
 def _prepare_deskew_input(
@@ -1313,7 +1439,7 @@ def _page_has_text(page: "pikepdf.Page") -> bool:
         if xobjects is None:
             return False
 
-        visited: set[tuple[int, int]] = set()
+        visited: set[_ObjectKey] = set()
         for name in xobjects.keys():
             try:
                 xobj = xobjects[name].get_object()
@@ -1330,9 +1456,9 @@ def _page_has_text(page: "pikepdf.Page") -> bool:
 def _form_xobject_has_text(
     xobj: "pikepdf.Object",
     text_operators: frozenset[str],
-    visited: set[tuple[int, int]],
+    visited: set[_ObjectKey],
 ) -> bool:
-    """Recursively checks a Form XObject for text operators.
+    """Check a Form XObject and its descendants for text operators.
 
     Args:
         xobj: The XObject to check.
@@ -1344,53 +1470,52 @@ def _form_xobject_has_text(
     """
     import pikepdf
 
-    try:
-        subtype = xobj.get("/Subtype")
-        if subtype is None or str(subtype) != "/Form":
-            return False
-    except Exception:
-        return False
+    pending = [xobj]
+    while pending:
+        current = pending.pop()
+        try:
+            subtype = current.get("/Subtype")
+            if subtype is None or str(subtype) != "/Form":
+                continue
+        except Exception:
+            continue
 
-    try:
-        objgen = xobj.objgen
-    except Exception:
-        objgen = (0, 0)
-    if objgen != (0, 0):
-        if objgen in visited:
-            return False
-        visited.add(objgen)
+        key = _object_key(current)
+        if key in visited:
+            continue
+        visited.add(key)
 
-    try:
-        for operands, operator in pikepdf.parse_content_stream(xobj):
-            operator_name = str(operator)
-            if operator_name in text_operators and _text_show_has_content(
-                operands, operator_name
-            ):
-                return True
-    except Exception as e:
-        log_suppressed_error(
-            logger, e, "Error parsing Form XObject content stream: %s", e
-        )
-        return False
+        try:
+            for operands, operator in pikepdf.parse_content_stream(current):
+                operator_name = str(operator)
+                if operator_name in text_operators and _text_show_has_content(
+                    operands, operator_name
+                ):
+                    return True
+        except Exception as e:
+            log_suppressed_error(
+                logger, e, "Error parsing Form XObject content stream: %s", e
+            )
+            continue
 
-    # Check nested Form XObjects
-    try:
-        resources = xobj.get("/Resources")
-        if resources is None:
-            return False
-        nested_xobjects = resources.get("/XObject")
-        if nested_xobjects is None:
-            return False
+        try:
+            resources = current.get("/Resources")
+            if resources is None:
+                continue
+            nested_xobjects = resources.get("/XObject")
+            if nested_xobjects is None:
+                continue
 
-        for name in nested_xobjects.keys():
-            try:
-                nested = nested_xobjects[name].get_object()
-            except (AttributeError, TypeError, ValueError):
-                nested = nested_xobjects[name]
-            if _form_xobject_has_text(nested, text_operators, visited):
-                return True
-    except Exception as e:
-        log_suppressed_error(logger, e, "Error checking nested XObjects: %s", e)
+            nested_forms = []
+            for name in nested_xobjects.keys():
+                try:
+                    nested = nested_xobjects[name].get_object()
+                except (AttributeError, TypeError, ValueError):
+                    nested = nested_xobjects[name]
+                nested_forms.append(nested)
+            pending.extend(reversed(nested_forms))
+        except Exception as e:
+            log_suppressed_error(logger, e, "Error checking nested XObjects: %s", e)
 
     return False
 

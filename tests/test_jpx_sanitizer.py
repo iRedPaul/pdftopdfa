@@ -4,6 +4,7 @@
 
 """Tests for JPEG2000 (JPXDecode) colr box sanitizer."""
 
+import logging
 import struct
 
 import pytest
@@ -677,6 +678,24 @@ class TestSanitizeJpxColorBoxes:
         assert result["jpx_reencoded"] == 0
         assert result["jpx_already_valid"] == 0
         assert result["jpx_failed"] == 0
+
+    def test_skips_indirect_integer_without_warning(
+        self, make_pdf_with_page, caplog: pytest.LogCaptureFixture
+    ):
+        pdf = make_pdf_with_page()
+        pdf.make_indirect(42)
+        caplog.set_level(logging.WARNING, logger="pdftopdfa.sanitizers.jpx")
+
+        result = sanitize_jpx_color_boxes(pdf)
+
+        assert result == {
+            "jpx_fixed": 0,
+            "jpx_wrapped": 0,
+            "jpx_reencoded": 0,
+            "jpx_already_valid": 0,
+            "jpx_failed": 0,
+        }
+        assert "Error processing JPX object" not in caplog.text
 
     def test_valid_jp2_unchanged(self, make_pdf_with_page):
         pdf = make_pdf_with_page()

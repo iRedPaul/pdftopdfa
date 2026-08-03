@@ -18,6 +18,8 @@ import warnings
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
+from ..exceptions import ConversionError
+from ..fonts.glyph_usage import find_ambiguous_resource_context_streams
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 
@@ -119,6 +121,7 @@ VALID_CONTENT_STREAM_OPERATORS: frozenset[str] = frozenset(
 )
 
 _DEFAULT_INTENT = Name.RelativeColorimetric
+type _ObjectIdentity = tuple[int, int] | tuple[str, bytes]
 
 # Expected operand counts for critical operators (veraPDF checks these).
 # value is (count, validator) where validator checks operand types.
@@ -183,6 +186,203 @@ def _visit_once(obj, visited: set[tuple[int, int]]) -> bool:
     return True
 
 
+def _stream_identity(stream: Stream) -> _ObjectIdentity:
+    """Return the identity used by resource-context alias detection."""
+    return _object_identity(stream)
+
+
+def _object_identity(obj) -> _ObjectIdentity:
+    """Return a stable resource-context equivalence key.
+
+    Equal direct objects intentionally share a key. Mutating traversals must
+    instead process direct objects independently and deduplicate only objgens.
+    """
+    objgen = obj.objgen
+    return objgen if objgen != (0, 0) else ("direct", obj.unparse())
+
+
+def _clone_stream(pdf: Pdf, source: Stream) -> Stream:
+    """Clone a stream after decoding it, preserving its non-filter entries."""
+    clone = pdf.make_stream(source.read_bytes())
+    omitted = {"/Length", "/Filter", "/DecodeParms"}
+    for key in list(source.keys()):
+        if str(key) not in omitted:
+            value = source[key]
+            if str(key) == "/Resources":
+                resources = _resolve_indirect(value)
+                if isinstance(resources, Dictionary):
+                    value = _clone_resources_for_context(resources)
+            clone[key] = value
+    return clone
+
+
+def _clone_resource_context_streams(pdf: Pdf) -> int:
+    """Clone streams that are reused under different resource dictionaries."""
+    first_context: dict[
+        _ObjectIdentity,
+        _ObjectIdentity,
+    ] = {}
+    processed: set[tuple[_ObjectIdentity, _ObjectIdentity]] = set()
+    active: set[_ObjectIdentity] = set()
+    processed_resources: set[tuple[int, int]] = set()
+    processed_type3: set[tuple[_ObjectIdentity, _ObjectIdentity]] = set()
+    cloned = 0
+
+    def resource_tasks(resources) -> list[tuple]:
+        resources = _resolve_indirect(resources)
+        if not isinstance(resources, Dictionary):
+            return []
+        if not _visit_once(resources, processed_resources):
+            return []
+        discovered: list[tuple] = []
+
+        xobjects = _resolve_indirect(resources.get("/XObject"))
+        if isinstance(xobjects, Dictionary):
+            for name in list(xobjects.keys()):
+                candidate = _resolve_indirect(xobjects[name])
+                if (
+                    isinstance(candidate, Stream)
+                    and str(candidate.get("/Subtype")) == "/Form"
+                ):
+                    discovered.append(("stream", xobjects, name, resources))
+
+        patterns = _resolve_indirect(resources.get("/Pattern"))
+        if isinstance(patterns, Dictionary):
+            for name in list(patterns.keys()):
+                candidate = _resolve_indirect(patterns[name])
+                if (
+                    isinstance(candidate, Stream)
+                    and int(candidate.get("/PatternType", 0)) == 1
+                ):
+                    discovered.append(("stream", patterns, name, resources))
+
+        extgstates = _resolve_indirect(resources.get("/ExtGState"))
+        if isinstance(extgstates, Dictionary):
+            for name in list(extgstates.keys()):
+                extgstate = _resolve_indirect(extgstates[name])
+                if not isinstance(extgstate, Dictionary):
+                    continue
+                smask = _resolve_indirect(extgstate.get("/SMask"))
+                if isinstance(smask, Dictionary) and isinstance(
+                    _resolve_indirect(smask.get("/G")), Stream
+                ):
+                    discovered.append(("stream", smask, Name.G, resources))
+
+        fonts = _resolve_indirect(resources.get("/Font"))
+        if isinstance(fonts, Dictionary):
+            for name in list(fonts.keys()):
+                font = _resolve_indirect(fonts[name])
+                if (
+                    not isinstance(font, Dictionary)
+                    or str(font.get("/Subtype")) != "/Type3"
+                ):
+                    continue
+                font_resources = _resolve_indirect(font.get("/Resources"))
+                if not isinstance(font_resources, Dictionary):
+                    font_resources = resources
+                font_context = (
+                    _object_identity(font),
+                    _object_identity(font_resources),
+                )
+                if font_context in processed_type3:
+                    continue
+                processed_type3.add(font_context)
+                charprocs = _resolve_indirect(font.get("/CharProcs"))
+                if isinstance(charprocs, Dictionary):
+                    for char_name in list(charprocs.keys()):
+                        if isinstance(_resolve_indirect(charprocs[char_name]), Stream):
+                            discovered.append(
+                                ("stream", charprocs, char_name, font_resources)
+                            )
+                if font_resources is not resources:
+                    discovered.append(("resources", font_resources, None, None))
+        return discovered
+
+    def appearance_tasks(container, key, page_resources) -> list[tuple]:
+        entry = _resolve_indirect(container[key])
+        if isinstance(entry, Stream):
+            return [("stream", container, key, page_resources)]
+        if not isinstance(entry, Dictionary):
+            return []
+        return [
+            ("stream", entry, state, page_resources)
+            for state in list(entry.keys())
+            if isinstance(_resolve_indirect(entry[state]), Stream)
+        ]
+
+    for page in pdf.pages:
+        page_dict = _resolve_indirect(page.obj)
+        page_resources = _resolve_indirect(page_dict.get("/Resources"))
+        if not isinstance(page_resources, Dictionary):
+            page_resources = _get_inherited_page_resources(page_dict)
+        if not isinstance(page_resources, Dictionary):
+            page_resources = Dictionary()
+
+        tasks: list[tuple] = []
+        contents = _resolve_indirect(page_dict.get("/Contents"))
+        if isinstance(contents, Stream):
+            tasks.append(("stream", page_dict, Name.Contents, page_resources))
+        elif isinstance(contents, Array):
+            for index in range(len(contents)):
+                if isinstance(_resolve_indirect(contents[index]), Stream):
+                    tasks.append(("stream", contents, index, page_resources))
+
+        tasks.append(("resources", page_resources, None, None))
+
+        annots = _resolve_indirect(page_dict.get("/Annots"))
+        if isinstance(annots, Array):
+            for annot in annots:
+                annot = _resolve_indirect(annot)
+                if not isinstance(annot, Dictionary):
+                    continue
+                ap = _resolve_indirect(annot.get("/AP"))
+                if not isinstance(ap, Dictionary):
+                    continue
+                for ap_key in (Name.N, Name.R, Name.D):
+                    if ap_key in ap:
+                        tasks.extend(appearance_tasks(ap, ap_key, page_resources))
+
+        tasks.reverse()
+        while tasks:
+            kind, container, key, parent_resources = tasks.pop()
+            if kind == "exit":
+                active.discard(container)
+                continue
+            if kind == "resources":
+                discovered = resource_tasks(container)
+                tasks.extend(reversed(discovered))
+                continue
+
+            stream = _resolve_indirect(container[key])
+            if not isinstance(stream, Stream):
+                continue
+            stream_key = _stream_identity(stream)
+            context_key = _object_identity(parent_resources)
+            if stream_key in active or (stream_key, context_key) in processed:
+                continue
+
+            prior_context = first_context.setdefault(stream_key, context_key)
+            if prior_context != context_key:
+                stream = _clone_stream(pdf, stream)
+                container[key] = stream
+                stream_key = _stream_identity(stream)
+                first_context[stream_key] = context_key
+                cloned += 1
+
+            processed.add((stream_key, context_key))
+            active.add(stream_key)
+            tasks.append(("exit", stream_key, None, None))
+            own_resources = _resolve_indirect(stream.get("/Resources"))
+            nested_resources = (
+                own_resources
+                if isinstance(own_resources, Dictionary)
+                else parent_resources
+            )
+            tasks.append(("resources", nested_resources, None, None))
+
+    return cloned
+
+
 def _clone_resources_shallow(
     resources: Dictionary, excluded_keys: frozenset[str] = frozenset()
 ) -> Dictionary:
@@ -192,6 +392,29 @@ def _clone_resources_shallow(
         if str(key) in excluded_keys:
             continue
         cloned[key] = resources[key]
+    return cloned
+
+
+def _clone_resources_for_context(resources: Dictionary) -> Dictionary:
+    """Clone mutable resource containers while sharing their leaf objects."""
+    cloned = _clone_resources_shallow(resources)
+    for category_name in ("/XObject", "/Pattern", "/Font", "/ExtGState"):
+        category = _resolve_indirect(cloned.get(category_name))
+        if not isinstance(category, Dictionary):
+            continue
+        category_clone = _clone_resources_shallow(category)
+        cloned[category_name] = category_clone
+        if category_name != "/ExtGState":
+            continue
+        for name in list(category_clone.keys()):
+            extgstate = _resolve_indirect(category_clone[name])
+            if not isinstance(extgstate, Dictionary):
+                continue
+            extgstate_clone = _clone_resources_shallow(extgstate)
+            smask = _resolve_indirect(extgstate_clone.get("/SMask"))
+            if isinstance(smask, Dictionary):
+                extgstate_clone[Name.SMask] = _clone_resources_shallow(smask)
+            category_clone[name] = extgstate_clone
     return cloned
 
 
@@ -469,6 +692,29 @@ def _iter_tiling_patterns(resources, visited: set[tuple[int, int]]):
         yield pattern
 
 
+def _iter_soft_mask_groups(resources, visited: set[tuple[int, int]]):
+    """Yield transparency-group streams referenced by soft masks."""
+    resources = _resolve_indirect(resources)
+    if not isinstance(resources, Dictionary):
+        return
+
+    extgstates = _resolve_indirect(resources.get("/ExtGState"))
+    if not isinstance(extgstates, Dictionary):
+        return
+
+    for name in list(extgstates.keys()):
+        extgstate = _resolve_indirect(extgstates[name])
+        if not isinstance(extgstate, Dictionary):
+            continue
+        smask = _resolve_indirect(extgstate.get("/SMask"))
+        if not isinstance(smask, Dictionary):
+            continue
+        group = _resolve_indirect(smask.get("/G"))
+        if not isinstance(group, Stream) or not _visit_once(group, visited):
+            continue
+        yield group
+
+
 def _iter_type3_fonts(resources, visited: set[tuple[int, int]]):
     """Yield Type3 fonts from a resources dictionary with cycle detection."""
     resources = _resolve_indirect(resources)
@@ -496,54 +742,79 @@ def _ensure_explicit_resources_in_resource_graph(
     visited_forms: set[tuple[int, int]],
     visited_fonts: set[tuple[int, int]],
     visited_patterns: set[tuple[int, int]],
+    ambiguous_streams: set[_ObjectIdentity],
 ) -> tuple[int, int]:
     """Ensure explicit resources for nested content stream containers."""
-    resources = _resolve_indirect(resources)
-    if not isinstance(resources, Dictionary):
-        return 0, 0
-
     resources_added = 0
     resources_merged = 0
+    pending = [resources]
+    processed_resources: set[tuple[int, int]] = set()
+    processed_owners: set[tuple[int, int]] = set()
 
-    # Form XObjects
-    for form in _iter_form_xobjects(resources, visited_forms):
-        form_resources, added, merged = _ensure_associated_resources(form, resources)
-        resources_added += added
-        resources_merged += merged
+    while pending:
+        parent = _resolve_indirect(pending.pop())
+        if not isinstance(parent, Dictionary):
+            continue
+        if not _visit_once(parent, processed_resources):
+            continue
 
-        add2, merge2 = _ensure_explicit_resources_in_resource_graph(
-            form_resources, visited_forms, visited_fonts, visited_patterns
-        )
-        resources_added += add2
-        resources_merged += merge2
+        for form in _iter_form_xobjects(parent, visited_forms):
+            if not _visit_once(form, processed_owners):
+                continue
+            form_key = _stream_identity(form)
+            if form_key in ambiguous_streams:
+                form_resources = _resolve_indirect(form.get("/Resources"))
+                if not isinstance(form_resources, Dictionary):
+                    continue
+                added = merged = 0
+            else:
+                form_resources, added, merged = _ensure_associated_resources(
+                    form, parent
+                )
+            resources_added += added
+            resources_merged += merged
+            if isinstance(form_resources, Dictionary):
+                pending.append(form_resources)
 
-    # Type3 fonts used by CharProcs
-    for _font_name, font in _iter_type3_fonts(resources, visited_fonts):
-        # Avoid injecting /Font from parent into Type3 /Resources, which can
-        # create self-referential font loops for direct (objgen 0,0) objects.
-        font_resources, added, merged = _ensure_associated_resources(
-            font, resources, excluded_keys=frozenset({"/Font"})
-        )
-        resources_added += added
-        resources_merged += merged
+        for _font_name, font in _iter_type3_fonts(parent, visited_fonts):
+            if not _visit_once(font, processed_owners):
+                continue
+            font_resources, added, merged = _ensure_associated_resources(
+                font,
+                parent,
+                excluded_keys=frozenset({"/Font"}),
+            )
+            resources_added += added
+            resources_merged += merged
+            if isinstance(font_resources, Dictionary):
+                pending.append(font_resources)
 
-        add2, merge2 = _ensure_explicit_resources_in_resource_graph(
-            font_resources, visited_forms, visited_fonts, visited_patterns
-        )
-        resources_added += add2
-        resources_merged += merge2
+        for pattern in _iter_tiling_patterns(parent, visited_patterns):
+            if not _visit_once(pattern, processed_owners):
+                continue
+            pattern_key = _stream_identity(pattern)
+            if pattern_key in ambiguous_streams:
+                pattern_resources = _resolve_indirect(pattern.get("/Resources"))
+                if not isinstance(pattern_resources, Dictionary):
+                    continue
+                added = merged = 0
+            else:
+                pattern_resources, added, merged = _ensure_associated_resources(
+                    pattern, parent
+                )
+            resources_added += added
+            resources_merged += merged
+            if isinstance(pattern_resources, Dictionary):
+                pending.append(pattern_resources)
 
-    # Tiling patterns are content streams with their own resources
-    for pattern in _iter_tiling_patterns(resources, visited_patterns):
-        pat_resources, added, merged = _ensure_associated_resources(pattern, resources)
-        resources_added += added
-        resources_merged += merged
-
-        add2, merge2 = _ensure_explicit_resources_in_resource_graph(
-            pat_resources, visited_forms, visited_fonts, visited_patterns
-        )
-        resources_added += add2
-        resources_merged += merge2
+        for group in _iter_soft_mask_groups(parent, visited_forms):
+            if not _visit_once(group, processed_owners):
+                continue
+            group_resources, added, merged = _ensure_associated_resources(group, parent)
+            resources_added += added
+            resources_merged += merged
+            if isinstance(group_resources, Dictionary):
+                pending.append(group_resources)
 
     return resources_added, resources_merged
 
@@ -555,70 +826,53 @@ def _sanitize_operators_in_resource_graph(
     visited_patterns: set[tuple[int, int]],
 ) -> tuple[int, int, int, int]:
     """Sanitize operators in nested forms, Type3 CharProcs and patterns."""
-    resources = _resolve_indirect(resources)
-    if not isinstance(resources, Dictionary):
-        return 0, 0, 0, 0
-
     ri_fixed = 0
     undefined_removed = 0
     inline_fixed = 0
     bad_args_removed = 0
+    pending = [resources]
+    processed_resources: set[tuple[int, int]] = set()
+    processed_streams: set[_ObjectIdentity] = set()
 
-    # Form XObjects
-    for form in _iter_form_xobjects(resources, visited_forms):
-        ri, undef, inl, bad = _sanitize_stream_operators(form)
+    def sanitize_stream(stream: Stream) -> None:
+        nonlocal ri_fixed, undefined_removed, inline_fixed, bad_args_removed
+        stream_key = _stream_identity(stream)
+        if stream_key in processed_streams:
+            return
+        processed_streams.add(stream_key)
+        ri, undefined, inline, bad_args = _sanitize_stream_operators(stream)
         ri_fixed += ri
-        undefined_removed += undef
-        inline_fixed += inl
-        bad_args_removed += bad
+        undefined_removed += undefined
+        inline_fixed += inline
+        bad_args_removed += bad_args
 
-        form_resources = _resolve_indirect(form.get("/Resources"))
-        ri2, undef2, inl2, bad2 = _sanitize_operators_in_resource_graph(
-            form_resources, visited_forms, visited_fonts, visited_patterns
-        )
-        ri_fixed += ri2
-        undefined_removed += undef2
-        inline_fixed += inl2
-        bad_args_removed += bad2
+    while pending:
+        parent = _resolve_indirect(pending.pop())
+        if not isinstance(parent, Dictionary):
+            continue
+        if not _visit_once(parent, processed_resources):
+            continue
 
-    # Type3 CharProcs
-    for _font_name, font in _iter_type3_fonts(resources, visited_fonts):
-        charprocs = _resolve_indirect(font.get("/CharProcs"))
-        if isinstance(charprocs, Dictionary):
-            for cp_name in list(charprocs.keys()):
-                cp_stream = _resolve_indirect(charprocs[cp_name])
-                if isinstance(cp_stream, Stream):
-                    ri, undef, inl, bad = _sanitize_stream_operators(cp_stream)
-                    ri_fixed += ri
-                    undefined_removed += undef
-                    inline_fixed += inl
-                    bad_args_removed += bad
+        for form in _iter_form_xobjects(parent, visited_forms):
+            sanitize_stream(form)
+            pending.append(_resolve_indirect(form.get("/Resources")))
 
-        font_resources = _resolve_indirect(font.get("/Resources"))
-        ri2, undef2, inl2, bad2 = _sanitize_operators_in_resource_graph(
-            font_resources, visited_forms, visited_fonts, visited_patterns
-        )
-        ri_fixed += ri2
-        undefined_removed += undef2
-        inline_fixed += inl2
-        bad_args_removed += bad2
+        for _font_name, font in _iter_type3_fonts(parent, visited_fonts):
+            charprocs = _resolve_indirect(font.get("/CharProcs"))
+            if isinstance(charprocs, Dictionary):
+                for name in list(charprocs.keys()):
+                    stream = _resolve_indirect(charprocs[name])
+                    if isinstance(stream, Stream):
+                        sanitize_stream(stream)
+            pending.append(_resolve_indirect(font.get("/Resources")))
 
-    # Tiling patterns
-    for pattern in _iter_tiling_patterns(resources, visited_patterns):
-        ri, undef, inl, bad = _sanitize_stream_operators(pattern)
-        ri_fixed += ri
-        undefined_removed += undef
-        inline_fixed += inl
-        bad_args_removed += bad
+        for pattern in _iter_tiling_patterns(parent, visited_patterns):
+            sanitize_stream(pattern)
+            pending.append(_resolve_indirect(pattern.get("/Resources")))
 
-        pat_resources = _resolve_indirect(pattern.get("/Resources"))
-        ri2, undef2, inl2, bad2 = _sanitize_operators_in_resource_graph(
-            pat_resources, visited_forms, visited_fonts, visited_patterns
-        )
-        ri_fixed += ri2
-        undefined_removed += undef2
-        inline_fixed += inl2
-        bad_args_removed += bad2
+        for group in _iter_soft_mask_groups(parent, visited_forms):
+            sanitize_stream(group)
+            pending.append(_resolve_indirect(group.get("/Resources")))
 
     return ri_fixed, undefined_removed, inline_fixed, bad_args_removed
 
@@ -629,6 +883,7 @@ def _ensure_resources_in_ap_stream(
     visited_forms: set[tuple[int, int]],
     visited_fonts: set[tuple[int, int]],
     visited_patterns: set[tuple[int, int]],
+    ambiguous_streams: set[_ObjectIdentity],
 ) -> tuple[int, int]:
     """Ensure explicit resources on AP streams and nested content streams."""
     ap_entry = _resolve_indirect(ap_entry)
@@ -636,13 +891,23 @@ def _ensure_resources_in_ap_stream(
     resources_merged = 0
 
     if isinstance(ap_entry, Stream):
-        ap_resources, added, merged = _ensure_associated_resources(
-            ap_entry, page_resources
-        )
+        if _stream_identity(ap_entry) in ambiguous_streams:
+            ap_resources = _resolve_indirect(ap_entry.get("/Resources"))
+            if not isinstance(ap_resources, Dictionary):
+                return 0, 0
+            added = merged = 0
+        else:
+            ap_resources, added, merged = _ensure_associated_resources(
+                ap_entry, page_resources
+            )
         resources_added += added
         resources_merged += merged
         add2, merge2 = _ensure_explicit_resources_in_resource_graph(
-            ap_resources, visited_forms, visited_fonts, visited_patterns
+            ap_resources,
+            visited_forms,
+            visited_fonts,
+            visited_patterns,
+            ambiguous_streams,
         )
         resources_added += add2
         resources_merged += merge2
@@ -650,13 +915,23 @@ def _ensure_resources_in_ap_stream(
         for state_name in list(ap_entry.keys()):
             state_stream = _resolve_indirect(ap_entry[state_name])
             if isinstance(state_stream, Stream):
-                st_resources, added, merged = _ensure_associated_resources(
-                    state_stream, page_resources
-                )
+                if _stream_identity(state_stream) in ambiguous_streams:
+                    st_resources = _resolve_indirect(state_stream.get("/Resources"))
+                    if not isinstance(st_resources, Dictionary):
+                        continue
+                    added = merged = 0
+                else:
+                    st_resources, added, merged = _ensure_associated_resources(
+                        state_stream, page_resources
+                    )
                 resources_added += added
                 resources_merged += merged
                 add2, merge2 = _ensure_explicit_resources_in_resource_graph(
-                    st_resources, visited_forms, visited_fonts, visited_patterns
+                    st_resources,
+                    visited_forms,
+                    visited_fonts,
+                    visited_patterns,
+                    ambiguous_streams,
                 )
                 resources_added += add2
                 resources_merged += merge2
@@ -725,26 +1000,26 @@ def _sanitize_image_intents_in_resource_graph(
     Image XObjects with invalid ``/Intent`` and replaces with the default
     ``/RelativeColorimetric``.
     """
-    resources = _resolve_indirect(resources)
-    if not isinstance(resources, Dictionary):
-        return 0
-
     fixed = 0
+    pending = [resources]
+    processed_resources: set[tuple[int, int]] = set()
 
-    xobjects = resources.get("/XObject")
-    xobjects = _resolve_indirect(xobjects) if xobjects else None
-    if isinstance(xobjects, Dictionary):
-        for xobj_name in list(xobjects.keys()):
-            xobj = _resolve_indirect(xobjects[xobj_name])
-            if not isinstance(xobj, Stream):
-                continue
+    while pending:
+        parent = _resolve_indirect(pending.pop())
+        if not isinstance(parent, Dictionary):
+            continue
+        if not _visit_once(parent, processed_resources):
+            continue
 
-            subtype = str(xobj.get("/Subtype", ""))
-
-            if subtype == "/Image":
-                intent = xobj.get("/Intent")
-                if intent is not None:
-                    intent = _resolve_indirect(intent)
+        xobjects = _resolve_indirect(parent.get("/XObject"))
+        if isinstance(xobjects, Dictionary):
+            for xobj_name in list(xobjects.keys()):
+                xobj = _resolve_indirect(xobjects[xobj_name])
+                if not isinstance(xobj, Stream):
+                    continue
+                subtype = str(xobj.get("/Subtype", ""))
+                if subtype == "/Image":
+                    intent = _resolve_indirect(xobj.get("/Intent"))
                     if isinstance(intent, Name) and (
                         str(intent) not in VALID_RENDERING_INTENTS
                     ):
@@ -755,28 +1030,22 @@ def _sanitize_image_intents_in_resource_graph(
                             intent,
                             xobj_name,
                         )
-            elif subtype == "/Form":
-                if not _visit_once(xobj, visited):
-                    continue
-                form_resources = _resolve_indirect(xobj.get("/Resources"))
-                fixed += _sanitize_image_intents_in_resource_graph(
-                    form_resources, visited
-                )
+                elif subtype == "/Form" and _visit_once(xobj, visited):
+                    pending.append(_resolve_indirect(xobj.get("/Resources")))
 
-    # Tiling patterns can reference Image XObjects
-    patterns = resources.get("/Pattern")
-    patterns = _resolve_indirect(patterns) if patterns else None
-    if isinstance(patterns, Dictionary):
-        for pattern_name in list(patterns.keys()):
-            pattern = _resolve_indirect(patterns[pattern_name])
-            if not isinstance(pattern, Stream):
-                continue
-            if int(pattern.get("/PatternType", 0)) != 1:
-                continue
-            if not _visit_once(pattern, visited):
-                continue
-            pat_resources = _resolve_indirect(pattern.get("/Resources"))
-            fixed += _sanitize_image_intents_in_resource_graph(pat_resources, visited)
+        patterns = _resolve_indirect(parent.get("/Pattern"))
+        if isinstance(patterns, Dictionary):
+            for name in list(patterns.keys()):
+                pattern = _resolve_indirect(patterns[name])
+                if (
+                    isinstance(pattern, Stream)
+                    and int(pattern.get("/PatternType", 0)) == 1
+                    and _visit_once(pattern, visited)
+                ):
+                    pending.append(_resolve_indirect(pattern.get("/Resources")))
+
+        for group in _iter_soft_mask_groups(parent, visited):
+            pending.append(_resolve_indirect(group.get("/Resources")))
 
     return fixed
 
@@ -828,6 +1097,14 @@ def sanitize_rendering_intent(pdf: Pdf) -> dict[str, int]:
     resources_added_total = 0
     resources_merged_total = 0
 
+    context_streams_cloned = _clone_resource_context_streams(pdf)
+    ambiguous_streams = find_ambiguous_resource_context_streams(pdf)
+    if ambiguous_streams:
+        raise ConversionError(
+            "Cannot safely associate reused content streams with their "
+            "resource contexts"
+        )
+
     ensure_forms_visited: set[tuple[int, int]] = set()
     ensure_fonts_visited: set[tuple[int, int]] = set()
     ensure_patterns_visited: set[tuple[int, int]] = set()
@@ -837,7 +1114,6 @@ def sanitize_rendering_intent(pdf: Pdf) -> dict[str, int]:
     sanitize_patterns_visited: set[tuple[int, int]] = set()
 
     image_intents_visited: set[tuple[int, int]] = set()
-
     for page_num, page in enumerate(pdf.pages, start=1):
         try:
             page_dict = _resolve_indirect(page.obj)
@@ -855,6 +1131,7 @@ def sanitize_rendering_intent(pdf: Pdf) -> dict[str, int]:
                 ensure_forms_visited,
                 ensure_fonts_visited,
                 ensure_patterns_visited,
+                ambiguous_streams,
             )
             resources_added_total += add2
             resources_merged_total += merge2
@@ -879,6 +1156,7 @@ def sanitize_rendering_intent(pdf: Pdf) -> dict[str, int]:
                                 ensure_forms_visited,
                                 ensure_fonts_visited,
                                 ensure_patterns_visited,
+                                ambiguous_streams,
                             )
                             resources_added_total += add_ap
                             resources_merged_total += merge_ap
@@ -961,18 +1239,21 @@ def sanitize_rendering_intent(pdf: Pdf) -> dict[str, int]:
         or bad_args_total > 0
         or resources_added_total > 0
         or resources_merged_total > 0
+        or context_streams_cloned > 0
         or image_intents_total > 0
     ):
         logger.info(
             "Content streams sanitized: %d ri fixed, %d undefined operators "
             "removed, %d bad-args operators removed, "
             "%d resources dictionaries added, %d resource entries "
-            "merged, %d image intents fixed",
+            "merged, %d resource-context streams cloned, "
+            "%d image intents fixed",
             ri_total,
             undefined_total,
             bad_args_total,
             resources_added_total,
             resources_merged_total,
+            context_streams_cloned,
             image_intents_total,
         )
 

@@ -39,6 +39,17 @@ def _make_form_xobject(pdf, resources=None):
     return stream
 
 
+def _wrap_xobject_in_form_chain(pdf, xobject, depth=1200):
+    """Wrap an XObject in a deeply nested Form resource graph."""
+    nested = xobject
+    for _ in range(depth):
+        nested = _make_form_xobject(
+            pdf,
+            resources=Dictionary(XObject=Dictionary(Nested=nested)),
+        )
+    return nested
+
+
 def _get_first_inline_image_token_value(stream, token_name: str):
     """Return the value of one token in the first inline image of a stream."""
     for item in pikepdf.parse_content_stream(stream):
@@ -201,6 +212,23 @@ class TestRemoveForbiddenXobjects:
         result = remove_forbidden_xobjects(pdf)
         assert result >= 1
 
+    def test_forbidden_xobject_through_1200_forms_is_removed(self, make_pdf_with_page):
+        """Forbidden XObjects are reached beyond Python's recursion limit."""
+        pdf = make_pdf_with_page()
+        ps_stream = pdf.make_stream(b"% PS")
+        ps_stream[Name.Type] = Name.XObject
+        ps_stream[Name.Subtype] = Name("/PS")
+        outer = _wrap_xobject_in_form_chain(pdf, ps_stream)
+        pdf.pages[0]["/Resources"] = Dictionary(XObject=Dictionary(Outer=outer))
+
+        result = remove_forbidden_xobjects(pdf)
+
+        assert result == 1
+        nested = outer
+        for _ in range(1199):
+            nested = nested.Resources.XObject.Nested
+        assert "/Nested" not in nested.Resources.XObject
+
     def test_multiple_pages(self, make_pdf_with_page):
         """XObjects across multiple pages are processed."""
         pdf = make_pdf_with_page()
@@ -277,6 +305,43 @@ class TestFixImageInterpolate:
         result = fix_image_interpolate(pdf)
         assert result == 1
 
+    def test_interpolate_through_1200_forms_is_fixed(self, make_pdf_with_page):
+        """Interpolate repair reaches images beyond Python's recursion limit."""
+        pdf = make_pdf_with_page()
+        image = _make_image_xobject(pdf, interpolate=True)
+        outer = _wrap_xobject_in_form_chain(pdf, image)
+        pdf.pages[0]["/Resources"] = Dictionary(XObject=Dictionary(Outer=outer))
+
+        result = fix_image_interpolate(pdf)
+
+        assert result == 1
+        assert bool(image.get("/Interpolate")) is False
+
+    def test_image_in_tiling_pattern_nested_in_form(self, make_pdf_with_page):
+        """Images in tiling-pattern resources are fixed through nested contexts."""
+        pdf = make_pdf_with_page()
+        image = _make_image_xobject(pdf, interpolate=True)
+        pattern = pdf.make_stream(b"/Im0 Do")
+        pattern["/Type"] = Name.Pattern
+        pattern["/PatternType"] = 1
+        pattern["/PaintType"] = 1
+        pattern["/TilingType"] = 1
+        pattern["/BBox"] = Array([0, 0, 1, 1])
+        pattern["/XStep"] = 1
+        pattern["/YStep"] = 1
+        pattern["/Resources"] = Dictionary(XObject=Dictionary(Im0=image))
+        form = _make_form_xobject(
+            pdf,
+            resources=Dictionary(Pattern=Dictionary(P1=pattern)),
+        )
+        form.write(b"/Pattern cs /P1 scn 0 0 1 1 re f")
+        pdf.pages[0]["/Resources"] = Dictionary(XObject=Dictionary(Fm0=form))
+
+        result = fix_image_interpolate(pdf)
+
+        assert result == 1
+        assert bool(image.get("/Interpolate")) is False
+
     def test_fixes_interpolate_in_soft_mask_image(self, make_pdf_with_page):
         """Soft-mask image streams inherit the same Interpolate constraint."""
         pdf = make_pdf_with_page()
@@ -288,6 +353,37 @@ class TestFixImageInterpolate:
         result = fix_image_interpolate(pdf)
         assert result == 1
         assert bool(soft_mask.get("/Interpolate")) is False
+
+    def test_interpolate_through_1200_image_masks_is_fixed(self, make_pdf_with_page):
+        """Interpolate repair follows deep image-mask chains iteratively."""
+        pdf = make_pdf_with_page()
+        leaf = _make_image_xobject(pdf, interpolate=True)
+        outer = leaf
+        for _ in range(1200):
+            parent = _make_image_xobject(pdf)
+            parent[Name.SMask] = outer
+            outer = parent
+        pdf.pages[0]["/Resources"] = Dictionary(XObject=Dictionary(Outer=outer))
+
+        result = fix_image_interpolate(pdf)
+
+        assert result == 1
+        assert bool(leaf.get("/Interpolate")) is False
+
+    def test_interpolate_image_mask_cycle_terminates(self, make_pdf_with_page):
+        """Cyclic explicit and soft masks are fixed once and terminate."""
+        pdf = make_pdf_with_page()
+        first = _make_image_xobject(pdf, interpolate=True)
+        second = _make_image_xobject(pdf, interpolate=True)
+        first[Name.SMask] = second
+        second[Name.Mask] = first
+        pdf.pages[0]["/Resources"] = Dictionary(XObject=Dictionary(First=first))
+
+        result = fix_image_interpolate(pdf)
+
+        assert result == 2
+        assert bool(first.get("/Interpolate")) is False
+        assert bool(second.get("/Interpolate")) is False
 
     def test_multiple_images(self, make_pdf_with_page):
         """All images with Interpolate=true are fixed."""
@@ -326,6 +422,26 @@ class TestFixImageInterpolate:
             pdf.pages[0].Contents, "/Interpolate"
         )
         assert bool(token_value) is False
+
+    def test_inline_image_failed_rewrite_is_not_reported_as_fixed(
+        self, make_pdf_with_page, monkeypatch
+    ):
+        """A failed inline-image rebuild leaves bytes and the count unchanged."""
+        pdf = make_pdf_with_page()
+        contents = pdf.make_stream(
+            b"q BI /W 1 /H 1 /BPC 8 /CS /G /I true ID \x80 EI Q\n"
+        )
+        pdf.pages[0][Name.Contents] = contents
+        original = bytes(contents.read_bytes())
+        monkeypatch.setattr(
+            "pdftopdfa.sanitizers.xobjects._extract_inline_image_payload",
+            lambda _image: None,
+        )
+
+        result = fix_image_interpolate(pdf)
+
+        assert result == 0
+        assert bytes(contents.read_bytes()) == original
 
 
 def _make_annotation_with_ap(pdf, ap_resources):
@@ -587,6 +703,35 @@ class TestFixBitsPerComponent:
         pdf.pages[0]["/Resources"] = Dictionary(XObject=Dictionary(Fm0=form))
         result = fix_bits_per_component(pdf)
         assert result["invalid_bpc_fixed"] == 1
+
+    def test_invalid_bpc_through_1200_forms_is_fixed(self, make_pdf_with_page):
+        """BPC repair reaches images beyond Python's recursion limit."""
+        pdf = make_pdf_with_page()
+        image = _make_image_xobject_with_bpc(pdf, 12)
+        outer = _wrap_xobject_in_form_chain(pdf, image)
+        pdf.pages[0]["/Resources"] = Dictionary(XObject=Dictionary(Outer=outer))
+
+        result = fix_bits_per_component(pdf)
+
+        assert result["invalid_bpc_fixed"] == 1
+        assert int(image[Name.BitsPerComponent]) == 8
+
+    def test_invalid_bpc_through_1200_image_masks_is_fixed(self, make_pdf_with_page):
+        """BPC repair follows image-mask graphs without Python recursion."""
+        pdf = make_pdf_with_page()
+        leaf = _make_image_xobject_with_bpc(pdf, 12)
+        outer = leaf
+        for _ in range(1200):
+            parent = _make_image_xobject_with_bpc(pdf, 8)
+            parent[Name.SMask] = outer
+            outer = parent
+        del outer[Name.BitsPerComponent]
+        pdf.pages[0]["/Resources"] = Dictionary(XObject=Dictionary(Outer=outer))
+
+        result = fix_bits_per_component(pdf)
+
+        assert result["invalid_bpc_fixed"] == 1
+        assert int(leaf[Name.BitsPerComponent]) == 8
 
     def test_invalid_bpc_in_ap_stream(self, make_pdf_with_page):
         """Invalid BPC in annotation AP stream is fixed."""
@@ -857,3 +1002,50 @@ class TestBpcReencoding:
         img = pdf.pages[0].Resources.XObject["/Im0"]
         data = img.read_bytes()
         assert len(data) == 4 * 3 * 1  # W * H * 1 component (DeviceGray)
+
+
+class TestDeepResourceGraphTraversal:
+    """Tests XObject sanitizers across non-XObject resource edges."""
+
+    def test_1200_nested_soft_masks_reach_leaf_xobjects(self, make_pdf_with_page):
+        """Forbidden-XObject and BPC repair traverse deep soft-mask groups."""
+        pdf = make_pdf_with_page()
+        forbidden = pdf.make_stream(b"% PS")
+        forbidden[Name.Type] = Name.XObject
+        forbidden[Name.Subtype] = Name("/PS")
+        image = _make_image_xobject_with_bpc(pdf, 12)
+        nested = _make_form_xobject(
+            pdf,
+            Dictionary(
+                XObject=Dictionary(
+                    Forbidden=forbidden,
+                    Image=image,
+                )
+            ),
+        )
+
+        for _ in range(1200):
+            nested = _make_form_xobject(
+                pdf,
+                Dictionary(
+                    ExtGState=Dictionary(
+                        GS=Dictionary(
+                            Type=Name.ExtGState,
+                            SMask=Dictionary(S=Name.Luminosity, G=nested),
+                        )
+                    )
+                ),
+            )
+
+        pdf.pages[0]["/Resources"] = Dictionary(
+            ExtGState=Dictionary(
+                GS=Dictionary(
+                    Type=Name.ExtGState,
+                    SMask=Dictionary(S=Name.Luminosity, G=nested),
+                )
+            )
+        )
+
+        assert remove_forbidden_xobjects(pdf) == 1
+        assert fix_bits_per_component(pdf)["invalid_bpc_fixed"] == 1
+        assert int(image[Name.BitsPerComponent]) == 8

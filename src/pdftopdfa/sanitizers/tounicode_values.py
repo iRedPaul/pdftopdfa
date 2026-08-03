@@ -9,27 +9,32 @@ and Unicode surrogate code points (U+D800–U+DFFF) in ToUnicode CMap
 mappings. This sanitizer detects and replaces these values in
 pre-existing ToUnicode streams with Private Use Area codepoints.
 
-For PDF/A-2u and PDF/A-3u (Unicode levels), every glyph used in content
-streams must be mappable to Unicode via the ToUnicode CMap. The
-``fill_tounicode_gaps`` function ensures complete coverage by adding
-PUA codepoints for any character codes that appear in content streams
-but are missing from the font's ToUnicode CMap.
+For PDF/A-2u, PDF/A-3u, PDF/A-2a, and PDF/A-3a, every glyph used in
+content streams must be mappable to Unicode via the ToUnicode CMap.
+The ``fill_tounicode_gaps`` function ensures complete coverage by adding
+semantic mappings for known UTF-16/UCS-2 CMaps and PUA codepoints for
+otherwise unresolvable character codes.
 """
 
 import logging
 import re
+from collections.abc import Iterator
 
 import pikepdf
 from pikepdf import Pdf, Stream
 
-from ..fonts.analysis import get_font_type
+from ..fonts.constants import UTF16_ENCODING_NAMES
+from ..fonts.glyph_usage import (
+    _iter_content_streams_with_resources,
+    _resolve_font_object,
+)
 from ..fonts.tounicode import (
     _is_invalid_unicode,
-    generate_cidfont_tounicode_cmap,
-    generate_tounicode_cmap_data,
-    parse_tounicode_cmap,
+    get_font_code_space_ranges,
+    parse_tounicode_cmap_sequences,
+    split_cmap_codes,
 )
-from ..fonts.traversal import iter_all_page_fonts
+from ..fonts.utils import get_encoding_name
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
@@ -55,8 +60,13 @@ def _sanitize_tounicode_cmap(cmap_data: bytes) -> bytes:
     except UnicodeDecodeError:
         return cmap_data
 
-    parsed = parse_tounicode_cmap(cmap_data)
-    used_pua = {value for value in parsed.values() if 0xE000 <= value <= 0xF8FF}
+    parsed = parse_tounicode_cmap_sequences(cmap_data)
+    used_pua = {
+        value
+        for values in parsed.values()
+        for value in values
+        if 0xE000 <= value <= 0xF8FF
+    }
     next_pua = 0xE000
 
     def sanitize_destination(hex_value: str) -> str:
@@ -155,52 +165,51 @@ def sanitize_tounicode_values(pdf: Pdf) -> dict[str, int]:
     total_fixed = 0
     processed: set[tuple[int, int]] = set()
 
-    for page in pdf.pages:
-        for _font_key, font_obj in iter_all_page_fonts(page):
-            try:
-                obj_key = font_obj.objgen
-                if obj_key != (0, 0):
-                    if obj_key in processed:
-                        continue
-                    processed.add(obj_key)
-
-                tounicode = font_obj.get("/ToUnicode")
-                if tounicode is None:
+    for _font_key, font_obj in _iter_fonts_from_effective_resources(pdf):
+        try:
+            objgen = font_obj.objgen
+            if objgen != (0, 0):
+                if objgen in processed:
                     continue
+                processed.add(objgen)
 
-                tounicode = _resolve(tounicode)
-                if not isinstance(tounicode, Stream):
-                    continue
-
-                # Parse existing CMap
-                try:
-                    cmap_data = bytes(tounicode.read_bytes())
-                except Exception:
-                    continue
-
-                new_cmap = _sanitize_tounicode_cmap(cmap_data)
-                if new_cmap == cmap_data:
-                    continue
-
-                # Replace the ToUnicode stream
-                new_stream = Stream(pdf, new_cmap)
-                font_obj[pikepdf.Name.ToUnicode] = pdf.make_indirect(new_stream)
-
-                total_fixed += 1
-                logger.debug(
-                    "Fixed invalid Unicode values in ToUnicode for font %s",
-                    _font_key,
-                )
-
-            except Exception as e:
-                log_suppressed_error(
-                    logger,
-                    e,
-                    "Error fixing ToUnicode values for font %s: %s",
-                    _font_key,
-                    e,
-                )
+            tounicode = font_obj.get("/ToUnicode")
+            if tounicode is None:
                 continue
+
+            tounicode = _resolve(tounicode)
+            if not isinstance(tounicode, Stream):
+                continue
+
+            # Parse existing CMap
+            try:
+                cmap_data = bytes(tounicode.read_bytes())
+            except Exception:
+                continue
+
+            new_cmap = _sanitize_tounicode_cmap(cmap_data)
+            if new_cmap == cmap_data:
+                continue
+
+            # Replace the ToUnicode stream
+            new_stream = Stream(pdf, new_cmap)
+            font_obj[pikepdf.Name.ToUnicode] = pdf.make_indirect(new_stream)
+
+            total_fixed += 1
+            logger.debug(
+                "Fixed invalid Unicode values in ToUnicode for font %s",
+                _font_key,
+            )
+
+        except Exception as e:
+            log_suppressed_error(
+                logger,
+                e,
+                "Error fixing ToUnicode values for font %s: %s",
+                _font_key,
+                e,
+            )
+            continue
 
     if total_fixed > 0:
         logger.info("ToUnicode values: %d font(s) fixed", total_fixed)
@@ -208,14 +217,37 @@ def sanitize_tounicode_values(pdf: Pdf) -> dict[str, int]:
     return {"tounicode_values_fixed": total_fixed}
 
 
+def _iter_fonts_from_effective_resources(
+    pdf: Pdf,
+) -> Iterator[tuple[str, pikepdf.Object]]:
+    """Yield fonts from every resource context reached by content traversal."""
+    for page in pdf.pages:
+        for _owner, resources in _iter_content_streams_with_resources(page):
+            resources = _resolve(resources)
+            if not isinstance(resources, pikepdf.Dictionary):
+                continue
+            font_dict = _resolve(resources.get("/Font"))
+            if not isinstance(font_dict, pikepdf.Dictionary):
+                continue
+            for font_key in list(font_dict.keys()):
+                try:
+                    font = _resolve(font_dict[font_key])
+                except Exception:
+                    continue
+                if isinstance(font, pikepdf.Dictionary):
+                    yield str(font_key), font
+
+
 def fill_tounicode_gaps(pdf: Pdf) -> dict[str, int]:
     """Fills gaps in ToUnicode CMaps for character codes used in content streams.
 
-    For PDF/A-2u and PDF/A-3u compliance (veraPDF rule 6.2.11.7.2), every
-    glyph used in a content stream must be mappable to Unicode. This function
-    parses all content streams to discover which character codes are actually
-    used per font, then checks the existing ToUnicode CMap for gaps. Any
-    unmapped codes are assigned Private Use Area (PUA) codepoints.
+    For PDF/A Unicode and level A compliance (veraPDF rule 6.2.11.7.2),
+    every glyph used in a content stream must be mappable to Unicode. This
+    function parses all content streams to discover which character codes are
+    actually used per font, then checks the existing ToUnicode CMap for gaps.
+    Codes from known UTF-16/UCS-2 CMaps retain their inherent Unicode
+    semantics; otherwise unmapped codes receive Private Use Area (PUA)
+    codepoints.
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
@@ -224,44 +256,8 @@ def fill_tounicode_gaps(pdf: Pdf) -> dict[str, int]:
         Dictionary with ``{"tounicode_gaps_filled": N}``.
     """
     total_filled = 0
+    font_used_codes, font_objs = _collect_used_codes(pdf)
 
-    # Phase 1: Collect used character codes per font (by objgen)
-    # Indirect fonts use objgen as key; direct fonts (rare) use
-    # a stable key derived from BaseFont + FirstChar + LastChar so
-    # the same direct font on different pages is consolidated.
-    font_used_codes: dict[tuple[int, int], set[int]] = {}
-    font_objs: dict[tuple[int, int], pikepdf.Object] = {}
-    direct_font_keys: dict[str, tuple[int, int]] = {}
-    _next_direct_id = -1
-
-    for page in pdf.pages:
-        page_font_map = _build_page_font_map(page)
-        if not page_font_map:
-            continue
-
-        used = _extract_used_codes_from_page(page, page_font_map)
-
-        for font_key, codes in used.items():
-            font_obj = page_font_map[font_key]
-            obj_key = font_obj.objgen
-            if obj_key == (0, 0):
-                # Direct object — derive a stable key from font properties
-                bf = font_obj.get("/BaseFont")
-                fc = font_obj.get("/FirstChar")
-                lc = font_obj.get("/LastChar")
-                stable_key = f"{bf}:{fc}:{lc}"
-                if stable_key in direct_font_keys:
-                    obj_key = direct_font_keys[stable_key]
-                else:
-                    obj_key = (_next_direct_id, 0)
-                    _next_direct_id -= 1
-                    direct_font_keys[stable_key] = obj_key
-            if obj_key not in font_used_codes:
-                font_used_codes[obj_key] = set()
-                font_objs[obj_key] = font_obj
-            font_used_codes[obj_key].update(codes)
-
-    # Phase 2: For each font with used codes, check ToUnicode gaps
     for obj_key, used_codes in font_used_codes.items():
         font_obj = font_objs[obj_key]
 
@@ -275,35 +271,45 @@ def fill_tounicode_gaps(pdf: Pdf) -> dict[str, int]:
                 continue
 
             cmap_data = bytes(tounicode.read_bytes())
-            code_to_unicode = parse_tounicode_cmap(cmap_data)
+            code_to_unicode = parse_tounicode_cmap_sequences(cmap_data)
 
             # Find codes used in content but missing from ToUnicode
             missing_codes = used_codes - set(code_to_unicode.keys())
             if not missing_codes:
                 continue
 
-            # Assign PUA codepoints to missing codes
+            # Preserve the inherent Unicode semantics of UTF-16/UCS-2 CMaps.
+            # Only codes whose meaning cannot be derived receive PUA values.
             existing_pua = {
-                v for v in code_to_unicode.values() if 0xE000 <= v <= 0xF8FF
+                value
+                for values in code_to_unicode.values()
+                for value in values
+                if 0xE000 <= value <= 0xF8FF
             }
             next_pua = 0xE000
+            additions: dict[bytes, int] = {}
             for code in sorted(missing_codes):
+                unicode_value = _unicode_cmap_identity(font_obj, code)
+                if unicode_value is not None:
+                    additions[code] = unicode_value
+                    if 0xE000 <= unicode_value <= 0xF8FF:
+                        existing_pua.add(unicode_value)
+                    continue
                 while next_pua in existing_pua and next_pua <= 0xF8FF:
                     next_pua += 1
                 if next_pua <= 0xF8FF:
-                    code_to_unicode[code] = next_pua
+                    additions[code] = next_pua
                     existing_pua.add(next_pua)
                     next_pua += 1
                 else:
                     # BMP PUA exhausted, skip remaining
                     break
 
-            # Regenerate CMap based on font type
-            font_type = get_font_type(font_obj)
-            if font_type == "CIDFont":
-                new_cmap = generate_cidfont_tounicode_cmap(code_to_unicode)
-            else:
-                new_cmap = generate_tounicode_cmap_data(code_to_unicode)
+            if not additions:
+                continue
+            new_cmap = _append_tounicode_mappings(cmap_data, additions)
+            if new_cmap is None:
+                continue
 
             new_stream = Stream(pdf, new_cmap)
             font_obj[pikepdf.Name.ToUnicode] = pdf.make_indirect(new_stream)
@@ -311,13 +317,17 @@ def fill_tounicode_gaps(pdf: Pdf) -> dict[str, int]:
             total_filled += 1
             base_font = font_obj.get("/BaseFont")
             font_label = str(base_font) if base_font is not None else str(obj_key)
-            logger.warning(
-                "PDF/A 'u' level: font %s has %d character codes mapped to "
-                "PUA codepoints (U+E000-U+F8FF) — text extraction will not "
-                "produce meaningful Unicode for these characters",
-                font_label,
-                len(missing_codes),
+            pua_additions = sum(
+                0xE000 <= value <= 0xF8FF for value in additions.values()
             )
+            if pua_additions:
+                logger.warning(
+                    "PDF/A Unicode/level A: font %s has %d character codes mapped to "
+                    "PUA codepoints (U+E000-U+F8FF) — text extraction will not "
+                    "produce meaningful Unicode for these characters",
+                    font_label,
+                    pua_additions,
+                )
 
         except Exception as e:
             log_suppressed_error(
@@ -331,124 +341,161 @@ def fill_tounicode_gaps(pdf: Pdf) -> dict[str, int]:
 
     if total_filled > 0:
         logger.info(
-            "ToUnicode gaps: %d font(s) patched with PUA mappings",
+            "ToUnicode gaps: %d font(s) patched with ToUnicode mappings",
             total_filled,
         )
 
     return {"tounicode_gaps_filled": total_filled}
 
 
-def _build_page_font_map(
-    page: pikepdf.Object,
-) -> dict[str, pikepdf.Object]:
-    """Builds a mapping from font resource keys to font objects for a page.
-
-    Args:
-        page: A pikepdf Page object.
-
-    Returns:
-        Dictionary mapping font keys (e.g. "/F0") to resolved font objects.
-    """
-    result: dict[str, pikepdf.Object] = {}
-
-    for font_key, font_obj in iter_all_page_fonts(page):
-        result[font_key] = font_obj
-
-    return result
-
-
-def _extract_used_codes_from_page(
-    page: pikepdf.Object,
-    font_map: dict[str, pikepdf.Object],
-) -> dict[str, set[int]]:
-    """Extracts used character codes from a page's content stream.
-
-    Parses the content stream to track the current font (via Tf) and
-    extract character codes from text-showing operators (Tj, TJ, ', ").
-
-    Args:
-        page: A pikepdf Page object.
-        font_map: Mapping from font keys to font objects.
-
-    Returns:
-        Dictionary mapping font keys to sets of used character codes.
-    """
-    used: dict[str, set[int]] = {}
-
+def _unicode_cmap_identity(font_obj: pikepdf.Object, code: bytes) -> int | None:
+    """Decode a character code whose predefined CMap defines Unicode semantics."""
+    encoding = _resolve(font_obj.get("/Encoding"))
+    if encoding is None or get_encoding_name(encoding) not in UTF16_ENCODING_NAMES:
+        return None
     try:
-        instructions = pikepdf.parse_content_stream(page)
-    except Exception:
-        return used
+        text = code.decode("utf-16-be")
+    except UnicodeDecodeError:
+        return None
+    if len(text) != 1:
+        return None
+    value = ord(text)
+    return None if _is_invalid_unicode(value) else value
 
-    current_font_key: str | None = None
 
-    for item in instructions:
-        if isinstance(item, pikepdf.ContentStreamInlineImage):
-            continue
+def _append_tounicode_mappings(
+    cmap_data: bytes,
+    additions: dict[bytes, int],
+) -> bytes | None:
+    """Insert new bfchar entries while preserving every existing mapping."""
+    if not additions:
+        return cmap_data
+    matches = list(re.finditer(rb"\bendcmap\b", cmap_data))
+    if not matches:
+        return None
 
-        operands, operator = item.operands, item.operator
-        op_str = str(operator)
+    blocks: list[bytes] = []
+    ordered = sorted(additions.items())
+    for offset in range(0, len(ordered), 100):
+        chunk = ordered[offset : offset + 100]
+        lines = [f"{len(chunk)} beginbfchar".encode("ascii")]
+        lines.extend(
+            (
+                f"<{code.hex().upper()}> "
+                f"<{chr(value).encode('utf-16-be').hex().upper()}>"
+            ).encode("ascii")
+            for code, value in chunk
+        )
+        lines.append(b"endbfchar")
+        blocks.append(b"\n".join(lines))
+    insertion = b"\n" + b"\n".join(blocks) + b"\n"
+    position = matches[-1].start()
+    return cmap_data[:position] + insertion + cmap_data[position:]
 
-        # Track font changes via Tf operator
-        if op_str == "Tf" and len(operands) >= 1:
+
+def _collect_used_codes(
+    pdf: Pdf,
+) -> tuple[
+    dict[tuple[int, int], set[bytes]],
+    dict[tuple[int, int], pikepdf.Object],
+]:
+    """Collect width-preserving character codes from every rendered text stream."""
+    usage: dict[tuple[int, int], set[bytes]] = {}
+    fonts: dict[tuple[int, int], pikepdf.Object] = {}
+    ranges_by_font: dict[tuple[int, int], tuple[tuple[bytes, bytes], ...]] = {}
+    next_direct_id = -1
+
+    def font_key(font: pikepdf.Object) -> tuple[int, int]:
+        nonlocal next_direct_id
+        key = font.objgen
+        if key != (0, 0):
+            return key
+        key = (next_direct_id, 0)
+        next_direct_id -= 1
+        return key
+
+    def code_ranges(
+        font: pikepdf.Object,
+        key: tuple[int, int],
+    ) -> tuple[tuple[bytes, bytes], ...]:
+        cached = ranges_by_font.get(key)
+        if cached is not None:
+            return cached
+        tounicode_data = None
+        tounicode = _resolve(font.get("/ToUnicode"))
+        if isinstance(tounicode, Stream):
             try:
-                current_font_key = str(operands[0])
+                tounicode_data = bytes(tounicode.read_bytes())
             except Exception:
-                current_font_key = None
-            continue
+                pass
+        ranges = get_font_code_space_ranges(font, tounicode_data)
+        ranges_by_font[key] = ranges
+        return ranges
 
-        if current_font_key is None or current_font_key not in font_map:
-            continue
+    for page in pdf.pages:
+        for owner, resources in _iter_content_streams_with_resources(page):
+            try:
+                instructions = pikepdf.parse_content_stream(owner)
+            except Exception:
+                continue
 
-        font_obj = font_map[current_font_key]
-        is_cidfont = get_font_type(font_obj) == "CIDFont"
+            current: (
+                tuple[
+                    pikepdf.Object,
+                    tuple[int, int],
+                    tuple[tuple[bytes, bytes], ...],
+                ]
+                | None
+            ) = None
+            stack: list[
+                tuple[
+                    pikepdf.Object,
+                    tuple[int, int],
+                    tuple[tuple[bytes, bytes], ...],
+                ]
+                | None
+            ] = []
+            for item in instructions:
+                if isinstance(item, pikepdf.ContentStreamInlineImage):
+                    continue
+                operands, operator = item.operands, str(item.operator)
+                if operator == "q":
+                    stack.append(current)
+                    continue
+                if operator == "Q":
+                    current = stack.pop() if stack else None
+                    continue
+                if operator == "Tf":
+                    current = None
+                    if operands:
+                        font = _resolve_font_object(str(operands[0]), resources)
+                        if font is not None:
+                            key = font_key(font)
+                            fonts.setdefault(key, font)
+                            current = (font, key, code_ranges(font, key))
+                    continue
+                if current is None:
+                    continue
 
-        # Single-string text operators: Tj, ', "
-        if op_str in _TEXT_OPERATORS:
-            for operand in operands:
-                if isinstance(operand, pikepdf.String):
-                    codes = _extract_codes_from_string(bytes(operand), is_cidfont)
+                strings: list[pikepdf.String] = []
+                if operator == _TJ_OPERATOR:
+                    if operands and isinstance(operands[0], pikepdf.Array):
+                        strings.extend(
+                            value
+                            for value in operands[0]
+                            if isinstance(value, pikepdf.String)
+                        )
+                elif operator == '"':
+                    if len(operands) >= 3 and isinstance(operands[2], pikepdf.String):
+                        strings.append(operands[2])
+                elif operator in {"Tj", "'"}:
+                    if operands and isinstance(operands[0], pikepdf.String):
+                        strings.append(operands[0])
+
+                _font, key, ranges = current
+                for string in strings:
+                    codes = split_cmap_codes(bytes(string), ranges)
                     if codes:
-                        if current_font_key not in used:
-                            used[current_font_key] = set()
-                        used[current_font_key].update(codes)
+                        usage.setdefault(key, set()).update(codes)
 
-        # TJ operator: array of strings and adjustments
-        elif op_str == _TJ_OPERATOR:
-            for operand in operands:
-                if isinstance(operand, pikepdf.Array):
-                    for item_val in operand:
-                        if isinstance(item_val, pikepdf.String):
-                            codes = _extract_codes_from_string(
-                                bytes(item_val), is_cidfont
-                            )
-                            if codes:
-                                if current_font_key not in used:
-                                    used[current_font_key] = set()
-                                used[current_font_key].update(codes)
-
-    return used
-
-
-def _extract_codes_from_string(raw: bytes, is_cidfont: bool) -> list[int]:
-    """Extracts character codes from a raw PDF string.
-
-    For CIDFonts (Type0), codes are 2-byte big-endian values.
-    For simple fonts (Type1, TrueType, Type3), codes are 1-byte values.
-
-    Args:
-        raw: Raw bytes from a pikepdf.String.
-        is_cidfont: True if the font is a CIDFont (2-byte codes).
-
-    Returns:
-        List of character codes.
-    """
-    codes: list[int] = []
-    if is_cidfont:
-        for i in range(0, len(raw) - 1, 2):
-            code = (raw[i] << 8) | raw[i + 1]
-            codes.append(code)
-    else:
-        for b in raw:
-            codes.append(b)
-    return codes
+    return usage, fonts

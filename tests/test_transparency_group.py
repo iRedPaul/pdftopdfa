@@ -223,6 +223,120 @@ class TestTransparencyGroupNested:
         assert isinstance(cs, Array)
         assert cs[0] == Name.ICCBased
 
+    def test_1200_nested_forms_are_detected_and_fixed_iteratively(self):
+        """Deep Form chains neither crash detection nor group-CS repair."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+        nested = _make_form_with_transparency_group(pdf, Name.DeviceCMYK)
+
+        for _ in range(1200):
+            parent = pdf.make_stream(b"/Nested Do")
+            parent[Name.Type] = Name.XObject
+            parent[Name.Subtype] = Name.Form
+            parent[Name.BBox] = Array([0, 0, 100, 100])
+            parent[Name.Resources] = Dictionary(XObject=Dictionary(Nested=nested))
+            nested = parent
+
+        _add_page_with_form(pdf, nested)
+
+        assert _add_missing_transparency_groups(pdf, icc_cache) == 1
+        assert _fix_transparency_group_colorspaces(pdf, icc_cache) == 1
+        colorspace = next(
+            form[Name.Group][Name.CS]
+            for form in pdf.objects
+            if isinstance(form, Stream)
+            and form.get(Name.Subtype) == Name.Form
+            and form.get(Name.Group) is not None
+        )
+        assert colorspace[0] == Name.ICCBased
+
+    def test_1200_nested_soft_mask_groups_are_fixed_iteratively(self):
+        """Group-CS repair reaches Forms through deeply nested soft masks."""
+        pdf = new_pdf()
+        icc_cache: dict = {}
+        nested = _make_form_with_transparency_group(pdf, Name.DeviceRGB)
+
+        for _ in range(1200):
+            parent = pdf.make_stream(b"/GS gs")
+            parent[Name.Type] = Name.XObject
+            parent[Name.Subtype] = Name.Form
+            parent[Name.BBox] = Array([0, 0, 100, 100])
+            parent[Name.Resources] = Dictionary(
+                ExtGState=Dictionary(
+                    GS=Dictionary(
+                        Type=Name.ExtGState,
+                        SMask=Dictionary(S=Name.Luminosity, G=nested),
+                    )
+                )
+            )
+            nested = parent
+
+        page = pdf.add_blank_page(page_size=(100, 100))
+        page.obj[Name.Resources] = Dictionary(
+            ExtGState=Dictionary(
+                GS=Dictionary(
+                    Type=Name.ExtGState,
+                    SMask=Dictionary(S=Name.Luminosity, G=nested),
+                )
+            )
+        )
+
+        assert _fix_transparency_group_colorspaces(pdf, icc_cache) == 1
+        target = next(
+            form
+            for form in pdf.objects
+            if isinstance(form, Stream) and form.get(Name.Group) is not None
+        )
+        assert target[Name.Group][Name.CS][0] == Name.ICCBased
+
+    def test_1200_alternating_resource_owners_detect_transparency_and_cmyk(self):
+        """Forms, patterns, and Type3 resources share one iterative graph."""
+        pdf = new_pdf()
+        leaf = pdf.make_stream(b"0 0 0 1 k")
+        leaf[Name.Type] = Name.XObject
+        leaf[Name.Subtype] = Name.Form
+        leaf[Name.BBox] = Array([0, 0, 1, 1])
+        leaf[Name.Resources] = Dictionary(
+            ExtGState=Dictionary(GS=Dictionary(Type=Name.ExtGState, ca=0.5))
+        )
+        resources = Dictionary(XObject=Dictionary(Node=leaf))
+
+        for depth in range(1200):
+            if depth % 3 == 0:
+                owner = pdf.make_stream(b"/Node Do")
+                owner[Name.Type] = Name.XObject
+                owner[Name.Subtype] = Name.Form
+                owner[Name.BBox] = Array([0, 0, 1, 1])
+                owner[Name.Resources] = resources
+                resources = Dictionary(XObject=Dictionary(Node=owner))
+            elif depth % 3 == 1:
+                owner = pdf.make_stream(b"")
+                owner[Name.Type] = Name.Pattern
+                owner[Name.PatternType] = 1
+                owner[Name.PaintType] = 1
+                owner[Name.TilingType] = 1
+                owner[Name.BBox] = Array([0, 0, 1, 1])
+                owner[Name.XStep] = 1
+                owner[Name.YStep] = 1
+                owner[Name.Resources] = resources
+                resources = Dictionary(Pattern=Dictionary(Node=owner))
+            else:
+                owner = pdf.make_indirect(
+                    Dictionary(
+                        Type=Name.Font,
+                        Subtype=Name.Type3,
+                        Resources=resources,
+                    )
+                )
+                resources = Dictionary(Font=Dictionary(Node=owner))
+
+        page = pdf.add_blank_page(page_size=(10, 10))
+        page.obj[Name.Resources] = resources
+
+        assert _add_missing_transparency_groups(pdf, {}) == 1
+        assert page.obj[Name.Group][Name.CS][0] == Name.ICCBased
+        assert int(page.obj[Name.Group][Name.CS][1][Name.N]) == 4
+
     def test_cycle_detection(self):
         """Cycle in Form XObject references does not cause infinite loop."""
         pdf = new_pdf()
@@ -501,8 +615,8 @@ class TestTransparencyGroupIntegration:
         assert isinstance(cs, Array)
         assert cs[0] == Name.ICCBased
 
-    def test_image_and_transparency_group_both_fixed(self):
-        """Image and transparency group in same form are both handled."""
+    def test_image_uses_default_and_transparency_group_is_fixed(self):
+        """Images use Defaults while transparency groups use explicit ICCBased."""
         pdf = new_pdf()
 
         # Form XObject with transparency group
@@ -542,10 +656,10 @@ class TestTransparencyGroupIntegration:
         assert isinstance(cs, Array)
         assert cs[0] == Name.ICCBased
 
-        # Image should also be fixed (RGB is non-dominant when CMYK present)
-        img_cs = image[Name.ColorSpace]
-        assert isinstance(img_cs, Array)
-        assert img_cs[0] == Name.ICCBased
+        assert image[Name.ColorSpace] == Name.DeviceRGB
+        default_rgb = pdf.pages[0][Name.Resources][Name.ColorSpace][Name.DefaultRGB]
+        assert default_rgb[0] == Name.ICCBased
+        assert default_rgb[1][Name.N] == 3
 
 
 def _make_page_with_gs(pdf: Pdf, gs_dict: Dictionary) -> None:

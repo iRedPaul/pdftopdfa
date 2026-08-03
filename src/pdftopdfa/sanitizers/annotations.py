@@ -470,7 +470,7 @@ def fix_annotation_flags(pdf: Pdf, level: str = "3b") -> int:
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
-        level: PDF/A conformance level ('2b' or '3b').
+        level: PDF/A conformance level.
 
     Returns:
         Number of annotations fixed.
@@ -583,6 +583,130 @@ def _create_minimal_appearance_stream(pdf: Pdf, annot) -> object:
     return stream
 
 
+def _create_draft_stamp_appearance_stream(pdf: Pdf, annot) -> Stream:
+    """Create the visible default appearance of a ``/Stamp`` annotation."""
+    width = 0.0
+    height = 0.0
+    try:
+        rect = annot.get("/Rect")
+        if rect is not None and len(rect) == 4:
+            width = abs(float(rect[2]) - float(rect[0]))
+            height = abs(float(rect[3]) - float(rect[1]))
+    except Exception:
+        pass
+
+    if width <= 0 or height <= 0:
+        return _create_minimal_appearance_stream(pdf, annot)
+
+    glyph_programs = {
+        "A": (
+            b"650 0 0 0 600 700 d1 "
+            b"50 0 m 150 0 l 300 700 l 200 700 l h "
+            b"450 0 m 550 0 l 400 700 l 300 700 l h "
+            b"150 250 300 90 re f"
+        ),
+        "D": (
+            b"650 0 0 0 600 700 d1 "
+            b"50 0 m 50 700 l 300 700 l 550 700 550 0 300 0 c h "
+            b"150 100 m 300 100 l 450 100 450 600 300 600 c 150 600 l h f*"
+        ),
+        "F": (
+            b"650 0 0 0 600 700 d1 50 0 100 700 re "
+            b"150 600 400 100 re 150 300 300 100 re f"
+        ),
+        "R": (
+            b"650 0 0 0 600 700 d1 50 0 100 700 re "
+            b"150 600 300 100 re 150 300 300 100 re 450 300 100 400 re "
+            b"250 300 m 370 300 l 570 0 l 440 0 l h f"
+        ),
+        "T": b"650 0 0 0 600 700 d1 50 600 500 100 re 250 0 100 600 re f",
+    }
+    char_procs = Dictionary()
+    for glyph_name, program in glyph_programs.items():
+        char_procs[Name(f"/{glyph_name}")] = pdf.make_stream(program)
+
+    encoding = Dictionary(
+        Type=Name.Encoding,
+        Differences=Array([65, Name.A, 68, Name.D, 70, Name.F, 82, Name.R, 84, Name.T]),
+    )
+    to_unicode = pdf.make_stream(
+        b"/CIDInit /ProcSet findresource begin\n"
+        b"12 dict begin\n"
+        b"begincmap\n"
+        b"/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+        b"/CMapName /Adobe-Identity-UCS def\n"
+        b"/CMapType 2 def\n"
+        b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+        b"5 beginbfchar\n"
+        b"<41> <0041>\n<44> <0044>\n<46> <0046>\n"
+        b"<52> <0052>\n<54> <0054>\n"
+        b"endbfchar\n"
+        b"endcmap\n"
+        b"CMapName currentdict /CMap defineresource pop\n"
+        b"end\nend\n"
+    )
+    font = Dictionary(
+        Type=Name.Font,
+        Subtype=Name.Type3,
+        Name=Name("/DraftStampFont"),
+        FontBBox=Array([0, 0, 600, 700]),
+        FontMatrix=Array([0.001, 0, 0, 0.001, 0, 0]),
+        CharProcs=char_procs,
+        Encoding=encoding,
+        FirstChar=65,
+        LastChar=84,
+        Widths=Array([650] * 20),
+        Resources=Dictionary(),
+        PaintType=2,
+        ToUnicode=to_unicode,
+    )
+
+    box_height = min(height * 0.2, width / 4)
+    box_width = min(width, box_height * 4)
+    box_x = (width - box_width) / 2
+    box_y = (height - box_height) / 2
+    border_width = max(box_height * 0.04, 0.5)
+    font_size = box_height * 0.78
+    text_width = 5 * 0.65 * font_size
+    text_x = (width - text_width) / 2
+    text_y = box_y + (box_height - 0.7 * font_size) / 2
+    inset = border_width / 2
+    content = (
+        "q 0 G 0 g "
+        f"{_format_pdf_number(border_width)} w "
+        f"{_format_pdf_number(box_x + inset)} "
+        f"{_format_pdf_number(box_y + inset)} "
+        f"{_format_pdf_number(box_width - border_width)} "
+        f"{_format_pdf_number(box_height - border_width)} re S "
+        "BT /DraftFont "
+        f"{_format_pdf_number(font_size)} Tf "
+        f"{_format_pdf_number(text_x)} {_format_pdf_number(text_y)} Td "
+        "(DRAFT) Tj ET Q\n"
+    ).encode("ascii")
+
+    stream = pdf.make_stream(content)
+    stream[Name.Type] = Name.XObject
+    stream[Name.Subtype] = Name.Form
+    stream[Name.BBox] = Array([0, 0, width, height])
+    stream[Name.Resources] = Dictionary(
+        Font=Dictionary(DraftFont=pdf.make_indirect(font))
+    )
+    return stream
+
+
+def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
+    """Create a meaningful appearance when the source has no normal one."""
+    subtype = annot.get("/Subtype")
+    name = annot.get("/Name")
+    if (
+        subtype is not None
+        and str(subtype) == "/Stamp"
+        and (name is None or str(name) == "/Draft")
+    ):
+        return _create_draft_stamp_appearance_stream(pdf, annot)
+    return _create_minimal_appearance_stream(pdf, annot)
+
+
 def remove_needs_appearances(pdf: Pdf) -> bool:
     """Remove /NeedAppearances from /AcroForm.
 
@@ -653,7 +777,7 @@ def _fix_appearance_state_dict(
 
     # Not a Dictionary either — replace with minimal stream
     if not isinstance(n, Dictionary):
-        ap[Name.N] = _create_minimal_appearance_stream(pdf, annot)
+        ap[Name.N] = _create_missing_appearance_stream(pdf, annot)
         logger.debug("Replaced invalid /AP/N with minimal stream")
         return 1
 
@@ -672,7 +796,7 @@ def _fix_appearance_state_dict(
     if stream is not None:
         ap[Name.N] = stream
     else:
-        ap[Name.N] = _create_minimal_appearance_stream(pdf, annot)
+        ap[Name.N] = _create_missing_appearance_stream(pdf, annot)
 
     # Remove /AS since the appearance is no longer a state dict
     if annot.get("/AS") is not None:
@@ -773,7 +897,7 @@ def ensure_appearance_streams(pdf: Pdf, level: str = "3b") -> int:
                     if is_widget:
                         appearance = create_widget_appearance(pdf, resolved, acroform)
                     else:
-                        appearance = _create_minimal_appearance_stream(pdf, resolved)
+                        appearance = _create_missing_appearance_stream(pdf, resolved)
 
                     resolved[Name.AP] = Dictionary(N=appearance)
                     added_count += 1
@@ -789,7 +913,7 @@ def ensure_appearance_streams(pdf: Pdf, level: str = "3b") -> int:
                                 pdf, resolved, acroform
                             )
                         else:
-                            appearance = _create_minimal_appearance_stream(
+                            appearance = _create_missing_appearance_stream(
                                 pdf, resolved
                             )
                         ap[Name.N] = appearance

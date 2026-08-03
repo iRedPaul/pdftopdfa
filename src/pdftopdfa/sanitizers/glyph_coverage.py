@@ -21,8 +21,11 @@ import struct
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
-from ..fonts.glyph_usage import FontUsageCache, collect_font_usage
-from ..fonts.tounicode import parse_cidtogidmap_stream
+from ..fonts.glyph_usage import CharacterCode, FontUsageCache, collect_font_usage
+from ..fonts.tounicode import (
+    map_type0_character_codes_to_cids,
+    parse_cidtogidmap_stream,
+)
 from ..fonts.traversal import iter_all_page_fonts
 from ..fonts.utils import safe_str as _safe_str
 from ..utils import log_suppressed_error
@@ -135,7 +138,9 @@ def _get_font_file_key(font: pikepdf.Object) -> str | None:
 
 
 def _process_type0_font(
-    pdf: Pdf, type0_font: pikepdf.Object, used_codes: set[int]
+    pdf: Pdf,
+    type0_font: pikepdf.Object,
+    used_codes: set[CharacterCode],
 ) -> int:
     """Processes a Type0 (CID) font for glyph coverage.
 
@@ -154,6 +159,10 @@ def _process_type0_font(
     desc_font = _resolve(descendants[0])
     if not isinstance(desc_font, Dictionary):
         return 0
+    used_cids = map_type0_character_codes_to_cids(type0_font, used_codes)
+    if used_cids is None:
+        return 0
+    used_cids = {cid if 0 <= cid <= 65_535 else 0 for cid in used_cids}
 
     font_file_key = _get_font_file_key(desc_font)
     if font_file_key is None:
@@ -165,7 +174,7 @@ def _process_type0_font(
     cidfont_subtype = desc_font.get("/Subtype")
     if cidfont_subtype is not None and _safe_str(cidfont_subtype) == "/CIDFontType0":
         return _fix_missing_cids_in_cff(
-            pdf, desc_font, font_file_key, font_name, used_codes
+            pdf, desc_font, font_file_key, font_name, used_cids
         )
 
     # Determine CID-to-GID mapping
@@ -188,7 +197,7 @@ def _process_type0_font(
 
     # Map used character codes (CIDs) to GIDs
     referenced_gids: set[int] = set()
-    for code in used_codes:
+    for code in used_cids:
         if cid_to_gid is not None:
             gid = cid_to_gid.get(code)
             if gid is not None:
@@ -228,14 +237,23 @@ def _process_simple_font(pdf: Pdf, font: pikepdf.Object, used_codes: set[int]) -
 
     font_name = _get_font_name(font)
 
-    # Resolve encoding to get code -> glyph_name mapping
-    encoding = _resolve_encoding(font)
-    if not encoding:
-        return 0
-
     fd = _resolve(font.get("/FontDescriptor"))
     stream = _resolve(fd.get(font_file_key))
     font_data = bytes(stream.read_bytes())
+
+    subtype = _safe_str(font.get("/Subtype") or b"")
+    if subtype == "/TrueType":
+        from ..fonts.subsetter import _resolve_truetype_font_encoding
+
+        encoding = _resolve_truetype_font_encoding(
+            font,
+            font_data,
+            pdfa_normalized=True,
+        )
+    else:
+        encoding = _resolve_encoding(font)
+    if not encoding:
+        return 0
 
     from fontTools.ttLib import TTFont
 

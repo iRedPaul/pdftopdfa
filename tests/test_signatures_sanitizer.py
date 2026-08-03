@@ -252,9 +252,12 @@ class TestSanitizeSignaturesLogging:
         with caplog.at_level(logging.WARNING):
             sanitize_signatures(pdf)
 
+        messages = [record.message for record in caplog.records]
         assert any(
-            "digital signature dictionary" in r.message.lower() for r in caplog.records
+            "digital signature dictionary" in message.lower() for message in messages
         )
+        assert any("document processing" in message.lower() for message in messages)
+        assert not any("PDF/A" in message for message in messages)
 
     def test_no_warning_without_signatures(self, make_pdf_with_page, caplog):
         """No warning is emitted when no signatures are found."""
@@ -296,6 +299,20 @@ class TestCollectSignatureFields:
 
         result = _collect_signature_fields(Array([parent]))
         assert len(result) <= 2
+
+    def test_field_tree_beyond_python_recursion_limit(self, make_pdf_with_page):
+        """A signature is found at the leaf of an exceptionally deep field tree."""
+        pdf = make_pdf_with_page()
+        sig = _make_sig_dict(pdf)
+        field = _make_sig_field(pdf, sig)
+        expected_field = field
+        for _ in range(1200):
+            field = pdf.make_indirect(Dictionary(Kids=Array([field])))
+
+        result = _collect_signature_fields(Array([field]))
+        assert len(result) == 1
+        assert result[0][0].objgen == expected_field.objgen
+        assert result[0][1].objgen == sig.objgen
 
     def test_empty_fields(self):
         """Empty fields array returns empty list."""

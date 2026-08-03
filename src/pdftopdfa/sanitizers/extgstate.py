@@ -22,7 +22,6 @@ import logging
 
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
-from ..utils import iter_type3_fonts as _iter_type3_fonts
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 from .rendering_intent import VALID_RENDERING_INTENTS
@@ -80,55 +79,48 @@ def _is_iccbased_cmyk(cs) -> bool:
         return False
 
 
-def _colorspace_uses_iccbased_cmyk(cs, visited: set[tuple[int, int]]) -> bool:
+def _colorspace_uses_iccbased_cmyk(
+    cs,
+    visited: set[tuple[int, int] | int],
+) -> bool:
     """Return True if a color space tree contains ICCBased CMYK."""
-    cs = _resolve_indirect(cs)
+    stack = [cs]
+    while stack:
+        cs = _resolve_indirect(stack.pop())
+        objgen = getattr(cs, "objgen", (0, 0))
+        if objgen != (0, 0):
+            if objgen in visited:
+                continue
+            visited.add(objgen)
 
-    objgen = getattr(cs, "objgen", (0, 0))
-    if objgen != (0, 0):
-        if objgen in visited:
-            return False
-        visited.add(objgen)
-
-    if _is_iccbased_cmyk(cs):
-        return True
-
-    if not isinstance(cs, Array) or len(cs) == 0:
-        return False
-
-    cs_type = str(cs[0])
-
-    # [/Separation name alternate tint]
-    if cs_type == "/Separation" and len(cs) >= 3:
-        return _colorspace_uses_iccbased_cmyk(cs[2], visited)
-
-    # [/DeviceN [names] alternate tint attrs?]
-    if cs_type == "/DeviceN":
-        if len(cs) >= 3 and _colorspace_uses_iccbased_cmyk(cs[2], visited):
+        if _is_iccbased_cmyk(cs):
             return True
 
-        if len(cs) >= 5:
-            attrs = _resolve_indirect(cs[4])
-            if isinstance(attrs, Dictionary):
-                colorants = _resolve_indirect(attrs.get("/Colorants"))
-                if isinstance(colorants, Dictionary):
-                    for cname in list(colorants.keys()):
-                        if _colorspace_uses_iccbased_cmyk(colorants[cname], visited):
-                            return True
-        return False
+        if not isinstance(cs, Array) or len(cs) == 0:
+            continue
 
-    # [/Indexed base hival lookup]
-    if cs_type == "/Indexed" and len(cs) >= 2:
-        return _colorspace_uses_iccbased_cmyk(cs[1], visited)
-
-    # [/Pattern underlying]
-    if cs_type == "/Pattern" and len(cs) >= 2:
-        return _colorspace_uses_iccbased_cmyk(cs[1], visited)
+        cs_type = str(cs[0])
+        if cs_type == "/Separation" and len(cs) >= 3:
+            stack.append(cs[2])
+        elif cs_type == "/DeviceN":
+            if len(cs) >= 3:
+                stack.append(cs[2])
+            if len(cs) >= 5:
+                attrs = _resolve_indirect(cs[4])
+                if isinstance(attrs, Dictionary):
+                    colorants = _resolve_indirect(attrs.get("/Colorants"))
+                    if isinstance(colorants, Dictionary):
+                        stack.extend(colorants.values())
+        elif cs_type in {"/Indexed", "/Pattern"} and len(cs) >= 2:
+            stack.append(cs[1])
 
     return False
 
 
-def _resources_use_iccbased_cmyk(resources, visited: set[tuple[int, int]]) -> bool:
+def _resources_use_iccbased_cmyk(
+    resources,
+    visited: set[tuple[int, int] | int],
+) -> bool:
     """Return True if Resources contain ICCBased CMYK anywhere relevant."""
     resources = _resolve_indirect(resources)
     if not isinstance(resources, Dictionary):
@@ -160,138 +152,50 @@ def _resources_use_iccbased_cmyk(resources, visited: set[tuple[int, int]]) -> bo
     return False
 
 
-def _form_xobjects_use_iccbased_cmyk(
-    resources, visited_forms: set[tuple[int, int]], visited_cs: set[tuple[int, int]]
-) -> bool:
-    """Return True if nested Form XObjects use ICCBased CMYK."""
-    resources = _resolve_indirect(resources)
-    if not isinstance(resources, Dictionary):
-        return False
+def _iter_resource_dictionaries(pdf: Pdf):
+    """Yield every reachable Resources dictionary without recursive descent."""
+    yielded: set[tuple[int, int]] = set()
+    visited: set[tuple[int, int]] = set()
+    stack = [pdf.Root]
+    stack.extend(pdf.objects)
 
-    xobjects = _resolve_indirect(resources.get("/XObject"))
-    if not isinstance(xobjects, Dictionary):
-        return False
+    acroform = _resolve_indirect(pdf.Root.get("/AcroForm"))
+    if isinstance(acroform, Dictionary):
+        default_resources = _resolve_indirect(acroform.get("/DR"))
+        if isinstance(default_resources, Dictionary):
+            key = default_resources.objgen
+            if key != (0, 0):
+                yielded.add(key)
+            yield default_resources
 
-    for xobj_name in list(xobjects.keys()):
-        xobj = _resolve_indirect(xobjects[xobj_name])
-        if not isinstance(xobj, Stream):
-            continue
-
-        subtype = xobj.get("/Subtype")
-        if subtype is None or str(subtype) != "/Form":
-            continue
-
-        objgen = xobj.objgen
+    while stack:
+        obj = _resolve_indirect(stack.pop())
+        objgen = getattr(obj, "objgen", (0, 0))
         if objgen != (0, 0):
-            if objgen in visited_forms:
+            if objgen in visited:
                 continue
-            visited_forms.add(objgen)
+            visited.add(objgen)
 
-        form_resources = xobj.get("/Resources")
-        if not form_resources:
-            continue
-
-        form_resources = _resolve_indirect(form_resources)
-        if _resources_use_iccbased_cmyk(form_resources, visited_cs):
-            return True
-        if _form_xobjects_use_iccbased_cmyk(form_resources, visited_forms, visited_cs):
-            return True
-
-    return False
-
-
-def _ap_entry_uses_iccbased_cmyk(
-    ap_entry, visited_forms: set[tuple[int, int]], visited_cs: set[tuple[int, int]]
-) -> bool:
-    """Return True if an annotation AP entry uses ICCBased CMYK."""
-    ap_entry = _resolve_indirect(ap_entry)
-
-    if isinstance(ap_entry, Stream):
-        form_resources = ap_entry.get("/Resources")
-        if form_resources:
-            form_resources = _resolve_indirect(form_resources)
-            if _resources_use_iccbased_cmyk(form_resources, visited_cs):
-                return True
-            if _form_xobjects_use_iccbased_cmyk(
-                form_resources, visited_forms, visited_cs
-            ):
-                return True
-    elif isinstance(ap_entry, Dictionary):
-        for state_name in list(ap_entry.keys()):
-            state_stream = _resolve_indirect(ap_entry[state_name])
-            if not isinstance(state_stream, Stream):
-                continue
-            form_resources = state_stream.get("/Resources")
-            if not form_resources:
-                continue
-            form_resources = _resolve_indirect(form_resources)
-            if _resources_use_iccbased_cmyk(form_resources, visited_cs):
-                return True
-            if _form_xobjects_use_iccbased_cmyk(
-                form_resources, visited_forms, visited_cs
-            ):
-                return True
-
-    return False
-
-
-def _type3_fonts_use_iccbased_cmyk(
-    resources, visited_forms: set[tuple[int, int]], visited_cs: set[tuple[int, int]]
-) -> bool:
-    """Return True if any Type3 font resources use ICCBased CMYK."""
-    for _font_name, font in _iter_type3_fonts(resources, visited_forms):
-        font_resources = font.get("/Resources")
-        if font_resources is None:
-            continue
-
-        font_resources = _resolve_indirect(font_resources)
-        if not isinstance(font_resources, Dictionary):
-            continue
-
-        if _resources_use_iccbased_cmyk(font_resources, visited_cs):
-            return True
-        if _form_xobjects_use_iccbased_cmyk(font_resources, visited_forms, visited_cs):
-            return True
-
-    return False
+        if isinstance(obj, (Dictionary, Stream)):
+            resources = _resolve_indirect(obj.get("/Resources"))
+            if isinstance(resources, Dictionary):
+                resource_key = resources.objgen
+                if resource_key == (0, 0) or resource_key not in yielded:
+                    if resource_key != (0, 0):
+                        yielded.add(resource_key)
+                    yield resources
+            stack.extend(obj.values())
+        elif isinstance(obj, Array):
+            stack.extend(obj)
 
 
 def _pdf_uses_iccbased_cmyk(pdf: Pdf) -> bool:
     """Return True if the PDF uses ICCBased CMYK in relevant resources."""
-    visited_forms: set[tuple[int, int]] = set()
-    visited_cs: set[tuple[int, int]] = set()
-
-    for page in pdf.pages:
-        page_dict = _resolve_indirect(page.obj)
-
-        resources = page_dict.get("/Resources")
-        if resources:
-            resources = _resolve_indirect(resources)
-            if _resources_use_iccbased_cmyk(resources, visited_cs):
-                return True
-            if _form_xobjects_use_iccbased_cmyk(resources, visited_forms, visited_cs):
-                return True
-            if _type3_fonts_use_iccbased_cmyk(resources, visited_forms, visited_cs):
-                return True
-
-        annots = page_dict.get("/Annots")
-        if annots:
-            annots = _resolve_indirect(annots)
-            for annot in annots:
-                annot = _resolve_indirect(annot)
-                if not isinstance(annot, Dictionary):
-                    continue
-                ap = _resolve_indirect(annot.get("/AP"))
-                if not isinstance(ap, Dictionary):
-                    continue
-                for ap_key in ("/N", "/R", "/D"):
-                    ap_entry = ap.get(ap_key)
-                    if ap_entry and _ap_entry_uses_iccbased_cmyk(
-                        ap_entry, visited_forms, visited_cs
-                    ):
-                        return True
-
-    return False
+    visited_cs: set[tuple[int, int] | int] = set()
+    return any(
+        _resources_use_iccbased_cmyk(resources, visited_cs)
+        for resources in _iter_resource_dictionaries(pdf)
+    )
 
 
 def _overprint_enabled(gs_dict: Dictionary, key: str) -> bool:
@@ -301,6 +205,34 @@ def _overprint_enabled(gs_dict: Dictionary, key: str) -> bool:
         return val
     if isinstance(val, (int, float)):
         return bool(val)
+    return False
+
+
+def _pdf_enables_overprint(pdf: Pdf) -> bool:
+    """Return True when any reachable graphics state enables overprint."""
+    stack = [pdf.Root]
+    visited: set[tuple[int, int]] = set()
+
+    while stack:
+        try:
+            obj = _resolve_indirect(stack.pop())
+            objgen = getattr(obj, "objgen", (0, 0))
+            if objgen != (0, 0):
+                if objgen in visited:
+                    continue
+                visited.add(objgen)
+
+            if isinstance(obj, (Dictionary, Stream)):
+                if _overprint_enabled(obj, "/OP") or _overprint_enabled(obj, "/op"):
+                    return True
+                stack.extend(obj.values())
+            elif isinstance(obj, Array):
+                stack.extend(obj)
+        except Exception as exc:
+            log_suppressed_error(
+                logger, exc, "Error inspecting object for overprint: %s", exc
+            )
+
     return False
 
 
@@ -415,7 +347,7 @@ def _sanitize_halftone_dict(
     - /TransferFunction shall be used only as required by ISO 32000-1
     - /HalftoneName must not be present
 
-    For HalftoneType 5 (composite), recurses into all sub-halftone
+    For HalftoneType 5 (composite), walks all sub-halftone
     dictionary values including the required /Default entry. TransferFunction
     handling follows the colorant-specific rule used by veraPDF:
     - top-level and CMYK primary colorants: TransferFunction must be absent
@@ -434,76 +366,91 @@ def _sanitize_halftone_dict(
         the caller.
     """
     fixes = 0
+    pending = [(ht_dict, colorant_name, fallback_transfer_function)]
+    visited: set[tuple[tuple[int, int], str | None]] = set()
+    while pending:
+        current, current_colorant, current_fallback = pending.pop()
+        current = _resolve_indirect(current)
+        try:
+            objgen = current.objgen
+        except Exception:
+            objgen = (0, 0)
+        if objgen != (0, 0):
+            context_key = (objgen, current_colorant)
+            if context_key in visited:
+                continue
+            visited.add(context_key)
 
-    ht_type_obj = _resolve_indirect(ht_dict.get("/HalftoneType"))
-    try:
-        ht_type = int(ht_type_obj)
-    except Exception:
-        ht_type = None
+        ht_type_obj = _resolve_indirect(current.get("/HalftoneType"))
+        try:
+            ht_type = int(ht_type_obj)
+        except Exception:
+            ht_type = None
 
-    # PDF/A-2/-3 only allow halftone types 1 and 5.
-    if ht_type not in (1, 5):
-        logger.debug("Invalid HalftoneType %s in halftone dictionary", ht_type_obj)
-        return fixes, False
+        # PDF/A-2/-3 only allow halftone types 1 and 5.
+        if ht_type not in (1, 5):
+            logger.debug("Invalid HalftoneType %s in halftone dictionary", ht_type_obj)
+            return fixes, False
 
-    # TransferFunction usage is colorant dependent for Type 5 sub-halftones.
-    has_transfer_function = "/TransferFunction" in ht_dict
-    transfer_function_required = (
-        colorant_name is not None
-        and colorant_name != "Default"
-        and colorant_name not in PRIMARY_HALFTONE_COLORANTS
-    )
-    transfer_function_forbidden = (
-        colorant_name is None or colorant_name in PRIMARY_HALFTONE_COLORANTS
-    )
+        # TransferFunction usage is colorant dependent for Type 5 sub-halftones.
+        has_transfer_function = "/TransferFunction" in current
+        transfer_function_required = (
+            current_colorant is not None
+            and current_colorant != "Default"
+            and current_colorant not in PRIMARY_HALFTONE_COLORANTS
+        )
+        transfer_function_forbidden = (
+            current_colorant is None or current_colorant in PRIMARY_HALFTONE_COLORANTS
+        )
 
-    if transfer_function_forbidden and has_transfer_function:
-        del ht_dict["/TransferFunction"]
-        fixes += 1
-        logger.debug("Removed /TransferFunction from halftone dictionary")
-    elif transfer_function_required and not has_transfer_function:
-        if fallback_transfer_function is not None:
-            ht_dict["/TransferFunction"] = fallback_transfer_function
-        else:
-            ht_dict["/TransferFunction"] = Name.Identity
-        fixes += 1
-        logger.debug("Added /TransferFunction to non-primary halftone dictionary")
+        if transfer_function_forbidden and has_transfer_function:
+            del current["/TransferFunction"]
+            fixes += 1
+            logger.debug("Removed /TransferFunction from halftone dictionary")
+        elif transfer_function_required and not has_transfer_function:
+            current["/TransferFunction"] = (
+                current_fallback if current_fallback is not None else Name.Identity
+            )
+            fixes += 1
+            logger.debug("Added /TransferFunction to non-primary halftone dictionary")
 
-    # /HalftoneName must not be present
-    if "/HalftoneName" in ht_dict:
-        del ht_dict["/HalftoneName"]
-        fixes += 1
-        logger.debug("Removed forbidden /HalftoneName from halftone dictionary")
+        # /HalftoneName must not be present
+        if "/HalftoneName" in current:
+            del current["/HalftoneName"]
+            fixes += 1
+            logger.debug("Removed forbidden /HalftoneName from halftone dictionary")
 
-    # HalftoneType 5 (composite): recurse into sub-halftone dictionaries
-    if ht_type == 5:
-        default_halftone = _resolve_indirect(ht_dict.get("/Default"))
+        if ht_type != 5:
+            continue
+
+        default_halftone = _resolve_indirect(current.get("/Default"))
         default_transfer_function = None
         if isinstance(default_halftone, Dictionary):
             default_transfer_function = default_halftone.get("/TransferFunction")
 
-        for key in list(ht_dict.keys()):
+        children = []
+        for key in list(current.keys()):
             if key in ("/Type", "/HalftoneType"):
                 continue
-            sub_val = _resolve_indirect(ht_dict[key])
+            sub_val = _resolve_indirect(current[key])
             if not isinstance(sub_val, Dictionary):
                 logger.debug(
                     "Invalid Type 5 halftone entry %s: expected dictionary", key
                 )
                 return fixes, False
-            sub_fixes, sub_valid = _sanitize_halftone_dict(
-                sub_val,
-                colorant_name=str(key).lstrip("/"),
-                fallback_transfer_function=default_transfer_function,
+            children.append(
+                (
+                    sub_val,
+                    str(key).lstrip("/"),
+                    default_transfer_function,
+                )
             )
-            fixes += sub_fixes
-            if not sub_valid:
-                return fixes, False
+        pending.extend(reversed(children))
 
     return fixes, True
 
 
-def _sanitize_gs_dict(gs_dict: Dictionary, has_iccbased_cmyk: bool) -> int:
+def _sanitize_gs_dict(gs_dict: Dictionary, reset_opm: bool) -> int:
     """Check and remove forbidden entries from a single ExtGState dictionary.
 
     Args:
@@ -522,21 +469,16 @@ def _sanitize_gs_dict(gs_dict: Dictionary, has_iccbased_cmyk: bool) -> int:
 
     # PDF/A 6.2.4.2:
     # OPM=1 is forbidden with ICCBased CMYK when overprint is enabled.
-    # The has_iccbased_cmyk flag is intentionally document-wide rather than
-    # per-page: ExtGState dictionaries can be shared across pages via
-    # indirect references, and the visited-set cycle guard in Form XObject
-    # processing means a shared GS is sanitized only on its first encounter.
-    # Using a conservative document-wide check ensures OPM is always reset
-    # when any page uses ICCBased CMYK, avoiding missed cases from
-    # processing-order dependencies.
-    if has_iccbased_cmyk and "/OPM" in gs_dict:
+    # Both the colour space and overprint flags are intentionally checked
+    # document-wide. Graphics-state parameters persist independently, so an
+    # /OPM value and /OP or /op may be supplied by different ExtGState
+    # dictionaries or inherited across a nested content stream.
+    if reset_opm and "/OPM" in gs_dict:
         try:
             opm = int(_resolve_indirect(gs_dict["/OPM"]))
         except Exception:
             opm = 0
-        if opm == 1 and (
-            _overprint_enabled(gs_dict, "/OP") or _overprint_enabled(gs_dict, "/op")
-        ):
+        if opm == 1:
             gs_dict["/OPM"] = 0
             removed += 1
             logger.debug("Set /OPM to 0 due to ICCBased CMYK with overprint enabled")
@@ -648,7 +590,7 @@ def _sanitize_gs_dict(gs_dict: Dictionary, has_iccbased_cmyk: bool) -> int:
     return removed
 
 
-def _process_extgstate_dict(extgstate_dict, has_iccbased_cmyk: bool) -> int:
+def _process_extgstate_dict(extgstate_dict, reset_opm: bool) -> int:
     """Iterate all entries in an /ExtGState resource dictionary.
 
     Args:
@@ -666,7 +608,7 @@ def _process_extgstate_dict(extgstate_dict, has_iccbased_cmyk: bool) -> int:
     for gs_name in list(extgstate_dict.keys()):
         gs = _resolve_indirect(extgstate_dict[gs_name])
         if isinstance(gs, Dictionary):
-            removed += _sanitize_gs_dict(gs, has_iccbased_cmyk)
+            removed += _sanitize_gs_dict(gs, reset_opm)
 
     return removed
 
@@ -739,7 +681,7 @@ def _sanitize_shadings_in_resources(resources) -> int:
     return removed
 
 
-def _process_resources(resources, has_iccbased_cmyk: bool) -> int:
+def _process_resources(resources, reset_opm: bool) -> int:
     """Extract /ExtGState from a Resources dictionary and process it.
 
     Args:
@@ -756,140 +698,10 @@ def _process_resources(resources, has_iccbased_cmyk: bool) -> int:
 
     extgstate = resources.get("/ExtGState")
     if extgstate:
-        removed += _process_extgstate_dict(extgstate, has_iccbased_cmyk)
+        removed += _process_extgstate_dict(extgstate, reset_opm)
 
     # Remove /TR and /TR2 from Shading dictionaries (ISO 19005-2, §6.2.5)
     removed += _sanitize_shadings_in_resources(resources)
-
-    return removed
-
-
-def _process_form_xobjects_recursive(
-    resources, visited: set, has_iccbased_cmyk: bool
-) -> int:
-    """Recurse into Form XObjects' nested Resources for ExtGState entries.
-
-    Args:
-        resources: A resolved Resources dictionary.
-        visited: Set of (objnum, gen) tuples for cycle detection.
-
-    Returns:
-        Number of forbidden entries removed.
-    """
-    removed = 0
-    resources = _resolve_indirect(resources)
-
-    if not isinstance(resources, Dictionary):
-        return 0
-
-    xobjects = resources.get("/XObject")
-    if not xobjects:
-        return 0
-
-    xobjects = _resolve_indirect(xobjects)
-    if not isinstance(xobjects, Dictionary):
-        return 0
-
-    for xobj_name in list(xobjects.keys()):
-        xobj = _resolve_indirect(xobjects[xobj_name])
-
-        # Check if this is a Form XObject (streams with /Subtype /Form)
-        if not isinstance(xobj, Stream):
-            continue
-
-        subtype = xobj.get("/Subtype")
-        if subtype is None or str(subtype) != "/Form":
-            continue
-
-        # Cycle detection using objgen for indirect objects
-        objgen = xobj.objgen
-        if objgen != (0, 0):
-            if objgen in visited:
-                continue
-            visited.add(objgen)
-
-        # Process this Form XObject's own Resources
-        form_resources = xobj.get("/Resources")
-        if form_resources:
-            form_resources = _resolve_indirect(form_resources)
-            removed += _process_resources(form_resources, has_iccbased_cmyk)
-            # Recurse into nested Form XObjects
-            removed += _process_form_xobjects_recursive(
-                form_resources, visited, has_iccbased_cmyk
-            )
-
-    return removed
-
-
-def _process_ap_stream(ap_entry, visited: set, has_iccbased_cmyk: bool) -> int:
-    """Process an annotation appearance stream entry for ExtGState.
-
-    An AP entry value can be a Form XObject (stream) directly, or a
-    dictionary of sub-state Form XObjects.
-
-    Args:
-        ap_entry: An appearance entry (N, R, or D value).
-        visited: Set of (objnum, gen) tuples for cycle detection.
-
-    Returns:
-        Number of forbidden entries removed.
-    """
-    removed = 0
-    ap_entry = _resolve_indirect(ap_entry)
-
-    if isinstance(ap_entry, Stream):
-        # Direct Form XObject appearance stream
-        form_resources = ap_entry.get("/Resources")
-        if form_resources:
-            form_resources = _resolve_indirect(form_resources)
-            removed += _process_resources(form_resources, has_iccbased_cmyk)
-            removed += _process_form_xobjects_recursive(
-                form_resources, visited, has_iccbased_cmyk
-            )
-    elif isinstance(ap_entry, Dictionary):
-        # Sub-state dictionary: keys map to Form XObject streams
-        for state_name in list(ap_entry.keys()):
-            state_stream = _resolve_indirect(ap_entry[state_name])
-            if isinstance(state_stream, Stream):
-                form_resources = state_stream.get("/Resources")
-                if form_resources:
-                    form_resources = _resolve_indirect(form_resources)
-                    removed += _process_resources(form_resources, has_iccbased_cmyk)
-                    removed += _process_form_xobjects_recursive(
-                        form_resources, visited, has_iccbased_cmyk
-                    )
-
-    return removed
-
-
-def _process_type3_font_extgstate(
-    resources, visited: set, has_iccbased_cmyk: bool
-) -> int:
-    """Process ExtGState entries inside Type3 font resources.
-
-    Also recurses into Form XObjects in the font's own ``/Resources``.
-
-    Args:
-        resources: A resolved Resources dictionary.
-        visited: Set of (objnum, gen) tuples for cycle detection.
-
-    Returns:
-        Number of forbidden entries removed.
-    """
-    removed = 0
-
-    for _font_name, font in _iter_type3_fonts(resources, visited):
-        font_resources = font.get("/Resources")
-        if font_resources is None:
-            continue
-        font_resources = _resolve_indirect(font_resources)
-        if not isinstance(font_resources, Dictionary):
-            continue
-
-        removed += _process_resources(font_resources, has_iccbased_cmyk)
-        removed += _process_form_xobjects_recursive(
-            font_resources, visited, has_iccbased_cmyk
-        )
 
     return removed
 
@@ -907,10 +719,9 @@ def sanitize_extgstate(pdf: Pdf) -> dict[str, int]:
     - /CA and /ca (opacity) — clamped to [0.0, 1.0]
     - /SMask (soft mask) — must be /None or a valid dictionary
 
-    Traverses:
-    - Page Resources → ExtGState
-    - Page Resources → XObject → Form XObjects → Resources (recursive)
-    - Page Annotations → AP streams → Resources
+    Traverses every reachable Resources dictionary, including inherited page
+    resources, nested forms and patterns, soft-mask groups, Type3 fonts,
+    annotation appearances, and AcroForm default resources.
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
@@ -918,59 +729,13 @@ def sanitize_extgstate(pdf: Pdf) -> dict[str, int]:
     Returns:
         Dictionary with key 'extgstate_fixed': number of entries removed.
     """
+    reset_opm = _pdf_uses_iccbased_cmyk(pdf) and _pdf_enables_overprint(pdf)
     total_removed = 0
-    visited: set = set()
-    has_iccbased_cmyk = _pdf_uses_iccbased_cmyk(pdf)
-
-    for page_num, page in enumerate(pdf.pages, start=1):
+    for resources in _iter_resource_dictionaries(pdf):
         try:
-            page_dict = _resolve_indirect(page.obj)
-
-            # 1. Page → Resources → ExtGState
-            resources = page_dict.get("/Resources")
-            if resources:
-                resources = _resolve_indirect(resources)
-                total_removed += _process_resources(resources, has_iccbased_cmyk)
-
-                # 2. Page → Resources → XObject → Form XObjects (recursive)
-                total_removed += _process_form_xobjects_recursive(
-                    resources, visited, has_iccbased_cmyk
-                )
-
-                # 2b. Page → Resources → Font → Type3 ExtGState
-                total_removed += _process_type3_font_extgstate(
-                    resources, visited, has_iccbased_cmyk
-                )
-
-            # 3. Page → Annots → AP streams
-            annots = page_dict.get("/Annots")
-            if annots:
-                annots = _resolve_indirect(annots)
-                for annot in annots:
-                    annot = _resolve_indirect(annot)
-                    if not isinstance(annot, Dictionary):
-                        continue
-
-                    ap = annot.get("/AP")
-                    if not ap:
-                        continue
-
-                    ap = _resolve_indirect(ap)
-                    if not isinstance(ap, Dictionary):
-                        continue
-
-                    # Process N (normal), R (rollover), D (down) appearances
-                    for ap_key in ("/N", "/R", "/D"):
-                        ap_entry = ap.get(ap_key)
-                        if ap_entry:
-                            total_removed += _process_ap_stream(
-                                ap_entry, visited, has_iccbased_cmyk
-                            )
-
+            total_removed += _process_resources(resources, reset_opm)
         except Exception as e:
-            log_suppressed_error(
-                logger, e, "Error sanitizing ExtGState on page %d: %s", page_num, e
-            )
+            log_suppressed_error(logger, e, "Error sanitizing ExtGState: %s", e)
 
     if total_removed > 0:
         logger.info("ExtGState sanitized: %d forbidden entries removed", total_removed)

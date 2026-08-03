@@ -5,6 +5,7 @@
 """Tests for ToUnicode values sanitizer (veraPDF rule 6.2.11.7.2)."""
 
 import pikepdf
+import pytest
 from conftest import new_pdf
 from pikepdf import Array, Dictionary, Name
 
@@ -14,6 +15,7 @@ from pdftopdfa.fonts.tounicode import (
     generate_cidfont_tounicode_cmap,
     generate_tounicode_cmap_data,
     parse_tounicode_cmap,
+    parse_tounicode_cmap_sequences,
     resolve_glyph_to_unicode,
 )
 from pdftopdfa.sanitizers import sanitize_for_pdfa
@@ -195,6 +197,14 @@ class TestFilterInvalidUnicodeValues:
         assert len(pua_values) == 3  # All distinct
         assert all(0xE000 <= v <= 0xF8FF for v in pua_values)
 
+    def test_invalid_value_inside_sequence_is_replaced(self):
+        mapping = {65: (0x0041, 0x0000), 66: 0xE000}
+
+        result = filter_invalid_unicode_values(mapping)
+
+        assert result[65] == (0x0041, 0xE001)
+        assert result[66] == 0xE000
+
     def test_empty_mapping(self):
         result = filter_invalid_unicode_values({})
         assert result == {}
@@ -202,6 +212,55 @@ class TestFilterInvalidUnicodeValues:
 
 class TestSanitizeToUnicodeValues:
     """Tests for the sanitize_tounicode_values() sanitizer."""
+
+    def test_invalid_mapping_in_soft_mask_font_is_fixed(self):
+        """Fonts reachable only through an SMask group are sanitized."""
+        pdf = new_pdf()
+        font = _make_simple_font_with_tounicode(pdf, {65: 0x0000})
+        group = pdf.make_stream(b"BT /F1 12 Tf (A) Tj ET")
+        group[Name.Type] = Name.XObject
+        group[Name.Subtype] = Name.Form
+        group[Name.BBox] = Array([0, 0, 10, 10])
+        group[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 100, 100]),
+                Resources=Dictionary(
+                    ExtGState=Dictionary(
+                        GS=Dictionary(
+                            SMask=Dictionary(
+                                S=Name("/Luminosity"),
+                                G=group,
+                            )
+                        )
+                    )
+                ),
+                Contents=pdf.make_stream(b"/GS gs"),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_tounicode_values(pdf)
+
+        assert result["tounicode_values_fixed"] == 1
+        mapping = parse_tounicode_cmap(bytes(font.ToUnicode.read_bytes()))
+        assert 0xE000 <= mapping[65] <= 0xF8FF
+
+    def test_pua_inside_unicode_sequence_is_not_reused(self):
+        """Replacement values avoid PUA scalars in multi-codepoint mappings."""
+        pdf = new_pdf()
+        font = _make_simple_font_with_tounicode(pdf, {65: 0xE000, 66: 0x0000})
+        original = bytes(font["/ToUnicode"].read_bytes())
+        font["/ToUnicode"].write(original.replace(b"<41> <E000>", b"<41> <0066E000>"))
+        _make_page_with_font(pdf, font)
+
+        result = sanitize_tounicode_values(pdf)
+
+        assert result["tounicode_values_fixed"] == 1
+        mapping = parse_tounicode_cmap_sequences(bytes(font["/ToUnicode"].read_bytes()))
+        assert mapping[b"A"] == (ord("f"), 0xE000)
+        assert mapping[b"B"] == (0xE001,)
 
     def test_tounicode_with_u0000_replaced(self):
         """U+0000 in existing ToUnicode is replaced with PUA."""
@@ -387,6 +446,14 @@ class TestGenerateCmapFiltersInvalid:
         assert parsed[66] != 0x0000
         assert 0xE000 <= parsed[66] <= 0xF8FF
 
+    def test_8bit_cmap_preserves_unicode_sequences(self):
+        cmap_data = generate_tounicode_cmap_data({65: (0x0066, 0x0066), 66: 0x100000})
+
+        assert parse_tounicode_cmap_sequences(cmap_data) == {
+            b"A": (0x0066, 0x0066),
+            b"B": (0x100000,),
+        }
+
     def test_16bit_cmap_filters_ufeff(self):
         mapping = {1: 0x0041, 2: 0xFEFF}
         cmap_data = generate_cidfont_tounicode_cmap(mapping)
@@ -507,6 +574,179 @@ class TestFillToUnicodeGaps:
         assert new_mapping[65] == 0x0041
         assert 66 in new_mapping
         assert 0xE000 <= new_mapping[66] <= 0xF8FF
+
+    def test_existing_multicodepoint_mapping_is_preserved(self):
+        """Adding a gap does not reserialize an existing Unicode sequence."""
+        pdf = new_pdf()
+        cmap = _make_tounicode_cmap_8bit({1: 0x0041}).replace(
+            b"<01> <0041>",
+            b"<01> <00660069>",
+        )
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.TrueType,
+            BaseFont=Name("/TestFont"),
+            FirstChar=0,
+            LastChar=255,
+            Encoding=Name.WinAnsiEncoding,
+            ToUnicode=pdf.make_stream(cmap),
+        )
+        _make_page_with_simple_font_content(pdf, font, b"\x01\x02")
+
+        result = fill_tounicode_gaps(pdf)
+
+        assert result["tounicode_gaps_filled"] == 1
+        new_data = bytes(font.ToUnicode.read_bytes())
+        assert b"<01> <00660069>" in new_data
+        mapping = parse_tounicode_cmap_sequences(new_data)
+        assert mapping[b"\x01"] == (ord("f"), ord("i"))
+        assert 0xE000 <= mapping[b"\x02"][0] <= 0xF8FF
+
+    def test_type0_one_byte_codespace_gap_is_filled(self):
+        """Type0 strings are decoded using their declared CMap codespace."""
+        pdf = new_pdf()
+        encoding = pdf.make_stream(
+            b"begincmap\n"
+            b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+            b"1 begincidchar\n<01> 1\nendcidchar\nendcmap"
+        )
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCIDFont"),
+            Encoding=encoding,
+            DescendantFonts=Array([]),
+            ToUnicode=pdf.make_stream(_make_tounicode_cmap_8bit({1: 0x0041})),
+        )
+        _make_page_with_cidfont_content(pdf, font, b"\x01\x02")
+
+        result = fill_tounicode_gaps(pdf)
+
+        assert result["tounicode_gaps_filled"] == 1
+        mapping = parse_tounicode_cmap_sequences(bytes(font.ToUnicode.read_bytes()))
+        assert mapping[b"\x01"] == (0x0041,)
+        assert 0xE000 <= mapping[b"\x02"][0] <= 0xF8FF
+
+    def test_unicode_cmap_gap_preserves_space_semantics(self, caplog):
+        """UCS-2 character codes retain their inherent Unicode meaning."""
+        caplog.set_level("INFO")
+        pdf = new_pdf()
+        encoding = pdf.make_stream(
+            b"begincmap\n"
+            b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n"
+            b"2 begincidchar\n<0020> 1\n<0041> 34\nendcidchar\nendcmap"
+        )
+        encoding[Name.CMapName] = Name("/UniJIS-UCS2-H")
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCIDFont"),
+            Encoding=encoding,
+            DescendantFonts=Array([]),
+            ToUnicode=pdf.make_stream(_make_tounicode_cmap_16bit({0x41: 0x41})),
+        )
+        _make_page_with_cidfont_content(pdf, font, b"\x00A\x00 ")
+
+        result = fill_tounicode_gaps(pdf)
+
+        assert result["tounicode_gaps_filled"] == 1
+        mapping = parse_tounicode_cmap_sequences(bytes(font.ToUnicode.read_bytes()))
+        assert mapping[b"\x00A"] == (ord("A"),)
+        assert mapping[b"\x00 "] == (ord(" "),)
+        assert "PUA codepoints" not in caplog.text
+
+    def test_nested_form_pattern_and_appearance_usage_is_collected(self):
+        """Gap collection covers nested rendered content streams."""
+        pdf = new_pdf()
+        font = pdf.make_indirect(_make_simple_font_with_tounicode(pdf, {1: 0x0041}))
+
+        def resources():
+            return Dictionary(Font=Dictionary(F1=font))
+
+        form = pdf.make_stream(b"BT /F1 12 Tf <02> Tj ET")
+        form[Name.Type] = Name.XObject
+        form[Name.Subtype] = Name.Form
+        form[Name.BBox] = Array([0, 0, 10, 10])
+        form[Name.Resources] = resources()
+
+        pattern = pdf.make_stream(b"BT /F1 12 Tf <03> Tj ET")
+        pattern[Name.Type] = Name.Pattern
+        pattern[Name.PatternType] = 1
+        pattern[Name.PaintType] = 1
+        pattern[Name.TilingType] = 1
+        pattern[Name.BBox] = Array([0, 0, 10, 10])
+        pattern[Name.XStep] = 10
+        pattern[Name.YStep] = 10
+        pattern[Name.Resources] = resources()
+
+        appearance = pdf.make_stream(b"BT /F1 12 Tf <04> Tj ET")
+        appearance[Name.Type] = Name.XObject
+        appearance[Name.Subtype] = Name.Form
+        appearance[Name.BBox] = Array([0, 0, 10, 10])
+        appearance[Name.Resources] = resources()
+        annotation = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name.Stamp,
+                Rect=Array([0, 0, 10, 10]),
+                AP=Dictionary(N=appearance),
+            )
+        )
+
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 100, 100]),
+                Resources=Dictionary(
+                    XObject=Dictionary(Fm=form),
+                    Pattern=Dictionary(P1=pattern),
+                ),
+                Contents=pdf.make_stream(b"/Fm Do"),
+                Annots=Array([annotation]),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = fill_tounicode_gaps(pdf)
+
+        assert result["tounicode_gaps_filled"] == 1
+        mapping = parse_tounicode_cmap(bytes(font.ToUnicode.read_bytes()))
+        assert {2, 3, 4} <= mapping.keys()
+
+    def test_soft_mask_group_usage_is_collected(self):
+        """Gap filling reaches fonts inside ExtGState soft-mask groups."""
+        pdf = new_pdf()
+        font = _make_simple_font_with_tounicode(pdf, {1: 0x0041})
+        group = pdf.make_stream(b"BT /F1 12 Tf <0102> Tj ET")
+        group[Name.Type] = Name.XObject
+        group[Name.Subtype] = Name.Form
+        group[Name.BBox] = Array([0, 0, 10, 10])
+        group[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 100, 100]),
+                Resources=Dictionary(
+                    ExtGState=Dictionary(
+                        GS=Dictionary(
+                            SMask=Dictionary(
+                                S=Name("/Luminosity"),
+                                G=group,
+                            )
+                        )
+                    )
+                ),
+                Contents=pdf.make_stream(b"/GS gs"),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = fill_tounicode_gaps(pdf)
+
+        assert result["tounicode_gaps_filled"] == 1
+        mapping = parse_tounicode_cmap_sequences(bytes(font.ToUnicode.read_bytes()))
+        assert mapping[b"\x01"] == (0x0041,)
+        assert 0xE000 <= mapping[b"\x02"][0] <= 0xF8FF
 
     def test_font_without_tounicode_skipped(self):
         """Font without ToUnicode is not modified."""
@@ -632,22 +872,24 @@ class TestFillToUnicodeGaps:
 class TestFillToUnicodeGapsIntegration:
     """Integration tests: fill_tounicode_gaps via sanitize_for_pdfa."""
 
-    def test_gaps_filled_at_2u_level(self):
-        """sanitize_for_pdfa at level '2u' fills ToUnicode gaps."""
+    @pytest.mark.parametrize("level", ["2a", "2u"])
+    def test_gaps_filled_at_pdfa2_unicode_levels(self, level):
+        """PDF/A-2 Unicode and accessible levels fill ToUnicode gaps."""
         pdf = new_pdf()
         font = _make_cidfont_with_tounicode(pdf, {1: 0x0041})
         _make_page_with_cidfont_content(pdf, font, b"\x00\x01\x00\x05")
 
-        result = sanitize_for_pdfa(pdf, level="2u")
+        result = sanitize_for_pdfa(pdf, level=level)
         assert result["tounicode_gaps_filled"] == 1
 
-    def test_gaps_filled_at_3u_level(self):
-        """sanitize_for_pdfa at level '3u' fills ToUnicode gaps."""
+    @pytest.mark.parametrize("level", ["3a", "3u"])
+    def test_gaps_filled_at_pdfa3_unicode_levels(self, level):
+        """PDF/A-3 Unicode and accessible levels fill ToUnicode gaps."""
         pdf = new_pdf()
         font = _make_cidfont_with_tounicode(pdf, {1: 0x0041})
         _make_page_with_cidfont_content(pdf, font, b"\x00\x01\x00\x05")
 
-        result = sanitize_for_pdfa(pdf, level="3u")
+        result = sanitize_for_pdfa(pdf, level=level)
         assert result["tounicode_gaps_filled"] == 1
 
     def test_gaps_not_filled_at_2b_level(self):

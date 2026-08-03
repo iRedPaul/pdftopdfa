@@ -635,9 +635,8 @@ class TestIsSymbolicFont:
         )
         assert is_symbolic_font(font_dict) is False
 
-    def test_combined_flags_with_symbolic(self):
-        """Font with multiple flags including Symbolic is detected."""
-        # Flags = 36 = Symbolic (4) + Nonsymbolic (32) — unusual but tests bit check
+    def test_conflicting_symbolic_and_nonsymbolic_flags_are_not_symbolic(self):
+        """Mutually exclusive classification flags are treated as invalid."""
         font_dict = Dictionary(
             Type=Name.Font,
             Subtype=Name.Type1,
@@ -648,7 +647,7 @@ class TestIsSymbolicFont:
                 Flags=36,
             ),
         )
-        assert is_symbolic_font(font_dict) is True
+        assert is_symbolic_font(font_dict) is False
 
 
 class TestDuplicateFontNames:

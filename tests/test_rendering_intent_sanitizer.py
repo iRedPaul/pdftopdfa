@@ -466,6 +466,75 @@ class TestUndefinedOperatorsAndResources:
         assert "/ColorSpace" in form_resources
         assert "/CS0" in form_resources.ColorSpace
 
+    def test_shared_resourceless_form_is_cloned_per_page_context(self):
+        """A reused Form is relinked to resources from each calling page."""
+        pdf = new_pdf()
+        font_a = pdf.make_indirect(
+            Dictionary(Type=Name.Font, Subtype=Name.Type3, Name=Name("/A"))
+        )
+        font_b = pdf.make_indirect(
+            Dictionary(Type=Name.Font, Subtype=Name.Type3, Name=Name("/B"))
+        )
+        form = pdf.make_stream(b"BT /F1 12 Tf (A) Tj ET")
+        form[Name.Type] = Name.XObject
+        form[Name.Subtype] = Name.Form
+        form[Name.BBox] = Array([0, 0, 100, 100])
+
+        for font in (font_a, font_b):
+            page = pikepdf.Page(
+                Dictionary(
+                    Type=Name.Page,
+                    MediaBox=Array([0, 0, 612, 792]),
+                    Resources=Dictionary(
+                        Font=Dictionary(F1=font),
+                        XObject=Dictionary(Fm=form),
+                    ),
+                    Contents=pdf.make_stream(b"/Fm Do"),
+                )
+            )
+            pdf.pages.append(page)
+
+        sanitize_rendering_intent(pdf)
+
+        forms = [pdf.pages[index].Resources.XObject.Fm for index in range(2)]
+        assert forms[0].objgen != forms[1].objgen
+        assert forms[0].Resources.Font.F1.objgen == font_a.objgen
+        assert forms[1].Resources.Font.F1.objgen == font_b.objgen
+
+    @pytest.mark.parametrize("indirect_resources", [False, True])
+    def test_1200_nested_forms_are_sanitized_without_recursion(
+        self, indirect_resources: bool
+    ):
+        """Resource materialization and operator repair reach a deep leaf."""
+        pdf = new_pdf()
+        root = pdf.make_stream(b"/Bad ri")
+        root[Name.Type] = Name.XObject
+        root[Name.Subtype] = Name.Form
+        root[Name.BBox] = Array([0, 0, 1, 1])
+        leaf_resources = Dictionary()
+        root[Name.Resources] = (
+            pdf.make_indirect(leaf_resources) if indirect_resources else leaf_resources
+        )
+
+        for _ in range(1200):
+            form = pdf.make_stream(b"/Next Do")
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = Array([0, 0, 1, 1])
+            resources = Dictionary(XObject=Dictionary(Next=root))
+            form[Name.Resources] = (
+                pdf.make_indirect(resources) if indirect_resources else resources
+            )
+            root = form
+
+        page = pdf.add_blank_page(page_size=(10, 10))
+        page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Root=root))
+        page.obj[Name.Contents] = pdf.make_stream(b"/Root Do")
+
+        result = sanitize_rendering_intent(pdf)
+
+        assert result["ri_operators_fixed"] == 1
+
     def test_type3_resources_added_from_parent(self):
         """Missing Type3 font /Resources are added from parent resources."""
         pdf = new_pdf()
@@ -502,6 +571,45 @@ class TestUndefinedOperatorsAndResources:
         assert isinstance(font_resources, Dictionary)
         assert "/ColorSpace" in font_resources
         assert "/CS0" in font_resources.ColorSpace
+
+    def test_equal_direct_type3_fonts_are_both_materialized(self):
+        """Equal direct dictionaries are distinct mutable resource owners."""
+        pdf = new_pdf()
+        charproc_stream = pdf.make_stream(b"/CS0 cs")
+
+        def make_font() -> Dictionary:
+            return Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type3,
+                FontBBox=Array([0, 0, 1000, 1000]),
+                FontMatrix=Array([0.001, 0, 0, 0.001, 0, 0]),
+                CharProcs=Dictionary(a=charproc_stream),
+                Encoding=Dictionary(
+                    Type=Name.Encoding,
+                    Differences=Array([0, Name.a]),
+                ),
+            )
+
+        first_font = make_font()
+        second_font = make_font()
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Resources=Dictionary(
+                    ColorSpace=Dictionary(CS0=Name.DeviceRGB),
+                    Font=Dictionary(F1=first_font, F2=second_font),
+                ),
+            )
+        )
+        pdf.pages.append(page)
+
+        sanitize_rendering_intent(pdf)
+
+        for font in (first_font, second_font):
+            resources = font.get("/Resources")
+            assert isinstance(resources, Dictionary)
+            assert resources.ColorSpace.CS0 == Name.DeviceRGB
 
 
 # --- Image XObject /Intent ---

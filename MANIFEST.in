@@ -1,0 +1,4 @@
+include CHANGELOG.md
+include run_corpus_test.py
+recursive-include docs *.md
+recursive-include scripts *.py

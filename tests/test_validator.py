@@ -93,9 +93,12 @@ class TestDetectPdfaLevel:
             level = detect_pdfa_level(pdf)
             assert level is None
 
-    @pytest.mark.parametrize("target_level", ["2b", "2u", "3b", "3u"])
+    @pytest.mark.parametrize("target_level", ["2a", "2b", "2u", "3a", "3b", "3u"])
     def test_detect_all_levels(
-        self, sample_pdf: Path, tmp_dir: Path, target_level: str
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        target_level: str,
     ) -> None:
         """Detects all PDF/A levels correctly."""
         output_path = tmp_dir / f"converted_{target_level}.pdf"
@@ -190,6 +193,13 @@ class TestDetectIsoStandards:
                 "2",
             ),
             (
+                "pdfe",
+                "http://www.aiim.org/pdfe/ns/id/",
+                "ISO_PDFEVersion>PDF/E-1</pdfe:ISO_PDFEVersion",
+                "PDF/E",
+                "PDF/E-1",
+            ),
+            (
                 "pdfeid",
                 "http://www.aiim.org/pdfe/ns/id/",
                 "part>1</pdfeid:part",
@@ -204,7 +214,7 @@ class TestDetectIsoStandards:
                 "PDF/VT-1",
             ),
         ],
-        ids=["PDF/X", "PDF/UA", "PDF/E", "PDF/VT"],
+        ids=["PDF/X", "PDF/UA", "PDF/E", "PDF/E legacy", "PDF/VT"],
     )
     def test_detect_iso_standard(
         self,
@@ -292,3 +302,26 @@ class TestDetectIsoStandards:
         assert len(standards) == 1
         assert standards[0].standard == "PDF/UA"
         assert standards[0].version == "1"
+
+    def test_detect_pdfe_attribute_form(self, sample_pdf_bytes: bytes) -> None:
+        """Detects the normative PDF/E identifier from XMP attribute form."""
+        from io import BytesIO
+
+        xmp = b"""<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+        <x:xmpmeta xmlns:x="adobe:ns:meta/">
+            <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+                <rdf:Description rdf:about=""
+                    xmlns:pdfe="http://www.aiim.org/pdfe/ns/id/"
+                    pdfe:ISO_PDFEVersion="PDF/E-1"/>
+            </rdf:RDF>
+        </x:xmpmeta>
+        <?xpacket end="w"?>"""
+
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
+        metadata_stream = pikepdf.Stream(pdf, xmp)
+        pdf.Root.Metadata = pdf.make_indirect(metadata_stream)
+
+        standards = detect_iso_standards(pdf)
+        assert len(standards) == 1
+        assert standards[0].standard == "PDF/E"
+        assert standards[0].version == "PDF/E-1"

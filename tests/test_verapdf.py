@@ -5,6 +5,7 @@
 """Unit tests for verapdf.py."""
 
 import logging
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -212,6 +213,8 @@ class TestGetVerapdfVersion:
         result = get_verapdf_version()
 
         assert result == "veraPDF 1.24.1"
+        assert mock_run.call_args.kwargs["encoding"] == "utf-8"
+        assert mock_run.call_args.kwargs["errors"] == "replace"
 
     @patch("pdftopdfa.verapdf.subprocess.run")
     @patch("pdftopdfa.verapdf.is_verapdf_available")
@@ -364,17 +367,15 @@ class TestParseVerapdfXml:
         assert len(result.errors) > 0
         assert "6.2.3" in result.errors[0]
 
-    def test_handles_invalid_xml(self) -> None:
-        """Handles invalid XML without crashing."""
+    def test_rejects_invalid_xml(self) -> None:
+        """Rejects truncated or otherwise invalid XML."""
         xml = "not valid xml <<<"
 
-        result = _parse_verapdf_xml(xml)
+        with pytest.raises(VeraPDFError, match="Invalid veraPDF XML report"):
+            _parse_verapdf_xml(xml)
 
-        assert result.compliant is False
-        assert len(result.errors) > 0
-
-    def test_handles_missing_validation_report(self) -> None:
-        """Handles missing validationReport element."""
+    def test_rejects_missing_validation_report(self) -> None:
+        """Rejects XML without the expected validationReport element."""
         xml = """<?xml version="1.0" encoding="UTF-8"?>
         <report>
             <jobs>
@@ -383,14 +384,187 @@ class TestParseVerapdfXml:
             </jobs>
         </report>"""
 
+        with pytest.raises(VeraPDFError, match="found 0"):
+            _parse_verapdf_xml(xml)
+
+    def test_rejects_multiple_validation_reports(self) -> None:
+        """Rejects ambiguous output for the single requested input."""
+        xml = """
+        <report>
+            <validationReport isCompliant="true">
+                <details passedRules="1" failedRules="0"/>
+            </validationReport>
+            <validationReport isCompliant="false">
+                <details passedRules="0" failedRules="1"/>
+            </validationReport>
+        </report>
+        """
+
+        with pytest.raises(VeraPDFError, match="found 2"):
+            _parse_verapdf_xml(xml)
+
+    @pytest.mark.parametrize(
+        ("validation_report", "error_match"),
+        [
+            (
+                '<validationReport><details passedRules="1" failedRules="0"/>'
+                "</validationReport>",
+                "isCompliant",
+            ),
+            (
+                '<validationReport isCompliant="unknown">'
+                '<details passedRules="1" failedRules="0"/>'
+                "</validationReport>",
+                "isCompliant",
+            ),
+            (
+                '<validationReport isCompliant="true"></validationReport>',
+                "details element",
+            ),
+            (
+                '<validationReport isCompliant="true">'
+                '<details passedRules="invalid" failedRules="0"/>'
+                "</validationReport>",
+                "passedRules",
+            ),
+        ],
+    )
+    def test_rejects_broken_validation_report(
+        self, validation_report: str, error_match: str
+    ) -> None:
+        """Rejects incomplete or malformed validationReport content."""
+        with pytest.raises(VeraPDFError, match=error_match):
+            _parse_verapdf_xml(f"<report>{validation_report}</report>")
+
+    @pytest.mark.parametrize(
+        ("is_compliant", "failed_rules"),
+        [("true", 1), ("false", 0)],
+    )
+    def test_rejects_compliance_and_failed_rule_contradictions(
+        self, is_compliant: str, failed_rules: int
+    ) -> None:
+        """Rejects contradictory status and rule counters."""
+        xml = (
+            "<report>"
+            f'<validationReport isCompliant="{is_compliant}">'
+            f'<details passedRules="1" failedRules="{failed_rules}"/>'
+            "</validationReport>"
+            "</report>"
+        )
+
+        with pytest.raises(VeraPDFError, match="Inconsistent veraPDF"):
+            _parse_verapdf_xml(xml)
+
+    def test_parses_namespaced_report(self) -> None:
+        """Parses report, details, and failed rules independent of namespaces."""
+        xml = """
+        <v:report xmlns:v="urn:verapdf:report">
+            <v:jobs>
+                <v:job>
+                    <v:validationReport
+                        isCompliant="false"
+                        profileName="PDF/A-3A validation profile">
+                        <v:details passedRules="120" failedRules="1">
+                            <v:rule status="failed" clause="6.2.2">
+                                <v:description>Missing output intent</v:description>
+                            </v:rule>
+                        </v:details>
+                    </v:validationReport>
+                </v:job>
+            </v:jobs>
+        </v:report>
+        """
+
         result = _parse_verapdf_xml(xml)
 
         assert result.compliant is False
-        assert len(result.warnings) > 0
+        assert result.flavour == "3a"
+        assert result.passed_rules == 120
+        assert result.failed_rules == 1
+        assert result.errors == ["Rule 6.2.2: Missing output intent"]
+
+    @pytest.mark.parametrize(
+        "task_result",
+        [
+            '<taskResult exceptionMessage="parser crashed"/>',
+            "<taskResult><exceptionMessage>parser crashed</exceptionMessage>"
+            "</taskResult>",
+            "<taskException><exceptionMessage>parser crashed</exceptionMessage>"
+            "</taskException>",
+        ],
+    )
+    def test_rejects_task_exceptions(self, task_result: str) -> None:
+        """Treats veraPDF task exceptions as execution failures."""
+        xml = f"""
+        <report>
+            <validationReport isCompliant="true">
+                <details passedRules="1" failedRules="0"/>
+            </validationReport>
+            {task_result}
+        </report>
+        """
+
+        with pytest.raises(VeraPDFError, match="parser crashed"):
+            _parse_verapdf_xml(xml)
+
+    @pytest.mark.parametrize(
+        "attribute",
+        ["failedToParse", "encrypted", "outOfMemory", "veraExceptions"],
+    )
+    def test_rejects_batch_failures(self, attribute: str) -> None:
+        """Treats every veraPDF batch failure counter as an execution failure."""
+        xml = f"""
+        <report>
+            <validationReport isCompliant="true">
+                <details passedRules="1" failedRules="0"/>
+            </validationReport>
+            <batchSummary {attribute}="1"/>
+        </report>
+        """
+
+        with pytest.raises(VeraPDFError, match=attribute):
+            _parse_verapdf_xml(xml)
+
+    @pytest.mark.parametrize("value", ["invalid", "-1"])
+    def test_rejects_invalid_batch_counters(self, value: str) -> None:
+        """Rejects malformed batch counters instead of ignoring them."""
+        xml = f"""
+        <report>
+            <validationReport isCompliant="true">
+                <details passedRules="1" failedRules="0"/>
+            </validationReport>
+            <batchSummary failedToParse="{value}"/>
+        </report>
+        """
+
+        with pytest.raises(VeraPDFError, match="failedToParse"):
+            _parse_verapdf_xml(xml)
+
+    def test_rejects_failed_batch_jobs(self) -> None:
+        """Treats failed validation jobs in the batch summary as failures."""
+        xml = """
+        <report>
+            <validationReport isCompliant="true">
+                <details passedRules="1" failedRules="0"/>
+            </validationReport>
+            <batchSummary>
+                <validationReports failedJobs="1"/>
+            </batchSummary>
+        </report>
+        """
+
+        with pytest.raises(VeraPDFError, match="failedJobs=1"):
+            _parse_verapdf_xml(xml)
 
     def test_preserves_raw_xml(self) -> None:
         """Stores the raw XML in the result."""
-        xml = "<report></report>"
+        xml = (
+            "<report>"
+            '<validationReport isCompliant="true">'
+            '<details passedRules="1" failedRules="0"/>'
+            "</validationReport>"
+            "</report>"
+        )
 
         result = _parse_verapdf_xml(xml)
 
@@ -451,6 +625,102 @@ class TestValidateWithVerapdf:
         assert "--flavour" in cmd
         assert "2b" in cmd
         assert str(pdf_path) in cmd
+        assert call_args.kwargs["encoding"] == "utf-8"
+        assert call_args.kwargs["errors"] == "replace"
+
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available", return_value=True)
+    def test_decodes_utf8_report_for_unicode_path(
+        self,
+        _mock_available: MagicMock,
+        mock_run: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Windows locale encoding cannot corrupt a UTF-8 veraPDF report."""
+        pdf_path = tmp_path / "卍.pdf"
+        pdf_path.touch()
+        xml_bytes = (
+            "<report>"
+            f'<item name="{pdf_path.name}"/>'
+            '<validationReport isCompliant="true" profileName="PDF/A-2B">'
+            '<details passedRules="1" failedRules="0"/>'
+            "</validationReport>"
+            "</report>"
+        ).encode()
+
+        def encoded_result(*_args: object, **kwargs: object) -> MagicMock:
+            encoding = kwargs["encoding"]
+            errors = kwargs["errors"]
+            return MagicMock(
+                stdout=xml_bytes.decode(encoding, errors),
+                stderr="",
+                returncode=0,
+            )
+
+        mock_run.side_effect = encoded_result
+
+        result = validate_with_verapdf(pdf_path, flavour="2b")
+
+        assert result.compliant is True
+        assert pdf_path.name in result.raw_xml
+
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available")
+    def test_sets_java_stack_only_in_child_environment(
+        self, mock_available: MagicMock, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
+        """Adds the deep-document stack default without mutating os.environ."""
+        mock_available.return_value = True
+        xml_response = (
+            "<report><jobs><job>"
+            '<validationReport isCompliant="true" profileName="PDF/A-2B">'
+            '<details passedRules="1" failedRules="0"></details>'
+            "</validationReport></job></jobs></report>"
+        )
+        mock_run.return_value = MagicMock(stdout=xml_response, stderr="", returncode=0)
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.touch()
+
+        with patch.dict(os.environ, {"JAVA_OPTS": "-Xmx512m"}, clear=True):
+            validate_with_verapdf(pdf_path, flavour="2b")
+
+            assert os.environ["JAVA_OPTS"] == "-Xmx512m"
+
+        child_env = mock_run.call_args.kwargs["env"]
+        assert child_env["JAVA_OPTS"] == "-Xmx512m -Xss16m"
+
+    @pytest.mark.parametrize(
+        "variable",
+        ["JAVA_OPTS", "JDK_JAVA_OPTIONS", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS"],
+    )
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available")
+    def test_preserves_explicit_java_stack_option(
+        self,
+        mock_available: MagicMock,
+        mock_run: MagicMock,
+        tmp_path: Path,
+        variable: str,
+    ) -> None:
+        """Keeps an explicit user-provided Java stack size unchanged."""
+        mock_available.return_value = True
+        xml_response = (
+            "<report><jobs><job>"
+            '<validationReport isCompliant="true" profileName="PDF/A-2B">'
+            '<details passedRules="1" failedRules="0"></details>'
+            "</validationReport></job></jobs></report>"
+        )
+        mock_run.return_value = MagicMock(stdout=xml_response, stderr="", returncode=0)
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.touch()
+        java_options = "-Xmx512m -Xss8m"
+
+        with patch.dict(os.environ, {variable: java_options}, clear=True):
+            validate_with_verapdf(pdf_path, flavour="2b")
+
+        child_env = mock_run.call_args.kwargs["env"]
+        assert child_env[variable] == java_options
+        assert "-Xss16m" not in child_env.get("JAVA_OPTS", "")
 
     @patch("pdftopdfa.verapdf.subprocess.run")
     @patch("pdftopdfa.verapdf.is_verapdf_available")
@@ -521,6 +791,89 @@ class TestValidateWithVerapdf:
 
     @patch("pdftopdfa.verapdf.subprocess.run")
     @patch("pdftopdfa.verapdf.is_verapdf_available")
+    def test_rejects_reported_flavour_mismatch(
+        self, mock_available: MagicMock, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
+        """Rejects a report for a different flavour than requested."""
+        mock_available.return_value = True
+        xml_response = (
+            "<report><jobs><job>"
+            '<validationReport isCompliant="true" profileName="PDF/A-2B">'
+            '<details passedRules="100" failedRules="0"></details>'
+            "</validationReport></job></jobs></report>"
+        )
+        mock_run.return_value = MagicMock(stdout=xml_response, stderr="", returncode=0)
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.touch()
+
+        with pytest.raises(VeraPDFError, match="requested 2a, reported 2b"):
+            validate_with_verapdf(pdf_path, flavour="2a")
+
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available")
+    def test_rejects_missing_reported_flavour(
+        self, mock_available: MagicMock, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
+        """Rejects a report without a flavour when one was requested."""
+        mock_available.return_value = True
+        xml_response = (
+            "<report><jobs><job>"
+            '<validationReport isCompliant="true">'
+            '<details passedRules="100" failedRules="0"></details>'
+            "</validationReport></job></jobs></report>"
+        )
+        mock_run.return_value = MagicMock(stdout=xml_response, stderr="", returncode=0)
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.touch()
+
+        with pytest.raises(VeraPDFError, match="requested 2a, reported unknown"):
+            validate_with_verapdf(pdf_path, flavour="2a")
+
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available")
+    def test_accepts_stderr_with_complete_report(
+        self, mock_available: MagicMock, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
+        """Does not confuse veraPDF log output with a validation failure."""
+        mock_available.return_value = True
+        xml_response = (
+            "<report><jobs><job>"
+            '<validationReport isCompliant="true" profileName="PDF/A-2B">'
+            '<details passedRules="100" failedRules="0"></details>'
+            "</validationReport></job></jobs></report>"
+        )
+        mock_run.return_value = MagicMock(
+            stdout=xml_response,
+            stderr="WARN: optional font cache was rebuilt",
+            returncode=0,
+        )
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.touch()
+
+        result = validate_with_verapdf(pdf_path, flavour="2b")
+
+        assert result.compliant is True
+
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available")
+    def test_raises_on_incomplete_xml_report(
+        self, mock_available: MagicMock, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
+        """Propagates truncated XML as an execution failure."""
+        mock_available.return_value = True
+        mock_run.return_value = MagicMock(
+            stdout="<report><jobs",
+            stderr="java.lang.StackOverflowError",
+            returncode=1,
+        )
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.touch()
+
+        with pytest.raises(VeraPDFError, match="Invalid veraPDF XML report"):
+            validate_with_verapdf(pdf_path, flavour="2b")
+
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available")
     def test_raises_on_empty_output(
         self, mock_available: MagicMock, mock_run: MagicMock, tmp_path: Path
     ) -> None:
@@ -586,6 +939,40 @@ class TestValidateWithVerapdf:
 
         assert isinstance(result, VeraPDFResult)
         assert result.compliant is False
+
+    @pytest.mark.parametrize(
+        ("returncode", "is_compliant", "failed_rules"),
+        [(1, "true", 0), (0, "false", 1)],
+    )
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available")
+    def test_rejects_exit_code_and_report_contradictions(
+        self,
+        mock_available: MagicMock,
+        mock_run: MagicMock,
+        tmp_path: Path,
+        returncode: int,
+        is_compliant: str,
+        failed_rules: int,
+    ) -> None:
+        """Rejects a report whose status contradicts the CLI exit code."""
+        mock_available.return_value = True
+        xml_response = (
+            "<report><jobs><job>"
+            f'<validationReport isCompliant="{is_compliant}" profileName="PDF/A-2B">'
+            f'<details passedRules="100" failedRules="{failed_rules}"></details>'
+            "</validationReport></job></jobs></report>"
+        )
+        mock_run.return_value = MagicMock(
+            stdout=xml_response,
+            stderr="",
+            returncode=returncode,
+        )
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.touch()
+
+        with pytest.raises(VeraPDFError, match="Inconsistent veraPDF result"):
+            validate_with_verapdf(pdf_path, flavour="2b")
 
     @patch("pdftopdfa.verapdf.subprocess.run")
     @patch("pdftopdfa.verapdf.is_verapdf_available")

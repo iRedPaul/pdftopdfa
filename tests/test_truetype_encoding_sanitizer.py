@@ -25,6 +25,8 @@ from pdftopdfa.utils import resolve_indirect as _resolve
 def _make_tt_font_bytes(
     cmap_subtables: list[tuple[int, int, dict[int, str]]],
     symbolic: bool = False,
+    *,
+    include_a: bool = True,
 ) -> bytes:
     """Build a minimal TrueType font with custom cmap subtables.
 
@@ -35,7 +37,9 @@ def _make_tt_font_bytes(
     Returns:
         Raw TrueType font bytes.
     """
-    glyphs = {".notdef": 500, "A": 600}
+    glyphs = {".notdef": 500}
+    if include_a:
+        glyphs["A"] = 600
     fb = FontBuilder(1000, isTTF=True)
     fb.setupGlyphOrder(list(glyphs.keys()))
     # Use first subtable mapping for setupCharacterMap (FontBuilder requirement)
@@ -46,8 +50,10 @@ def _make_tt_font_bytes(
             if 0 <= code <= 0xFFFF and gname in glyphs:
                 setup_cmap[code] = gname
         fb.setupCharacterMap(setup_cmap)
-    else:
+    elif include_a:
         fb.setupCharacterMap({0x41: "A"})
+    else:
+        fb.setupCharacterMap({})
 
     empty_glyph = Glyph()
     fb.setupGlyf({n: empty_glyph for n in glyphs.keys()})
@@ -176,6 +182,26 @@ def _get_cmap_subtables(fd: Dictionary) -> list[tuple[int, int]]:
         tt.close()
 
 
+def _get_cmap_mapping(
+    fd: Dictionary,
+    platform_id: int,
+    encoding_id: int,
+) -> dict[int, str]:
+    """Read one cmap subtable from the embedded font."""
+    font_file_ref = fd.get("/FontFile2")
+    if font_file_ref is None:
+        font_file_ref = fd["/FontFile3"]
+    font_file = _resolve(font_file_ref)
+    tt = TTFont(BytesIO(bytes(font_file.read_bytes())))
+    try:
+        for subtable in tt["cmap"].tables:
+            if subtable.platformID == platform_id and subtable.platEncID == encoding_id:
+                return dict(subtable.cmap)
+        return {}
+    finally:
+        tt.close()
+
+
 # ---------------------------------------------------------------------------
 # Rule 6.2.11.6-1 — Non-symbolic cmap
 # ---------------------------------------------------------------------------
@@ -218,6 +244,24 @@ def test_rule1_no_change_when_10_already_exists():
     assert result["tt_nonsymbolic_cmap_added"] == 0
 
 
+def test_rule1_adds_empty_31_for_notdef_only_subset():
+    """A .notdef-only subset still needs a non-symbolic cmap record."""
+    pdf = _new_page_pdf()
+    font_bytes = _make_tt_font_bytes([], include_a=False)
+    _font, fd = _add_truetype_font(
+        pdf,
+        font_bytes,
+        flags=32,
+        encoding=Name.WinAnsiEncoding,
+    )
+
+    result = sanitize_truetype_encoding(pdf)
+
+    assert result["tt_nonsymbolic_cmap_added"] == 1
+    assert (3, 1) in set(_get_cmap_subtables(fd))
+    assert _get_cmap_mapping(fd, 3, 1) == {}
+
+
 # ---------------------------------------------------------------------------
 # Rule 6.2.11.6-2 — Non-symbolic /Encoding
 # ---------------------------------------------------------------------------
@@ -236,7 +280,9 @@ def test_rule2_adds_winansi_when_no_encoding():
 
 
 def test_rule2_replaces_standard_encoding():
-    """Non-symbolic TrueType with /StandardEncoding should be replaced."""
+    """StandardEncoding is rebased without changing character selection."""
+    from pdftopdfa.fonts.subsetter import _resolve_simple_font_encoding
+
     pdf = _new_page_pdf()
     font_bytes = _make_tt_font_bytes([(3, 1, {0x0041: "A"})], symbolic=False)
     font, _fd = _add_truetype_font(
@@ -246,7 +292,13 @@ def test_rule2_replaces_standard_encoding():
     result = sanitize_truetype_encoding(pdf)
 
     assert result["tt_nonsymbolic_encoding_fixed"] == 1
-    assert str(font["/Encoding"]) == "/WinAnsiEncoding"
+    encoding = _resolve(font["/Encoding"])
+    assert encoding["/BaseEncoding"] == Name.WinAnsiEncoding
+    resolved = _resolve_simple_font_encoding(font, pdfa_normalized=True)
+    assert resolved is not None
+    assert resolved[0x27] == "quoteright"
+    assert resolved[0x60] == "quoteleft"
+    assert resolved[0xA4] == "fraction"
 
 
 def test_rule2_keeps_winansi_unchanged():
@@ -324,7 +376,8 @@ def test_fontfile3_opentype_is_fixed_and_preserved():
 
     assert result["tt_nonsymbolic_encoding_fixed"] == 1
     assert result["tt_nonsymbolic_cmap_added"] == 1
-    assert font["/Encoding"] == Name.WinAnsiEncoding
+    encoding = _resolve(font["/Encoding"])
+    assert encoding["/BaseEncoding"] == Name.WinAnsiEncoding
     assert fd.get("/FontFile2") is None
     rewritten_stream = _resolve(fd["/FontFile3"])
     assert rewritten_stream.get("/Subtype") == Name.OpenType
@@ -350,6 +403,30 @@ def test_rule3_removes_encoding_from_symbolic():
 
     assert result["tt_symbolic_encoding_removed"] == 1
     assert font.get("/Encoding") is None
+
+
+def test_rule3_migrates_pdf_encoding_to_symbol_cmap():
+    """Removing /Encoding preserves its byte-to-glyph mapping in cmap (3,0)."""
+    pdf = _new_page_pdf()
+    font_bytes = _make_tt_font_bytes(
+        [
+            (0, 3, {0x41: "A"}),
+            (3, 1, {0x41: "A"}),
+        ],
+        symbolic=True,
+    )
+    encoding = Dictionary(
+        BaseEncoding=Name.WinAnsiEncoding,
+        Differences=Array([99, Name("/A")]),
+    )
+    font, fd = _add_truetype_font(pdf, font_bytes, flags=4, encoding=encoding)
+
+    result = sanitize_truetype_encoding(pdf)
+
+    assert result["tt_symbolic_encoding_removed"] == 1
+    assert result["tt_symbolic_cmap_added"] == 1
+    assert font.get("/Encoding") is None
+    assert _get_cmap_mapping(fd, 3, 0)[0xF063] == "A"
 
 
 def test_rule3_sets_symbolic_flag_in_flags():

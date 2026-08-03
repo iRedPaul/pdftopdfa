@@ -16,7 +16,6 @@ from pdftopdfa.fonts.subsetter import (
     SubsettingResult,
     _build_glyphnames_from_unicode,
     _check_subsetting_allowed,
-    _clean_tounicode,
     _find_font_file,
     _generate_subset_prefix,
     _is_subset_font,
@@ -29,6 +28,7 @@ from pdftopdfa.fonts.tounicode import (
     generate_cidfont_tounicode_cmap,
     generate_tounicode_cmap_data,
     parse_tounicode_cmap,
+    parse_tounicode_cmap_sequences,
     validate_tounicode_cmap,
 )
 
@@ -42,6 +42,19 @@ def _load_liberation_sans() -> bytes:
         / "resources"
         / "fonts"
         / "LiberationSans-Regular.ttf"
+    )
+    return font_path.read_bytes()
+
+
+def _load_noto_sans_symbols2() -> bytes:
+    """Loads the bundled ZapfDingbats replacement font."""
+    from importlib import resources
+
+    font_path = (
+        resources.files("pdftopdfa")
+        / "resources"
+        / "fonts"
+        / "NotoSansSymbols2-Regular.ttf"
     )
     return font_path.read_bytes()
 
@@ -233,6 +246,29 @@ class TestGenerateSubsetPrefix:
 class TestSubsetFontData:
     """Tests for _subset_font_data."""
 
+    def test_unicode_cmap_ignores_variation_sequence_subtable(self):
+        """A format-14 variation subtable without `.cmap` is safely ignored."""
+        from types import SimpleNamespace
+
+        from fontTools.ttLib.tables._c_m_a_p import cmap_format_14
+
+        from pdftopdfa.fonts.subsetter import _get_unicode_cmap
+
+        unicode_table = SimpleNamespace(
+            platformID=3,
+            platEncID=1,
+            cmap={0x2714: "A"},
+        )
+        variation_table = cmap_format_14(14)
+        variation_table.platformID = 0
+        variation_table.platEncID = 5
+        variation_table.uvsDict = {}
+        tt_font = {
+            "cmap": SimpleNamespace(tables=[unicode_table, variation_table]),
+        }
+
+        assert _get_unicode_cmap(tt_font) == {0x2714: "A"}
+
     def test_subset_reduces_size(self):
         """Subsetting with few glyphs produces smaller data."""
         font_data = _load_liberation_sans()
@@ -283,6 +319,28 @@ class TestSubsetFontData:
         # With retain_gids=True, the subsetted font should have at least
         # as many glyph slots as the highest retained GID
         assert len(subsetted_order) > 1  # More than just .notdef
+
+    def test_zapfdingbats_difference_retains_authoritative_glyph(self):
+        """Zapf /a20 retains the Adobe heavy-check-mark glyph, not raw code 52."""
+        from fontTools.ttLib import TTFont
+
+        result = _subset_font_data(
+            _load_noto_sans_symbols2(),
+            {52},
+            is_cid=False,
+            code_to_glyphname={52: "a20"},
+        )
+
+        assert result is not None
+        tt_font = TTFont(BytesIO(result))
+        try:
+            cmap = tt_font.getBestCmap()
+            assert cmap is not None
+            glyph_name = cmap[0x2714]
+            advance = tt_font["hmtx"].metrics[glyph_name][0]
+            assert round(advance * 1000 / tt_font["head"].unitsPerEm) == 930
+        finally:
+            tt_font.close()
 
 
 class TestFontSubsetter:
@@ -342,6 +400,67 @@ class TestFontSubsetter:
 
         assert len(result.fonts_subsetted) == 1
         assert result.bytes_saved > 0
+
+    def test_cid_zero_keeps_semantic_tounicode_glyph_for_ocr_remap(self):
+        """A CID0 OCR mapping retains the real glyph needed for safe repair."""
+        from fontTools.ttLib import TTFont
+        from fontTools.ttLib.tables._c_m_a_p import (
+            cmap_format_4,
+            table__c_m_a_p,
+        )
+
+        source_font = TTFont(BytesIO(_load_liberation_sans()))
+        glyph_name = source_font.getBestCmap()[0x41]
+        cmap_table = table__c_m_a_p()
+        cmap_table.tableVersion = 0
+        cmap_table.tables = []
+        for platform_id, encoding_id, mapping in (
+            (3, 10, {0x42: glyph_name}),
+            (3, 1, {0x41: glyph_name}),
+        ):
+            subtable = cmap_format_4(4)
+            subtable.platformID = platform_id
+            subtable.platEncID = encoding_id
+            subtable.language = 0
+            subtable.cmap = mapping
+            cmap_table.tables.append(subtable)
+        source_font["cmap"] = cmap_table
+        buffer = BytesIO()
+        source_font.save(buffer)
+        source_font.close()
+
+        pdf = new_pdf()
+        font_obj = _make_embedded_cidfont(
+            pdf,
+            "TestCID",
+            buffer.getvalue(),
+        )
+        font_obj[Name.ToUnicode] = pdf.make_indirect(
+            Stream(pdf, generate_cidfont_tounicode_cmap({0: 0x41}))
+        )
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 612, 792]),
+                Resources=Dictionary(Font=Dictionary(F1=font_obj)),
+                Contents=pdf.make_stream(b"BT /F1 12 Tf 3 Tr <0000> Tj ET"),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = FontSubsetter(pdf).subset_all_fonts()
+
+        font_stream = font_obj.DescendantFonts[0].FontDescriptor.FontFile2
+        subsetted = TTFont(BytesIO(font_stream.read_bytes()))
+        try:
+            from pdftopdfa.fonts.subsetter import _get_unicode_cmap
+
+            retained_glyph = _get_unicode_cmap(subsetted).get(0x41)
+            assert retained_glyph == glyph_name
+            assert subsetted.getGlyphID(retained_glyph) > 0
+        finally:
+            subsetted.close()
+        assert len(result.fonts_subsetted) == 1
 
     def test_subset_cidfont_with_explicit_cidtogidmap(self):
         """CIDFont subsetting follows explicit CIDToGIDMap streams."""
@@ -1539,11 +1658,11 @@ class TestValidateToUnicodeCmap:
             validate_tounicode_cmap(data)
 
 
-class TestCleanToUnicode:
-    """Tests for _clean_tounicode."""
+class TestToUnicodePreservation:
+    """Tests that font subsetting never rewrites semantic Unicode mappings."""
 
-    def test_simple_font_tounicode_cleaned(self):
-        """After subsetting, simple font ToUnicode only has used codes."""
+    def test_simple_font_tounicode_preserved(self):
+        """Simple-font mappings, sequences, and inheritance stay byte-exact."""
         pdf = new_pdf()
         font_data = _load_liberation_sans()
 
@@ -1551,8 +1670,16 @@ class TestCleanToUnicode:
 
         # Add a ToUnicode with entries for A(65), B(66), C(67)
         mapping = {65: 0x0041, 66: 0x0042, 67: 0x0043}
-        cmap_data = generate_tounicode_cmap_data(mapping)
-        font_obj[Name.ToUnicode] = pdf.make_indirect(Stream(pdf, cmap_data))
+        cmap_data = generate_tounicode_cmap_data(mapping).replace(
+            b"<41> <0041>",
+            b"<41> <00660069>",
+        )
+        original_stream = pdf.make_indirect(Stream(pdf, cmap_data))
+        inherited_cmap = pdf.make_indirect(
+            Stream(pdf, generate_tounicode_cmap_data({68: 0x0044}))
+        )
+        original_stream[Name("/UseCMap")] = inherited_cmap
+        font_obj[Name.ToUnicode] = original_stream
 
         font_dict = Dictionary(F1=font_obj)
         # Content only uses A and B
@@ -1570,18 +1697,19 @@ class TestCleanToUnicode:
 
         assert len(result.fonts_subsetted) == 1
 
-        # Parse the cleaned ToUnicode
         tounicode_stream = font_obj.get("/ToUnicode")
         assert tounicode_stream is not None
-        cleaned = parse_tounicode_cmap(bytes(tounicode_stream.read_bytes()))
+        assert tounicode_stream.objgen == original_stream.objgen
+        assert tounicode_stream.get("/UseCMap").objgen == inherited_cmap.objgen
+        preserved_data = bytes(tounicode_stream.read_bytes())
+        assert preserved_data == cmap_data
+        preserved = parse_tounicode_cmap_sequences(preserved_data)
+        assert preserved[b"A"] == (0x66, 0x69)
+        assert preserved[b"B"] == (0x42,)
+        assert preserved[b"C"] == (0x43,)
 
-        # Should only have codes 65 and 66 (A and B), not 67 (C)
-        assert 65 in cleaned
-        assert 66 in cleaned
-        assert 67 not in cleaned
-
-    def test_cidfont_tounicode_cleaned(self):
-        """After subsetting, CIDFont ToUnicode only has used codes."""
+    def test_cidfont_tounicode_preserved(self):
+        """CIDFont ToUnicode remains byte-exact after font subsetting."""
         pdf = new_pdf()
         font_data = _load_liberation_sans()
 
@@ -1590,7 +1718,8 @@ class TestCleanToUnicode:
         # Add a ToUnicode with entries for GIDs 0x41, 0x42, 0x43
         mapping = {0x0041: 0x0041, 0x0042: 0x0042, 0x0043: 0x0043}
         cmap_data = generate_cidfont_tounicode_cmap(mapping)
-        font_obj[Name.ToUnicode] = pdf.make_indirect(Stream(pdf, cmap_data))
+        original_stream = pdf.make_indirect(Stream(pdf, cmap_data))
+        font_obj[Name.ToUnicode] = original_stream
 
         font_dict = Dictionary(F1=font_obj)
         # Content uses codes 0x0041 and 0x0042 only
@@ -1608,15 +1737,10 @@ class TestCleanToUnicode:
 
         assert len(result.fonts_subsetted) == 1
 
-        # Parse the cleaned ToUnicode
         tounicode_stream = font_obj.get("/ToUnicode")
         assert tounicode_stream is not None
-        cleaned = parse_tounicode_cmap(bytes(tounicode_stream.read_bytes()))
-
-        # Should only have codes 0x41 and 0x42, not 0x43
-        assert 0x0041 in cleaned
-        assert 0x0042 in cleaned
-        assert 0x0043 not in cleaned
+        assert tounicode_stream.objgen == original_stream.objgen
+        assert bytes(tounicode_stream.read_bytes()) == cmap_data
 
     def test_font_without_tounicode_not_affected(self):
         """Font without ToUnicode is subsetted without errors."""
@@ -1644,57 +1768,6 @@ class TestCleanToUnicode:
         assert len(result.fonts_subsetted) == 1
         # Still no ToUnicode
         assert font_obj.get("/ToUnicode") is None
-
-    def test_stale_entries_removed(self):
-        """Stale ToUnicode entries for unused codes are removed."""
-        pdf = new_pdf()
-
-        # Build a large mapping with many entries
-        full_mapping = {i: i for i in range(32, 128)}
-        cmap_data = generate_tounicode_cmap_data(full_mapping)
-
-        # Only codes 65 and 66 are "used"
-        used_codes = {65, 66}
-
-        font = Dictionary(
-            Type=Name.Font,
-            Subtype=Name.TrueType,
-            BaseFont=Name("/TestFont"),
-        )
-        font_obj = pdf.make_indirect(font)
-        font_obj[Name.ToUnicode] = pdf.make_indirect(Stream(pdf, cmap_data))
-
-        _clean_tounicode(font_obj, used_codes, is_cid=False, pdf=pdf)
-
-        # Parse the cleaned ToUnicode
-        tounicode_stream = font_obj.get("/ToUnicode")
-        cleaned = parse_tounicode_cmap(bytes(tounicode_stream.read_bytes()))
-
-        assert cleaned == {65: 65, 66: 66}
-
-    def test_no_rewrite_when_all_entries_used(self):
-        """ToUnicode is not rewritten when all entries are used."""
-        pdf = new_pdf()
-
-        mapping = {65: 0x0041, 66: 0x0042}
-        cmap_data = generate_tounicode_cmap_data(mapping)
-
-        font = Dictionary(
-            Type=Name.Font,
-            Subtype=Name.TrueType,
-            BaseFont=Name("/TestFont"),
-        )
-        font_obj = pdf.make_indirect(font)
-        original_stream = pdf.make_indirect(Stream(pdf, cmap_data))
-        font_obj[Name.ToUnicode] = original_stream
-
-        used_codes = {65, 66}
-        original_objgen = font_obj.get("/ToUnicode").objgen
-
-        _clean_tounicode(font_obj, used_codes, is_cid=False, pdf=pdf)
-
-        # Stream object should be unchanged (same objgen)
-        assert font_obj.get("/ToUnicode").objgen == original_objgen
 
 
 def _make_font_with_fstype(fstype_value: int) -> bytes:
@@ -2413,6 +2486,217 @@ class TestSymbolicTrueTypeSubsetting:
         assert encoding.get(0x41) == "symbolA"
         assert encoding.get(0x42) == "symbolB"
         assert encoding.get(0x20) == "space"
+
+    def test_program_byte_mapping_is_not_reinterpreted_as_agl(self) -> None:
+        """A byte-cmap glyph name is already the final program glyph."""
+        from fontTools.ttLib import TTFont
+        from fontTools.ttLib.tables._c_m_a_p import cmap_format_4
+
+        from pdftopdfa.fonts.subsetter import (
+            _populate_from_encoding,
+            _resolve_truetype_font_encoding_with_source,
+        )
+
+        tt_font = TTFont(BytesIO(_make_symbolic_truetype_font_data()))
+        # Force all lazy cmap subtables to decompile before replacing one;
+        # otherwise fontTools may serialize the original shared table bytes.
+        for table in tt_font["cmap"].tables:
+            _ = table.cmap
+        symbol_cmap = next(
+            table
+            for table in tt_font["cmap"].tables
+            if (table.platformID, table.platEncID) == (3, 0)
+        )
+        symbol_cmap.cmap = {0xF041: "symbolB"}
+        unicode_cmap = cmap_format_4(4)
+        unicode_cmap.platformID = 3
+        unicode_cmap.platEncID = 1
+        unicode_cmap.language = 0
+        unicode_cmap.cmap = {
+            0x41: "symbolB",
+            0x42: "symbolA",
+        }
+        tt_font["cmap"].tables = [symbol_cmap, unicode_cmap]
+        buffer = BytesIO()
+        tt_font.save(buffer)
+        tt_font.close()
+
+        pdf = new_pdf()
+        font_obj = _make_embedded_symbolic_font(
+            pdf,
+            "TestSymbol",
+            buffer.getvalue(),
+        )
+        encoding, from_program = _resolve_truetype_font_encoding_with_source(
+            font_obj,
+            buffer.getvalue(),
+        )
+        assert encoding == {0x41: "symbolB"}
+        assert from_program is True
+
+        class CaptureSubsetter:
+            glyphs = set()
+            unicodes = set()
+
+            def populate(self, *, glyphs=(), unicodes=()):
+                self.glyphs.update(glyphs)
+                self.unicodes.update(unicodes)
+
+        parsed = TTFont(BytesIO(buffer.getvalue()))
+        try:
+            capture = CaptureSubsetter()
+            _populate_from_encoding(
+                capture,
+                parsed,
+                {0x41},
+                encoding,
+                glyph_names_are_program=True,
+            )
+            assert capture.glyphs == {"symbolB"}
+            assert "symbolA" not in capture.glyphs
+        finally:
+            parsed.close()
+
+    def test_f2_symbol_cmap_precedes_conflicting_mac_cmap(self) -> None:
+        """Microsoft Symbol F200 mapping is authoritative over Mac Roman."""
+        from fontTools.ttLib import TTFont
+
+        from pdftopdfa.fonts.subsetter import _build_symbolic_truetype_encoding
+
+        tt_font = TTFont(BytesIO(_make_symbolic_truetype_font_data()))
+        for table in tt_font["cmap"].tables:
+            _ = table.cmap
+        symbol_cmap = next(
+            table
+            for table in tt_font["cmap"].tables
+            if (table.platformID, table.platEncID) == (3, 0)
+        )
+        symbol_cmap.cmap = {0xF241: "symbolB"}
+        mac_cmap = next(
+            table
+            for table in tt_font["cmap"].tables
+            if (table.platformID, table.platEncID) == (1, 0)
+        )
+        mac_cmap.cmap = {0x41: "symbolA"}
+        buffer = BytesIO()
+        tt_font.save(buffer)
+        tt_font.close()
+
+        pdf = new_pdf()
+        font_obj = _make_embedded_symbolic_font(
+            pdf,
+            "TestSymbol",
+            buffer.getvalue(),
+        )
+
+        assert _build_symbolic_truetype_encoding(
+            font_obj,
+            buffer.getvalue(),
+        ) == {0x41: "symbolB"}
+
+    def test_existing_symbol_cmap_wins_over_difference_when_subsetting(self) -> None:
+        """Subsetting follows the authoritative Microsoft Symbol cmap."""
+        from fontTools.ttLib import TTFont
+        from fontTools.ttLib.tables._c_m_a_p import cmap_format_4
+
+        from pdftopdfa.sanitizers.truetype_encoding import (
+            sanitize_truetype_encoding,
+        )
+
+        tt_font = TTFont(BytesIO(_load_noto_sans_symbols2()))
+        expected_glyph = tt_font.getBestCmap()[0x2714]
+        symbol_cmap = cmap_format_4(4)
+        symbol_cmap.platformID = 3
+        symbol_cmap.platEncID = 0
+        symbol_cmap.language = 0
+        symbol_cmap.cmap = {0xF041: expected_glyph}
+        tt_font["cmap"].tables.append(symbol_cmap)
+        buffer = BytesIO()
+        tt_font.save(buffer)
+        tt_font.close()
+
+        pdf = new_pdf()
+        font_obj = _make_embedded_symbolic_font(
+            pdf,
+            "TestSymbol",
+            buffer.getvalue(),
+        )
+        font_obj[Name.Encoding] = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Encoding,
+                Differences=Array([52, Name("/a20")]),
+            )
+        )
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(Font=Dictionary(F1=font_obj)),
+            Contents=pdf.make_stream(b"BT /F1 12 Tf <41> Tj ET"),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+
+        subset_result = FontSubsetter(pdf).subset_all_fonts()
+        sanitize_truetype_encoding(pdf)
+
+        assert len(subset_result.fonts_subsetted) == 1
+        assert font_obj.get("/Encoding") is None
+        font_stream = font_obj.FontDescriptor.FontFile2
+        subsetted_font = TTFont(BytesIO(font_stream.read_bytes()))
+        try:
+            assert subsetted_font.getBestCmap()[0x2714] == expected_glyph
+            symbol_cmap = next(
+                table
+                for table in subsetted_font["cmap"].tables
+                if table.platformID == 3 and table.platEncID == 0
+            )
+            assert symbol_cmap.cmap[0xF041] == expected_glyph
+            assert 0xF034 not in symbol_cmap.cmap
+        finally:
+            subsetted_font.close()
+
+    def test_mac_symbol_cmap_survives_subsetting(self) -> None:
+        """A Mac-only symbolic byte cmap remains usable after subsetting."""
+        from fontTools.ttLib import TTFont
+
+        tt_font = TTFont(BytesIO(_make_symbolic_truetype_font_data()))
+        tt_font["cmap"].tables = [
+            table
+            for table in tt_font["cmap"].tables
+            if not (table.platformID == 3 and table.platEncID == 0)
+        ]
+        buffer = BytesIO()
+        tt_font.save(buffer)
+        tt_font.close()
+
+        pdf = new_pdf()
+        font_obj = _make_embedded_symbolic_font(
+            pdf,
+            "TestSymbol",
+            buffer.getvalue(),
+        )
+        page_dict = Dictionary(
+            Type=Name.Page,
+            MediaBox=Array([0, 0, 612, 792]),
+            Resources=Dictionary(Font=Dictionary(F1=font_obj)),
+            Contents=pdf.make_stream(b"BT /F1 12 Tf <4142> Tj ET"),
+        )
+        pdf.pages.append(pikepdf.Page(page_dict))
+
+        result = FontSubsetter(pdf).subset_all_fonts()
+
+        assert len(result.fonts_subsetted) == 1
+        font_stream = font_obj.FontDescriptor.FontFile2
+        subsetted_font = TTFont(BytesIO(font_stream.read_bytes()))
+        try:
+            mac_cmap = next(
+                table
+                for table in subsetted_font["cmap"].tables
+                if table.platformID == 1 and table.platEncID == 0
+            )
+            assert mac_cmap.cmap[0x41] == "symbolA"
+            assert mac_cmap.cmap[0x42] == "symbolB"
+        finally:
+            subsetted_font.close()
 
     def test_nonsymbolic_font_returns_none(self) -> None:
         """Non-symbolic font should return None."""

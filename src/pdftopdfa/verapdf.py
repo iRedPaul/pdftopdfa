@@ -49,6 +49,21 @@ VALID_FLAVOURS = frozenset(
     }
 )
 
+_DEFAULT_JAVA_STACK_OPTION = "-Xss16m"
+_JAVA_OPTION_ENV_VARS = (
+    "JAVA_OPTS",
+    "JDK_JAVA_OPTIONS",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+)
+_JAVA_STACK_OPTION_RE = re.compile(r"(?<!\S)-Xss(?:=)?\S+")
+_BATCH_FAILURE_ATTRIBUTES = (
+    "failedToParse",
+    "encrypted",
+    "outOfMemory",
+    "veraExceptions",
+)
+
 
 def _get_verapdf_candidates(platform_name: str | None = None) -> tuple[str, ...]:
     """Returns candidate launcher names for the current platform."""
@@ -132,6 +147,8 @@ def get_verapdf_version() -> str | None:
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
         # veraPDF outputs version on stdout
@@ -195,6 +212,9 @@ def _parse_verapdf_xml(xml_string: str) -> VeraPDFResult:
 
     Returns:
         VeraPDFResult with the extracted information.
+
+    Raises:
+        VeraPDFError: If the XML is incomplete or reports a veraPDF failure.
     """
     result = VeraPDFResult(compliant=False, raw_xml=xml_string)
 
@@ -202,28 +222,74 @@ def _parse_verapdf_xml(xml_string: str) -> VeraPDFResult:
         parser = etree.XMLParser(resolve_entities=False, no_network=True)
         root = etree.fromstring(xml_string.encode("utf-8"), parser=parser)
     except etree.XMLSyntaxError as e:
-        logger.warning("Error parsing veraPDF XML: %s", e)
-        result.errors.append(f"XML parsing error: {e}")
-        return result
+        raise VeraPDFError(f"Invalid veraPDF XML report: {e}") from e
 
-    # Search for validationReport
-    # veraPDF XML structure: <report><jobs><job><validationReport>...
-    validation_report = root.find(".//validationReport")
+    task_errors: list[str] = []
+    for task_result in root.xpath(
+        ".//*[local-name()='taskResult' or local-name()='taskException']"
+    ):
+        exception_message = task_result.get("exceptionMessage")
+        exception_elements = task_result.xpath("./*[local-name()='exceptionMessage']")
+        if exception_message is None and exception_elements:
+            exception_message = " ".join(exception_elements[0].itertext())
+        if exception_message is not None:
+            task_errors.append(exception_message.strip() or "unknown task error")
+    if task_errors:
+        raise VeraPDFError(f"veraPDF task failed: {'; '.join(task_errors)}")
 
-    if validation_report is None:
-        # Alternative path for some veraPDF versions
-        validation_report = root.find(
-            ".//batchSummary/validationReports/validationReport"
+    batch_errors: list[str] = []
+    for batch_summary in root.xpath(".//*[local-name()='batchSummary']"):
+        for attribute in _BATCH_FAILURE_ATTRIBUTES:
+            value = batch_summary.get(attribute)
+            if value is None:
+                continue
+            try:
+                count = int(value)
+            except ValueError as e:
+                raise VeraPDFError(
+                    f"Invalid veraPDF batch counter {attribute}={value!r}"
+                ) from e
+            if count < 0:
+                raise VeraPDFError(
+                    f"Invalid veraPDF batch counter {attribute}={value!r}"
+                )
+            if count:
+                batch_errors.append(f"{attribute}={count}")
+
+        for report_summary in batch_summary.xpath(".//*[@failedJobs]"):
+            value = report_summary.get("failedJobs")
+            try:
+                count = int(value)
+            except (TypeError, ValueError) as e:
+                raise VeraPDFError(
+                    f"Invalid veraPDF batch counter failedJobs={value!r}"
+                ) from e
+            if count < 0:
+                raise VeraPDFError(
+                    f"Invalid veraPDF batch counter failedJobs={value!r}"
+                )
+            if count:
+                batch_errors.append(f"failedJobs={count}")
+    if batch_errors:
+        raise VeraPDFError(f"veraPDF batch failed: {', '.join(batch_errors)}")
+
+    validation_reports = root.xpath(
+        "descendant-or-self::*[local-name()='validationReport']"
+    )
+    if len(validation_reports) != 1:
+        raise VeraPDFError(
+            "Expected exactly one validationReport in veraPDF XML, "
+            f"found {len(validation_reports)}"
         )
-
-    if validation_report is None:
-        logger.warning("No validationReport found in veraPDF XML")
-        result.warnings.append("No validation report found in veraPDF result")
-        return result
+    validation_report = validation_reports[0]
 
     # Extract compliance status
-    is_compliant = validation_report.get("isCompliant", "false").lower() == "true"
-    result.compliant = is_compliant
+    compliance_status = validation_report.get("isCompliant", "").strip().lower()
+    if compliance_status not in {"true", "false"}:
+        raise VeraPDFError(
+            "Invalid or missing isCompliant attribute in veraPDF validationReport"
+        )
+    result.compliant = compliance_status == "true"
 
     # Extract flavour (profileName contains e.g. "PDF/A-2B validation profile")
     profile_name = validation_report.get("profileName", "")
@@ -231,34 +297,73 @@ def _parse_verapdf_xml(xml_string: str) -> VeraPDFResult:
         result.flavour = _extract_flavour_from_profile(profile_name)
 
     # Count passed/failed rules
-    details = validation_report.find("details")
-    if details is not None:
-        passed_rules = details.get("passedRules", "0")
-        failed_rules = details.get("failedRules", "0")
+    details_elements = validation_report.xpath("./*[local-name()='details']")
+    if len(details_elements) != 1:
+        raise VeraPDFError(
+            "Expected exactly one details element in veraPDF validationReport, "
+            f"found {len(details_elements)}"
+        )
+    details = details_elements[0]
+    for attribute in ("passedRules", "failedRules"):
+        value = details.get(attribute)
         try:
-            result.passed_rules = int(passed_rules)
-            result.failed_rules = int(failed_rules)
-        except ValueError:
-            pass
+            count = int(value)
+        except (TypeError, ValueError) as e:
+            raise VeraPDFError(
+                f"Invalid or missing {attribute} in veraPDF validationReport"
+            ) from e
+        if count < 0:
+            raise VeraPDFError(
+                f"Invalid or missing {attribute} in veraPDF validationReport"
+            )
+        if attribute == "passedRules":
+            result.passed_rules = count
+        else:
+            result.failed_rules = count
 
-        # Extract error messages from failed rules
-        for rule in details.findall(".//rule[@status='failed']"):
-            clause = rule.get("clause", "")
-            description_elem = rule.find("description")
-            description = description_elem.text if description_elem is not None else ""
+    expected_compliance = result.failed_rules == 0
+    if result.compliant != expected_compliance:
+        raise VeraPDFError(
+            "Inconsistent veraPDF validationReport: "
+            f"isCompliant={compliance_status}, failedRules={result.failed_rules}"
+        )
 
-            error_msg = f"Rule {clause}: {description}" if clause else description
-            if error_msg:
-                result.errors.append(error_msg)
+    # Extract error messages from failed rules
+    for rule in details.xpath(".//*[local-name()='rule']"):
+        if rule.get("status", "").lower() != "failed":
+            continue
+        clause = rule.get("clause", "")
+        description_elements = rule.xpath("./*[local-name()='description']")
+        description = (
+            " ".join(description_elements[0].itertext()).strip()
+            if description_elements
+            else ""
+        )
 
-    # Search for taskResult for additional errors
-    task_result = root.find(".//taskResult")
-    if task_result is not None:
-        exception_msg = task_result.get("exceptionMessage")
-        if exception_msg:
-            result.errors.append(f"veraPDF error: {exception_msg}")
+        error_msg = f"Rule {clause}: {description}" if clause else description
+        if error_msg:
+            result.errors.append(error_msg)
 
     return result
+
+
+def _get_verapdf_subprocess_env() -> dict[str, str]:
+    """Builds an isolated environment suitable for deeply nested PDFs.
+
+    veraPDF's default Java thread stack can be exhausted by valid, deeply nested
+    resource graphs. An explicit user stack size in any standard Java option
+    variable takes precedence; otherwise only the child process receives 16 MiB.
+    """
+    env = os.environ.copy()
+    if any(
+        _JAVA_STACK_OPTION_RE.search(env.get(variable, ""))
+        for variable in _JAVA_OPTION_ENV_VARS
+    ):
+        return env
+
+    java_options = env.get("JAVA_OPTS", "").strip()
+    env["JAVA_OPTS"] = f"{java_options} {_DEFAULT_JAVA_STACK_OPTION}".strip()
+    return env
 
 
 def _extract_flavour_from_profile(profile_name: str) -> str | None:
@@ -318,8 +423,8 @@ def validate_with_verapdf(
     # Build command
     cmd = [_get_verapdf_cmd(), "--format", "xml"]
 
-    if flavour:
-        normalized_flavour = _normalize_flavour(flavour)
+    normalized_flavour = _normalize_flavour(flavour) if flavour else None
+    if normalized_flavour:
         cmd.extend(["--flavour", normalized_flavour])
 
     cmd.append(str(path))
@@ -332,7 +437,10 @@ def validate_with_verapdf(
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
+            env=_get_verapdf_subprocess_env(),
         )
     except FileNotFoundError as e:
         raise VeraPDFError(
@@ -364,16 +472,21 @@ def validate_with_verapdf(
             raise VeraPDFError(f"veraPDF error: {result.stderr.strip()}")
         raise VeraPDFError("veraPDF returned no output")
 
-    # Parse XML result
-    try:
-        verapdf_result = _parse_verapdf_xml(xml_output)
-    except Exception as e:
-        logger.warning("Error parsing veraPDF result: %s", e)
-        # Try to extract at least the basic status
-        verapdf_result = VeraPDFResult(
-            compliant=False,
-            raw_xml=xml_output,
-            errors=[f"XML parsing failed: {e}"],
+    # Parse XML result. Incomplete reports and veraPDF execution failures raise
+    # VeraPDFError instead of being misclassified as ordinary non-compliance.
+    verapdf_result = _parse_verapdf_xml(xml_output)
+    expected_returncode = 0 if verapdf_result.compliant else 1
+    if result.returncode != expected_returncode:
+        raise VeraPDFError(
+            "Inconsistent veraPDF result: "
+            f"exit code {result.returncode} reports "
+            f"isCompliant={str(verapdf_result.compliant).lower()}"
+        )
+    if normalized_flavour and verapdf_result.flavour != normalized_flavour:
+        reported_flavour = verapdf_result.flavour or "unknown"
+        raise VeraPDFError(
+            "veraPDF validated an unexpected flavour: "
+            f"requested {normalized_flavour}, reported {reported_flavour}"
         )
 
     log_level = logging.INFO if verapdf_result.compliant else non_compliant_log_level

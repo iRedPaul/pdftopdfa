@@ -23,13 +23,24 @@ import logging
 from io import BytesIO
 
 import pikepdf
-from fontTools.agl import AGL2UV
-from fontTools.ttLib import TTFont
+from fontTools.agl import AGL2UV, LEGACY_AGL2UV
+from fontTools.ttLib import TTFont, newTable
 from fontTools.ttLib.tables._c_m_a_p import cmap_format_4
-from pikepdf import Dictionary, Name, Pdf, Stream
+from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..fonts.analysis import is_symbolic_font
+from ..fonts.encodings import STANDARD_ENCODING
+from ..fonts.tounicode import (
+    generate_tounicode_for_macroman,
+    generate_tounicode_for_winansi,
+    generate_tounicode_from_encoding_dict,
+)
 from ..fonts.traversal import iter_acroform_dr_fonts, iter_all_page_fonts
+from ..fonts.utils import (
+    get_truetype_byte_encoding,
+    parse_symbol_cmap,
+    symbol_cmap_to_byte_mapping,
+)
 from ..fonts.utils import safe_str as _safe_str
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
@@ -42,7 +53,9 @@ _VALID_ENCODINGS = frozenset({"/WinAnsiEncoding", "/MacRomanEncoding"})
 
 def _is_agl_glyph_name(glyph_name: str) -> bool:
     """Return True when a glyph name is explicitly listed in Adobe Glyph List."""
-    return glyph_name == ".notdef" or glyph_name in AGL2UV
+    return (
+        glyph_name == ".notdef" or glyph_name in AGL2UV or glyph_name in LEGACY_AGL2UV
+    )
 
 
 def sanitize_truetype_encoding(pdf: Pdf) -> dict[str, int]:
@@ -76,7 +89,7 @@ def sanitize_truetype_encoding(pdf: Pdf) -> dict[str, int]:
         try:
             if subtype in ("/Type1", "/MMType1"):
                 _fix_type1_encoding(font, result)
-            elif is_symbolic_font(font):
+            elif _classify_truetype_font(font, fd, result):
                 _fix_symbolic_truetype(pdf, font, fd, result)
             else:
                 _fix_nonsymbolic_truetype(pdf, font, fd, result)
@@ -245,6 +258,54 @@ def _load_tt_font(fd: pikepdf.Object) -> TTFont | None:
         return None
 
 
+def _classify_truetype_font(
+    font: pikepdf.Object,
+    fd: pikepdf.Object,
+    result: dict[str, int],
+) -> bool:
+    """Normalize mutually exclusive font flags and return Symbolic status."""
+    try:
+        flags = int(fd.get("/Flags", 0))
+    except (TypeError, ValueError):
+        flags = 0
+
+    symbolic_flag = bool(flags & 4)
+    nonsymbolic_flag = bool(flags & 32)
+    byte_source = None
+    tt_font = _load_tt_font(fd)
+    if tt_font is not None:
+        try:
+            byte_encoding = get_truetype_byte_encoding(tt_font)
+            if byte_encoding is not None:
+                byte_source = byte_encoding[0]
+        finally:
+            tt_font.close()
+
+    if symbolic_flag != nonsymbolic_flag:
+        symbolic = symbolic_flag
+        if not symbolic and font.get("/Encoding") is None and byte_source is not None:
+            symbolic = True
+    elif (symbolic_flag and nonsymbolic_flag and byte_source is not None) or (
+        not symbolic_flag
+        and not nonsymbolic_flag
+        and font.get("/Encoding") is None
+        and byte_source is not None
+    ):
+        # With contradictory flags, preserve the program byte-cmap lookup that
+        # viewers use when the Symbolic bit is set, regardless of a stray PDF
+        # Encoding entry.
+        symbolic = True
+    else:
+        symbolic = False
+
+    normalized_flags = (flags & ~(4 | 32)) | (4 if symbolic else 32)
+    if normalized_flags != flags:
+        fd[Name.Flags] = normalized_flags
+        if symbolic:
+            result["tt_symbolic_flag_set"] += 1
+    return symbolic
+
+
 def _save_tt_font(pdf: Pdf, fd: pikepdf.Object, tt_font: TTFont) -> None:
     """Saves a modified TTFont back to its original descriptor entry.
 
@@ -307,7 +368,7 @@ def _fix_nonsymbolic_truetype(
     """
     # Rule 6.2.11.6-2 first (encoding dict), then rule 6.2.11.6-1 (cmap)
     _apply_rule_6_2_11_6_2(pdf, font, fd, result)
-    _apply_rule_6_2_11_6_1(pdf, fd, result)
+    _apply_rule_6_2_11_6_1(pdf, font, fd, result)
 
 
 def _fix_symbolic_truetype(
@@ -324,12 +385,47 @@ def _fix_symbolic_truetype(
         fd: Resolved FontDescriptor Dictionary.
         result: Result counters dict (modified in place).
     """
+    code_to_glyph = None
+    try:
+        from ..fonts.subsetter import (
+            _build_symbolic_truetype_encoding,
+            _resolve_explicit_encoding_differences,
+        )
+
+        # A usable program byte cmap is authoritative. Differences are used
+        # only to recover malformed replacement fonts that have Unicode cmaps
+        # but no Microsoft Symbol or Macintosh byte cmap.
+        font_file_info = _get_truetype_font_stream(fd)
+        usable_program_cmap = False
+        if font_file_info is not None:
+            _font_file_key, font_file = font_file_info
+            font_data = bytes(font_file.read_bytes())
+            tt_font = TTFont(BytesIO(font_data))
+            try:
+                usable_program_cmap = get_truetype_byte_encoding(tt_font) is not None
+            finally:
+                tt_font.close()
+        if (
+            not usable_program_cmap
+            and _resolve_explicit_encoding_differences(font)
+            and font_file_info is not None
+        ):
+            font_file_info = _get_truetype_font_stream(fd)
+            if font_file_info is not None:
+                code_to_glyph = _build_symbolic_truetype_encoding(
+                    font,
+                    font_data,
+                )
+    except Exception:
+        code_to_glyph = None
+
     _apply_rule_6_2_11_6_3(font, fd, result)
-    _apply_rule_6_2_11_6_4(pdf, fd, result)
+    _apply_rule_6_2_11_6_4(pdf, fd, result, code_to_glyph=code_to_glyph)
 
 
 def _apply_rule_6_2_11_6_1(
     pdf: Pdf,
+    font: pikepdf.Object,
     fd: pikepdf.Object,
     result: dict[str, int],
 ) -> None:
@@ -341,6 +437,7 @@ def _apply_rule_6_2_11_6_1(
 
     Args:
         pdf: The PDF object.
+        font: Resolved font Dictionary.
         fd: Resolved FontDescriptor Dictionary.
         result: Result counters dict (modified in place).
     """
@@ -351,7 +448,10 @@ def _apply_rule_6_2_11_6_1(
     try:
         cmap_table = tt_font.get("cmap")
         if cmap_table is None:
-            return
+            cmap_table = newTable("cmap")
+            cmap_table.tableVersion = 0
+            cmap_table.tables = []
+            tt_font["cmap"] = cmap_table
 
         subtables = cmap_table.tables
 
@@ -367,16 +467,10 @@ def _apply_rule_6_2_11_6_1(
                 source_30 = st
                 break
 
-        if source_30 is None:
-            return  # No usable (3,0) source
-
-        # Build (3,1) mapping: strip 0xF000 prefix for symbol-range codes
-        new_mapping: dict[int, str] = {}
-        for code, glyph_name in source_30.cmap.items():
-            if 0xF000 <= code <= 0xF0FF:
-                new_mapping[code & 0xFF] = glyph_name
-            else:
-                new_mapping[code] = glyph_name
+        new_mapping = _build_nonsymbolic_unicode_mapping(tt_font, font, source_30)
+        if not new_mapping:
+            if set(tt_font.getGlyphOrder()) != {".notdef"}:
+                return
 
         new_subtable = cmap_format_4(4)
         new_subtable.platformID = 3
@@ -391,6 +485,52 @@ def _apply_rule_6_2_11_6_1(
 
     finally:
         tt_font.close()
+
+
+def _nonsymbolic_code_to_unicode(font: pikepdf.Object) -> dict[int, int]:
+    """Returns the final PDF/A encoding of a non-symbolic simple font."""
+    encoding = font.get("/Encoding")
+    try:
+        encoding = _resolve(encoding)
+    except Exception:
+        return {}
+    if isinstance(encoding, Name):
+        if _safe_str(encoding) == "/MacRomanEncoding":
+            return generate_tounicode_for_macroman()
+        return generate_tounicode_for_winansi()
+    if isinstance(encoding, Dictionary):
+        return generate_tounicode_from_encoding_dict(encoding)
+    return {}
+
+
+def _build_nonsymbolic_unicode_mapping(
+    tt_font: TTFont,
+    font: pikepdf.Object,
+    source_30: object | None,
+) -> dict[int, str]:
+    """Build a Unicode cmap from the final PDF encoding and program glyphs."""
+    byte_mapping = (
+        symbol_cmap_to_byte_mapping(source_30.cmap) if source_30 is not None else {}
+    )
+    code_to_unicode = _nonsymbolic_code_to_unicode(font)
+    from ..fonts.subsetter import _resolve_simple_font_encoding
+
+    encoded_names = (
+        _resolve_simple_font_encoding(
+            font,
+            pdfa_normalized=True,
+        )
+        or {}
+    )
+    glyph_names = set(tt_font.getGlyphOrder())
+    result: dict[int, str] = {}
+    for code, unicode_value in code_to_unicode.items():
+        glyph_name = encoded_names.get(code)
+        if glyph_name not in glyph_names or glyph_name == ".notdef":
+            glyph_name = byte_mapping.get(code)
+        if glyph_name in glyph_names and glyph_name != ".notdef":
+            result[unicode_value] = glyph_name
+    return result
 
 
 def _apply_rule_6_2_11_6_2(
@@ -417,8 +557,17 @@ def _apply_rule_6_2_11_6_2(
     encoding_obj = font.get("/Encoding")
 
     if encoding_obj is None:
-        # No /Encoding — add WinAnsiEncoding
-        font[Name.Encoding] = Name.WinAnsiEncoding
+        # Preserve the program's Macintosh byte lookup when present.
+        encoding_name = Name.WinAnsiEncoding
+        tt_font = _load_tt_font(fd)
+        if tt_font is not None:
+            try:
+                byte_encoding = get_truetype_byte_encoding(tt_font)
+                if byte_encoding is not None and byte_encoding[0] == (1, 0):
+                    encoding_name = Name.MacRomanEncoding
+            finally:
+                tt_font.close()
+        font[Name.Encoding] = encoding_name
         result["tt_nonsymbolic_encoding_fixed"] += 1
         return
 
@@ -431,20 +580,40 @@ def _apply_rule_6_2_11_6_2(
         enc_str = _safe_str(encoding_obj)
         if enc_str in _VALID_ENCODINGS:
             return  # Already compliant
-        # Wrong encoding name — replace with WinAnsiEncoding
-        font[Name.Encoding] = Name.WinAnsiEncoding
+        if enc_str == "/StandardEncoding":
+            font[Name.Encoding] = _winansi_encoding_for_mapping(
+                pdf,
+                dict(STANDARD_ENCODING),
+            )
+            if _ensure_ms_unicode_cmap(pdf, fd, font):
+                result["tt_nonsymbolic_cmap_added"] += 1
+        else:
+            font[Name.Encoding] = Name.WinAnsiEncoding
         result["tt_nonsymbolic_encoding_fixed"] += 1
         return
 
     if isinstance(encoding_obj, Dictionary):
+        base_enc = encoding_obj.get("/BaseEncoding")
+        standard_based = base_enc is None
+        if base_enc is not None:
+            try:
+                standard_based = _safe_str(_resolve(base_enc)) == "/StandardEncoding"
+            except Exception:
+                standard_based = False
+        if standard_based:
+            font[Name.Encoding] = _winansi_encoding_for_mapping(
+                pdf,
+                _standard_encoding_mapping(encoding_obj),
+            )
+            result["tt_nonsymbolic_encoding_fixed"] += 1
+            if _ensure_ms_unicode_cmap(pdf, fd, font):
+                result["tt_nonsymbolic_cmap_added"] += 1
+            return
+
         changed = False
 
         # Check /BaseEncoding
-        base_enc = encoding_obj.get("/BaseEncoding")
-        if base_enc is None:
-            encoding_obj[Name.BaseEncoding] = Name.WinAnsiEncoding
-            changed = True
-        else:
+        if base_enc is not None:
             try:
                 base_enc = _resolve(base_enc)
                 base_str = _safe_str(base_enc)
@@ -472,14 +641,71 @@ def _apply_rule_6_2_11_6_2(
 
             # Valid AGL Differences stay — ensure the font program has a
             # Microsoft Unicode (3,1) cmap so the names map reliably.
-            if keep_differences and _ensure_ms_unicode_cmap(pdf, fd):
+            if keep_differences and _ensure_ms_unicode_cmap(pdf, fd, font):
                 result["tt_nonsymbolic_cmap_added"] += 1
 
         if changed:
             result["tt_nonsymbolic_encoding_fixed"] += 1
 
 
-def _ensure_ms_unicode_cmap(pdf: Pdf, fd: pikepdf.Object) -> bool:
+def _standard_encoding_mapping(encoding: pikepdf.Object) -> dict[int, str]:
+    """Return a StandardEncoding mapping with valid Differences applied."""
+    mapping = dict(STANDARD_ENCODING)
+    differences = encoding.get("/Differences")
+    if differences is None:
+        return mapping
+    try:
+        differences = _resolve(differences)
+        if _has_non_agl_differences(differences):
+            return mapping
+    except Exception:
+        return mapping
+
+    current_code = 0
+    for item in differences:
+        try:
+            current_code = int(item)
+            continue
+        except (TypeError, ValueError):
+            pass
+        if isinstance(item, Name) and 0 <= current_code <= 0xFF:
+            mapping[current_code] = _safe_str(item).lstrip("/")
+            current_code += 1
+    return mapping
+
+
+def _winansi_encoding_for_mapping(
+    pdf: Pdf,
+    mapping: dict[int, str],
+) -> pikepdf.Object:
+    """Rebase a byte-to-glyph mapping on WinAnsi without changing glyph lookup."""
+    from ..fonts.subsetter import _build_winansi_glyphnames
+
+    winansi = _build_winansi_glyphnames()
+    differences: list[int | Name] = []
+    previous_code = -2
+    for code in range(256):
+        glyph_name = mapping.get(code, ".notdef")
+        if glyph_name == winansi.get(code, ".notdef"):
+            continue
+        if code != previous_code + 1:
+            differences.append(code)
+        differences.append(Name(f"/{glyph_name}"))
+        previous_code = code
+
+    encoding = Dictionary(
+        Type=Name.Encoding,
+        BaseEncoding=Name.WinAnsiEncoding,
+        Differences=Array(differences),
+    )
+    return pdf.make_indirect(encoding)
+
+
+def _ensure_ms_unicode_cmap(
+    pdf: Pdf,
+    fd: pikepdf.Object,
+    font: pikepdf.Object,
+) -> bool:
     """Ensures the font program has a Microsoft Unicode (3,1) cmap subtable.
 
     Builds the (3,1) subtable from the best available source cmap.  Mac
@@ -489,6 +715,7 @@ def _ensure_ms_unicode_cmap(pdf: Pdf, fd: pikepdf.Object) -> bool:
     Args:
         pdf: The PDF object.
         fd: Resolved FontDescriptor Dictionary.
+        font: Resolved PDF font dictionary whose final encoding is authoritative.
 
     Returns:
         True if the font program was modified, False otherwise.
@@ -515,7 +742,12 @@ def _ensure_ms_unicode_cmap(pdf: Pdf, fd: pikepdf.Object) -> bool:
         new_subtable.platformID = 3
         new_subtable.platEncID = 1
         new_subtable.language = 0
-        if source.platformID == 1 and source.platEncID == 0:
+        if source.platformID == 3 and source.platEncID == 0:
+            new_mapping = _build_nonsymbolic_unicode_mapping(tt_font, font, source)
+            if not new_mapping:
+                return False
+            new_subtable.cmap = new_mapping
+        elif source.platformID == 1 and source.platEncID == 0:
             new_mapping: dict[int, str] = {}
             for code, glyph_name in source.cmap.items():
                 if 0 <= code <= 0xFF:
@@ -566,8 +798,9 @@ def _apply_rule_6_2_11_6_3(
     except (TypeError, ValueError):
         flags = 0
 
-    if not (flags & 4):
-        fd[Name.Flags] = flags | 4
+    normalized_flags = (flags | 4) & ~32
+    if normalized_flags != flags:
+        fd[Name.Flags] = normalized_flags
         result["tt_symbolic_flag_set"] += 1
 
 
@@ -575,6 +808,8 @@ def _apply_rule_6_2_11_6_4(
     pdf: Pdf,
     fd: pikepdf.Object,
     result: dict[str, int],
+    *,
+    code_to_glyph: dict[int, str] | None = None,
 ) -> None:
     """Rule 6.2.11.6-4: Symbolic TrueType with multiple cmaps must have (3,0).
 
@@ -593,40 +828,112 @@ def _apply_rule_6_2_11_6_4(
 
     try:
         cmap_table = tt_font.get("cmap")
+
+        # A symbolic TrueType font cannot retain its PDF /Encoding. Migrate
+        # that byte-to-glyph mapping into the Microsoft Symbol cmap before
+        # removing /Encoding so the same character codes still select the
+        # same glyphs.
+        glyph_names = set(tt_font.getGlyphOrder())
+        encoded_mapping = {
+            0xF000 | code: glyph_name
+            for code, glyph_name in (code_to_glyph or {}).items()
+            if 0 <= code <= 0xFF
+            and glyph_name != ".notdef"
+            and glyph_name in glyph_names
+        }
+        notdef_codes = {
+            code
+            for code, glyph_name in (code_to_glyph or {}).items()
+            if 0 <= code <= 0xFF and glyph_name == ".notdef"
+        }
         if cmap_table is None:
-            return
+            if not encoded_mapping:
+                return
+            cmap_table = newTable("cmap")
+            cmap_table.tableVersion = 0
+            cmap_table.tables = []
+            tt_font["cmap"] = cmap_table
 
         subtables = cmap_table.tables
-
-        # Exactly one subtable → compliant
-        if len(subtables) == 1:
-            return
-
-        # Check if (3,0) already exists and is non-empty
         existing_30 = None
         for st in subtables:
             if st.platformID == 3 and st.platEncID == 0:
                 existing_30 = st
                 break
 
+        symbol_tables = [
+            st
+            for st in subtables
+            if st.platformID == 3 and st.platEncID == 0 and getattr(st, "cmap", None)
+        ]
+        if symbol_tables and (
+            any(parse_symbol_cmap(st.cmap) is None for st in symbol_tables)
+            or get_truetype_byte_encoding(tt_font) is None
+        ):
+            logger.warning(
+                "Cannot repair ambiguous Microsoft Symbol cmap without "
+                "inventing byte semantics"
+            )
+            return
+
+        mapping_changed = False
+        if encoded_mapping:
+            if existing_30 is None:
+                existing_30 = cmap_format_4(4)
+                existing_30.platformID = 3
+                existing_30.platEncID = 0
+                existing_30.language = 0
+                existing_30.cmap = encoded_mapping
+                cmap_table.tables.append(existing_30)
+                mapping_changed = True
+            else:
+                merged_mapping = dict(existing_30.cmap)
+                merged_mapping.update(encoded_mapping)
+                if merged_mapping != existing_30.cmap:
+                    existing_30.cmap = merged_mapping
+                    mapping_changed = True
+
+        if mapping_changed and (existing_30.cmap or len(subtables) == 1):
+            _save_tt_font(pdf, fd, tt_font)
+            result["tt_symbolic_cmap_added"] += 1
+            logger.info("Migrated symbolic TrueType PDF encoding into the (3,0) cmap")
+            return
+
+        # Exactly one subtable is compliant when no PDF encoding needs to be
+        # migrated.
+        if len(subtables) == 1:
+            return
+
         if existing_30 is not None and existing_30.cmap:
             return  # Already compliant
 
-        # Find best source subtable (prefer (1,0), then (3,1), then first)
-        source_subtables = [
-            st
-            for st in subtables
-            if st.cmap and not (st.platformID == 3 and st.platEncID == 0)
-        ]
-        source = _find_best_cmap_source(source_subtables)
+        # A Macintosh byte cmap can be migrated without guessing. Unicode
+        # cmaps cannot: truncating their keys would invent byte semantics.
+        source = next(
+            (
+                st
+                for st in subtables
+                if st.platformID == 1
+                and st.platEncID == 0
+                and getattr(st, "cmap", None)
+            ),
+            None,
+        )
         if source is None:
             return
 
         # Build (3,0) mapping in 0xF000 range
         new_mapping: dict[int, str] = {}
-        for code, glyph_name in source.cmap.items():
-            sym_code = (code & 0xFF) | 0xF000
+        for byte_code, glyph_name in source.cmap.items():
+            if not 0 <= byte_code <= 0xFF:
+                continue
+            if byte_code in notdef_codes:
+                continue
+            sym_code = byte_code | 0xF000
             new_mapping[sym_code] = glyph_name
+
+        if not new_mapping:
+            return
 
         if existing_30 is not None:
             # Repair empty (3,0) in-place

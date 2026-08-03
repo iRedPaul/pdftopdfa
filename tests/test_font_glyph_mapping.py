@@ -14,22 +14,21 @@ from pdftopdfa.fonts import FontEmbedder
 class TestGlyphMapping:
     """Tests for glyph name mapping module."""
 
-    def test_zapfdingbats_mapping_has_required_glyphs(self):
-        """ZapfDingbats mapping contains all a1-a206 glyphs."""
+    def test_zapfdingbats_mapping_matches_fonttools(self):
+        """ZapfDingbats mapping matches fontTools for the complete encoding."""
+        from fontTools.agl import toUnicode
+
+        from pdftopdfa.fonts.encodings import ZAPFDINGBATS_ENCODING
         from pdftopdfa.fonts.glyph_mapping import ZAPFDINGBATS_GLYPH_TO_UNICODE
 
-        # Check space
-        assert "space" in ZAPFDINGBATS_GLYPH_TO_UNICODE
-        assert ZAPFDINGBATS_GLYPH_TO_UNICODE["space"] == 0x0020
+        expected = {
+            glyph_name: ord(toUnicode(glyph_name, isZapfDingbats=True))
+            for glyph_name in ZAPFDINGBATS_ENCODING.values()
+        }
 
-        # Check some key dingbat glyphs
-        assert "a1" in ZAPFDINGBATS_GLYPH_TO_UNICODE  # Scissors
-        assert "a2" in ZAPFDINGBATS_GLYPH_TO_UNICODE
-        assert "a206" in ZAPFDINGBATS_GLYPH_TO_UNICODE
-
-        # Check specific Unicode mappings
-        assert ZAPFDINGBATS_GLYPH_TO_UNICODE["a1"] == 0x2701  # UPPER BLADE SCISSORS
-        assert ZAPFDINGBATS_GLYPH_TO_UNICODE["a2"] == 0x2702  # BLACK SCISSORS
+        assert ZAPFDINGBATS_GLYPH_TO_UNICODE == expected
+        assert set(ZAPFDINGBATS_GLYPH_TO_UNICODE) == set(ZAPFDINGBATS_ENCODING.values())
+        assert ZAPFDINGBATS_GLYPH_TO_UNICODE["a20"] == 0x2714
 
     def test_symbol_mapping_has_construction_glyphs(self):
         """Symbol mapping handles construction glyphs correctly."""

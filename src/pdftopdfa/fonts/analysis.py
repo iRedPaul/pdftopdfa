@@ -61,7 +61,8 @@ def is_symbolic_font(font: pikepdf.Object) -> bool:
         flags = font_descriptor.get("/Flags")
         if flags is None:
             return False
-        return bool(int(flags) & 4)
+        value = int(flags)
+        return bool(value & 4) and not bool(value & 32)
     except Exception:
         return False
 

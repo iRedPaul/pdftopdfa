@@ -13,18 +13,31 @@ streams, Type3 CharProcs).
 
 import io
 import logging
+import re
 import struct
+from dataclasses import dataclass, field
 
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Operator, Pdf, Stream, String
 
+from ..exceptions import ConversionError
 from ..fonts.glyph_mapping import resolve_glyph_name
+from ..fonts.glyph_usage import (
+    _iter_content_streams_with_resources,
+    find_ambiguous_resource_context_streams,
+)
 from ..fonts.subsetter import (
+    _get_unicode_cmap,
     _resolve_simple_font_encoding,
+)
+from ..fonts.tounicode import (
+    CIDEncodingMap,
+    get_type0_cid_encoding_map,
+    parse_tounicode_cmap_sequences,
+    split_cmap_codes,
 )
 from ..fonts.utils import get_any_cmap as _get_any_cmap
 from ..fonts.utils import safe_str as _safe_str
-from ..utils import iter_type3_fonts as _iter_type3_fonts
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
@@ -44,19 +57,25 @@ class _NotdefCodes:
     without building a 65k-entry frozenset.
     """
 
-    __slots__ = ("_explicit", "_max_valid_code", "_valid_codes")
+    __slots__ = ("_cid_map", "_explicit", "_max_valid_code", "_valid_codes")
 
     def __init__(
         self,
         explicit: frozenset[int] = frozenset(),
         max_valid_code: int | None = None,
         valid_codes: frozenset[int] | None = None,
+        cid_map: CIDEncodingMap | None = None,
     ) -> None:
         self._explicit = explicit
         self._max_valid_code = max_valid_code
         self._valid_codes = valid_codes
+        self._cid_map = cid_map
 
-    def __contains__(self, code: int) -> bool:
+    def __contains__(self, code: int | bytes) -> bool:
+        if self._cid_map is not None:
+            code = self._cid_map.map_code(code)
+        elif isinstance(code, bytes):
+            code = int.from_bytes(code, "big")
         if code in self._explicit:
             return True
         if self._valid_codes is not None:
@@ -69,6 +88,21 @@ class _NotdefCodes:
             or self._max_valid_code is not None
             or self._valid_codes is not None
         )
+
+    @property
+    def code_space_ranges(self) -> tuple[tuple[bytes, bytes], ...]:
+        """Return the embedded CMap code-space ranges, when available."""
+        if self._cid_map is None:
+            return ()
+        return self._cid_map.code_space_ranges
+
+    def mapped_code(self, code: int | bytes) -> int:
+        """Return the descendant CID, or the simple-font character code."""
+        if self._cid_map is not None:
+            return self._cid_map.map_code(code)
+        if isinstance(code, bytes):
+            return int.from_bytes(code, "big")
+        return code
 
 
 def sanitize_notdef_usage(pdf: Pdf) -> dict[str, int]:
@@ -85,60 +119,29 @@ def sanitize_notdef_usage(pdf: Pdf) -> dict[str, int]:
         Dictionary with ``{"notdef_usage_fixed": N}``.
     """
     total_fixed = 0
-    visited: set[tuple[int, int]] = set()
     # Cache notdef codes per font objgen to avoid recomputation
     notdef_cache: dict[tuple[int, int], _NotdefCodes] = {}
+    ambiguous_streams = find_ambiguous_resource_context_streams(pdf)
 
     for page_num, page in enumerate(pdf.pages, start=1):
         try:
-            page_dict = _resolve(page.obj)
-
-            # Build font map from page resources
-            resources = page_dict.get("/Resources")
-            if resources is not None:
-                resources = _resolve(resources)
-            font_map = _build_font_map(resources) if resources else {}
-
-            # 1. Page Contents
-            total_fixed += _fix_notdef_in_page_contents(
-                page_dict, font_map, notdef_cache
-            )
-
-            # 2. Form XObjects (recursive)
-            if resources is not None:
-                total_fixed += _fix_notdef_in_form_xobjects(
-                    resources, visited, notdef_cache
-                )
-
-                # 3. Tiling Patterns (recursive)
-                total_fixed += _fix_notdef_in_patterns(resources, visited, notdef_cache)
-
-                # 4. Type3 CharProcs
-                total_fixed += _fix_notdef_in_type3_charprocs(
-                    resources, visited, notdef_cache
-                )
-
-            # 5. Annotation AP streams
-            annots = page_dict.get("/Annots")
-            if annots:
-                annots = _resolve(annots)
-                for annot_ref in annots:
-                    annot = _resolve(annot_ref)
-                    if not isinstance(annot, Dictionary):
+            for owner, resources in _iter_content_streams_with_resources(page):
+                font_map = _build_font_map(resources)
+                if isinstance(owner, Stream):
+                    objgen = owner.objgen
+                    if objgen != (0, 0) and objgen in ambiguous_streams:
                         continue
-                    ap = annot.get("/AP")
-                    if not ap:
-                        continue
-                    ap = _resolve(ap)
-                    if not isinstance(ap, Dictionary):
-                        continue
-                    for ap_key in ("/N", "/R", "/D"):
-                        ap_entry = ap.get(ap_key)
-                        if ap_entry:
-                            total_fixed += _fix_notdef_in_ap_stream(
-                                ap_entry, visited, notdef_cache
-                            )
+                    total_fixed += _fix_notdef_in_stream(owner, font_map, notdef_cache)
+                else:
+                    total_fixed += _fix_notdef_in_page_contents(
+                        owner,
+                        font_map,
+                        notdef_cache,
+                        ambiguous_streams,
+                    )
 
+        except ConversionError:
+            raise
         except Exception as e:
             log_suppressed_error(
                 logger, e, "Error fixing .notdef usage on page %d: %s", page_num, e
@@ -254,10 +257,6 @@ def _find_missing_glyphs_in_simple_font(font_obj: pikepdf.Object) -> set[int]:
         Set of character codes whose encoded glyph is missing.
     """
     try:
-        encoding = _resolve_simple_font_encoding(font_obj)
-        if not encoding:
-            return set()
-
         fd = font_obj.get("/FontDescriptor")
         if fd is None:
             return set()
@@ -275,6 +274,20 @@ def _find_missing_glyphs_in_simple_font(font_obj: pikepdf.Object) -> set[int]:
                 break
 
         if font_data is None:
+            return set()
+
+        subtype = _safe_str(font_obj.get("/Subtype") or b"")
+        if subtype == "/TrueType":
+            from ..fonts.subsetter import _resolve_truetype_font_encoding
+
+            encoding = _resolve_truetype_font_encoding(
+                font_obj,
+                font_data,
+                pdfa_normalized=True,
+            )
+        else:
+            encoding = _resolve_simple_font_encoding(font_obj)
+        if not encoding:
             return set()
 
         from fontTools.ttLib import TTFont
@@ -456,6 +469,9 @@ def _get_cidfont_notdef_codes(font_obj: pikepdf.Object) -> _NotdefCodes:
         _NotdefCodes for CID values that are .notdef.
     """
     notdef: set[int] = set()
+    cid_map = get_type0_cid_encoding_map(font_obj)
+    if cid_map is None:
+        return _NotdefCodes()
 
     descendants = font_obj.get("/DescendantFonts")
     if descendants is None:
@@ -472,8 +488,8 @@ def _get_cidfont_notdef_codes(font_obj: pikepdf.Object) -> _NotdefCodes:
     if cidfont_subtype == "/CIDFontType0":
         valid_cids = _get_cidfonttype0_valid_cids(cidfont)
         if valid_cids is not None:
-            return _NotdefCodes(frozenset({0}), valid_codes=valid_cids)
-        return _NotdefCodes(frozenset({0}))
+            return _NotdefCodes(frozenset({0}), valid_codes=valid_cids, cid_map=cid_map)
+        return _NotdefCodes(frozenset({0}), cid_map=cid_map)
 
     num_glyphs = _get_cidfont_num_glyphs(cidfont)
 
@@ -482,7 +498,7 @@ def _get_cidfont_notdef_codes(font_obj: pikepdf.Object) -> _NotdefCodes:
         # No mapping — CID 0 is .notdef by convention
         notdef.add(0)
         max_valid = (num_glyphs - 1) if num_glyphs is not None else None
-        return _NotdefCodes(frozenset(notdef), max_valid)
+        return _NotdefCodes(frozenset(notdef), max_valid, cid_map=cid_map)
 
     cidtogidmap = _resolve(cidtogidmap)
 
@@ -491,13 +507,16 @@ def _get_cidfont_notdef_codes(font_obj: pikepdf.Object) -> _NotdefCodes:
         # and CID >= numGlyphs → beyond font program
         notdef.add(0)
         max_valid = (num_glyphs - 1) if num_glyphs is not None else None
-        return _NotdefCodes(frozenset(notdef), max_valid)
+        return _NotdefCodes(frozenset(notdef), max_valid, cid_map=cid_map)
     elif isinstance(cidtogidmap, Stream):
         # Stream mapping: parse to find CIDs that map to GID 0
         # or to GID >= numGlyphs
+        notdef.add(0)
+        max_valid: int | None = None
         try:
             stream_data = bytes(cidtogidmap.read_bytes())
             num_entries = len(stream_data) // 2
+            max_valid = num_entries - 1
             for cid in range(num_entries):
                 gid = struct.unpack_from(">H", stream_data, cid * 2)[0]
                 if gid == 0:
@@ -508,12 +527,35 @@ def _get_cidfont_notdef_codes(font_obj: pikepdf.Object) -> _NotdefCodes:
             # If we can't parse, conservatively only flag CID 0
             notdef.add(0)
 
-    return _NotdefCodes(frozenset(notdef))
+        return _NotdefCodes(
+            frozenset(notdef),
+            max_valid_code=max_valid,
+            cid_map=cid_map,
+        )
+
+    return _NotdefCodes(frozenset(notdef), cid_map=cid_map)
 
 
 # ---------------------------------------------------------------------------
 # Content stream fixing
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ContentState:
+    """Font-related graphics state shared by consecutive content streams."""
+
+    current_font_name: str | None = None
+    font_size: float = 0.0
+    char_spacing: float = 0.0
+    word_spacing: float = 0.0
+    text_rendering_mode: int = 0
+    graphics_state_stack: list[tuple[str | None, float, float, float, int]] = field(
+        default_factory=list
+    )
+    width_cache: dict[tuple[tuple[int, int], bytes], float | None] = field(
+        default_factory=dict
+    )
 
 
 def _is_cidfont(font_obj: pikepdf.Object) -> bool:
@@ -534,53 +576,518 @@ def _is_cidfont(font_obj: pikepdf.Object) -> bool:
     return False
 
 
-def _filter_text_operand(
-    operand: pikepdf.Object,
+def _font_identity(font_obj: pikepdf.Object) -> tuple[int, int] | None:
+    """Return a stable cache key for an indirect font."""
+    objgen = font_obj.objgen
+    return objgen if objgen != (0, 0) else None
+
+
+def _type0_wmode(font_obj: pikepdf.Object) -> int:
+    """Return the Type 0 font writing mode."""
+    encoding = _resolve(font_obj.get("/Encoding"))
+    if isinstance(encoding, Name):
+        return int(str(encoding).endswith("-V"))
+    if isinstance(encoding, Stream):
+        try:
+            wmode = encoding.get("/WMode")
+            if wmode is not None:
+                return int(wmode)
+            match = re.search(rb"/WMode\s+([01])\s+def", encoding.read_bytes())
+            if match is not None:
+                return int(match.group(1))
+        except Exception:
+            pass
+    return 0
+
+
+def _cid_width(cidfont: Dictionary, cid: int, vertical: bool) -> float:
+    """Return a CID's horizontal or vertical displacement in glyph units."""
+    if vertical:
+        default = -1000.0
+        dw2 = _resolve(cidfont.get("/DW2"))
+        if isinstance(dw2, Array) and len(dw2) >= 2:
+            try:
+                default = float(dw2[1])
+            except (TypeError, ValueError):
+                pass
+        widths = _resolve(cidfont.get("/W2"))
+        stride = 3
+    else:
+        try:
+            default = float(cidfont.get("/DW", 1000))
+        except (TypeError, ValueError):
+            default = 1000.0
+        widths = _resolve(cidfont.get("/W"))
+        stride = 1
+
+    if not isinstance(widths, Array):
+        return default
+
+    items = list(widths)
+    index = 0
+    while index < len(items):
+        try:
+            start = int(items[index])
+        except (TypeError, ValueError):
+            break
+        index += 1
+        if index >= len(items):
+            break
+        next_item = _resolve(items[index])
+        if isinstance(next_item, Array):
+            offset = (cid - start) * stride
+            if 0 <= offset < len(next_item):
+                try:
+                    return float(next_item[offset])
+                except (TypeError, ValueError):
+                    return default
+            index += 1
+            continue
+        try:
+            end = int(next_item)
+        except (TypeError, ValueError):
+            break
+        index += 1
+        if index + stride > len(items):
+            break
+        if start <= cid <= end:
+            try:
+                return float(items[index])
+            except (TypeError, ValueError):
+                return default
+        index += stride
+    return default
+
+
+def _simple_notdef_width(font_obj: Dictionary, code: int) -> float | None:
+    """Return the exact advance used for a simple-font .notdef glyph."""
+    try:
+        first_char = int(font_obj.get("/FirstChar", 0))
+        widths = _resolve(font_obj.get("/Widths"))
+        offset = code - first_char
+        if isinstance(widths, Array) and 0 <= offset < len(widths):
+            return float(widths[offset])
+    except (TypeError, ValueError):
+        pass
+
+    descriptor = _resolve(font_obj.get("/FontDescriptor"))
+    if isinstance(descriptor, Dictionary):
+        try:
+            missing_width = descriptor.get("/MissingWidth")
+            if missing_width is not None:
+                return float(missing_width)
+        except (TypeError, ValueError):
+            pass
+
+        for key in ("/FontFile2", "/FontFile3"):
+            font_stream = _resolve(descriptor.get(key))
+            if not isinstance(font_stream, Stream):
+                continue
+            try:
+                from fontTools.ttLib import TTFont
+
+                tt_font = TTFont(io.BytesIO(bytes(font_stream.read_bytes())))
+                try:
+                    glyph_order = tt_font.getGlyphOrder()
+                    if (
+                        glyph_order
+                        and "hmtx" in tt_font
+                        and glyph_order[0] in tt_font["hmtx"].metrics
+                    ):
+                        width = tt_font["hmtx"].metrics[glyph_order[0]][0]
+                        units_per_em = tt_font["head"].unitsPerEm
+                        return width * 1000.0 / units_per_em
+                finally:
+                    tt_font.close()
+            except Exception:
+                continue
+    return None
+
+
+def _code_advance_width(
+    font_obj: pikepdf.Object,
+    encoded: bytes,
     notdef_codes: _NotdefCodes,
-    *,
-    is_cid: bool = False,
-) -> pikepdf.Object | None:
-    """Filters .notdef bytes from a text string operand.
+    state: _ContentState,
+) -> float | None:
+    """Return the text displacement of one encoded .notdef character."""
+    identity = _font_identity(font_obj)
+    cache_key = (identity, encoded) if identity is not None else None
+    if cache_key is not None and cache_key in state.width_cache:
+        return state.width_cache[cache_key]
 
-    Args:
-        operand: A pikepdf String operand from a text operator.
-        notdef_codes: Set of byte values that are .notdef.
-        is_cid: If True, treat operand as 2-byte CID pairs instead of
-            single bytes.
+    width: float | None = None
+    font_obj = _resolve(font_obj)
+    if isinstance(font_obj, Dictionary):
+        if _is_cidfont(font_obj):
+            descendants = _resolve(font_obj.get("/DescendantFonts"))
+            if isinstance(descendants, Array) and descendants:
+                cidfont = _resolve(descendants[0])
+                if isinstance(cidfont, Dictionary):
+                    cid = notdef_codes.mapped_code(encoded)
+                    width = _cid_width(
+                        cidfont,
+                        cid,
+                        vertical=_type0_wmode(font_obj) == 1,
+                    )
+        elif len(encoded) == 1:
+            width = _simple_notdef_width(font_obj, encoded[0])
 
-    Returns:
-        Filtered String, or None if the string becomes empty.
-    """
+    if cache_key is not None:
+        state.width_cache[cache_key] = width
+    return width
+
+
+def _cid_notdef_width(font_obj: pikepdf.Object) -> float | None:
+    """Return the descendant font's .notdef displacement."""
+    font_obj = _resolve(font_obj)
+    if not isinstance(font_obj, Dictionary) or not _is_cidfont(font_obj):
+        return None
+    descendants = _resolve(font_obj.get("/DescendantFonts"))
+    if not isinstance(descendants, Array) or not descendants:
+        return None
+    cidfont = _resolve(descendants[0])
+    if not isinstance(cidfont, Dictionary):
+        return None
+    return _cid_width(
+        cidfont,
+        0,
+        vertical=_type0_wmode(font_obj) == 1,
+    )
+
+
+def _semantic_cid_replacement(
+    font_obj: pikepdf.Object,
+    encoded: bytes,
+    unicode_sequence: tuple[int, ...],
+) -> tuple[bytes, float]:
+    """Map invisible OCR text to a real nonzero glyph with the same Unicode."""
+    font_obj = _resolve(font_obj)
+    if not isinstance(font_obj, Dictionary):
+        raise ConversionError("Invisible OCR font dictionary is invalid")
+
+    encoding = _resolve(font_obj.get("/Encoding"))
+    if not isinstance(encoding, Name) or str(encoding) != "/Identity-H":
+        raise ConversionError(
+            "Invisible .notdef OCR text can only be safely remapped for "
+            "Identity-H CID fonts"
+        )
+    if len(encoded) != 2 or not unicode_sequence:
+        raise ConversionError("Invisible OCR character mapping is not remappable")
+
+    descendants = _resolve(font_obj.get("/DescendantFonts"))
+    if not isinstance(descendants, Array) or not descendants:
+        raise ConversionError("Invisible OCR CID font has no descendant")
+    cidfont = _resolve(descendants[0])
+    if (
+        not isinstance(cidfont, Dictionary)
+        or str(cidfont.get("/Subtype")) != "/CIDFontType2"
+    ):
+        raise ConversionError(
+            "Invisible .notdef OCR text requires a CIDFontType2 descendant"
+        )
+
+    cidtogid = _resolve(cidfont.get("/CIDToGIDMap"))
+    if not isinstance(cidtogid, Name) or str(cidtogid) != "/Identity":
+        raise ConversionError(
+            "Invisible .notdef OCR text requires an Identity CIDToGIDMap"
+        )
+
+    descriptor = _resolve(cidfont.get("/FontDescriptor"))
+    if not isinstance(descriptor, Dictionary):
+        raise ConversionError("Invisible OCR font has no descriptor")
+    font_stream = None
+    for key in ("/FontFile2", "/FontFile3"):
+        candidate = _resolve(descriptor.get(key))
+        if isinstance(candidate, Stream):
+            font_stream = candidate
+            break
+    if font_stream is None:
+        raise ConversionError("Invisible OCR font program is unavailable")
+
+    from fontTools.ttLib import TTFont
+
+    tt_font = TTFont(io.BytesIO(font_stream.read_bytes()))
+    try:
+        cmap = _get_unicode_cmap(tt_font)
+        glyph_name = cmap.get(unicode_sequence[0])
+        if glyph_name is None:
+            raise ConversionError(
+                "Invisible OCR Unicode value has no real glyph in the font"
+            )
+        glyph_id = tt_font.getGlyphID(glyph_name)
+        if glyph_id <= 0 or glyph_id > 65_535:
+            raise ConversionError(
+                "Invisible OCR Unicode value does not resolve to a valid CID"
+            )
+        if "hmtx" not in tt_font or "head" not in tt_font:
+            raise ConversionError("Invisible OCR font has no horizontal metrics")
+        advance = tt_font["hmtx"].metrics[glyph_name][0]
+        width = advance * 1000.0 / tt_font["head"].unitsPerEm
+    finally:
+        tt_font.close()
+
+    replacement = glyph_id.to_bytes(2, "big")
+    _set_cid_width(cidfont, glyph_id, round(width))
+    _add_tounicode_mapping(font_obj, replacement, unicode_sequence)
+    return replacement, width
+
+
+def _set_cid_width(cidfont: Dictionary, cid: int, width: int) -> None:
+    """Set one horizontal CID width without disturbing surrounding ranges."""
+    widths = _resolve(cidfont.get("/W"))
+    if not isinstance(widths, Array):
+        cidfont[Name.W] = Array([cid, Array([width])])
+        return
+
+    items = list(widths)
+    rewritten: list = []
+    found = False
+    index = 0
+    while index < len(items):
+        try:
+            start = int(items[index])
+        except (TypeError, ValueError):
+            rewritten.extend(items[index:])
+            break
+        if index + 1 >= len(items):
+            rewritten.append(items[index])
+            break
+
+        next_item = _resolve(items[index + 1])
+        if isinstance(next_item, Array):
+            values = list(next_item)
+            offset = cid - start
+            if 0 <= offset < len(values):
+                values[offset] = width
+                found = True
+            rewritten.extend([start, Array(values)])
+            index += 2
+            continue
+
+        if index + 2 >= len(items):
+            rewritten.extend(items[index:])
+            break
+        try:
+            end = int(next_item)
+            range_width = items[index + 2]
+        except (TypeError, ValueError):
+            rewritten.extend(items[index : index + 3])
+            index += 3
+            continue
+        if start <= cid <= end:
+            if start < cid:
+                rewritten.extend([start, cid - 1, range_width])
+            rewritten.extend([cid, Array([width])])
+            if cid < end:
+                rewritten.extend([cid + 1, end, range_width])
+            found = True
+        else:
+            rewritten.extend(items[index : index + 3])
+        index += 3
+
+    if not found:
+        rewritten.extend([cid, Array([width])])
+    cidfont[Name.W] = Array(rewritten)
+
+
+def _add_tounicode_mapping(
+    font_obj: Dictionary,
+    encoded: bytes,
+    unicode_sequence: tuple[int, ...],
+) -> None:
+    """Add a non-conflicting source mapping to an existing ToUnicode CMap."""
+    tounicode = _resolve(font_obj.get("/ToUnicode"))
+    if not isinstance(tounicode, Stream):
+        raise ConversionError("Invisible OCR font has no ToUnicode CMap")
+    data = tounicode.read_bytes()
+    mappings = parse_tounicode_cmap_sequences(data)
+    existing = mappings.get(encoded)
+    if existing == unicode_sequence:
+        return
+    if existing is not None:
+        raise ConversionError(
+            "Invisible OCR remap would overwrite an existing ToUnicode mapping"
+        )
+
+    marker = re.search(rb"\bendcmap\b", data)
+    if marker is None:
+        raise ConversionError("Invisible OCR ToUnicode CMap is malformed")
+    try:
+        destination = "".join(chr(value) for value in unicode_sequence).encode(
+            "utf-16-be"
+        )
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise ConversionError("Invisible OCR Unicode mapping is invalid") from exc
+    entry = (
+        b"1 beginbfchar\n<"
+        + encoded.hex().upper().encode()
+        + b"> <"
+        + destination.hex().upper().encode()
+        + b">\nendbfchar\n"
+    )
+    tounicode.write(data[: marker.start()] + entry + data[marker.start() :])
+
+
+def _remap_invisible_tj_items(
+    operand: pikepdf.Object,
+    font_obj: pikepdf.Object,
+    notdef_codes: _NotdefCodes,
+    state: _ContentState,
+) -> list | None:
+    """Replace invisible .notdef codes while preserving Unicode and advance."""
     try:
         raw = bytes(operand)
     except Exception:
-        return operand
+        return None
+
+    ranges = notdef_codes.code_space_ranges or ((b"\x00\x00", b"\xff\xff"),)
+    codes = split_cmap_codes(raw, ranges)
+    tounicode = _resolve(font_obj.get("/ToUnicode"))
+    unicode_map = (
+        parse_tounicode_cmap_sequences(tounicode.read_bytes())
+        if isinstance(tounicode, Stream)
+        else {}
+    )
+
+    items: list = []
+    changed = False
+    consumed = 0
+    for encoded in codes:
+        consumed += len(encoded)
+        if encoded not in notdef_codes:
+            _append_tj_item(items, String(encoded))
+            continue
+
+        old_width = _code_advance_width(font_obj, encoded, notdef_codes, state)
+        if old_width is None:
+            raise ConversionError(
+                "Invisible .notdef OCR text has no reliable advance width"
+            )
+        unicode_sequence = unicode_map.get(encoded)
+        if not unicode_sequence:
+            adjustment = -old_width
+            if state.char_spacing:
+                if state.font_size == 0:
+                    raise ConversionError(
+                        "Invisible .notdef OCR text has no reliable advance width"
+                    )
+                adjustment -= 1000.0 * state.char_spacing / state.font_size
+            _append_tj_item(items, adjustment)
+            changed = True
+            continue
+        replacement, new_width = _semantic_cid_replacement(
+            font_obj,
+            encoded,
+            unicode_sequence,
+        )
+        if replacement in notdef_codes:
+            raise ConversionError("Invisible OCR replacement still resolves to .notdef")
+        _append_tj_item(items, String(replacement))
+        adjustment = new_width - old_width
+        if abs(adjustment) > 0.001:
+            _append_tj_item(items, adjustment)
+        changed = True
+
+    if consumed < len(raw):
+        _append_tj_item(items, String(raw[consumed:]))
+    return items if changed else None
+
+
+def _append_tj_item(items: list, item: pikepdf.Object | float) -> None:
+    """Append a TJ item while coalescing adjacent strings or adjustments."""
+    if isinstance(item, String) and items and isinstance(items[-1], String):
+        items[-1] = String(bytes(items[-1]) + bytes(item))
+    elif (
+        isinstance(item, (int, float)) and items and isinstance(items[-1], (int, float))
+    ):
+        items[-1] = float(items[-1]) + float(item)
+    else:
+        items.append(item)
+
+
+def _replacement_tj_items(
+    operand: pikepdf.Object,
+    font_obj: pikepdf.Object,
+    notdef_codes: _NotdefCodes,
+    state: _ContentState,
+    *,
+    is_cid: bool,
+) -> list | None:
+    """Replace .notdef codes with equivalent TJ cursor adjustments."""
+    try:
+        raw = bytes(operand)
+    except Exception:
+        return None
 
     if is_cid:
-        # Filter 2-byte CID pairs
-        filtered = bytearray()
-        for i in range(0, len(raw) - 1, 2):
-            cid = (raw[i] << 8) | raw[i + 1]
-            if cid not in notdef_codes:
-                filtered.extend(raw[i : i + 2])
-        if len(raw) % 2:
-            # Keep the trailing byte of a malformed odd-length string so
-            # that a string without .notdef CIDs stays byte-identical
-            filtered.append(raw[-1])
-        filtered = bytes(filtered)
+        ranges = notdef_codes.code_space_ranges or ((b"\x00\x00", b"\xff\xff"),)
+        encoded_codes = split_cmap_codes(raw, ranges)
     else:
-        filtered = bytes(b for b in raw if b not in notdef_codes)
-    if filtered == raw:
-        return operand
-    if not filtered:
-        return None
-    return String(filtered)
+        encoded_codes = [bytes([value]) for value in raw]
+
+    items: list = []
+    changed = False
+    consumed = 0
+    for encoded in encoded_codes:
+        consumed += len(encoded)
+        if encoded not in notdef_codes:
+            _append_tj_item(items, String(encoded))
+            continue
+
+        width = _code_advance_width(font_obj, encoded, notdef_codes, state)
+        if width is None:
+            return None
+        spacing = state.char_spacing
+        if not is_cid and encoded == b"\x20":
+            spacing += state.word_spacing
+        if spacing and state.font_size == 0:
+            return None
+        adjustment = -width
+        if spacing:
+            adjustment -= 1000.0 * spacing / state.font_size
+        _append_tj_item(items, adjustment)
+        changed = True
+
+    if consumed < len(raw):
+        if not is_cid:
+            _append_tj_item(items, String(raw[consumed:]))
+        else:
+            width = _cid_notdef_width(font_obj)
+            if width is None:
+                return None
+            adjustment = -width
+            if state.char_spacing:
+                if state.font_size == 0:
+                    return None
+                adjustment -= 1000.0 * state.char_spacing / state.font_size
+            _append_tj_item(items, adjustment)
+            changed = True
+    return items if changed else None
+
+
+def _operand_uses_notdef(
+    operand: pikepdf.Object,
+    notdef_codes: _NotdefCodes,
+    *,
+    is_cid: bool,
+) -> bool:
+    """Return whether a string operand contains a .notdef character."""
+    try:
+        raw = bytes(operand)
+    except Exception:
+        return False
+    if is_cid:
+        ranges = notdef_codes.code_space_ranges or ((b"\x00\x00", b"\xff\xff"),)
+        return any(code in notdef_codes for code in split_cmap_codes(raw, ranges))
+    return any(bytes([value]) in notdef_codes for value in raw)
 
 
 def _fix_notdef_in_stream(
     stream_obj: Stream,
     font_map: dict[str, pikepdf.Object],
     notdef_cache: dict[tuple[int, int], _NotdefCodes],
+    state: _ContentState | None = None,
 ) -> int:
     """Parses a content stream and removes .notdef references from text ops.
 
@@ -597,10 +1104,15 @@ def _fix_notdef_in_stream(
     except Exception:
         return 0
 
+    state = state or _ContentState()
     fixed = 0
     new_instructions = []
-    current_font_name: str | None = None
-    graphics_state_stack: list[str | None] = []
+    current_font_name = state.current_font_name
+    font_size = state.font_size
+    char_spacing = state.char_spacing
+    word_spacing = state.word_spacing
+    text_rendering_mode = state.text_rendering_mode
+    graphics_state_stack = state.graphics_state_stack
 
     for item in instructions:
         if isinstance(item, pikepdf.ContentStreamInlineImage):
@@ -611,15 +1123,33 @@ def _fix_notdef_in_stream(
         op_str = str(operator)
 
         if op_str == _SAVE_GRAPHICS_STATE:
-            graphics_state_stack.append(current_font_name)
+            graphics_state_stack.append(
+                (
+                    current_font_name,
+                    font_size,
+                    char_spacing,
+                    word_spacing,
+                    text_rendering_mode,
+                )
+            )
             new_instructions.append(item)
             continue
 
         if op_str == _RESTORE_GRAPHICS_STATE:
             if graphics_state_stack:
-                current_font_name = graphics_state_stack.pop()
+                (
+                    current_font_name,
+                    font_size,
+                    char_spacing,
+                    word_spacing,
+                    text_rendering_mode,
+                ) = graphics_state_stack.pop()
             else:
                 current_font_name = None
+                font_size = 0.0
+                char_spacing = 0.0
+                word_spacing = 0.0
+                text_rendering_mode = 0
             new_instructions.append(item)
             continue
 
@@ -629,21 +1159,94 @@ def _fix_notdef_in_stream(
                 current_font_name = str(operands[0])
             except Exception:
                 current_font_name = None
+            if len(operands) >= 2:
+                try:
+                    font_size = float(operands[1])
+                except (TypeError, ValueError):
+                    font_size = 0.0
+            new_instructions.append(item)
+            continue
+
+        if op_str == "Tc" and operands:
+            try:
+                char_spacing = float(operands[0])
+            except (TypeError, ValueError):
+                pass
+            new_instructions.append(item)
+            continue
+
+        if op_str == "Tw" and operands:
+            try:
+                word_spacing = float(operands[0])
+            except (TypeError, ValueError):
+                pass
+            new_instructions.append(item)
+            continue
+
+        if op_str == "Tr" and operands:
+            try:
+                text_rendering_mode = int(operands[0])
+            except (TypeError, ValueError):
+                pass
             new_instructions.append(item)
             continue
 
         # Handle single-string text operators: Tj, ', "
         if op_str in _TEXT_OPERATORS and current_font_name is not None:
+            if op_str == '"' and len(operands) >= 2:
+                try:
+                    word_spacing = float(operands[0])
+                    char_spacing = float(operands[1])
+                except (TypeError, ValueError):
+                    pass
             font_obj = font_map.get(current_font_name)
             if font_obj is not None:
                 notdef_codes = _get_notdef_codes(font_obj, notdef_cache)
-                if notdef_codes:
-                    is_cid = _is_cidfont(font_obj)
-                    replacement = _fix_single_string_op(
+                is_cid = _is_cidfont(font_obj)
+                string_index = 2 if op_str == '"' else 0
+                if (
+                    notdef_codes
+                    and text_rendering_mode == 3
+                    and len(operands) > string_index
+                    and isinstance(operands[string_index], String)
+                    and _operand_uses_notdef(
+                        operands[string_index],
+                        notdef_codes,
+                        is_cid=is_cid,
+                    )
+                ):
+                    if not is_cid:
+                        raise ConversionError(
+                            "Invisible simple-font OCR text references .notdef"
+                        )
+                    state.font_size = font_size
+                    state.char_spacing = char_spacing
+                    state.word_spacing = word_spacing
+                    replacement = _fix_invisible_single_string_op(
                         operands,
                         operator,
                         op_str,
+                        font_obj,
                         notdef_codes,
+                        state,
+                    )
+                    if replacement is None:
+                        raise ConversionError(
+                            "Invisible .notdef OCR text could not be remapped"
+                        )
+                    fixed += 1
+                    new_instructions.extend(replacement)
+                    continue
+                if notdef_codes:
+                    state.font_size = font_size
+                    state.char_spacing = char_spacing
+                    state.word_spacing = word_spacing
+                    replacement = _fix_single_string_op(
+                        operands,
+                        op_str,
+                        font_obj,
+                        notdef_codes,
+                        state,
                         is_cid=is_cid,
                     )
                     if replacement is not None:
@@ -660,12 +1263,53 @@ def _fix_notdef_in_stream(
             font_obj = font_map.get(current_font_name)
             if font_obj is not None:
                 notdef_codes = _get_notdef_codes(font_obj, notdef_cache)
+                is_cid = _is_cidfont(font_obj)
+                if (
+                    notdef_codes
+                    and text_rendering_mode == 3
+                    and operands
+                    and isinstance(operands[0], Array)
+                    and any(
+                        isinstance(element, String)
+                        and _operand_uses_notdef(
+                            element,
+                            notdef_codes,
+                            is_cid=is_cid,
+                        )
+                        for element in operands[0]
+                    )
+                ):
+                    if not is_cid:
+                        raise ConversionError(
+                            "Invisible simple-font OCR text references .notdef"
+                        )
+                    state.font_size = font_size
+                    state.char_spacing = char_spacing
+                    state.word_spacing = word_spacing
+                    replacement_tj = _fix_invisible_tj_array_op(
+                        operands,
+                        operator,
+                        font_obj,
+                        notdef_codes,
+                        state,
+                    )
+                    if replacement_tj is None:
+                        raise ConversionError(
+                            "Invisible .notdef OCR text could not be remapped"
+                        )
+                    fixed += 1
+                    new_instructions.extend(replacement_tj)
+                    continue
                 if notdef_codes:
-                    is_cid = _is_cidfont(font_obj)
+                    state.font_size = font_size
+                    state.char_spacing = char_spacing
+                    state.word_spacing = word_spacing
                     replacement_tj = _fix_tj_array_op(
                         operands,
                         operator,
+                        font_obj,
                         notdef_codes,
+                        state,
                         is_cid=is_cid,
                     )
                     if replacement_tj is not None:
@@ -682,14 +1326,96 @@ def _fix_notdef_in_stream(
     if fixed > 0:
         stream_obj.write(pikepdf.unparse_content_stream(new_instructions))
 
+    state.current_font_name = current_font_name
+    state.font_size = font_size
+    state.char_spacing = char_spacing
+    state.word_spacing = word_spacing
+    state.text_rendering_mode = text_rendering_mode
     return fixed
+
+
+def _fix_invisible_single_string_op(
+    operands: list,
+    operator: pikepdf.Operator,
+    op_str: str,
+    font_obj: pikepdf.Object,
+    notdef_codes: _NotdefCodes,
+    state: _ContentState,
+) -> list[pikepdf.ContentStreamInstruction] | None:
+    """Remap invisible CID text without removing its searchable content."""
+    string_index = 2 if op_str == '"' else 0
+    if len(operands) <= string_index or not isinstance(operands[string_index], String):
+        return None
+    items = _remap_invisible_tj_items(
+        operands[string_index],
+        font_obj,
+        notdef_codes,
+        state,
+    )
+    if items is None:
+        return None
+
+    if op_str == "Tj" and len(items) == 1 and isinstance(items[0], String):
+        replacement_operands = list(operands)
+        replacement_operands[string_index] = items[0]
+        return [pikepdf.ContentStreamInstruction(replacement_operands, operator)]
+
+    replacement: list[pikepdf.ContentStreamInstruction] = []
+    if op_str == "'":
+        replacement.append(pikepdf.ContentStreamInstruction([], Operator("T*")))
+    elif op_str == '"':
+        replacement.extend(
+            [
+                pikepdf.ContentStreamInstruction([operands[0]], Operator("Tw")),
+                pikepdf.ContentStreamInstruction([operands[1]], Operator("Tc")),
+                pikepdf.ContentStreamInstruction([], Operator("T*")),
+            ]
+        )
+    replacement.append(pikepdf.ContentStreamInstruction([Array(items)], Operator("TJ")))
+    return replacement
+
+
+def _fix_invisible_tj_array_op(
+    operands: list,
+    operator: pikepdf.Operator,
+    font_obj: pikepdf.Object,
+    notdef_codes: _NotdefCodes,
+    state: _ContentState,
+) -> list[pikepdf.ContentStreamInstruction] | None:
+    """Remap invisible .notdef strings inside a TJ array."""
+    if not operands or not isinstance(operands[0], Array):
+        return None
+
+    changed = False
+    items: list = []
+    for value in operands[0]:
+        if not isinstance(value, String):
+            _append_tj_item(items, value)
+            continue
+        replacement = _remap_invisible_tj_items(
+            value,
+            font_obj,
+            notdef_codes,
+            state,
+        )
+        if replacement is None:
+            _append_tj_item(items, value)
+            continue
+        changed = True
+        for item in replacement:
+            _append_tj_item(items, item)
+
+    if not changed:
+        return None
+    return [pikepdf.ContentStreamInstruction([Array(items)], operator)]
 
 
 def _fix_single_string_op(
     operands: list,
-    operator: pikepdf.Operator,
     op_str: str,
+    font_obj: pikepdf.Object,
     notdef_codes: _NotdefCodes,
+    state: _ContentState,
     *,
     is_cid: bool = False,
 ) -> list[pikepdf.ContentStreamInstruction] | None:
@@ -722,33 +1448,51 @@ def _fix_single_string_op(
     if not isinstance(operand, String):
         return None
 
-    filtered = _filter_text_operand(operand, notdef_codes, is_cid=is_cid)
-    if filtered is operand:
-        return None  # No change
+    replacement_items = _replacement_tj_items(
+        operand,
+        font_obj,
+        notdef_codes,
+        state,
+        is_cid=is_cid,
+    )
+    if replacement_items is None:
+        return None
 
-    if filtered is None:
-        # String became empty.  ' and " have side effects beyond showing
-        # text (moving to the next line; " also sets word/char spacing),
-        # which must be preserved when the operator is dropped.
-        if op_str == "'":
-            return [pikepdf.ContentStreamInstruction([], Operator("T*"))]
-        if op_str == '"':
-            return [
+    replacement: list[pikepdf.ContentStreamInstruction] = []
+    if op_str == "'":
+        replacement.append(pikepdf.ContentStreamInstruction([], Operator("T*")))
+    elif op_str == '"':
+        replacement.extend(
+            [
                 pikepdf.ContentStreamInstruction([operands[0]], Operator("Tw")),
                 pikepdf.ContentStreamInstruction([operands[1]], Operator("Tc")),
                 pikepdf.ContentStreamInstruction([], Operator("T*")),
             ]
-        return []
-
-    new_operands = list(operands)
-    new_operands[string_idx] = filtered
-    return [pikepdf.ContentStreamInstruction(new_operands, operator)]
+        )
+    for replacement_item in replacement_items:
+        if isinstance(replacement_item, String):
+            replacement.append(
+                pikepdf.ContentStreamInstruction(
+                    [replacement_item],
+                    Operator("Tj"),
+                )
+            )
+        else:
+            replacement.append(
+                pikepdf.ContentStreamInstruction(
+                    [Array([replacement_item])],
+                    Operator("TJ"),
+                )
+            )
+    return replacement
 
 
 def _fix_tj_array_op(
     operands: list,
     operator: pikepdf.Operator,
+    font_obj: pikepdf.Object,
     notdef_codes: _NotdefCodes,
+    state: _ContentState,
     *,
     is_cid: bool = False,
 ) -> list[pikepdf.ContentStreamInstruction] | None:
@@ -774,12 +1518,17 @@ def _fix_tj_array_op(
 
     for elem in arr:
         if isinstance(elem, String):
-            filtered = _filter_text_operand(elem, notdef_codes, is_cid=is_cid)
-            if filtered is not elem:
+            replacement_items = _replacement_tj_items(
+                elem,
+                font_obj,
+                notdef_codes,
+                state,
+                is_cid=is_cid,
+            )
+            if replacement_items is not None:
                 changed = True
-                if filtered is not None:
-                    new_items.append(filtered)
-                # else: skip empty string
+                for replacement_item in replacement_items:
+                    _append_tj_item(new_items, replacement_item)
             else:
                 new_items.append(elem)
         else:
@@ -788,11 +1537,6 @@ def _fix_tj_array_op(
 
     if not changed:
         return None
-
-    # Check if any strings remain
-    has_strings = any(isinstance(item, String) for item in new_items)
-    if not has_strings:
-        return []  # Remove operator entirely
 
     new_arr = Array(new_items)
     return [pikepdf.ContentStreamInstruction([new_arr], operator)]
@@ -807,6 +1551,7 @@ def _fix_notdef_in_page_contents(
     page_dict: Dictionary,
     font_map: dict[str, pikepdf.Object],
     notdef_cache: dict[tuple[int, int], _NotdefCodes],
+    ambiguous_streams: set[object] | None = None,
 ) -> int:
     """Fixes .notdef references in page Contents.
 
@@ -824,221 +1569,25 @@ def _fix_notdef_in_page_contents(
 
     contents = _resolve(contents)
     fixed = 0
+    ambiguous_streams = ambiguous_streams or set()
 
     if isinstance(contents, Stream):
-        fixed += _fix_notdef_in_stream(contents, font_map, notdef_cache)
+        objgen = contents.objgen
+        if objgen == (0, 0) or objgen not in ambiguous_streams:
+            fixed += _fix_notdef_in_stream(contents, font_map, notdef_cache)
     elif isinstance(contents, Array):
+        state = _ContentState()
         for item in contents:
             item = _resolve(item)
             if isinstance(item, Stream):
-                fixed += _fix_notdef_in_stream(item, font_map, notdef_cache)
-
-    return fixed
-
-
-def _fix_notdef_in_form_xobjects(
-    resources: pikepdf.Object,
-    visited: set[tuple[int, int]],
-    notdef_cache: dict[tuple[int, int], _NotdefCodes],
-) -> int:
-    """Recurses into Form XObjects to fix .notdef references.
-
-    Args:
-        resources: A resolved Resources dictionary.
-        visited: Set of (objnum, gen) tuples for cycle detection.
-        notdef_cache: Shared notdef code cache.
-
-    Returns:
-        Number of text operators fixed.
-    """
-    fixed = 0
-    resources = _resolve(resources)
-    if not isinstance(resources, Dictionary):
-        return 0
-
-    xobjects = resources.get("/XObject")
-    if not xobjects:
-        return 0
-    xobjects = _resolve(xobjects)
-    if not isinstance(xobjects, Dictionary):
-        return 0
-
-    for xobj_name in list(xobjects.keys()):
-        xobj = _resolve(xobjects[xobj_name])
-        if not isinstance(xobj, Stream):
-            continue
-
-        subtype = xobj.get("/Subtype")
-        if subtype is None or str(subtype) != "/Form":
-            continue
-
-        objgen = xobj.objgen
-        if objgen != (0, 0):
-            if objgen in visited:
-                continue
-            visited.add(objgen)
-
-        # Build font map from Form XObject's own resources
-        form_resources = xobj.get("/Resources")
-        if form_resources:
-            form_resources = _resolve(form_resources)
-            form_font_map = _build_font_map(form_resources)
-        else:
-            form_font_map = {}
-
-        fixed += _fix_notdef_in_stream(xobj, form_font_map, notdef_cache)
-
-        # Recurse into nested Form XObjects and Patterns
-        if form_resources:
-            fixed += _fix_notdef_in_form_xobjects(form_resources, visited, notdef_cache)
-            fixed += _fix_notdef_in_patterns(form_resources, visited, notdef_cache)
-
-    return fixed
-
-
-def _fix_notdef_in_patterns(
-    resources: pikepdf.Object,
-    visited: set[tuple[int, int]],
-    notdef_cache: dict[tuple[int, int], _NotdefCodes],
-) -> int:
-    """Recurses into Tiling Patterns to fix .notdef references.
-
-    Args:
-        resources: A resolved Resources dictionary.
-        visited: Set of (objnum, gen) tuples for cycle detection.
-        notdef_cache: Shared notdef code cache.
-
-    Returns:
-        Number of text operators fixed.
-    """
-    fixed = 0
-    resources = _resolve(resources)
-    if not isinstance(resources, Dictionary):
-        return 0
-
-    patterns = resources.get("/Pattern")
-    if not patterns:
-        return 0
-    patterns = _resolve(patterns)
-    if not isinstance(patterns, Dictionary):
-        return 0
-
-    for pat_name in list(patterns.keys()):
-        try:
-            pattern = _resolve(patterns[pat_name])
-            if not isinstance(pattern, Stream):
-                continue
-
-            # Only process Tiling Patterns (PatternType 1)
-            pattern_type = pattern.get("/PatternType")
-            if pattern_type is None or int(pattern_type) != 1:
-                continue
-
-            objgen = pattern.objgen
-            if objgen != (0, 0):
-                if objgen in visited:
+                objgen = item.objgen
+                if objgen != (0, 0) and objgen in ambiguous_streams:
                     continue
-                visited.add(objgen)
-
-            # Build font map from pattern's own resources
-            pat_resources = pattern.get("/Resources")
-            if pat_resources:
-                pat_resources = _resolve(pat_resources)
-                pat_font_map = _build_font_map(pat_resources)
-            else:
-                pat_font_map = {}
-
-            fixed += _fix_notdef_in_stream(pattern, pat_font_map, notdef_cache)
-
-            # Recurse into nested Form XObjects and Patterns
-            if pat_resources:
-                fixed += _fix_notdef_in_form_xobjects(
-                    pat_resources, visited, notdef_cache
+                fixed += _fix_notdef_in_stream(
+                    item,
+                    font_map,
+                    notdef_cache,
+                    state,
                 )
-                fixed += _fix_notdef_in_patterns(pat_resources, visited, notdef_cache)
-        except Exception:
-            continue
-
-    return fixed
-
-
-def _fix_notdef_in_ap_stream(
-    ap_entry: pikepdf.Object,
-    visited: set[tuple[int, int]],
-    notdef_cache: dict[tuple[int, int], _NotdefCodes],
-) -> int:
-    """Fixes .notdef references in an annotation appearance stream entry.
-
-    Args:
-        ap_entry: An appearance entry (N, R, or D value).
-        visited: Set of (objnum, gen) tuples for cycle detection.
-        notdef_cache: Shared notdef code cache.
-
-    Returns:
-        Number of text operators fixed.
-    """
-    fixed = 0
-    ap_entry = _resolve(ap_entry)
-
-    if isinstance(ap_entry, Stream):
-        ap_resources = ap_entry.get("/Resources")
-        ap_font_map = _build_font_map(ap_resources) if ap_resources else {}
-        fixed += _fix_notdef_in_stream(ap_entry, ap_font_map, notdef_cache)
-        if ap_resources:
-            ap_resources = _resolve(ap_resources)
-            fixed += _fix_notdef_in_form_xobjects(ap_resources, visited, notdef_cache)
-            fixed += _fix_notdef_in_patterns(ap_resources, visited, notdef_cache)
-    elif isinstance(ap_entry, Dictionary):
-        for state_name in list(ap_entry.keys()):
-            state_stream = _resolve(ap_entry[state_name])
-            if isinstance(state_stream, Stream):
-                st_resources = state_stream.get("/Resources")
-                st_font_map = _build_font_map(st_resources) if st_resources else {}
-                fixed += _fix_notdef_in_stream(state_stream, st_font_map, notdef_cache)
-                if st_resources:
-                    st_resources = _resolve(st_resources)
-                    fixed += _fix_notdef_in_form_xobjects(
-                        st_resources, visited, notdef_cache
-                    )
-                    fixed += _fix_notdef_in_patterns(
-                        st_resources, visited, notdef_cache
-                    )
-
-    return fixed
-
-
-def _fix_notdef_in_type3_charprocs(
-    resources: pikepdf.Object,
-    visited: set[tuple[int, int]],
-    notdef_cache: dict[tuple[int, int], _NotdefCodes],
-) -> int:
-    """Fixes .notdef references in Type3 font CharProcs.
-
-    Args:
-        resources: A resolved Resources dictionary.
-        visited: Set of (objnum, gen) tuples for cycle detection.
-        notdef_cache: Shared notdef code cache.
-
-    Returns:
-        Number of text operators fixed.
-    """
-    fixed = 0
-
-    for _font_name, font in _iter_type3_fonts(resources, visited):
-        charprocs = font.get("/CharProcs")
-        if charprocs is None:
-            continue
-        charprocs = _resolve(charprocs)
-        if not isinstance(charprocs, Dictionary):
-            continue
-
-        # Type3 CharProcs may reference fonts from the font's own resources
-        font_resources = font.get("/Resources")
-        cp_font_map = _build_font_map(font_resources) if font_resources else {}
-
-        for cp_name in list(charprocs.keys()):
-            cp_stream = _resolve(charprocs[cp_name])
-            if isinstance(cp_stream, Stream):
-                fixed += _fix_notdef_in_stream(cp_stream, cp_font_map, notdef_cache)
 
     return fixed

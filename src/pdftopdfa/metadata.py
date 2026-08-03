@@ -9,6 +9,7 @@ import logging
 import re
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta, timezone
+from itertools import chain
 from typing import Any
 from uuid import uuid4
 
@@ -659,8 +660,9 @@ _KNOWN_EXTENSION_SCHEMAS: dict[
     ),
     NAMESPACES["pdfeid"]: (
         "PDF/E ID",
-        "pdfeid",
+        "pdfe",
         {
+            "ISO_PDFEVersion": ("Text", "internal", "PDF/E version identifier"),
             "GTS_PDFEVersion": ("Text", "internal", "PDF/E version identifier"),
             "part": ("Integer", "internal", "PDF/E part number"),
         },
@@ -2998,20 +3000,13 @@ def _reserialize_xmp(tree: etree._Element) -> bytes:
     return XMP_HEADER + xml_bytes + XMP_TRAILER
 
 
-def remove_pdfx_identification(pdf: pikepdf.Pdf) -> bool:
-    """Remove PDF/X identification properties from the catalog XMP.
-
-    A PDF/X identification (pdfxid namespace) is only meaningful together
-    with a PDF/X OutputIntent. When conversion drops the PDF/X OutputIntent,
-    the XMP claim must be removed as well so the file does not assert PDF/X
-    conformance it no longer declares.
-
-    Args:
-        pdf: pikepdf Pdf object to modify.
-
-    Returns:
-        True if any PDF/X identification property was removed.
-    """
+def _remove_identification_properties(
+    pdf: pikepdf.Pdf,
+    *,
+    namespace_key: str,
+    standard: str,
+) -> bool:
+    """Remove one ISO standard's identification properties from catalog XMP."""
     metadata = pdf.Root.get("/Metadata")
     if metadata is None:
         return False
@@ -3025,18 +3020,18 @@ def remove_pdfx_identification(pdf: pikepdf.Pdf) -> bool:
     if tree is None:
         return False
 
-    pdfxid_prefix = f"{{{NAMESPACES['pdfxid']}}}"
+    namespace_prefix = f"{{{NAMESPACES[namespace_key]}}}"
     removed = False
     for elem in list(tree.iter()):
         tag = elem.tag
-        if isinstance(tag, str) and tag.startswith(pdfxid_prefix):
+        if isinstance(tag, str) and tag.startswith(namespace_prefix):
             parent = elem.getparent()
             if parent is not None:
                 parent.remove(elem)
                 removed = True
             continue
         for attr_name in list(elem.attrib):
-            if attr_name.startswith(pdfxid_prefix):
+            if attr_name.startswith(namespace_prefix):
                 del elem.attrib[attr_name]
                 removed = True
 
@@ -3052,8 +3047,44 @@ def remove_pdfx_identification(pdf: pikepdf.Pdf) -> bool:
                 rdf_root.remove(desc)
 
     embed_xmp_metadata(pdf, _reserialize_xmp(tree))
-    logger.info("Removed PDF/X identification from XMP metadata")
+    logger.info("Removed %s identification from XMP metadata", standard)
     return True
+
+
+def remove_pdfx_identification(pdf: pikepdf.Pdf) -> bool:
+    """Remove PDF/X identification after its required OutputIntent is dropped."""
+    return _remove_identification_properties(
+        pdf,
+        namespace_key="pdfxid",
+        standard="PDF/X",
+    )
+
+
+def remove_pdfua_identification(pdf: pikepdf.Pdf) -> bool:
+    """Remove PDF/UA identification after the logical structure is rebuilt."""
+    return _remove_identification_properties(
+        pdf,
+        namespace_key="pdfuaid",
+        standard="PDF/UA",
+    )
+
+
+def remove_pdfvt_identification(pdf: pikepdf.Pdf) -> bool:
+    """Remove PDF/VT identification after its required PDF/X basis is dropped."""
+    return _remove_identification_properties(
+        pdf,
+        namespace_key="pdfvtid",
+        standard="PDF/VT",
+    )
+
+
+def remove_pdfe_identification(pdf: pikepdf.Pdf) -> bool:
+    """Remove PDF/E identification after its required DocInfo marker is dropped."""
+    return _remove_identification_properties(
+        pdf,
+        namespace_key="pdfeid",
+        standard="PDF/E",
+    )
 
 
 def _sanitize_non_catalog_xmp_tree(tree: etree._Element) -> None:
@@ -3317,57 +3348,74 @@ def _iter_non_catalog_metadata_holders(
     XMP packet in the document.
     """
     root_objgen = pdf.Root.objgen
+    visited: set[tuple[int, int]] = set()
 
-    for obj in pdf.objects:
-        try:
-            obj = obj.get_object()
-        except Exception:
-            pass
-
-        try:
-            has_metadata = "/Metadata" in obj
-        except Exception:
-            continue
-
-        if not has_metadata:
-            continue
-
-        try:
-            if obj.objgen == root_objgen:
+    for start in chain((pdf.Root,), pdf.objects):
+        stack = [start]
+        while stack:
+            try:
+                resolved = resolve_indirect(stack.pop())
+            except Exception as exc:
+                log_suppressed_error(
+                    logger,
+                    exc,
+                    "Error resolving object while scanning /Metadata: %s",
+                    exc,
+                )
                 continue
-        except Exception:
-            pass
 
-        yield obj
+            if not isinstance(resolved, pikepdf.Object):
+                continue
+
+            objgen = resolved.objgen
+            if objgen != (0, 0):
+                if objgen in visited:
+                    continue
+                visited.add(objgen)
+
+            if isinstance(resolved, (pikepdf.Dictionary, pikepdf.Stream)):
+                if objgen != root_objgen and "/Metadata" in resolved:
+                    yield resolved
+                try:
+                    stack.extend(resolved.values())
+                except Exception as exc:
+                    log_suppressed_error(
+                        logger,
+                        exc,
+                        "Error traversing object while scanning /Metadata: %s",
+                        exc,
+                    )
+            elif isinstance(resolved, pikepdf.Array):
+                stack.extend(resolved)
 
 
 def _iter_embedded_file_name_tree_pairs(
     node: object,
-    *,
-    depth: int = 0,
 ) -> Iterator[tuple[object, object]]:
     """Yield embedded-file Name Tree pairs without mutating the tree."""
-    if depth >= 64:
-        raise ValueError("EmbeddedFiles Name Tree is too deep")
+    pending = [node]
+    visited: set[tuple[int, int]] = set()
+    while pending:
+        resolved = resolve_indirect(pending.pop())
+        objgen = resolved.objgen
+        if objgen != (0, 0):
+            if objgen in visited:
+                raise ValueError("EmbeddedFiles Name Tree contains a cycle")
+            visited.add(objgen)
 
-    resolved = resolve_indirect(node)
-    names = resolved.get("/Names")
-    kids = resolved.get("/Kids")
-    if names is not None and kids is not None:
-        raise ValueError("EmbeddedFiles Name Tree node has both /Names and /Kids")
+        names = resolved.get("/Names")
+        kids = resolved.get("/Kids")
+        if names is not None and kids is not None:
+            raise ValueError("EmbeddedFiles Name Tree node has both /Names and /Kids")
 
-    if names is not None:
-        if len(names) % 2:
-            raise ValueError("EmbeddedFiles Name Tree has an odd /Names array")
-        for index in range(0, len(names), 2):
-            yield names[index], names[index + 1]
+        if names is not None:
+            if len(names) % 2:
+                raise ValueError("EmbeddedFiles Name Tree has an odd /Names array")
+            for index in range(0, len(names), 2):
+                yield names[index], names[index + 1]
 
-    if kids is not None:
-        for child in kids:
-            yield from _iter_embedded_file_name_tree_pairs(
-                child,
-                depth=depth + 1,
-            )
+        if kids is not None:
+            pending.extend(reversed(kids))
 
 
 def _filespec_names(filespec: object) -> tuple[str | None, str | None]:

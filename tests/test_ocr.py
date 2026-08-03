@@ -35,9 +35,11 @@ from pdftopdfa.exceptions import OCRError
 from pdftopdfa.ocr import (
     _finalize_ocr_output,
     _find_deskew_pages,
+    _image_color_space_marks,
     _ocr_form_names,
     _page_has_images,
     _page_has_text,
+    _page_paint_analysis,
     _prepare_deskew_input,
     _strip_invisible_text_from_form,
     apply_ocr,
@@ -506,6 +508,23 @@ def _add_content_page(
     page.obj[Name.Contents] = pdf.make_stream(b"\n".join(content))
 
 
+def _nested_form_chain(
+    pdf: Pdf,
+    leaf: pikepdf.Object,
+    count: int = 1200,
+) -> pikepdf.Object:
+    """Wrap a Form XObject in a deeply nested Form chain."""
+    child = leaf
+    for _ in range(count - 1):
+        parent = pdf.make_stream(b"/Fm Do")
+        parent[Name.Type] = Name.XObject
+        parent[Name.Subtype] = Name.Form
+        parent[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+        parent[Name.Resources] = Dictionary(XObject=Dictionary(Fm=child))
+        child = parent
+    return child
+
+
 class TestOcrDetection:
     """Tests for public OCR availability and page analysis helpers."""
 
@@ -561,6 +580,64 @@ class TestOcrDetection:
 
             assert _page_has_text(page) is False
             assert needs_ocr(pdf) is True
+
+    def test_text_detection_handles_1200_nested_forms(self) -> None:
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            leaf = pdf.make_stream(b"BT 3 Tr (deep OCR text) Tj ET")
+            leaf[Name.Type] = Name.XObject
+            leaf[Name.Subtype] = Name.Form
+            leaf[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            leaf[Name.Resources] = Dictionary()
+            root = _nested_form_chain(pdf, leaf)
+            page.obj[Name.Resources] = Dictionary(XObject=Dictionary(DeepForm=root))
+            page.obj[Name.Contents] = pdf.make_stream(b"/DeepForm Do")
+
+            assert _page_has_text(page) is True
+
+    @pytest.mark.parametrize("color_space_kind", ["alias", "indexed"])
+    def test_color_space_analysis_handles_1200_nested_values(
+        self,
+        color_space_kind: str,
+    ) -> None:
+        with Pdf.new():
+            resources = Dictionary()
+            if color_space_kind == "alias":
+                color_spaces = Dictionary()
+                for index in range(1199):
+                    color_spaces[Name(f"/CS{index}")] = Name(f"/CS{index + 1}")
+                color_spaces[Name("/CS1199")] = Name.DeviceGray
+                resources[Name.ColorSpace] = color_spaces
+                color_space = Name("/CS0")
+            else:
+                color_space = Name.DeviceGray
+                for _ in range(1200):
+                    color_space = pikepdf.Array(
+                        [
+                            Name.Indexed,
+                            color_space,
+                            0,
+                            pikepdf.String(b"\x00"),
+                        ]
+                    )
+
+            assert _image_color_space_marks(color_space, resources) is True
+
+    def test_color_space_analysis_rejects_indexed_cycle(self) -> None:
+        with Pdf.new() as pdf:
+            color_space = pdf.make_indirect(
+                pikepdf.Array(
+                    [
+                        Name.Indexed,
+                        Name.DeviceGray,
+                        0,
+                        pikepdf.String(b"\x00"),
+                    ]
+                )
+            )
+            color_space[1] = color_space
+
+            assert _image_color_space_marks(color_space, Dictionary()) is False
 
 
 class TestOcrLanguageMetadata:
@@ -714,6 +791,30 @@ def test_invisible_form_cleanup_preserves_text_show_operator(
 
 class TestApplyOcr:
     """Tests for the fixed PaddleOCR/OCRmyPDF boundary."""
+
+    def test_deskew_analysis_handles_scan_in_1200_nested_forms(self) -> None:
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            image = pdf.make_stream(bytes([128]) * 100)
+            image[Name.Type] = Name.XObject
+            image[Name.Subtype] = Name.Image
+            image[Name.Width] = 10
+            image[Name.Height] = 10
+            image[Name.ColorSpace] = Name.DeviceGray
+            image[Name.BitsPerComponent] = 8
+            leaf = pdf.make_stream(b"q 100 0 0 100 0 0 cm /Im0 Do Q")
+            leaf[Name.Type] = Name.XObject
+            leaf[Name.Subtype] = Name.Form
+            leaf[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            leaf[Name.Resources] = Dictionary(XObject=Dictionary(Im0=image))
+            root = _nested_form_chain(pdf, leaf)
+            page.obj[Name.Resources] = Dictionary(XObject=Dictionary(DeepForm=root))
+            page.obj[Name.Contents] = pdf.make_stream(b"/DeepForm Do")
+
+            analysis = _page_paint_analysis(page)
+
+            assert analysis.unsafe is False
+            assert analysis.image_candidates == [(1.0, 1)]
 
     def test_deskew_selects_full_page_scan_for_one_targeted_call(
         self,
@@ -1531,6 +1632,41 @@ class TestApplyOcr:
             digital = pdf.pages[1].Resources.XObject.Shared
             assert b"Tj" not in selected.read_bytes()
             assert b"Tj" in digital.read_bytes()
+
+    def test_deskew_text_preparation_handles_1200_nested_forms(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        input_path = tmp_dir / "deep-form-text.pdf"
+        output_path = tmp_dir / "prepared.pdf"
+        with Pdf.new() as pdf:
+            selected_page = pdf.add_blank_page(page_size=(100, 100))
+            shared_page = pdf.add_blank_page(page_size=(100, 100))
+            leaf = pdf.make_stream(b"BT 3 Tr (deep OCR) Tj ET\n0 0 m")
+            leaf[Name.Type] = Name.XObject
+            leaf[Name.Subtype] = Name.Form
+            leaf[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            leaf[Name.Resources] = Dictionary()
+            root = _nested_form_chain(pdf, leaf)
+            for page in (selected_page, shared_page):
+                page.obj[Name.Resources] = Dictionary(XObject=Dictionary(DeepForm=root))
+                page.obj[Name.Contents] = pdf.make_stream(b"/DeepForm Do")
+            pdf.save(input_path)
+
+        _prepare_deskew_input(input_path, output_path, (1,))
+
+        with Pdf.open(output_path) as pdf:
+            assert _page_has_text(pdf.pages[0]) is False
+            assert _page_has_text(pdf.pages[1]) is True
+
+            current = pdf.pages[0].Resources.XObject.DeepForm
+            count = 1
+            while (xobjects := current.Resources.get("/XObject")) is not None:
+                current = xobjects.Fm
+                count += 1
+            assert count == 1200
+            assert b"Tj" not in current.read_bytes()
+            assert b"0 0 m" in current.read_bytes()
 
     def test_deskew_rejects_visible_form_text_with_inherited_resources(
         self,

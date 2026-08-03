@@ -1313,7 +1313,7 @@ class TestGetRequiredPdfVersion:
 
     @pytest.mark.parametrize(
         "level",
-        ["2b", "2u", "3b", "3u"],
+        ["2a", "2b", "2u", "3a", "3b", "3u"],
     )
     def test_all_valid_levels(self, level: str) -> None:
         """All valid PDF/A levels return 1.7."""
@@ -1329,17 +1329,17 @@ class TestGetRequiredPdfVersion:
 class TestValidatePdfaLevel:
     """Tests for validate_pdfa_level."""
 
-    @pytest.mark.parametrize("level", ["2b", "2u", "3b", "3u"])
+    @pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
     def test_valid_levels_accepted(self, level: str) -> None:
         """All supported target levels are accepted."""
         assert validate_pdfa_level(level) == level
 
-    @pytest.mark.parametrize("level", ["2B", "2U", "3B", "3U"])
+    @pytest.mark.parametrize("level", ["2A", "2B", "2U", "3A", "3B", "3U"])
     def test_uppercase_normalized_to_lowercase(self, level: str) -> None:
         """Uppercase input is normalized to lowercase."""
         assert validate_pdfa_level(level) == level.lower()
 
-    @pytest.mark.parametrize("level", ["2a", "3a", "4b", "1b", "", "invalid"])
+    @pytest.mark.parametrize("level", ["4b", "1b", "", "invalid"])
     def test_unsupported_levels_rejected(self, level: str) -> None:
         """Unsupported levels raise ConversionError."""
         with pytest.raises(ConversionError, match="Invalid PDF/A level"):
@@ -1347,7 +1347,7 @@ class TestValidatePdfaLevel:
 
     def test_supported_levels_constant(self) -> None:
         """SUPPORTED_LEVELS contains the expected values."""
-        assert SUPPORTED_LEVELS == frozenset({"2b", "2u", "3b", "3u"})
+        assert SUPPORTED_LEVELS == frozenset({"2a", "2b", "2u", "3a", "3b", "3u"})
 
 
 class TestFixAnnotationFlags:
@@ -1775,6 +1775,43 @@ class TestEnsureAppearanceStreams:
         ap = _resolve_indirect(ap)
         assert ap.get("/N") is not None
         assert ap.get("/R") is not None
+
+    def test_missing_stamp_name_gets_visible_draft_appearance(
+        self, tmp_path: Path
+    ) -> None:
+        """A Stamp without /Name uses the standard /Draft appearance."""
+        pdf = new_pdf()
+        page = pikepdf.Page(Dictionary(Type=Name.Page))
+        pdf.pages.append(page)
+
+        annot = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name.Stamp,
+                Rect=Array([0, 0, 612, 792]),
+            )
+        )
+        pdf.pages[0].Annots = Array([annot])
+
+        test_path = tmp_path / "stamp_without_name.pdf"
+        pdf.save(test_path)
+
+        pdf = open_pdf(test_path)
+        assert ensure_appearance_streams(pdf) == 1
+
+        annot = _resolve_indirect(pdf.pages[0].Annots[0])
+        normal = _resolve_indirect(annot["/AP"]["/N"])
+        assert b"(DRAFT) Tj" in normal.read_bytes()
+        font = _resolve_indirect(normal["/Resources"]["/Font"]["/DraftFont"])
+        assert font["/Subtype"] == Name.Type3
+        assert b"<44> <0044>" in font["/ToUnicode"].read_bytes()
+        assert set(font["/CharProcs"].keys()) == {
+            Name.A,
+            Name.D,
+            Name.F,
+            Name.R,
+            Name.T,
+        }
 
     def test_skips_popup_annotations(self, tmp_path: Path) -> None:
         """Popup annotation without /AP stays unchanged, returns 0."""

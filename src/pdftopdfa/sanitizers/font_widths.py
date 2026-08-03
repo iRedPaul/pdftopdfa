@@ -24,9 +24,11 @@ from ..fonts.tounicode import (
     generate_tounicode_for_winansi,
     generate_tounicode_from_encoding_dict,
     parse_cidtogidmap_stream,
+    parse_type1_font_program,
 )
 from ..fonts.traversal import iter_acroform_dr_fonts, iter_all_page_fonts
 from ..fonts.utils import get_any_cmap as _get_any_cmap
+from ..fonts.utils import get_truetype_byte_encoding
 from ..fonts.utils import safe_str as _safe_str
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
@@ -66,30 +68,14 @@ def _compute_exact_widths_for_encoding(
     cmap = _get_any_cmap(tt_font)
     if not cmap:
         return {}
+    byte_encoding = get_truetype_byte_encoding(tt_font)
+    byte_mapping = byte_encoding[2] if byte_encoding is not None else {}
 
     result: dict[int, float] = {}
     for code, unicode_val in code_to_unicode.items():
-        glyph_name = cmap.get(unicode_val)
+        glyph_name = cmap.get(unicode_val) or byte_mapping.get(code)
         if glyph_name and glyph_name in hmtx.metrics:
             result[code] = _scaled_width(hmtx.metrics[glyph_name][0], head.unitsPerEm)
-
-    if not result:
-        for code, unicode_val in code_to_unicode.items():
-            sym_val = 0xF000 + unicode_val
-            glyph_name = cmap.get(sym_val)
-            if glyph_name and glyph_name in hmtx.metrics:
-                result[code] = _scaled_width(
-                    hmtx.metrics[glyph_name][0],
-                    head.unitsPerEm,
-                )
-        if not result:
-            for code in code_to_unicode:
-                glyph_name = cmap.get(code)
-                if glyph_name and glyph_name in hmtx.metrics:
-                    result[code] = _scaled_width(
-                        hmtx.metrics[glyph_name][0],
-                        head.unitsPerEm,
-                    )
 
     return result
 
@@ -360,35 +346,34 @@ def _parse_type1_font(font_data: bytes):
     Returns:
         fontTools TTFont object with CFF table, or None if parsing fails.
     """
-    import os
-    import tempfile
-
     from fontTools.ttLib import TTFont
 
-    # T1Font requires a file path, not a BytesIO
-    suffix = ".pfa" if font_data[:2] == b"%!" else ".pfb"
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
-    try:
-        os.write(tmp_fd, font_data)
-    finally:
-        os.close(tmp_fd)
-    try:
-        from fontTools.t1Lib import T1Font
+    t1 = parse_type1_font_program(font_data)
+    if t1 is None:
+        return None
 
-        t1 = T1Font(tmp_path)
+    try:
         glyphset = t1.getGlyphSet()
 
         # Extract widths from Type1 charstrings (hsbw/sbw operators)
         glyph_widths: dict[str, int] = {}
+        font_matrix = t1.font.get("FontMatrix", [0.001, 0, 0, 0.001, 0, 0])
+        try:
+            width_scale = abs(float(font_matrix[0])) * 1000.0
+        except (IndexError, TypeError, ValueError):
+            width_scale = 1.0
+        if width_scale == 0:
+            width_scale = 1.0
+
         for gname, cs in glyphset.items():
             cs.decompile()
             prog = cs.program
             for i, token in enumerate(prog):
                 if token == "hsbw" and i >= 2:
-                    glyph_widths[gname] = int(prog[i - 1])
+                    glyph_widths[gname] = round(float(prog[i - 1]) * width_scale)
                     break
                 elif token == "sbw" and i >= 4:
-                    glyph_widths[gname] = int(prog[i - 2])
+                    glyph_widths[gname] = round(float(prog[i - 2]) * width_scale)
                     break
 
         if not glyph_widths:
@@ -476,14 +461,19 @@ def _parse_type1_font(font_data: bytes):
             cmap_table.tables = [subtable]
             tt["cmap"] = cmap_table
 
+        # When a Type 1 PDF font has no /Encoding entry, character codes are
+        # resolved through the Encoding in the embedded font program.
+        program_encoding = t1.font.get("Encoding")
+        if isinstance(program_encoding, list):
+            tt._pdftopdfa_type1_encoding = {
+                code: str(glyph_name)
+                for code, glyph_name in enumerate(program_encoding)
+                if str(glyph_name) in glyph_widths
+            }
+
         return tt
     except Exception:
         return None
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
 
 
 def _extract_font_program(font: pikepdf.Object):
@@ -583,15 +573,18 @@ def _get_encoding_mapping(font: pikepdf.Object) -> dict[int, int] | None:
     encoding = font.get("/Encoding")
     if encoding is None:
         # Default to WinAnsiEncoding for non-symbolic TrueType,
-        # StandardEncoding for Type1. Symbolic TrueType fonts without an
-        # explicit /Encoding resolve character codes through the font's own
-        # symbolic cmap, so returning a WinAnsi fallback would mask width
-        # mismatches that veraPDF still catches.
+        # while Type1 fonts use the Encoding in their embedded font program.
+        # Symbolic TrueType fonts without an explicit /Encoding resolve
+        # character codes through the font's own symbolic cmap, so returning
+        # a WinAnsi fallback would mask width mismatches that veraPDF catches.
         subtype = font.get("/Subtype")
-        if subtype is not None and _safe_str(subtype) == "/TrueType":
+        subtype_str = _safe_str(subtype) if subtype is not None else ""
+        if subtype_str == "/TrueType":
             if is_symbolic_font(font):
                 return None
             return generate_tounicode_for_winansi()
+        if subtype_str in ("/Type1", "/MMType1"):
+            return None
         return generate_tounicode_for_standard_encoding()
 
     encoding = _resolve(encoding)
@@ -637,6 +630,8 @@ def _compute_widths_by_name(font: pikepdf.Object, tt_font) -> dict[int, float]:
 
     try:
         encoding = _resolve_simple_font_encoding(font)
+        if encoding is None:
+            encoding = getattr(tt_font, "_pdftopdfa_type1_encoding", None)
         if encoding is None and is_symbolic_font(font):
             fd = _resolve(font.get("/FontDescriptor"))
             if fd is not None:

@@ -4,8 +4,11 @@
 
 """Unit tests for cli.py."""
 
+import os
+import subprocess
+import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -17,12 +20,13 @@ from pdftopdfa.cli import (
     EXIT_CONVERSION_FAILED,
     EXIT_FILE_NOT_FOUND,
     EXIT_GENERAL_ERROR,
+    EXIT_PERMISSION_ERROR,
     EXIT_SUCCESS,
     EXIT_VALIDATION_FAILED,
     main,
 )
 from pdftopdfa.converter import ConversionResult
-from pdftopdfa.exceptions import OCRError
+from pdftopdfa.exceptions import OCRError, VeraPDFError
 from pdftopdfa.verapdf import is_verapdf_available
 
 OCR_MODEL_ARGS = [
@@ -39,6 +43,25 @@ def runner() -> CliRunner:
     return CliRunner()
 
 
+def _run_cli_with_cp1252(*args: Path) -> subprocess.CompletedProcess[bytes]:
+    """Run the real CLI with Windows' legacy console encoding."""
+    project_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "cp1252"
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(project_root / "src"), env.get("PYTHONPATH")))
+    )
+    return subprocess.run(
+        [sys.executable, "-m", "pdftopdfa", *(str(arg) for arg in args)],
+        cwd=project_root,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+
+
 class TestCliHelp:
     """Tests for --help option."""
 
@@ -48,6 +71,7 @@ class TestCliHelp:
 
         assert result.exit_code == 0
         assert "--level" in result.output
+        assert "[2a|2b|2u|3a|3b|3u]" in result.output
         assert "--validate" in result.output
         assert "--recursive" in result.output
         assert "--force" in result.output
@@ -145,6 +169,43 @@ class TestCliConsoleOutput:
             err=True,
         )
 
+    def test_single_file_cli_handles_unicode_name_on_cp1252_console(
+        self,
+        sample_pdf_bytes: bytes,
+        tmp_dir: Path,
+    ) -> None:
+        """The real single-file CLI replaces an unencodable input name."""
+        input_path = tmp_dir / "卍.pdf"
+        output_path = tmp_dir / "single-output.pdf"
+        input_path.write_bytes(sample_pdf_bytes)
+
+        result = _run_cli_with_cp1252(input_path, output_path)
+
+        assert result.returncode == EXIT_SUCCESS, result.stderr.decode(
+            "cp1252", errors="replace"
+        )
+        assert b"UnicodeEncodeError" not in result.stderr
+        assert output_path.exists()
+
+    def test_directory_cli_handles_unicode_name_on_cp1252_console(
+        self,
+        encrypted_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """The real directory summary replaces an unencodable input name."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        input_path = input_dir / "卍.pdf"
+        input_path.write_bytes(encrypted_pdf.read_bytes())
+
+        result = _run_cli_with_cp1252(input_dir)
+
+        assert result.returncode == EXIT_SUCCESS, result.stderr.decode(
+            "cp1252", errors="replace"
+        )
+        assert b"UnicodeEncodeError" not in result.stderr
+        assert (input_dir / "卍_pdfa.pdf").exists()
+
 
 class TestCliConvert:
     """Tests for file conversion."""
@@ -235,34 +296,43 @@ class TestCliConvert:
 
     @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
-    def test_cli_single_file_skipped_result_does_not_validate(
+    def test_cli_single_file_skipped_result_is_still_validated(
         self,
         mock_convert_to_pdfa,
         mock_validate,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """Single-file skipped results bypass manual veraPDF validation."""
+        """Explicit validation also covers an unchanged skipped output."""
         output_path = tmp_dir / "output.pdf"
         mock_convert_to_pdfa.return_value = ConversionResult(
             success=True,
             input_path=sample_pdf,
             output_path=output_path,
-            level="3b",
+            level="2b",
             skipped=True,
+        )
+        mock_validate.return_value = MagicMock(
+            compliant=True,
+            passed_rules=1,
+            failed_rules=0,
         )
 
         result = cli_module._convert_single_file(
             sample_pdf,
             str(output_path),
-            "3b",
+            "3a",
             do_validate=True,
             force=False,
             quiet=True,
         )
 
         assert result == EXIT_SUCCESS
-        mock_validate.assert_not_called()
+        mock_validate.assert_called_once_with(
+            path=output_path,
+            flavour="2b",
+            timeout=300,
+        )
 
     @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
@@ -319,6 +389,26 @@ class TestCliConvert:
         assert result.exit_code == EXIT_SUCCESS
         assert "PDF/A-3b" in result.output or "3b" in result.output
 
+    @pytest.mark.parametrize("level", ["2a", "3a"])
+    @patch("pdftopdfa.cli._convert_single_file", return_value=EXIT_SUCCESS)
+    def test_cli_accepts_level_a(
+        self,
+        mock_convert_single,
+        level: str,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """The CLI accepts both accessible conformance levels."""
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main, [str(sample_pdf), str(output_path), "--level", level]
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert mock_convert_single.call_args.args[2] == level
+
     def test_cli_convert_default_output(
         self, runner: CliRunner, sample_pdf: Path
     ) -> None:
@@ -360,6 +450,24 @@ class TestCliConvert:
         assert "Skipped:" in result.output
         assert "encrypted" in result.output
 
+    def test_cli_password_encrypted_pdf_is_skipped(
+        self,
+        runner: CliRunner,
+        password_encrypted_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """The CLI safely copies PDFs that require a user password."""
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [str(password_encrypted_pdf), str(output_path), "--level", "2a"],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
+        assert "encrypted" in result.output
+
 
 class TestCliMissingInput:
     """Tests for missing input file."""
@@ -372,6 +480,24 @@ class TestCliMissingInput:
 
         # Click returns exit code 2 for missing file (exists=True)
         assert result.exit_code == EXIT_FILE_NOT_FOUND
+
+
+class TestCliPermissionErrors:
+    """Tests for output permission failures."""
+
+    @patch("pdftopdfa.cli.convert_to_pdfa", side_effect=PermissionError("read-only"))
+    def test_cli_permission_error_returns_exit_code(
+        self,
+        _mock_convert: MagicMock,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """A converter permission error uses the documented exit code."""
+        result = runner.invoke(main, [str(sample_pdf), str(tmp_dir / "output.pdf")])
+
+        assert result.exit_code == EXIT_PERMISSION_ERROR
+        assert "Access denied: read-only" in result.output
 
 
 class TestCliForceOverwrite:
@@ -528,8 +654,6 @@ class TestCliDirectory:
         self, runner: CliRunner, tmp_dir: Path, sample_pdf_bytes: bytes
     ) -> None:
         """--force overwrites existing PDF/A files in directory mode."""
-        from pdftopdfa.cli import EXIT_CONVERSION_FAILED
-
         input_dir = tmp_dir / "input"
         output_dir = tmp_dir / "output"
         input_dir.mkdir()
@@ -546,7 +670,7 @@ class TestCliDirectory:
 
         # Without --force: file is skipped (reported as failure)
         result2 = runner.invoke(main, [str(input_dir), str(output_dir)])
-        assert result2.exit_code == EXIT_CONVERSION_FAILED
+        assert result2.exit_code == EXIT_GENERAL_ERROR
 
         # With --force: file is overwritten successfully
         result3 = runner.invoke(main, [str(input_dir), str(output_dir), "--force"])
@@ -573,6 +697,61 @@ class TestCliDirectory:
 
 class TestCliValidation:
     """Tests for --validate option."""
+
+    @patch("pdftopdfa.verapdf.is_verapdf_available", return_value=False)
+    def test_cli_missing_validator_returns_validation_failure(
+        self,
+        _mock_available: MagicMock,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """A missing validator uses the documented validation exit code."""
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [str(sample_pdf), str(output_path), "--validate"],
+        )
+
+        assert result.exit_code == EXIT_VALIDATION_FAILED
+        assert "Validation requires veraPDF" in result.output
+        assert not output_path.exists()
+
+    @patch("pdftopdfa.cli.validate_with_verapdf")
+    @patch("pdftopdfa.cli.convert_to_pdfa")
+    def test_cli_validation_runtime_error_fails_closed(
+        self,
+        mock_convert_to_pdfa: MagicMock,
+        mock_validate: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A missing or crashed validator returns the validation failure code."""
+        output_path = tmp_dir / "output.pdf"
+        mock_convert_to_pdfa.return_value = ConversionResult(
+            success=True,
+            input_path=sample_pdf,
+            output_path=output_path,
+            level="3b",
+        )
+        mock_validate.side_effect = VeraPDFError("veraPDF crashed")
+
+        result = cli_module._convert_single_file(
+            sample_pdf,
+            str(output_path),
+            "3b",
+            do_validate=True,
+            force=False,
+            quiet=True,
+        )
+
+        assert result == EXIT_VALIDATION_FAILED
+        assert (
+            "Validation failed: veraPDF could not run (veraPDF crashed)"
+            in capsys.readouterr().err
+        )
 
     @pytest.mark.skipif(
         not is_verapdf_available(),
@@ -1252,6 +1431,33 @@ class TestDirectoryValidationFailures:
         result = runner.invoke(main, [str(input_dir)])
 
         assert result.exit_code == EXIT_VALIDATION_FAILED
+
+    @patch("pdftopdfa.cli.convert_directory")
+    def test_skipped_validation_failure_returns_exit_code(
+        self, mock_convert_dir, runner: CliRunner, tmp_dir: Path
+    ) -> None:
+        """A skipped, unvalidated copy is still a validation failure."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        input_path = input_dir / "encrypted.pdf"
+        input_path.write_bytes(b"%PDF-1.4 dummy")
+
+        mock_convert_dir.return_value = [
+            ConversionResult(
+                success=True,
+                input_path=input_path,
+                output_path=tmp_dir / "encrypted_pdfa.pdf",
+                level=None,
+                warnings=["Validation: veraPDF could not run"],
+                validation_failed=True,
+                skipped=True,
+            ),
+        ]
+
+        result = runner.invoke(main, [str(input_dir), "--validate"])
+
+        assert result.exit_code == EXIT_VALIDATION_FAILED
+        assert "1 file(s) failed validation" in result.output
 
     @patch("pdftopdfa.cli.convert_directory")
     def test_conversion_failure_takes_priority_over_validation(

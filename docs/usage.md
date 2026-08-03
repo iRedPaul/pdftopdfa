@@ -57,9 +57,10 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 - Single-file conversion without explicit output writes next to the input file.
 - Directory conversion without explicit output writes into the same directory.
 - Recursive directory conversion with an explicit output directory preserves subdirectory structure.
-- When converting in-place (`output_dir=None`), files already ending in `_pdfa.pdf` are skipped to avoid reconversion loops.
-- In processing-only mode, files already ending in `_processed.pdf` are skipped
-  instead.
+- When converting in-place (`output_dir=None`), generated `_pdfa.pdf` or
+  `_processed.pdf` outputs are skipped when the corresponding source file is
+  present, avoiding reconversion loops without excluding standalone inputs
+  whose names happen to use those suffixes.
 - Existing output files are not overwritten unless `-f/--force` (CLI) or `force_overwrite=True` (API) is used.
 
 ## Font Policy
@@ -84,7 +85,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 
 | Option | Description |
 |---|---|
-| `-l, --level [2b\|2u\|3b\|3u]` | Target PDF/A level (default: `3b`) |
+| `-l, --level [2a\|2b\|2u\|3a\|3b\|3u]` | Target PDF/A level (default: `3b`) |
 | `-v, --validate` | Validate output with veraPDF. Note: unlike the common CLI convention, `-v` does **not** mean verbose — use `--verbose` for detailed logs |
 | `--no-pdfa` | Apply requested OCR processing without running the PDF/A conversion pipeline |
 | `-r, --recursive` | Process directories recursively |
@@ -92,7 +93,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `-q, --quiet` | Show only errors |
 | `--verbose` | Enable detailed logs |
 | `--ocr` | Enable OCR for scanned/image-based PDFs; requires both model-directory options |
-| `--ocr-force` | Replace an existing OCR layer; requires both model-directory options, implies `--ocr`, and disables the compliant-PDF/A skip optimization |
+| `--ocr-force` | Replace an existing OCR layer; requires both model-directory options and implies `--ocr` |
 | `--ocr-lang LANG` | PaddleOCR language code (default: `en`), for example `de` or `de+en`; does not enable OCR by itself |
 | `--ocr-detection-model-dir DIR` | Directory containing compatible PP-OCRv6 Medium detection `inference.onnx` and `inference.yml` |
 | `--ocr-recognition-model-dir DIR` | Directory containing compatible PP-OCRv6 Medium recognition `inference.onnx` and `inference.yml` |
@@ -129,12 +130,14 @@ from pdftopdfa import convert_to_pdfa
 result = convert_to_pdfa(
     input_path=Path("input.pdf"),
     output_path=Path("output.pdf"),
-    level="2b",
-    validate=False,
+    level="2a",
+    validate=True,
 )
 
-if result.success:
+if result.success and not result.validation_failed:
     print("Done")
+elif result.validation_failed:
+    print("Conversion completed, but validation failed")
 else:
     print(result.error)
 ```
@@ -201,10 +204,22 @@ rejected, and PDF/A-specific settings such as `level`, `skip_any_pdfa`,
 identification metadata is not deliberately removed, but the output is not
 validated or guaranteed to conform to PDF/A.
 
+Requesting OCR processing disables the document-level optimization that copies
+an already-compliant PDF/A unchanged. Page selection still happens normally:
+without `ocr_force=True`, pages that already contain text are skipped.
+
 By default, non-standard visible annotations are flattened into page content for
 maximum archival robustness. Set `preserve_stamps=True` or pass
 `--preserve-stamps` to convert known proprietary stamp annotations to standard
 `/Stamp` annotations instead.
+
+For PDF/A-2a and PDF/A-3a, `pdftopdfa` preserves an existing Tagged PDF
+structure when the page content remains unchanged. Untagged inputs and
+OCR-processed documents receive a new structure tree based on page,
+content-stream, and annotation order. This provides the logical structure
+required by level A, including for scans, but cannot infer authorial semantics
+such as heading levels, table relationships, or alternative descriptions.
+PDF/A level A therefore does not imply PDF/UA conformance.
 
 ### `convert_directory()`
 
@@ -328,11 +343,11 @@ need OCR.
 | `success` | `bool` | `True` if conversion succeeded |
 | `input_path` | `Path` | Input file path |
 | `output_path` | `Path` | Output file path |
-| `level` | `str` | Effective PDF/A level |
+| `level` | `str \| None` | Requested level for converted output, detected level for a compliant skip, or `None` for unchanged unsupported/no-PDF/A output |
 | `warnings` | `list[str]` | Non-fatal conversion warnings |
 | `processing_time` | `float` | Runtime in seconds |
 | `error` | `str \\| None` | Error message if failed |
-| `validation_failed` | `bool` | `True` if veraPDF reported non-compliance |
+| `validation_failed` | `bool` | `True` if validation reported non-compliance or could not complete |
 | `skipped` | `bool` | `True` if the original PDF was copied unchanged |
 
 ## Exceptions
@@ -388,12 +403,14 @@ convert to PDF/A first and sign the PDF/A output afterwards.
 
 ## PDF/A Levels
 
-| Level | ISO Standard | Attachments | Unicode Required | Recommended For |
-|---|---|---|---|---|
-| `2b` | ISO 19005-2 | PDF/A attachments only | No | Basic archiving |
-| `2u` | ISO 19005-2 | PDF/A attachments only | Yes | Searchable archives |
-| `3b` | ISO 19005-3 | Any format | No | Hybrid documents (for example PDF + XML) |
-| `3u` | ISO 19005-3 | Any format | Yes | Searchable hybrid archives |
+| Level | ISO Standard | Attachments | Unicode Required | Tagged Structure | Recommended For |
+|---|---|---|---|---|---|
+| `2a` | ISO 19005-2 | PDF/A attachments only | Yes | Required | Structured archives |
+| `2b` | ISO 19005-2 | PDF/A attachments only | No | No | Basic archiving |
+| `2u` | ISO 19005-2 | PDF/A attachments only | Yes | No | Searchable archives |
+| `3a` | ISO 19005-3 | Any format | Yes | Required | Structured hybrid documents |
+| `3b` | ISO 19005-3 | Any format | No | No | Hybrid documents (for example PDF + XML) |
+| `3u` | ISO 19005-3 | Any format | Yes | No | Searchable hybrid archives |
 
 Default level: `3b`.
 
@@ -407,7 +424,7 @@ Default behavior:
 | Detected | Behavior |
 |---|---|
 | Same level (`2b` -> `2b`) | Skip conversion |
-| Higher conformance in same part (`2u` -> `2b`) | Skip conversion |
+| Higher conformance in same part (`2a` -> `2u` or `2b`) | Skip conversion |
 | Lower conformance in same part (`2b` -> `2u`) | Convert |
 | Different part (`1b` -> `3b`, `3u` -> `2b`) | Convert |
 
@@ -423,9 +440,9 @@ Notes:
 - If the metadata claim fails veraPDF validation, conversion is not skipped.
 - If veraPDF is unavailable, conversion is not skipped based only on metadata.
 - Skipped files return warning: `Conversion skipped: PDF already valid PDF/A (veraPDF compliant)`.
-- Forced OCR (`--ocr-force` or `ocr_force=True` with both model directories)
-  always runs and bypasses this skip logic.
-- Forced OCR does not bypass the signed-PDF protection; use `--allow-signature-invalidation` explicitly to convert signed inputs.
+- Any requested OCR processing bypasses this document-level skip logic.
+- OCR does not bypass the signed-PDF protection; use
+  `--allow-signature-invalidation` explicitly to convert signed inputs.
 
 ## Validation
 
@@ -434,7 +451,9 @@ Notes:
 - CLI: `pdftopdfa -v input.pdf`
 - API: pass `validate=True`
 
-If veraPDF is missing, conversion still runs, and validation is reported as skipped.
+Explicit validation is fail-closed: if veraPDF is missing or cannot complete,
+conversion APIs return a result with `validation_failed=True`, and the CLI
+exits with the validation-failure code.
 
 ## Environment Variables
 

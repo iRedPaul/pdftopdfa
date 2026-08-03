@@ -9,6 +9,7 @@ import logging
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
+from ..fonts.glyph_usage import _iter_content_streams_with_resources
 from ..utils import resolve_indirect as _resolve_indirect
 from ._profiles import _create_icc_colorspace
 from ._types import (
@@ -69,68 +70,53 @@ def _resources_have_transparency(
     resources,
     visited: set[tuple[int, int]],
 ) -> bool:
-    """Check if resources contain transparency features.
+    """Check nested Form resources for transparency without recursion."""
+    stack = [resources]
 
-    Examines ExtGState entries and recurses into Form XObjects.
+    while stack:
+        try:
+            current = _resolve_indirect(stack.pop())
 
-    Args:
-        resources: A resolved Resources dictionary.
-        visited: Set of (obj_num, gen) pairs for cycle detection.
+            ext_gstate = current.get(Name.ExtGState)
+            if ext_gstate is not None:
+                ext_gstate = _resolve_indirect(ext_gstate)
+                for key in ext_gstate.keys():
+                    try:
+                        gs = _resolve_indirect(ext_gstate[key])
+                        if _gs_has_transparency(gs):
+                            return True
+                    except (AttributeError, TypeError, ValueError):
+                        continue
 
-    Returns:
-        True if any transparency feature is detected.
-    """
-    # Check ExtGState entries
-    try:
-        ext_gstate = resources.get(Name.ExtGState)
-        if ext_gstate is not None:
-            ext_gstate = _resolve_indirect(ext_gstate)
-            for key in ext_gstate.keys():
-                try:
-                    gs = _resolve_indirect(ext_gstate[key])
-                    if _gs_has_transparency(gs):
-                        return True
-                except (AttributeError, TypeError, ValueError):
-                    continue
-    except (AttributeError, TypeError, ValueError):
-        pass
-
-    # Recurse into Form XObjects
-    try:
-        xobjects = resources.get(Name.XObject)
-        if xobjects is not None:
+            xobjects = current.get(Name.XObject)
+            if xobjects is None:
+                continue
             xobjects = _resolve_indirect(xobjects)
             for key in xobjects.keys():
                 try:
-                    xobj = _resolve_indirect(xobjects[key])
-
-                    # Cycle detection
-                    objgen = xobj.objgen
+                    xobject = _resolve_indirect(xobjects[key])
+                    objgen = xobject.objgen
                     if objgen != (0, 0):
                         if objgen in visited:
                             continue
                         visited.add(objgen)
 
-                    if xobj.get(Name.Subtype) != Name.Form:
+                    if xobject.get(Name.Subtype) != Name.Form:
                         continue
 
-                    # A Form XObject with /Group /S /Transparency is transparent
-                    group = xobj.get(Name.Group)
+                    group = xobject.get(Name.Group)
                     if group is not None:
                         group = _resolve_indirect(group)
                         if group.get(Name.S) == Name.Transparency:
                             return True
 
-                    # Recurse into Form XObject resources
-                    form_res = xobj.get(Name.Resources)
-                    if form_res is not None:
-                        form_res = _resolve_indirect(form_res)
-                        if _resources_have_transparency(form_res, visited):
-                            return True
+                    form_resources = xobject.get(Name.Resources)
+                    if form_resources is not None:
+                        stack.append(form_resources)
                 except (AttributeError, TypeError, ValueError):
                     continue
-    except (AttributeError, TypeError, ValueError):
-        pass
+        except (AttributeError, TypeError, ValueError):
+            continue
 
     return False
 
@@ -154,6 +140,24 @@ def _page_uses_transparency(page) -> bool:
         resources = _resolve_indirect(resources)
         if _resources_have_transparency(resources, visited):
             return True
+
+    # Patterns, Type3 CharProcs, and soft-mask groups are content-bearing
+    # resource owners too.  The generic content graph walker supplies their
+    # effective resources without relying on Python recursion.
+    try:
+        for owner, nested_resources in _iter_content_streams_with_resources(page):
+            owner = _resolve_indirect(owner)
+            if isinstance(owner, Stream):
+                group = _resolve_indirect(owner.get(Name.Group))
+                if (
+                    isinstance(group, Dictionary)
+                    and group.get(Name.S) == Name.Transparency
+                ):
+                    return True
+            if _resources_have_transparency(nested_resources, visited):
+                return True
+    except (pikepdf.PdfError, AttributeError, TypeError, ValueError):
+        pass
 
     # Check annotation AP streams
     annots = page.get(Name.Annots)
@@ -280,7 +284,60 @@ def _detect_page_dominant_cs(page) -> ColorSpaceType:
                                 has_gray = True
                     except (AttributeError, TypeError, ValueError):
                         continue
-    except (AttributeError, TypeError, ValueError):
+    except (pikepdf.PdfError, AttributeError, TypeError, ValueError):
+        pass
+
+    # Include Forms, tiling patterns, soft-mask groups, and Type3 CharProcs.
+    try:
+        for owner, resources in _iter_content_streams_with_resources(page):
+            owner = _resolve_indirect(owner)
+            if isinstance(owner, Stream):
+                try:
+                    for operands, operator in pikepdf.parse_content_stream(owner):
+                        op_name = str(operator)
+                        if op_name in _CMYK_OPERATORS:
+                            has_cmyk = True
+                        elif op_name in _RGB_OPERATORS:
+                            has_rgb = True
+                        elif op_name in _GRAY_OPERATORS:
+                            has_gray = True
+                        elif op_name in _CS_OPERATORS and operands:
+                            cs_name = operands[0]
+                            if cs_name == Name.DeviceCMYK:
+                                has_cmyk = True
+                            elif cs_name == Name.DeviceRGB:
+                                has_rgb = True
+                            elif cs_name == Name.DeviceGray:
+                                has_gray = True
+                except (
+                    pikepdf.PdfError,
+                    AttributeError,
+                    IndexError,
+                    TypeError,
+                ):
+                    pass
+
+            resources = _resolve_indirect(resources)
+            if not isinstance(resources, Dictionary):
+                continue
+            xobjects = _resolve_indirect(resources.get(Name.XObject))
+            if not isinstance(xobjects, Dictionary):
+                continue
+            for key in list(xobjects.keys()):
+                try:
+                    image = _resolve_indirect(xobjects[key])
+                    if image.get(Name.Subtype) != Name.Image:
+                        continue
+                    cs_type = _DEVICE_NAME_TO_TYPE.get(image.get(Name.ColorSpace))
+                    if cs_type == ColorSpaceType.DEVICE_CMYK:
+                        has_cmyk = True
+                    elif cs_type == ColorSpaceType.DEVICE_RGB:
+                        has_rgb = True
+                    elif cs_type == ColorSpaceType.DEVICE_GRAY:
+                        has_gray = True
+                except (AttributeError, TypeError, ValueError):
+                    continue
+    except (pikepdf.PdfError, AttributeError, TypeError, ValueError):
         pass
 
     if has_cmyk:
@@ -389,46 +446,41 @@ def _fix_transparency_groups_in_xobjects(
     icc_stream_cache: dict[ColorSpaceType, Stream],
     visited: set[tuple[int, int]],
 ) -> int:
-    """Recursively fix transparency group /CS in an XObject dictionary.
-
-    For each Form XObject found, fixes its own transparency group ``/CS``
-    and then recurses into ``/Resources/XObject`` for nested forms.
-
-    Args:
-        xobjects: ``/XObject`` Dictionary from resources.
-        pdf: The document being converted.
-        icc_stream_cache: Shared cache of ICC stream objects.
-        visited: Set of ``(obj_num, gen)`` pairs for cycle detection.
-
-    Returns:
-        Number of transparency groups fixed.
-    """
+    """Fix transparency group /CS entries in nested Form XObjects."""
     fixed = 0
+    stack = [xobjects]
 
-    for name in xobjects.keys():
-        xobj = _resolve_indirect(xobjects[name])
+    while stack:
+        try:
+            current = _resolve_indirect(stack.pop())
+            for name in current.keys():
+                try:
+                    xobject = _resolve_indirect(current[name])
+                    objgen = xobject.objgen
+                    if objgen != (0, 0):
+                        if objgen in visited:
+                            continue
+                        visited.add(objgen)
 
-        # Cycle detection using objgen
-        objgen = xobj.objgen
-        if objgen != (0, 0):
-            if objgen in visited:
-                continue
-            visited.add(objgen)
+                    if xobject.get(Name.Subtype) != Name.Form:
+                        continue
 
-        if xobj.get(Name.Subtype) != Name.Form:
+                    fixed += _fix_transparency_group_cs_in_form(
+                        xobject,
+                        pdf,
+                        icc_stream_cache,
+                    )
+
+                    resources = xobject.get(Name.Resources)
+                    if resources is not None:
+                        resources = _resolve_indirect(resources)
+                        nested = resources.get(Name.XObject)
+                        if nested is not None:
+                            stack.append(nested)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+        except (AttributeError, TypeError, ValueError):
             continue
-
-        fixed += _fix_transparency_group_cs_in_form(xobj, pdf, icc_stream_cache)
-
-        # Recurse into nested resources
-        form_resources = xobj.get(Name.Resources)
-        if form_resources is not None:
-            form_resources = _resolve_indirect(form_resources)
-            nested = form_resources.get(Name.XObject)
-            if nested:
-                fixed += _fix_transparency_groups_in_xobjects(
-                    nested, pdf, icc_stream_cache, visited
-                )
 
     return fixed
 
@@ -534,6 +586,15 @@ def _fix_transparency_group_colorspaces(
             if xobjects:
                 fixed += _fix_transparency_groups_in_xobjects(
                     xobjects, pdf, icc_stream_cache, visited
+                )
+
+        for owner, _resources in _iter_content_streams_with_resources(page):
+            owner = _resolve_indirect(owner)
+            if isinstance(owner, Stream) and owner.get(Name.Subtype) == Name.Form:
+                fixed += _fix_transparency_group_cs_in_form(
+                    owner,
+                    pdf,
+                    icc_stream_cache,
                 )
 
         # Process annotations

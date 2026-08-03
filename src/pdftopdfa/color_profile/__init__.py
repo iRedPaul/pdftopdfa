@@ -90,7 +90,7 @@ def create_output_intent_for_colorspace(
         pdf: pikepdf Pdf object to create the stream in.
         colorspace: The color space type.
         profile_data: Raw ICC profile bytes.
-        level: PDF/A conformance level ('2b', '2u', '3b', or '3u').
+        level: PDF/A conformance level.
 
     Returns:
         OutputIntent Dictionary ready to be added to PDF.
@@ -154,7 +154,7 @@ def embed_color_profiles(
 
     Args:
         pdf: pikepdf Pdf object to modify.
-        level: PDF/A conformance level ('2b', '2u', '3b', or '3u').
+        level: PDF/A conformance level.
         replace_existing: If True, replace existing OutputIntents.
             If False and OutputIntents exist, do nothing.
         convert_calibrated: If True, convert CalGray/CalRGB color spaces
@@ -222,7 +222,7 @@ def embed_color_profiles(
         )
         pdf.Root.OutputIntents = Array([pdf.make_indirect(output_intent)])
 
-    # Cover non-dominant Device color spaces with Default entries + image fixes.
+    # Cover non-dominant Device color spaces with contextual Default entries.
     # Note: Separation/DeviceN spaces are not converted - they are PDF/A-2/3
     # conformant when an OutputIntent is present (ISO 19005-2, 6.2.4.4).
     # Their alternate spaces may contribute to detected device spaces, which
@@ -232,7 +232,13 @@ def embed_color_profiles(
         ColorSpaceType.DEVICE_RGB,
         ColorSpaceType.DEVICE_CMYK,
     }
-    non_dominant = device_spaces - {document_colorspace}
+    # Any PDF/A OutputIntent covers DeviceGray, regardless of the profile's
+    # color space (ISO 19005-2/3, 6.2.4.3). RGB and CMYK require a matching
+    # OutputIntent or a device-independent Default color space.
+    non_dominant = device_spaces - {
+        document_colorspace,
+        ColorSpaceType.DEVICE_GRAY,
+    }
     if non_dominant:
         _apply_default_colorspaces(pdf, non_dominant, icc_stream_cache)
 

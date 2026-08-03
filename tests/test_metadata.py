@@ -40,6 +40,9 @@ from pdftopdfa.metadata import (
     create_xmp_metadata,
     embed_xmp_metadata,
     extract_pdf_info,
+    remove_pdfe_identification,
+    remove_pdfua_identification,
+    remove_pdfvt_identification,
     sync_metadata,
 )
 
@@ -541,7 +544,7 @@ class TestSyncMetadata:
         with pytest.raises(ConversionError, match="Invalid PDF/A level"):
             sync_metadata(pdf, "4b")
 
-    @pytest.mark.parametrize("level", ["2b", "2u", "3b", "3u"])
+    @pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
     def test_sync_all_valid_levels(self, sample_pdf_bytes: bytes, level: str) -> None:
         """All valid levels are accepted."""
         from io import BytesIO
@@ -906,6 +909,117 @@ def _build_xmp_with_extras(extra_xml: str) -> etree._Element:
     return etree.fromstring(xmp_xml.encode("utf-8"))
 
 
+class TestRemovePdfuaIdentification:
+    """Tests for removing stale PDF/UA claims."""
+
+    def test_removes_element_and_attribute_properties(self) -> None:
+        """All PDF/UA identification forms are removed without other claims."""
+        tree = _build_xmp_with_extras(
+            "<pdfuaid:part>1</pdfuaid:part>"
+            '<rdf:Description rdf:about="" pdfuaid:rev="2024" '
+            'pdfeid:part="1"/>'
+        )
+
+        with new_pdf() as pdf:
+            embed_xmp_metadata(pdf, _reserialize_xmp(tree))
+
+            assert remove_pdfua_identification(pdf) is True
+
+            result = _parse_xmp_bytes(bytes(pdf.Root.Metadata.read_bytes()))
+            assert result is not None
+            assert not result.xpath(
+                "//*[namespace-uri()=$namespace] | //@*[namespace-uri()=$namespace]",
+                namespace=NAMESPACES["pdfuaid"],
+            )
+            assert (
+                result.xpath(
+                    "string(//@pdfeid:part)",
+                    namespaces={"pdfeid": NAMESPACES["pdfeid"]},
+                )
+                == "1"
+            )
+
+    def test_returns_false_without_pdfua_claim(self) -> None:
+        """XMP without PDF/UA identification is left unchanged."""
+        tree = _build_xmp_with_extras("<pdfeid:part>1</pdfeid:part>")
+
+        with new_pdf() as pdf:
+            embed_xmp_metadata(pdf, _reserialize_xmp(tree))
+            before = bytes(pdf.Root.Metadata.read_bytes())
+
+            assert remove_pdfua_identification(pdf) is False
+            assert bytes(pdf.Root.Metadata.read_bytes()) == before
+
+
+class TestRemovePdfvtIdentification:
+    """Tests for removing PDF/VT claims after PDF/X is dropped."""
+
+    def test_removes_pdfvt_and_preserves_independent_claims(self) -> None:
+        """Only PDF/VT properties are removed."""
+        tree = _build_xmp_with_extras(
+            "<pdfvtid:GTS_PDFVTVersion>PDF/VT-1</pdfvtid:GTS_PDFVTVersion>"
+            "<pdfeid:ISO_PDFEVersion>PDF/E-1</pdfeid:ISO_PDFEVersion>"
+            "<pdfuaid:part>1</pdfuaid:part>"
+        )
+
+        with new_pdf() as pdf:
+            embed_xmp_metadata(pdf, _reserialize_xmp(tree))
+
+            assert remove_pdfvt_identification(pdf) is True
+
+            result = _parse_xmp_bytes(bytes(pdf.Root.Metadata.read_bytes()))
+            assert result is not None
+            assert not result.xpath(
+                "//*[namespace-uri()=$namespace] | //@*[namespace-uri()=$namespace]",
+                namespace=NAMESPACES["pdfvtid"],
+            )
+            assert (
+                result.xpath(
+                    "string(//pdfeid:ISO_PDFEVersion)",
+                    namespaces={"pdfeid": NAMESPACES["pdfeid"]},
+                )
+                == "PDF/E-1"
+            )
+            assert (
+                result.xpath(
+                    "string(//pdfuaid:part)",
+                    namespaces={"pdfuaid": NAMESPACES["pdfuaid"]},
+                )
+                == "1"
+            )
+
+
+class TestRemovePdfeIdentification:
+    """Tests for removing PDF/E claims after their DocInfo marker is dropped."""
+
+    def test_removes_element_and_attribute_and_preserves_other_claims(self) -> None:
+        """All PDF/E properties are removed without touching PDF/UA."""
+        tree = _build_xmp_with_extras(
+            "<pdfeid:ISO_PDFEVersion>PDF/E-1</pdfeid:ISO_PDFEVersion>"
+            '<rdf:Description rdf:about="" pdfeid:GTS_PDFEVersion="PDF/E-1"/>'
+            "<pdfuaid:part>1</pdfuaid:part>"
+        )
+
+        with new_pdf() as pdf:
+            embed_xmp_metadata(pdf, _reserialize_xmp(tree))
+
+            assert remove_pdfe_identification(pdf) is True
+
+            result = _parse_xmp_bytes(bytes(pdf.Root.Metadata.read_bytes()))
+            assert result is not None
+            assert not result.xpath(
+                "//*[namespace-uri()=$namespace] | //@*[namespace-uri()=$namespace]",
+                namespace=NAMESPACES["pdfeid"],
+            )
+            assert (
+                result.xpath(
+                    "string(//pdfuaid:part)",
+                    namespaces={"pdfuaid": NAMESPACES["pdfuaid"]},
+                )
+                == "1"
+            )
+
+
 class TestXmpPreservation:
     """Tests for preservation of existing XMP metadata."""
 
@@ -939,7 +1053,9 @@ class TestXmpPreservation:
 
     def test_pdfe_identification_preserved(self) -> None:
         """PDF/E identification is preserved in output XMP."""
-        tree = _build_xmp_with_extras("<pdfeid:part>1</pdfeid:part>")
+        tree = _build_xmp_with_extras(
+            "<pdfeid:ISO_PDFEVersion>PDF/E-1</pdfeid:ISO_PDFEVersion>"
+        )
         info: dict = {"title": "Test"}
         xmp = create_xmp_metadata(
             info,
@@ -947,7 +1063,7 @@ class TestXmpPreservation:
             pdfa_conformance="B",
             existing_xmp_tree=tree,
         )
-        assert b"pdfeid" in xmp or NAMESPACES["pdfeid"].encode() in xmp
+        assert b"PDF/E-1" in xmp
 
     def test_pdfvt_identification_preserved(self) -> None:
         """PDF/VT identification is preserved in output XMP."""
@@ -1709,6 +1825,21 @@ class TestXRechnungMetadataRepair:
         assert {
             elem.text for elem in schema.findall(f".//{{{_NS_PDFA_PROPERTY}}}category")
         } == {"external"}
+
+    def test_xrechnung_name_tree_beyond_python_recursion_limit(self) -> None:
+        """XRechnung metadata is repaired through an exceptionally deep name tree."""
+        pdf, _ = _make_xrechnung_pdf()
+        node = pdf.Root.Names.EmbeddedFiles
+        for _ in range(1200):
+            node = pdf.make_indirect(Dictionary(Kids=Array([node])))
+        pdf.Root.Names.EmbeddedFiles = node
+
+        sync_metadata(pdf, "3a")
+
+        tree = _parse_xmp_xml(bytes(pdf.Root.Metadata.read_bytes()))
+        assert [
+            elem.text for elem in tree.iter(f"{{{NAMESPACES['fx']}}}DocumentFileName")
+        ] == ["xrechnung.xml"]
 
     @pytest.mark.parametrize(
         ("guideline_id", "type_code"),
@@ -3590,6 +3721,77 @@ class TestSanitizeNonCatalogMetadata:
         content = bytes(page_meta.read_bytes())
         assert b"xmp:CreatorTool" in content
         assert b"custom:Foo" not in content
+
+    def test_sanitizes_metadata_on_nested_direct_dictionary(
+        self,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """Metadata on direct resource dictionaries is discovered and sanitized."""
+        from io import BytesIO
+
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
+        xmp_data = (
+            b'<?xpacket begin="\xef\xbb\xbf"'
+            b' id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b"<rdf:RDF xmlns:rdf="
+            b'"http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about=""'
+            b' xmlns:xmp="http://ns.adobe.com/xap/1.0/"'
+            b' xmlns:custom="http://example.com/custom/">'
+            b"<xmp:CreatorTool>scanner</xmp:CreatorTool>"
+            b"<custom:Foo>bar</custom:Foo>"
+            b"</rdf:Description>"
+            b"</rdf:RDF>"
+            b"</x:xmpmeta>\n"
+            b'<?xpacket end="w"?>'
+        )
+        metadata = pdf.make_stream(xmp_data)
+        metadata.Type = Name.Metadata
+        metadata.Subtype = Name.XML
+        holder = Dictionary(Metadata=pdf.make_indirect(metadata))
+        pdf.pages[0].obj["/Resources"] = Dictionary(
+            Properties=Dictionary(Nested=holder)
+        )
+
+        needs = _collect_non_catalog_extension_needs(pdf)
+        sanitized, removed = _sanitize_non_catalog_metadata(pdf)
+
+        assert needs == {"http://example.com/custom/": {"Foo"}}
+        assert sanitized == 1
+        assert removed == 0
+        content = bytes(metadata.read_bytes())
+        assert b"xmp:CreatorTool" in content
+        assert b"custom:Foo" not in content
+
+    def test_sanitizes_metadata_below_deep_indirect_chain(
+        self,
+        sample_pdf_bytes: bytes,
+    ) -> None:
+        """Deep object graphs are traversed without Python recursion limits."""
+        from io import BytesIO
+
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
+        xmp_data = (
+            b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b"<rdf:RDF xmlns:rdf="
+            b'"http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about=""/>'
+            b"</rdf:RDF>"
+            b"</x:xmpmeta>"
+        )
+        metadata = pdf.make_stream(xmp_data)
+        metadata.Type = Name.Metadata
+        metadata.Subtype = Name.XML
+        nested = pdf.make_indirect(Dictionary(Metadata=pdf.make_indirect(metadata)))
+        for _ in range(1200):
+            nested = pdf.make_indirect(Dictionary(Next=nested))
+        pdf.Root["/DeepMetadata"] = nested
+
+        sanitized, removed = _sanitize_non_catalog_metadata(pdf)
+
+        assert sanitized == 1
+        assert removed == 0
 
     def test_strips_problematic_photoshop_properties_from_stream_holder(
         self,

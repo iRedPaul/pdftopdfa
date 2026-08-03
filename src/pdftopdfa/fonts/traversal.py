@@ -2,7 +2,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-"""Recursive font discovery across all nested PDF structures.
+"""Font discovery across all nested PDF structures.
 
 Discovers fonts in:
 - Page-level Resources/Font
@@ -13,15 +13,93 @@ Discovers fonts in:
 """
 
 import logging
+import secrets
 from collections.abc import Iterator
 
 import pikepdf
 
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
-from .utils import check_visited as _check_visited
 
 logger = logging.getLogger(__name__)
+
+_ObjectKey = tuple[int, int]
+_DirectAncestors = tuple[pikepdf.Object, ...]
+
+
+def _indirect_identity(obj: pikepdf.Object) -> _ObjectKey | None:
+    """Return a stable identity for an indirect PDF object."""
+    objgen = obj.objgen
+    return objgen if objgen != (0, 0) else None
+
+
+def _check_visited(obj: pikepdf.Object, visited: set[_ObjectKey]) -> bool:
+    """Deduplicate indirect objects, whose object numbers are stable."""
+    key = _indirect_identity(obj)
+    if key is None:
+        return False
+    if key in visited:
+        return True
+    visited.add(key)
+    return False
+
+
+def _is_direct_cycle(
+    obj: pikepdf.Object,
+    ancestors: _DirectAncestors,
+    marker: str,
+) -> bool:
+    """Return whether a direct object already occurs on the current path."""
+    if not ancestors:
+        return False
+
+    # pikepdf does not expose qpdf's direct-object identity. A temporary key
+    # provides the same test because wrappers of one direct object share writes.
+    while marker in obj:
+        marker += "_"
+    obj[marker] = True
+    try:
+        return any(marker in ancestor for ancestor in ancestors)
+    finally:
+        del obj[marker]
+
+
+def _descendant_ancestors(
+    container: pikepdf.Object,
+    ancestors: _DirectAncestors,
+) -> _DirectAncestors:
+    """Reset direct ancestors after crossing a stable indirect object."""
+    return ancestors if _indirect_identity(container) is None else ()
+
+
+def get_page_resources(page: pikepdf.Page) -> pikepdf.Object | None:
+    """Return a page's local or inherited resources dictionary."""
+    current = _resolve_indirect(page.obj)
+    seen: set[_ObjectKey] = set()
+    direct_ancestors: _DirectAncestors = ()
+    cycle_marker = f"/__pdftopdfa_direct_cycle_{secrets.token_hex(32)}"
+    while isinstance(current, pikepdf.Dictionary):
+        key = _indirect_identity(current)
+        if key is None:
+            if _is_direct_cycle(current, direct_ancestors, cycle_marker):
+                return None
+            direct_ancestors += (current,)
+        else:
+            direct_ancestors = ()
+            if key in seen:
+                return None
+            seen.add(key)
+
+        resources = current.get("/Resources")
+        if resources is not None:
+            resources = _resolve_indirect(resources)
+            return resources if isinstance(resources, pikepdf.Dictionary) else None
+
+        parent = current.get("/Parent")
+        if parent is None:
+            return None
+        current = _resolve_indirect(parent)
+    return None
 
 
 def iter_all_page_fonts(
@@ -39,15 +117,13 @@ def iter_all_page_fonts(
     Yields:
         Tuples of (font_key, dereferenced_font_obj).
     """
-    visited: set[tuple[int, int]] = set()
+    visited: set[_ObjectKey] = set()
 
     # Page-level Resources
-    resources = page.get("/Resources")
-    if resources is not None:
-        try:
-            resources = _resolve_indirect(resources)
-        except Exception:
-            resources = None
+    try:
+        resources = get_page_resources(page)
+    except Exception:
+        resources = None
 
     if resources is not None:
         yield from _iter_fonts_from_resources(resources, visited)
@@ -105,107 +181,174 @@ def iter_acroform_dr_fonts(
 
 def _iter_fonts_from_resources(
     resources: pikepdf.Object,
-    visited: set[tuple[int, int]],
+    visited: set[_ObjectKey],
+    direct_ancestors: _DirectAncestors = (),
 ) -> Iterator[tuple[str, pikepdf.Object]]:
-    """Yields fonts from a Resources dictionary, recursing into XObjects and Patterns.
+    """Yield fonts from a resource graph without using Python recursion.
 
     Args:
         resources: A PDF Resources dictionary.
-        visited: Set of objgen tuples already visited (for cycle detection).
+        visited: Stable identities already visited for cycle detection.
 
     Yields:
         Tuples of (font_key, dereferenced_font_obj).
     """
-    # 1. Yield fonts from Resources/Font
-    font_dict = resources.get("/Font")
-    if font_dict is not None:
+    tasks: list[tuple[str, pikepdf.Object, str | None, _DirectAncestors]] = [
+        ("resources", resources, None, direct_ancestors)
+    ]
+    cycle_marker = f"/__pdftopdfa_direct_cycle_{secrets.token_hex(32)}"
+    while tasks:
+        kind, obj, font_key, current_ancestors = tasks.pop()
+        if kind == "font":
+            assert font_key is not None
+            yield font_key, obj
+            continue
+
         try:
-            font_dict = _resolve_indirect(font_dict)
+            current_resources = _resolve_indirect(obj)
+        except Exception:
+            continue
+        if not isinstance(current_resources, pikepdf.Dictionary):
+            continue
+        if _check_visited(current_resources, visited):
+            continue
+        if _indirect_identity(current_resources) is None:
+            if _is_direct_cycle(
+                current_resources,
+                current_ancestors,
+                cycle_marker,
+            ):
+                continue
+            current_ancestors += (current_resources,)
+        else:
+            current_ancestors = ()
+
+        discovered: list[tuple[str, pikepdf.Object, str | None, _DirectAncestors]] = []
+
+        # 1. Yield fonts from Resources/Font, then traverse Type3 resources.
+        try:
+            font_dict = _resolve_indirect(current_resources.get("/Font"))
         except Exception:
             font_dict = None
-
-    if font_dict is not None:
-        for font_key in list(font_dict.keys()):
-            try:
-                font_obj = font_dict[font_key]
-                font_obj = _resolve_indirect(font_obj)
+        if isinstance(font_dict, pikepdf.Dictionary):
+            for raw_font_key in list(font_dict.keys()):
                 try:
-                    key_str = str(font_key)
-                except (UnicodeDecodeError, UnicodeEncodeError):
-                    key_str = repr(font_key)
-                yield (key_str, font_obj)
+                    font_obj = _resolve_indirect(font_dict[raw_font_key])
+                    try:
+                        key_str = str(raw_font_key)
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        key_str = repr(raw_font_key)
+                    discovered.append(("font", font_obj, key_str, ()))
 
-                # Recurse into Type3 font Resources
-                subtype = font_obj.get("/Subtype")
-                if subtype is not None and str(subtype) == "/Type3":
-                    if not _check_visited(font_obj, visited):
-                        type3_resources = font_obj.get("/Resources")
-                        if type3_resources is not None:
-                            type3_resources = _resolve_indirect(type3_resources)
-                            yield from _iter_fonts_from_resources(
-                                type3_resources, visited
+                    if str(font_obj.get("/Subtype")) == "/Type3" and not _check_visited(
+                        font_obj, visited
+                    ):
+                        type3_resources = _resolve_indirect(font_obj.get("/Resources"))
+                        if isinstance(type3_resources, pikepdf.Dictionary):
+                            discovered.append(
+                                (
+                                    "resources",
+                                    type3_resources,
+                                    None,
+                                    _descendant_ancestors(font_obj, current_ancestors),
+                                )
                             )
-            except Exception:
-                continue
+                except Exception:
+                    continue
 
-    # 2. Recurse into Form XObjects in Resources/XObject
-    xobject_dict = resources.get("/XObject")
-    if xobject_dict is not None:
+        # 2. Traverse Form XObjects.
         try:
-            xobject_dict = _resolve_indirect(xobject_dict)
+            xobject_dict = _resolve_indirect(current_resources.get("/XObject"))
         except Exception:
             xobject_dict = None
-
-    if xobject_dict is not None:
-        for xobj_key in list(xobject_dict.keys()):
-            try:
-                xobj = xobject_dict[xobj_key]
-                xobj = _resolve_indirect(xobj)
-
-                if _check_visited(xobj, visited):
+        if isinstance(xobject_dict, pikepdf.Dictionary):
+            for xobj_key in list(xobject_dict.keys()):
+                try:
+                    xobj = _resolve_indirect(xobject_dict[xobj_key])
+                    if _check_visited(xobj, visited):
+                        continue
+                    if str(xobj.get("/Subtype")) != "/Form":
+                        continue
+                    nested_resources = _resolve_indirect(xobj.get("/Resources"))
+                    if isinstance(nested_resources, pikepdf.Dictionary):
+                        discovered.append(
+                            (
+                                "resources",
+                                nested_resources,
+                                None,
+                                _descendant_ancestors(xobj, current_ancestors),
+                            )
+                        )
+                except Exception:
                     continue
 
-                # Only recurse into Form XObjects
-                subtype = xobj.get("/Subtype")
-                if subtype is not None and str(subtype) == "/Form":
-                    nested_resources = xobj.get("/Resources")
-                    if nested_resources is not None:
-                        nested_resources = _resolve_indirect(nested_resources)
-                        yield from _iter_fonts_from_resources(nested_resources, visited)
-            except Exception:
-                continue
-
-    # 3. Recurse into Tiling Patterns in Resources/Pattern
-    pattern_dict = resources.get("/Pattern")
-    if pattern_dict is not None:
+        # 3. Traverse Tiling Patterns.
         try:
-            pattern_dict = _resolve_indirect(pattern_dict)
+            pattern_dict = _resolve_indirect(current_resources.get("/Pattern"))
         except Exception:
             pattern_dict = None
-
-    if pattern_dict is not None:
-        for pat_key in list(pattern_dict.keys()):
-            try:
-                pattern = pattern_dict[pat_key]
-                pattern = _resolve_indirect(pattern)
-
-                if _check_visited(pattern, visited):
+        if isinstance(pattern_dict, pikepdf.Dictionary):
+            for pat_key in list(pattern_dict.keys()):
+                try:
+                    pattern = _resolve_indirect(pattern_dict[pat_key])
+                    if _check_visited(pattern, visited):
+                        continue
+                    if int(pattern.get("/PatternType", 0)) != 1:
+                        continue
+                    nested_resources = _resolve_indirect(pattern.get("/Resources"))
+                    if isinstance(nested_resources, pikepdf.Dictionary):
+                        discovered.append(
+                            (
+                                "resources",
+                                nested_resources,
+                                None,
+                                _descendant_ancestors(pattern, current_ancestors),
+                            )
+                        )
+                except Exception:
                     continue
 
-                # Only recurse into Tiling Patterns (PatternType=1)
-                pattern_type = pattern.get("/PatternType")
-                if pattern_type is not None and int(pattern_type) == 1:
-                    nested_resources = pattern.get("/Resources")
-                    if nested_resources is not None:
-                        nested_resources = _resolve_indirect(nested_resources)
-                        yield from _iter_fonts_from_resources(nested_resources, visited)
-            except Exception:
-                continue
+        # 4. Traverse transparency soft-mask group Form XObjects.
+        try:
+            extgstate_dict = _resolve_indirect(current_resources.get("/ExtGState"))
+        except Exception:
+            extgstate_dict = None
+        if isinstance(extgstate_dict, pikepdf.Dictionary):
+            for gs_key in list(extgstate_dict.keys()):
+                try:
+                    extgstate = _resolve_indirect(extgstate_dict[gs_key])
+                    if not isinstance(extgstate, pikepdf.Dictionary):
+                        continue
+                    soft_mask = _resolve_indirect(extgstate.get("/SMask"))
+                    if not isinstance(soft_mask, pikepdf.Dictionary):
+                        continue
+                    group = _resolve_indirect(soft_mask.get("/G"))
+                    if not isinstance(group, pikepdf.Stream):
+                        continue
+                    subtype = group.get("/Subtype")
+                    if subtype is not None and str(subtype) != "/Form":
+                        continue
+                    if _check_visited(group, visited):
+                        continue
+                    nested_resources = _resolve_indirect(group.get("/Resources"))
+                    if isinstance(nested_resources, pikepdf.Dictionary):
+                        discovered.append(
+                            (
+                                "resources",
+                                nested_resources,
+                                None,
+                                _descendant_ancestors(group, current_ancestors),
+                            )
+                        )
+                except Exception:
+                    continue
+
+        tasks.extend(reversed(discovered))
 
 
 def _iter_fonts_from_appearance_streams(
     page: pikepdf.Page,
-    visited: set[tuple[int, int]],
+    visited: set[_ObjectKey],
 ) -> Iterator[tuple[str, pikepdf.Object]]:
     """Yields fonts from Annotation Appearance Streams on a page.
 
@@ -257,7 +400,7 @@ def _iter_fonts_from_appearance_streams(
 
 def _iter_fonts_from_ap_entry(
     ap_entry: pikepdf.Object,
-    visited: set[tuple[int, int]],
+    visited: set[_ObjectKey],
 ) -> Iterator[tuple[str, pikepdf.Object]]:
     """Yields fonts from a single AP entry (stream or sub-state dict).
 
@@ -286,7 +429,7 @@ def _iter_fonts_from_ap_entry(
 
 def _iter_fonts_from_form_xobject(
     xobj: pikepdf.Object,
-    visited: set[tuple[int, int]],
+    visited: set[_ObjectKey],
 ) -> Iterator[tuple[str, pikepdf.Object]]:
     """Yields fonts from a Form XObject's Resources.
 

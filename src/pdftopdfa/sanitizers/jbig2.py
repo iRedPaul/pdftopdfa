@@ -469,14 +469,14 @@ def convert_jbig2_external_globals(pdf: Pdf) -> dict[str, int]:
     seen: set[tuple[int, int]] = set()
     for obj in pdf.objects:
         try:
+            obj = _resolve_indirect(obj)
+            if not isinstance(obj, Stream):
+                continue
+
             objgen = obj.objgen
             if objgen in seen:
                 continue
             seen.add(objgen)
-            obj = _resolve_indirect(obj)
-
-            if not isinstance(obj, Stream):
-                continue
 
             if not _has_jbig2_filter(obj):
                 continue

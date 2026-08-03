@@ -290,6 +290,26 @@ class TestHTHalftone:
         assert "/TransferFunction" not in ht["/Cyan"]
         assert "/HalftoneName" not in ht["/Default"]
 
+    def test_ht_tree_beyond_python_recursion_limit(self) -> None:
+        """Sanitizes the leaf of an exceptionally deep Type 5 halftone tree."""
+        pdf = new_pdf()
+        halftone = Dictionary(
+            HalftoneType=1,
+            HalftoneName=Name("/Forbidden"),
+        )
+        leaf = halftone
+        for _ in range(1200):
+            parent = Dictionary(HalftoneType=5)
+            parent[Name("/Default")] = halftone
+            halftone = parent
+        _make_pdf_with_extgstate(
+            pdf,
+            Dictionary(Type=Name.ExtGState, HT=halftone),
+        )
+
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        assert "/HalftoneName" not in leaf
+
     def test_ht_type5_non_primary_transferfunction_added(self) -> None:
         """Adds /TransferFunction for non-primary Type 5 colorants."""
         pdf = new_pdf()
@@ -488,6 +508,99 @@ class TestNestedFormXObjects:
         result = sanitize_extgstate(pdf_with_deeply_nested_form)
 
         assert result["extgstate_fixed"] == 1
+
+    def test_very_deep_form_resources_are_iterative(self):
+        """A hostile resource depth must not exhaust the Python stack."""
+        pdf = new_pdf()
+        leaf_gs = Dictionary(Type=Name.ExtGState, TR=Name.Identity)
+        resources = Dictionary(ExtGState=Dictionary(GS0=leaf_gs))
+        for index in range(1200):
+            form = pdf.make_stream(b"q Q")
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = Array([0, 0, 1, 1])
+            form[Name.Resources] = resources
+            resources = Dictionary(XObject=Dictionary({f"/F{index}": form}))
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 1, 1]),
+                Resources=resources,
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_extgstate(pdf)
+
+        assert result["extgstate_fixed"] == 1
+        assert "/TR" not in leaf_gs
+
+
+class TestResourceDiscovery:
+    """Tests for every context that can own a Resources dictionary."""
+
+    def test_inherited_page_resources(self):
+        pdf = new_pdf()
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 10, 10]),
+            )
+        )
+        pdf.pages.append(page)
+        gs = Dictionary(Type=Name.ExtGState, TR=Name.Identity)
+        page.obj.Parent.Resources = Dictionary(ExtGState=Dictionary(GS0=gs))
+
+        result = sanitize_extgstate(pdf)
+
+        assert result["extgstate_fixed"] == 1
+        assert "/TR" not in gs
+
+    def test_tiling_pattern_resources(self):
+        pdf = new_pdf()
+        gs = Dictionary(Type=Name.ExtGState, TR=Name.Identity)
+        pattern = pdf.make_stream(b"/GS0 gs")
+        pattern[Name("/PatternType")] = 1
+        pattern[Name.Resources] = Dictionary(ExtGState=Dictionary(GS0=gs))
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 10, 10]),
+                Resources=Dictionary(Pattern=Dictionary(P0=pattern)),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_extgstate(pdf)
+
+        assert result["extgstate_fixed"] == 1
+        assert "/TR" not in gs
+
+    def test_soft_mask_group_resources(self):
+        pdf = new_pdf()
+        nested_gs = Dictionary(Type=Name.ExtGState, TR=Name.Identity)
+        group = _make_form_stream(pdf)
+        group[Name.Resources] = Dictionary(ExtGState=Dictionary(GS1=nested_gs))
+        smask = Dictionary(S=Name.Alpha, G=group)
+        outer_gs = Dictionary(Type=Name.ExtGState, SMask=smask)
+        _make_pdf_with_extgstate(pdf, outer_gs)
+
+        result = sanitize_extgstate(pdf)
+
+        assert result["extgstate_fixed"] == 1
+        assert "/TR" not in nested_gs
+
+    def test_acroform_default_resources(self):
+        pdf = new_pdf()
+        gs = Dictionary(Type=Name.ExtGState, TR=Name.Identity)
+        pdf.Root.AcroForm = Dictionary(
+            DR=Dictionary(ExtGState=Dictionary(GS0=gs)),
+        )
+
+        result = sanitize_extgstate(pdf)
+
+        assert result["extgstate_fixed"] == 1
+        assert "/TR" not in gs
 
 
 class TestAnnotationAppearanceStreams:
@@ -1024,6 +1137,23 @@ class TestOverprintIccBasedCmyk:
         pdf = new_pdf()
         gs = Dictionary(Type=Name.ExtGState, OPM=1, op=True)
         _make_pdf_with_extgstate(pdf, gs)
+        self._add_icc_cmyk_colorspace(pdf)
+
+        result = sanitize_extgstate(pdf)
+        assert result["extgstate_fixed"] == 1
+        assert int(pdf.pages[0].Resources.ExtGState.GS0.OPM) == 0
+
+    def test_opm_reset_when_overprint_is_in_another_graphics_state(self) -> None:
+        """Combines independently persistent OPM and overprint parameters."""
+        pdf = new_pdf()
+        _make_pdf_with_extgstate(
+            pdf,
+            Dictionary(Type=Name.ExtGState, OPM=1),
+        )
+        pdf.pages[0].Resources.ExtGState.GS1 = Dictionary(
+            Type=Name.ExtGState,
+            OP=True,
+        )
         self._add_icc_cmyk_colorspace(pdf)
 
         result = sanitize_extgstate(pdf)

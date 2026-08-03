@@ -1267,6 +1267,30 @@ class TestOrderArray:
         # ocg1 at top, [ocg2] nested, ocg3 appended
         assert len(d.Order) == 3
 
+    def test_order_beyond_python_recursion_limit(self):
+        """Recognises an OCG in an exceptionally deep /Order array."""
+        pdf = new_pdf()
+        pdf.pages.append(
+            pikepdf.Page(Dictionary(Type=Name.Page, MediaBox=Array([0, 0, 612, 792])))
+        )
+        ocg1 = pdf.make_indirect(
+            Dictionary(Type=Name.OCG, Name="Layer1", Intent=Name.View)
+        )
+        ocg2 = pdf.make_indirect(
+            Dictionary(Type=Name.OCG, Name="Layer2", Intent=Name.View)
+        )
+        order = Array([ocg1])
+        for _ in range(1200):
+            order = Array([order])
+        pdf.Root.OCProperties = Dictionary(
+            OCGs=Array([ocg1, ocg2]),
+            D=Dictionary(Name="Default", Order=order),
+        )
+
+        result = sanitize_optional_content(pdf)
+        assert result["order_ocgs_added"] == 1
+        assert len(pdf.Root.OCProperties.D.Order) == 2
+
     def test_fixes_order_in_alternate_config(self, pdf_with_order_in_alt_config: Pdf):
         """Adds missing OCGs to /Order in alternate configs."""
         result = sanitize_optional_content(pdf_with_order_in_alt_config)

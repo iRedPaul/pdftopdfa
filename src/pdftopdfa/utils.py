@@ -17,14 +17,15 @@ logger = logging.getLogger(__name__)
 
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
-# Supported target levels for PDF/A conversion (no "a" levels — those require
-# Tagged PDF structure which this tool does not produce)
-SUPPORTED_LEVELS = frozenset({"2b", "2u", "3b", "3u"})
+# Supported target levels for PDF/A conversion
+SUPPORTED_LEVELS = frozenset({"2a", "2b", "2u", "3a", "3b", "3u"})
 
 # Required PDF versions for PDF/A levels
 REQUIRED_PDF_VERSIONS = {
+    "2a": "1.7",
     "2b": "1.7",
     "2u": "1.7",
+    "3a": "1.7",
     "3b": "1.7",
     "3u": "1.7",
 }

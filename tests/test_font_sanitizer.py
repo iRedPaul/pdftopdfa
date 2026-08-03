@@ -4,14 +4,17 @@
 
 """Unit tests for sanitizers/fonts.py (CIDFont sanitizer)."""
 
-import logging
 from io import BytesIO
 
 import pikepdf
+import pytest
 from conftest import new_pdf, open_pdf, resolve
 from pikepdf import Array, Dictionary, Name, Pdf
 
+from pdftopdfa.exceptions import ConversionError
+from pdftopdfa.fonts.traversal import _iter_fonts_from_resources
 from pdftopdfa.sanitizers.fonts import (
+    _NAMED_CMAP_CIDSYSTEMINFO,
     _STANDARD_CMAP_NAMES,
     _get_cidsysteminfo_from_cmap,
     _strip_subset_prefix,
@@ -208,14 +211,14 @@ class TestCIDSystemInfoFix:
         assert result["cidsysteminfo_fixed"] == 0
 
     def test_named_cmap_unijis(self) -> None:
-        """UniJIS-UTF16-H CMap sets CIDSystemInfo to Adobe-Japan1-6."""
+        """UniJIS-UTF16-H caps CIDSystemInfo at Adobe-Japan1-5."""
         pdf = new_pdf()
         font = _make_type0_font(
             pdf,
             encoding="UniJIS-UTF16-H",
             registry="Adobe",
             ordering="Identity",
-            supplement=0,
+            supplement=6,
         )
         _build_pdf_with_type0_font(pdf, font)
 
@@ -226,7 +229,7 @@ class TestCIDSystemInfoFix:
         pdf = _roundtrip(pdf)
         cidfont = _get_cidfont(pdf)
         assert str(cidfont.CIDSystemInfo.Ordering) == "Japan1"
-        assert int(cidfont.CIDSystemInfo.Supplement) == 6
+        assert int(cidfont.CIDSystemInfo.Supplement) == 5
 
     def test_stream_cmap_cidsysteminfo(self) -> None:
         """Stream CMap's CIDSystemInfo is extracted and applied."""
@@ -267,10 +270,60 @@ end
         assert result["cidsysteminfo_fixed"] == 1
 
         pdf = _roundtrip(pdf)
+        type0_font = resolve(pdf.pages[0].Resources.Font["/F1"])
+        encoding = resolve(type0_font.Encoding)
+        assert str(encoding.CIDSystemInfo.Registry) == "Adobe"
+        assert str(encoding.CIDSystemInfo.Ordering) == "Korea1"
+        assert int(encoding.CIDSystemInfo.Supplement) == 2
         cidfont = _get_cidfont(pdf)
         assert str(cidfont.CIDSystemInfo.Registry) == "Adobe"
         assert str(cidfont.CIDSystemInfo.Ordering) == "Korea1"
-        assert int(cidfont.CIDSystemInfo.Supplement) == 2
+        assert int(cidfont.CIDSystemInfo.Supplement) == 0
+
+    @pytest.mark.parametrize(
+        ("registry", "ordering"),
+        [("Eboda", "Japan1"), ("Adobe", "China1")],
+    )
+    def test_stream_cmap_dictionary_cidsysteminfo_is_corrected(
+        self,
+        registry: str,
+        ordering: str,
+    ) -> None:
+        """CMap stream dictionaries are aligned with their program data."""
+        pdf = new_pdf()
+        cmap_stream = pdf.make_stream(
+            b"""/CIDSystemInfo 3 dict dup begin
+/Registry (Adobe) def
+/Ordering (Japan1) def
+/Supplement 4 def
+end def
+"""
+        )
+        cmap_stream[Name.CIDSystemInfo] = Dictionary(
+            Registry=registry,
+            Ordering=ordering,
+            Supplement=4,
+        )
+        font = _make_type0_font(
+            pdf,
+            cidfont_subtype="/CIDFontType0",
+            registry="Adobe",
+            ordering="Japan1",
+            supplement=4,
+            add_cidtogidmap=False,
+        )
+        resolve(font)[Name.Encoding] = cmap_stream
+        _build_pdf_with_type0_font(pdf, font)
+
+        result = sanitize_cidfont_structures(pdf)
+
+        assert result["cidsysteminfo_fixed"] == 1
+        pdf = _roundtrip(pdf)
+        type0_font = resolve(pdf.pages[0].Resources.Font["/F1"])
+        csi = resolve(type0_font.Encoding).CIDSystemInfo
+        assert str(csi.Registry) == "Adobe"
+        assert str(csi.Ordering) == "Japan1"
+        assert int(csi.Supplement) == 4
 
 
 class TestCIDToGIDMapFix:
@@ -495,11 +548,11 @@ class TestGetCIDSystemInfoFromCMap:
 
     def test_unigb(self) -> None:
         result = _get_cidsysteminfo_from_cmap(Name("/UniGB-UTF16-H"))
-        assert result == ("Adobe", "GB1", 5)
+        assert result == ("Adobe", "GB1", 4)
 
     def test_unicns(self) -> None:
         result = _get_cidsysteminfo_from_cmap(Name("/UniCNS-UTF16-H"))
-        assert result == ("Adobe", "CNS1", 6)
+        assert result == ("Adobe", "CNS1", 4)
 
     def test_uniks(self) -> None:
         result = _get_cidsysteminfo_from_cmap(Name("/UniKS-UTF16-H"))
@@ -507,6 +560,26 @@ class TestGetCIDSystemInfoFromCMap:
 
     def test_unknown_name_returns_none(self) -> None:
         assert _get_cidsysteminfo_from_cmap(Name("/UnknownCMap")) is None
+
+    def test_every_standard_cmap_has_cidsysteminfo(self) -> None:
+        assert _STANDARD_CMAP_NAMES == set(_NAMED_CMAP_CIDSYSTEMINFO)
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("90ms-RKSJ-H", ("Adobe", "Japan1", 2)),
+            ("GBK2K-H", ("Adobe", "GB1", 4)),
+            ("HKscs-B5-H", ("Adobe", "CNS1", 3)),
+            ("UniJIS-UTF16-H", ("Adobe", "Japan1", 5)),
+            ("UniKS-UTF16-H", ("Adobe", "Korea1", 2)),
+        ],
+    )
+    def test_named_cmap_metadata_matches_pdf_1_7(
+        self,
+        name: str,
+        expected: tuple[str, str, int],
+    ) -> None:
+        assert _get_cidsysteminfo_from_cmap(Name("/" + name)) == expected
 
 
 def _build_page_with_form_xobject_font(pdf: Pdf, type0_font: Dictionary) -> None:
@@ -654,6 +727,128 @@ class TestNestedCIDFonts:
 
         # Should only fix once despite appearing in two places
         assert result["cidsysteminfo_fixed"] == 1
+
+    def test_cidfont_below_1200_nested_forms_is_fixed(self) -> None:
+        """Font resource discovery is iterative through deep Form graphs."""
+        pdf = new_pdf()
+        font = _make_type0_font(
+            pdf,
+            encoding="Identity-H",
+            registry="Adobe",
+            ordering="Japan1",
+            supplement=6,
+        )
+        nested = pdf.make_stream(b"")
+        nested[Name.Type] = Name.XObject
+        nested[Name.Subtype] = Name.Form
+        nested[Name.BBox] = Array([0, 0, 10, 10])
+        nested[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+        for _ in range(1200):
+            parent = pdf.make_stream(b"/Fm Do")
+            parent[Name.Type] = Name.XObject
+            parent[Name.Subtype] = Name.Form
+            parent[Name.BBox] = Array([0, 0, 10, 10])
+            parent[Name.Resources] = Dictionary(XObject=Dictionary(Fm=nested))
+            nested = parent
+        pdf.pages.append(
+            pikepdf.Page(
+                Dictionary(
+                    Type=Name.Page,
+                    MediaBox=Array([0, 0, 10, 10]),
+                    Resources=Dictionary(XObject=Dictionary(Fm=nested)),
+                    Contents=pdf.make_stream(b"/Fm Do"),
+                )
+            )
+        )
+
+        result = sanitize_cidfont_structures(pdf)
+
+        assert result["cidsysteminfo_fixed"] == 1
+
+    def test_equal_direct_type3_resources_are_both_traversed(self) -> None:
+        """Equal direct objects are not conflated by a content signature."""
+        pdf = new_pdf()
+
+        def make_type3() -> tuple[Dictionary, Dictionary]:
+            descendant = Dictionary(
+                Type=Name.Font,
+                Subtype=Name.CIDFontType2,
+                BaseFont=Name("/Inner"),
+                CIDSystemInfo=Dictionary(
+                    Registry="Adobe",
+                    Ordering="Japan1",
+                    Supplement=6,
+                ),
+                FontDescriptor=Dictionary(
+                    Type=Name.FontDescriptor,
+                    FontName=Name("/Inner"),
+                    Flags=4,
+                ),
+                CIDToGIDMap=Name.Identity,
+            )
+            inner = Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type0,
+                BaseFont=Name("/Inner"),
+                Encoding=Name("/Identity-H"),
+                DescendantFonts=Array([descendant]),
+            )
+            type3 = Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type3,
+                FontBBox=Array([0, 0, 10, 10]),
+                FontMatrix=Array([0.001, 0, 0, 0.001, 0, 0]),
+                CharProcs=Dictionary(),
+                Encoding=Dictionary(
+                    Type=Name.Encoding,
+                    Differences=Array([]),
+                ),
+                FirstChar=0,
+                LastChar=0,
+                Resources=Dictionary(Font=Dictionary(Inner=inner)),
+            )
+            return type3, descendant
+
+        first, first_descendant = make_type3()
+        second, second_descendant = make_type3()
+        assert first.unparse() == second.unparse()
+        pdf.pages.append(
+            pikepdf.Page(
+                Dictionary(
+                    Type=Name.Page,
+                    MediaBox=Array([0, 0, 10, 10]),
+                    Resources=Dictionary(Font=Dictionary(T3A=first, T3B=second)),
+                    Contents=pdf.make_stream(b""),
+                )
+            )
+        )
+
+        result = sanitize_cidfont_structures(pdf)
+
+        assert result["cidsysteminfo_fixed"] == 2
+        assert str(first_descendant.CIDSystemInfo.Ordering) == "Identity"
+        assert str(second_descendant.CIDSystemInfo.Ordering) == "Identity"
+
+    def test_malformed_direct_type3_cycle_terminates(self) -> None:
+        """Direct cycles terminate without deduplicating equal siblings."""
+        type3 = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type3,
+            FontBBox=Array([0, 0, 10, 10]),
+            FontMatrix=Array([0.001, 0, 0, 0.001, 0, 0]),
+            CharProcs=Dictionary(),
+            Encoding=Dictionary(Type=Name.Encoding, Differences=Array([])),
+            FirstChar=0,
+            LastChar=0,
+        )
+        type3[Name.Resources] = Dictionary(Font=Dictionary(Self=type3))
+        resources = Dictionary(
+            Font=Dictionary(T3=type3),
+        )
+
+        fonts = list(_iter_fonts_from_resources(resources, set()))
+
+        assert len(fonts) == 2
 
 
 class TestCIDToGIDMapInvalidValues:
@@ -985,6 +1180,48 @@ class TestCMapWModeFix:
 class TestCMapUseCMap:
     """Tests for CMap /UseCMap fix (6.2.11.3.3 t03)."""
 
+    @staticmethod
+    def _make_unresolved_local_cmap_pdf(
+        shown_code: bytes,
+        *,
+        include_codespace: bool = True,
+    ) -> tuple[Pdf, pikepdf.Stream]:
+        pdf = new_pdf()
+        cmap = _make_cmap_stream(
+            pdf,
+            registry="Adobe",
+            ordering="Korea1",
+            supplement=2,
+            cmap_name="MyCMap",
+        )
+        data = cmap.read_bytes().replace(
+            b"1 begincidrange\n<0000> <FFFF> 0\nendcidrange",
+            b"1 begincidchar\n<0041> 65\nendcidchar",
+        )
+        if not include_codespace:
+            data = data.replace(
+                b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+                b"",
+            )
+        cmap.write(data)
+        cmap[Name("/UseCMap")] = Name("/Adobe-Korea1-2")
+        font = _make_type0_font(
+            pdf,
+            encoding="Identity-H",
+            cidfont_subtype="/CIDFontType0",
+            registry="Adobe",
+            ordering="Korea1",
+            supplement=2,
+            add_cidtogidmap=False,
+        )
+        resolve(font)[Name.Encoding] = cmap
+        _build_pdf_with_type0_font(pdf, font)
+        shown_hex = shown_code.hex().upper().encode("ascii")
+        pdf.pages[0].Contents = pdf.make_stream(
+            b"BT /F1 12 Tf <" + shown_hex + b"> Tj ET"
+        )
+        return pdf, cmap
+
     def test_usecmap_stream_triggers_stripping(self) -> None:
         """/UseCMap pointing to embedded stream → /UseCMap stripped."""
         pdf = new_pdf()
@@ -1027,8 +1264,8 @@ class TestCMapUseCMap:
         assert isinstance(enc, pikepdf.Stream)
         assert enc.get("/UseCMap") is None
 
-    def test_usecmap_nonstandard_name_triggers_stripping(self) -> None:
-        """/UseCMap with non-standard Name → /UseCMap stripped."""
+    def test_usecmap_nonstandard_name_fails_closed(self) -> None:
+        """An unresolved /UseCMap is not stripped with rendering loss."""
         pdf = new_pdf()
         cmap = _make_cmap_stream(
             pdf,
@@ -1051,15 +1288,47 @@ class TestCMapUseCMap:
         resolve(font)[Name.Encoding] = cmap
         _build_pdf_with_type0_font(pdf, font)
 
+        with pytest.raises(ConversionError, match="Cannot resolve inherited CMap"):
+            sanitize_cidfont_structures(pdf)
+
+        assert cmap.get("/UseCMap") == Name("/NonStandard-CMap")
+
+    def test_usecmap_nonstandard_name_stripped_when_used_codes_are_local(
+        self,
+    ) -> None:
+        """An unresolved base is unnecessary when all used codes map locally."""
+        pdf, cmap = self._make_unresolved_local_cmap_pdf(b"\x00A")
+
         result = sanitize_cidfont_structures(pdf)
 
         assert result["cmap_encoding_fixed"] == 1
-        pdf = _roundtrip(pdf)
-        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
-        enc = resolve(font_obj.Encoding)
-        # Encoding is still a Stream (CMap preserved), but /UseCMap is gone
-        assert isinstance(enc, pikepdf.Stream)
-        assert enc.get("/UseCMap") is None
+        assert cmap.get("/UseCMap") is None
+        assert b"<0041> 65" in cmap.read_bytes()
+
+    def test_usecmap_nonstandard_name_fails_for_used_inherited_code(
+        self,
+    ) -> None:
+        """A used code that is not local still requires the inherited CMap."""
+        pdf, cmap = self._make_unresolved_local_cmap_pdf(b"\x00B")
+
+        with pytest.raises(ConversionError, match="Cannot resolve inherited CMap"):
+            sanitize_cidfont_structures(pdf)
+
+        assert cmap.get("/UseCMap") == Name("/Adobe-Korea1-2")
+
+    def test_usecmap_nonstandard_name_fails_without_local_codespace(
+        self,
+    ) -> None:
+        """Inherited code-space ranges cannot be discarded safely."""
+        pdf, cmap = self._make_unresolved_local_cmap_pdf(
+            b"\x00A",
+            include_codespace=False,
+        )
+
+        with pytest.raises(ConversionError, match="Cannot resolve inherited CMap"):
+            sanitize_cidfont_structures(pdf)
+
+        assert cmap.get("/UseCMap") == Name("/Adobe-Korea1-2")
 
     def test_usecmap_standard_name_preserved(self) -> None:
         """/UseCMap with standard predefined Name is preserved."""
@@ -1376,8 +1645,8 @@ def _make_type0_with_cidfont(pdf: Pdf, cidfont: Dictionary) -> Dictionary:
 class TestCIDValuesOver65535:
     """Tests for CID value range validation (ISO 19005-2 rule 6.1.13-10)."""
 
-    def test_w_format1_cid_over_65535_warns(self, caplog) -> None:
-        """/W format-1 entry with CID > 65535 triggers a warning."""
+    def test_w_array_entry_above_65535_is_removed(self) -> None:
+        """/W array entries wholly above the CID limit are removed."""
         pdf = new_pdf()
         cidfont = Dictionary(
             Type=Name.Font,
@@ -1393,14 +1662,13 @@ class TestCIDValuesOver65535:
         font = _make_type0_with_cidfont(pdf, cidfont)
         _build_pdf_with_type0_font(pdf, font)
 
-        with caplog.at_level(logging.WARNING):
-            result = sanitize_cidfont_structures(pdf)
+        result = sanitize_cidfont_structures(pdf)
 
-        assert result["cid_values_over_65535_warned"] == 1
-        assert any("6.1.13-10" in r.message for r in caplog.records)
+        assert result["cid_values_over_65535_fixed"] == 1
+        assert list(cidfont["/W"]) == []
 
-    def test_w_format2_range_over_65535_warns(self, caplog) -> None:
-        """/W format-2 range where upper bound > 65535 triggers a warning."""
+    def test_w_range_above_65535_is_clipped(self) -> None:
+        """/W ranges retain the valid prefix through CID 65535."""
         pdf = new_pdf()
         cidfont = Dictionary(
             Type=Name.Font,
@@ -1416,16 +1684,72 @@ class TestCIDValuesOver65535:
         font = _make_type0_with_cidfont(pdf, cidfont)
         _build_pdf_with_type0_font(pdf, font)
 
-        with caplog.at_level(logging.WARNING):
-            result = sanitize_cidfont_structures(pdf)
+        result = sanitize_cidfont_structures(pdf)
 
-        assert result["cid_values_over_65535_warned"] == 1
-        assert any("6.1.13-10" in r.message for r in caplog.records)
+        assert result["cid_values_over_65535_fixed"] == 1
+        assert list(cidfont["/W"]) == [65500, 65535, 600]
 
-    def test_cidtogidmap_stream_over_131072_warns(self, caplog) -> None:
-        """/CIDToGIDMap stream longer than 131072 bytes implies CIDs > 65535."""
+    def test_w_array_implicit_end_is_clipped(self) -> None:
+        """/W array length cannot imply a CID above 65535."""
         pdf = new_pdf()
-        cidtogidmap_stream = pdf.make_stream(b"\x00" * 131074)
+        cidfont = Dictionary(
+            Type=Name.Font,
+            Subtype=Name("/CIDFontType2"),
+            BaseFont=Name("/TestFont"),
+            CIDSystemInfo=Dictionary(
+                Registry=pikepdf.String("Adobe"),
+                Ordering=pikepdf.String("Identity"),
+                Supplement=0,
+            ),
+            W=Array([65534, Array([500, 600, 700])]),
+        )
+        font = _make_type0_with_cidfont(pdf, cidfont)
+        _build_pdf_with_type0_font(pdf, font)
+
+        result = sanitize_cidfont_structures(pdf)
+
+        assert result["cid_values_over_65535_fixed"] == 1
+        assert list(cidfont["/W"][1]) == [500, 600]
+
+    def test_w2_array_and_range_entries_are_clipped(self) -> None:
+        """/W2 uses triples per CID and five operands for range entries."""
+        pdf = new_pdf()
+        cidfont = Dictionary(
+            Type=Name.Font,
+            Subtype=Name("/CIDFontType2"),
+            BaseFont=Name("/TestFont"),
+            CIDSystemInfo=Dictionary(
+                Registry=pikepdf.String("Adobe"),
+                Ordering=pikepdf.String("Identity"),
+                Supplement=0,
+            ),
+            W2=Array(
+                [
+                    65535,
+                    Array([880, 10, 20, 881, 11, 21]),
+                    65534,
+                    65540,
+                    900,
+                    12,
+                    22,
+                ]
+            ),
+        )
+        font = _make_type0_with_cidfont(pdf, cidfont)
+        _build_pdf_with_type0_font(pdf, font)
+
+        result = sanitize_cidfont_structures(pdf)
+
+        assert result["cid_values_over_65535_fixed"] == 2
+        assert list(cidfont["/W2"][1]) == [880, 10, 20]
+        assert list(cidfont["/W2"])[2:] == [65534, 65535, 900, 12, 22]
+        assert sanitize_cidfont_structures(pdf)["cid_values_over_65535_fixed"] == 0
+
+    def test_cidtogidmap_stream_above_limit_is_truncated(self) -> None:
+        """/CIDToGIDMap keeps exactly the entries for CIDs 0 through 65535."""
+        pdf = new_pdf()
+        map_data = b"\x12\x34" * 65_536 + b"\x56\x78"
+        cidtogidmap_stream = pdf.make_stream(map_data)
         cidfont = Dictionary(
             Type=Name.Font,
             Subtype=Name("/CIDFontType2"),
@@ -1440,14 +1764,13 @@ class TestCIDValuesOver65535:
         font = _make_type0_with_cidfont(pdf, cidfont)
         _build_pdf_with_type0_font(pdf, font)
 
-        with caplog.at_level(logging.WARNING):
-            result = sanitize_cidfont_structures(pdf)
+        result = sanitize_cidfont_structures(pdf)
 
-        assert result["cid_values_over_65535_warned"] == 1
-        assert any("6.1.13-10" in r.message for r in caplog.records)
+        assert result["cid_values_over_65535_fixed"] == 1
+        assert cidtogidmap_stream.read_bytes() == map_data[:131_072]
 
-    def test_cid_at_limit_does_not_warn(self, caplog) -> None:
-        """/W entry with CID exactly 65535 should not trigger a warning."""
+    def test_cid_at_limit_does_not_change(self) -> None:
+        """/W entry with CID exactly 65535 remains unchanged."""
         pdf = new_pdf()
         cidfont = Dictionary(
             Type=Name.Font,
@@ -1463,8 +1786,7 @@ class TestCIDValuesOver65535:
         font = _make_type0_with_cidfont(pdf, cidfont)
         _build_pdf_with_type0_font(pdf, font)
 
-        with caplog.at_level(logging.WARNING):
-            result = sanitize_cidfont_structures(pdf)
+        result = sanitize_cidfont_structures(pdf)
 
+        assert result["cid_values_over_65535_fixed"] == 0
         assert result["cid_values_over_65535_warned"] == 0
-        assert not any("6.1.13-10" in r.message for r in caplog.records)

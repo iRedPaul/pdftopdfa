@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from io import BytesIO
 
 import pikepdf
+from fontTools.agl import AGL2UV, LEGACY_AGL2UV
 from pikepdf import Name, Stream
 
 from ..utils import log_suppressed_error
@@ -27,20 +28,31 @@ from .analysis import (
     get_base_font_name,
     get_font_name,
     get_font_type,
+    is_symbolic_font,
 )
 from .encodings import STANDARD_ENCODING
-from .glyph_usage import collect_font_usage
+from .glyph_mapping import (
+    SYMBOL_GLYPH_TO_UNICODE,
+    ZAPFDINGBATS_GLYPH_TO_UNICODE,
+    resolve_glyph_name,
+)
+from .glyph_usage import CharacterCode, collect_font_usage
 from .tounicode import (
-    generate_cidfont_tounicode_cmap,
-    generate_tounicode_cmap_data,
     generate_tounicode_for_macroman,
     generate_tounicode_for_winansi,
+    map_type0_character_codes_to_cids,
     parse_cidtogidmap_stream,
-    parse_tounicode_cmap,
+    parse_tounicode_cmap_sequences,
     resolve_glyph_to_unicode,
 )
 from .traversal import iter_all_page_fonts
-from .utils import check_fstype_restrictions, get_fstype, is_permitted_fstype_notice
+from .utils import (
+    check_fstype_restrictions,
+    get_fstype,
+    get_truetype_byte_encoding,
+    is_permitted_fstype_notice,
+    resolve_symbol_cmap_glyph,
+)
 from .utils import safe_str as _safe_str
 
 logger = logging.getLogger(__name__)
@@ -198,7 +210,7 @@ class FontSubsetter:
         self,
         font_obj: pikepdf.Object,
         obj_key: tuple[int, int],
-        font_usage: dict[tuple[int, int], set[int]],
+        font_usage: dict[tuple[int, int], set[CharacterCode]],
         result: SubsettingResult,
     ) -> None:
         """Attempts to subset a single font.
@@ -241,7 +253,7 @@ class FontSubsetter:
         self,
         font_obj: pikepdf.Object,
         obj_key: tuple[int, int],
-        font_usage: dict[tuple[int, int], set[int]],
+        font_usage: dict[tuple[int, int], set[CharacterCode]],
         font_name: str,
         result: SubsettingResult,
     ) -> None:
@@ -280,10 +292,15 @@ class FontSubsetter:
             return
         font_file = font_file_info.stream
 
-        # Get used CIDs from content streams and translate them to GIDs when
-        # the descendant font provides an explicit CIDToGIDMap stream.
+        # Translate content-stream character codes through the Type 0 CMap,
+        # then through an explicit descendant CIDToGIDMap when present.
         used_codes = font_usage.get(obj_key, set())
-        used_gids = _resolve_cidfont_used_gids(desc_font, used_codes)
+        used_cids = map_type0_character_codes_to_cids(font_obj, used_codes)
+        if used_cids is None:
+            result.fonts_skipped.append(f"{font_name} (unresolved Type0 CMap)")
+            return
+        used_cids = {cid if 0 <= cid <= 65_535 else 0 for cid in used_cids}
+        used_gids = _resolve_cidfont_used_gids(desc_font, used_cids)
 
         # Perform subsetting
         try:
@@ -293,6 +310,15 @@ class FontSubsetter:
             # Check fsType embedding restrictions
             if not _check_subsetting_allowed(original_data, font_name, result):
                 return
+
+            if 0 in used_gids:
+                used_gids.update(
+                    _semantic_gids_for_notdef_codes(
+                        font_obj,
+                        used_codes,
+                        original_data,
+                    )
+                )
 
             subsetted_data = _subset_font_data(original_data, used_gids, is_cid=True)
 
@@ -338,9 +364,6 @@ class FontSubsetter:
                 saved,
             )
 
-            # Clean stale ToUnicode entries
-            _clean_tounicode(font_obj, used_codes, is_cid=True, pdf=self.pdf)
-
         except Exception as e:
             warning = f"Error subsetting CIDFont '{font_name}': {e}"
             result.warnings.append(warning)
@@ -350,7 +373,7 @@ class FontSubsetter:
         self,
         font_obj: pikepdf.Object,
         obj_key: tuple[int, int],
-        font_usage: dict[tuple[int, int], set[int]],
+        font_usage: dict[tuple[int, int], set[CharacterCode]],
         font_name: str,
         result: SubsettingResult,
     ) -> None:
@@ -383,24 +406,29 @@ class FontSubsetter:
         # Get used character codes
         used_codes = font_usage.get(obj_key, set())
 
-        # Resolve encoding for precise glyph selection
-        encoding_map = _resolve_simple_font_encoding(font_obj)
-
         # Perform subsetting
         try:
             original_data = bytes(font_file.read_bytes())
             original_size = len(original_data)
 
-            # For symbolic TrueType fonts without encoding, build a
-            # code-to-glyph-name mapping from the font's own cmap so
-            # the subsetter retains the correct glyphs.
-            is_symbolic = False
-            if encoding_map is None:
-                encoding_map = _build_symbolic_truetype_encoding(
-                    font_obj, original_data
+            is_symbolic = is_symbolic_font(font_obj)
+            program_glyph_names = False
+            if get_font_type(font_obj) == "TrueType":
+                encoding_map, program_glyph_names = (
+                    _resolve_truetype_font_encoding_with_source(
+                        font_obj,
+                        original_data,
+                        pdfa_normalized=True,
+                    )
                 )
-                if encoding_map is not None:
-                    is_symbolic = True
+                if is_symbolic and encoding_map is None:
+                    result.fonts_skipped.append(
+                        f"{font_name} (symbolic encoding unresolved)"
+                    )
+                    return
+            else:
+                # Resolve the PDF encoding for precise glyph selection.
+                encoding_map = _resolve_simple_font_encoding(font_obj)
 
             # Check fsType embedding restrictions
             if not _check_subsetting_allowed(original_data, font_name, result):
@@ -411,13 +439,14 @@ class FontSubsetter:
                 used_codes,
                 is_cid=False,
                 code_to_glyphname=encoding_map,
+                glyph_names_are_program=program_glyph_names,
             )
 
             # For symbolic TrueType fonts, the cmap subtable gets
             # dropped by fontTools (it only preserves cmaps when
             # subsetting by unicode).  Rebuild the (3,0) cmap from
             # the original font's cmap data.
-            if is_symbolic and subsetted_data is not None:
+            if (is_symbolic or program_glyph_names) and subsetted_data is not None:
                 subsetted_data = _rebuild_symbolic_cmap(original_data, subsetted_data)
 
             if subsetted_data is None:
@@ -460,9 +489,6 @@ class FontSubsetter:
                 new_name,
                 saved,
             )
-
-            # Clean stale ToUnicode entries
-            _clean_tounicode(font_obj, used_codes, is_cid=False, pdf=self.pdf)
 
         except Exception as e:
             warning = f"Error subsetting font '{font_name}': {e}"
@@ -528,55 +554,6 @@ def _safe_font_name(font_obj: pikepdf.Object) -> str:
         return get_font_name(font_obj)
     except Exception:
         return "Unknown"
-
-
-def _clean_tounicode(
-    font_obj: pikepdf.Object,
-    used_codes: set[int],
-    *,
-    is_cid: bool,
-    pdf: pikepdf.Pdf,
-) -> None:
-    """Removes stale entries from a font's ToUnicode CMap after subsetting.
-
-    Filters the CMap to retain only entries for character codes that are
-    actually used. If nothing was removed, the stream is left unchanged.
-
-    Args:
-        font_obj: The font dictionary (Type0 or simple font).
-        used_codes: Set of character codes used in content streams.
-        is_cid: True if the font is a CIDFont (16-bit codes).
-        pdf: The pikepdf Pdf object (needed to create new streams).
-    """
-    tounicode = font_obj.get("/ToUnicode")
-    if tounicode is None:
-        return
-
-    tounicode = _resolve_indirect(tounicode)
-
-    try:
-        raw_data = bytes(tounicode.read_bytes())
-    except Exception:
-        return
-
-    parsed = parse_tounicode_cmap(raw_data)
-    if not parsed:
-        return
-
-    # Filter to only used codes
-    filtered = {code: uni for code, uni in parsed.items() if code in used_codes}
-
-    if len(filtered) == len(parsed):
-        return
-
-    # Regenerate CMap
-    if is_cid:
-        new_data = generate_cidfont_tounicode_cmap(filtered)
-    else:
-        new_data = generate_tounicode_cmap_data(filtered)
-
-    new_stream = Stream(pdf, new_data)
-    font_obj[pikepdf.Name.ToUnicode] = pdf.make_indirect(new_stream)
 
 
 @dataclass
@@ -661,6 +638,8 @@ def _get_uv2agl() -> dict[int, str]:
 
 def _resolve_simple_font_encoding(
     font_obj: pikepdf.Object,
+    *,
+    pdfa_normalized: bool = False,
 ) -> dict[int, str] | None:
     """Builds a code-to-glyph-name mapping from a simple font's encoding.
 
@@ -676,12 +655,16 @@ def _resolve_simple_font_encoding(
         font_obj: pikepdf simple font object.
 
     Returns:
-        Dictionary mapping character codes to glyph names,
-        or None if no encoding can be resolved.
+        pdfa_normalized: Resolve invalid or missing non-symbolic TrueType
+            encodings as the WinAnsi encoding installed by the sanitizer.
+
+    Returns:
+        Dictionary mapping character codes to glyph names, or None if no
+        encoding can be resolved.
     """
     encoding = font_obj.get("/Encoding")
     if encoding is None:
-        return None
+        return _build_winansi_glyphnames() if pdfa_normalized else None
 
     if isinstance(encoding, pikepdf.Name):
         enc_name = _safe_str(encoding)
@@ -690,8 +673,9 @@ def _resolve_simple_font_encoding(
         elif enc_name == "/MacRomanEncoding":
             return _build_glyphnames_from_unicode(generate_tounicode_for_macroman())
         elif enc_name == "/StandardEncoding":
-            return dict(STANDARD_ENCODING)
-        return None
+            if not pdfa_normalized:
+                return dict(STANDARD_ENCODING)
+        return _build_winansi_glyphnames() if pdfa_normalized else None
 
     # Encoding dictionary with BaseEncoding + Differences
     try:
@@ -706,16 +690,30 @@ def _resolve_simple_font_encoding(
                     generate_tounicode_for_macroman()
                 )
             elif base_name == "/StandardEncoding":
-                code_to_glyphname = dict(STANDARD_ENCODING)
+                code_to_glyphname = (
+                    _build_winansi_glyphnames()
+                    if pdfa_normalized
+                    else dict(STANDARD_ENCODING)
+                )
             else:
-                code_to_glyphname = dict(STANDARD_ENCODING)
+                code_to_glyphname = (
+                    _build_winansi_glyphnames()
+                    if pdfa_normalized
+                    else dict(STANDARD_ENCODING)
+                )
         else:
-            # Default base encoding is StandardEncoding (PDF spec)
-            code_to_glyphname = dict(STANDARD_ENCODING)
+            code_to_glyphname = (
+                _build_winansi_glyphnames()
+                if pdfa_normalized
+                else dict(STANDARD_ENCODING)
+            )
 
-        # Apply /Differences array (overrides base encoding entries)
+        # Apply /Differences only when the sanitizer will retain the complete
+        # array. A single non-AGL name makes rule 6.2.11.6-2 remove it.
         differences = enc_dict.get("/Differences")
         if differences is not None:
+            overrides: dict[int, str] = {}
+            all_agl = True
             current_code = 0
             for item in differences:
                 try:
@@ -725,12 +723,68 @@ def _resolve_simple_font_encoding(
                     pass
                 if isinstance(item, pikepdf.Name):
                     glyph_name = _safe_str(item)[1:]  # Remove leading "/"
-                    code_to_glyphname[current_code] = glyph_name
+                    if (
+                        glyph_name != ".notdef"
+                        and glyph_name not in AGL2UV
+                        and glyph_name not in LEGACY_AGL2UV
+                    ):
+                        all_agl = False
+                    overrides[current_code] = glyph_name
                     current_code += 1
+            if not pdfa_normalized or all_agl:
+                code_to_glyphname.update(overrides)
 
         return code_to_glyphname if code_to_glyphname else None
     except Exception:
         return None
+
+
+def _resolve_truetype_font_encoding(
+    font_obj: pikepdf.Object,
+    font_data: bytes,
+    *,
+    pdfa_normalized: bool = False,
+) -> dict[int, str] | None:
+    """Resolve the effective byte-to-glyph mapping for a simple TrueType font."""
+    return _resolve_truetype_font_encoding_with_source(
+        font_obj,
+        font_data,
+        pdfa_normalized=pdfa_normalized,
+    )[0]
+
+
+def _resolve_truetype_font_encoding_with_source(
+    font_obj: pikepdf.Object,
+    font_data: bytes,
+    *,
+    pdfa_normalized: bool = False,
+) -> tuple[dict[int, str] | None, bool]:
+    """Resolve a TrueType encoding and whether names came from its byte cmap."""
+    symbolic = is_symbolic_font(font_obj)
+    if symbolic or font_obj.get("/Encoding") is None:
+        try:
+            from fontTools.ttLib import TTFont
+
+            tt_font = TTFont(BytesIO(font_data))
+            try:
+                byte_encoding = get_truetype_byte_encoding(tt_font)
+            finally:
+                tt_font.close()
+        except Exception:
+            byte_encoding = None
+
+        if byte_encoding is not None:
+            return byte_encoding[2], True
+        if symbolic:
+            return _build_symbolic_truetype_encoding(font_obj, font_data), False
+
+    return (
+        _resolve_simple_font_encoding(
+            font_obj,
+            pdfa_normalized=pdfa_normalized,
+        ),
+        False,
+    )
 
 
 def _build_winansi_glyphnames() -> dict[int, str]:
@@ -763,16 +817,135 @@ def _build_glyphnames_from_unicode(
     return result
 
 
+def _resolve_explicit_encoding_differences(
+    font_obj: pikepdf.Object,
+) -> dict[int, str]:
+    """Return only explicitly declared PDF encoding differences."""
+    encoding = font_obj.get("/Encoding")
+    if encoding is None or isinstance(encoding, pikepdf.Name):
+        return {}
+
+    try:
+        encoding = _resolve_indirect(encoding)
+        differences = encoding.get("/Differences")
+        if differences is None:
+            return {}
+    except Exception:
+        return {}
+
+    result: dict[int, str] = {}
+    current_code = 0
+    for item in differences:
+        try:
+            current_code = int(item)
+            continue
+        except (TypeError, ValueError):
+            pass
+        if isinstance(item, pikepdf.Name):
+            if 0 <= current_code <= 0xFF:
+                result[current_code] = _safe_str(item)[1:]
+            current_code += 1
+    return result
+
+
+def _get_unicode_cmap(tt_font) -> dict[int, str]:
+    """Return a Unicode-capable cmap without treating legacy bytes as Unicode."""
+    cmap_table = tt_font.get("cmap")
+    if cmap_table is None:
+        return {}
+
+    preferences = (
+        (3, 10),
+        (0, 6),
+        (0, 4),
+        (3, 1),
+        (0, 3),
+        (0, 2),
+        (0, 1),
+        (0, 0),
+    )
+    result: dict[int, str] = {}
+    visited: set[int] = set()
+    for platform_id, encoding_id in preferences:
+        for table in cmap_table.tables:
+            mapping = getattr(table, "cmap", None)
+            if (
+                table.platformID == platform_id
+                and table.platEncID == encoding_id
+                and mapping
+            ):
+                visited.add(id(table))
+                for codepoint, glyph_name in mapping.items():
+                    result.setdefault(codepoint, glyph_name)
+    for table in cmap_table.tables:
+        mapping = getattr(table, "cmap", None)
+        if id(table) not in visited and table.platformID == 0 and mapping:
+            for codepoint, glyph_name in mapping.items():
+                result.setdefault(codepoint, glyph_name)
+    return result
+
+
+def _resolve_encoded_truetype_glyph(
+    tt_font,
+    code: int,
+    glyph_name: str,
+) -> str | None:
+    """Resolve one PDF byte and glyph name to an embedded TrueType glyph."""
+    glyph_names = set(tt_font.getGlyphOrder())
+    try:
+        metrics = tt_font["hmtx"].metrics
+    except Exception:
+        metrics = {name: (0, 0) for name in glyph_names}
+
+    unicode_cmap = _get_unicode_cmap(tt_font)
+    for custom_mapping in (
+        ZAPFDINGBATS_GLYPH_TO_UNICODE,
+        SYMBOL_GLYPH_TO_UNICODE,
+    ):
+        resolved = resolve_glyph_name(
+            glyph_name,
+            unicode_cmap,
+            metrics,
+            custom_mapping,
+        )
+        if resolved is not None:
+            return resolved
+
+    cmap_table = tt_font.get("cmap")
+    if cmap_table is None:
+        return None
+
+    # PDF symbolic TrueType first uses a Microsoft Symbol cmap, then the
+    # legacy Mac cmap. These are byte mappings, not Unicode mappings.
+    for table in cmap_table.tables:
+        if table.platformID == 3 and table.platEncID == 0:
+            mapping = getattr(table, "cmap", None) or {}
+            resolved = resolve_symbol_cmap_glyph(mapping, code)
+            if resolved in glyph_names:
+                return resolved
+    for table in cmap_table.tables:
+        if table.platformID == 1 and table.platEncID == 0:
+            mapping = getattr(table, "cmap", None) or {}
+            resolved = mapping.get(code)
+            if resolved in glyph_names:
+                return resolved
+    return None
+
+
 def _build_symbolic_truetype_encoding(
     font_obj: pikepdf.Object,
     font_data: bytes,
 ) -> dict[int, str] | None:
     """Builds code-to-glyph-name mapping for symbolic TrueType fonts.
 
-    For symbolic TrueType fonts without an explicit /Encoding, character
-    codes are mapped to glyphs through the font's own cmap tables:
+    Character codes are mapped through the font program before considering
+    malformed PDF Encoding data:
     - (1,0) Mac Roman cmap: codes map directly
-    - (3,0) Microsoft Symbol cmap: codes map via 0xF000 + code
+    - (3,0) Microsoft Symbol cmap: codes use the 00/F0/F1/F2 ranges
+
+    A usable program byte cmap is authoritative and PDF /Encoding is ignored.
+    Explicit Differences are used only as a narrow recovery path when neither
+    byte cmap exists.
 
     Args:
         font_obj: pikepdf font object.
@@ -799,25 +972,23 @@ def _build_symbolic_truetype_encoding(
         return None
 
     try:
-        cmap_table = tt.get("cmap")
-        if cmap_table is None:
-            return None
+        byte_encoding = get_truetype_byte_encoding(tt)
+        if byte_encoding is not None:
+            return byte_encoding[2]
 
-        # Prefer (1,0) Mac cmap — direct code mapping
-        for table in cmap_table.tables:
-            if table.platformID == 1 and table.platEncID == 0:
-                return dict(table.cmap)
+        result: dict[int, str] = {}
+        for code, glyph_name in _resolve_explicit_encoding_differences(
+            font_obj
+        ).items():
+            resolved = _resolve_encoded_truetype_glyph(
+                tt,
+                code,
+                glyph_name,
+            )
+            if resolved is not None:
+                result[code] = resolved
 
-        # Fall back to (3,0) Microsoft Symbol cmap — strip 0xF000 prefix
-        for table in cmap_table.tables:
-            if table.platformID == 3 and table.platEncID == 0:
-                result = {}
-                for unicode_val, glyph_name in table.cmap.items():
-                    code = unicode_val & 0xFF
-                    result[code] = glyph_name
-                return result
-
-        return None
+        return result or None
     finally:
         tt.close()
 
@@ -828,10 +999,10 @@ def _rebuild_symbolic_cmap(
 ) -> bytes:
     """Rebuilds cmap subtables for a symbolic TrueType font after subsetting.
 
-    fontTools strips cmap subtables when subsetting by glyph names
-    (no unicodes specified). This function restores the (3,0) Microsoft
-    Symbol cmap from the original font, filtered to only include entries
-    for glyphs that survived subsetting.
+    fontTools strips legacy cmap subtables when subsetting by glyph names
+    (no unicodes specified). This function restores the authoritative (3,0)
+    Microsoft Symbol cmap, or a (1,0) Mac cmap when no (3,0) exists, filtered
+    to glyphs that survived subsetting.
 
     Args:
         original_data: Original font data (before subsetting).
@@ -852,16 +1023,28 @@ def _rebuild_symbolic_cmap(
         subsetted_tt = TTFont(BytesIO(subsetted_data))
 
         try:
-            # Get original cmap (3,0)
-            orig_cmap_30 = None
+            # Prefer the original Microsoft Symbol cmap, then the Mac byte cmap.
+            source_cmap = None
+            source_platform = None
             orig_cmap = original_tt.get("cmap")
             if orig_cmap is not None:
-                for table in orig_cmap.tables:
-                    if table.platformID == 3 and table.platEncID == 0:
-                        orig_cmap_30 = table.cmap
+                for platform_id, encoding_id in ((3, 0), (1, 0)):
+                    source = next(
+                        (
+                            table
+                            for table in orig_cmap.tables
+                            if table.platformID == platform_id
+                            and table.platEncID == encoding_id
+                            and table.cmap
+                        ),
+                        None,
+                    )
+                    if source is not None:
+                        source_cmap = source.cmap
+                        source_platform = (platform_id, encoding_id)
                         break
 
-            if orig_cmap_30 is None:
+            if source_cmap is None or source_platform is None:
                 return subsetted_data
 
             # Build unicode→GID mapping using original font
@@ -872,30 +1055,38 @@ def _rebuild_symbolic_cmap(
             sub_glyph_order = subsetted_tt.getGlyphOrder()
             num_sub_glyphs = len(sub_glyph_order)
 
-            new_cmap_30: dict[int, str] = {}
-            for unicode_val, orig_name in orig_cmap_30.items():
+            new_mapping: dict[int, str] = {}
+            for character_code, orig_name in source_cmap.items():
                 gid = orig_name_to_gid.get(orig_name)
                 if gid is not None and gid < num_sub_glyphs:
-                    new_cmap_30[unicode_val] = sub_glyph_order[gid]
+                    new_mapping[character_code] = sub_glyph_order[gid]
 
-            if not new_cmap_30:
+            if not new_mapping:
                 return subsetted_data
 
-            # Build new cmap table with (3,0) subtable
-            cmap_table = table__c_m_a_p()
-            cmap_table.tableVersion = 0
-
             subtable = cmap_format_4(4)
-            subtable.platformID = 3
-            subtable.platEncID = 0
+            subtable.platformID, subtable.platEncID = source_platform
             subtable.format = 4
             subtable.reserved = 0
             subtable.length = 0
             subtable.language = 0
-            subtable.cmap = new_cmap_30
-            cmap_table.tables = [subtable]
+            subtable.cmap = new_mapping
 
-            subsetted_tt["cmap"] = cmap_table
+            # Preserve Unicode cmaps retained by fontTools. They are needed
+            # later to resolve explicit PDF glyph-name Differences. Replace
+            # only Microsoft Symbol subtables with the rebuilt mapping.
+            cmap_table = subsetted_tt.get("cmap")
+            if cmap_table is None:
+                cmap_table = table__c_m_a_p()
+                cmap_table.tableVersion = 0
+                cmap_table.tables = []
+                subsetted_tt["cmap"] = cmap_table
+            cmap_table.tables = [
+                table
+                for table in cmap_table.tables
+                if (table.platformID, table.platEncID) != source_platform
+            ]
+            cmap_table.tables.append(subtable)
 
             # Save
             output = BytesIO()
@@ -909,12 +1100,54 @@ def _rebuild_symbolic_cmap(
         return subsetted_data
 
 
+def _semantic_gids_for_notdef_codes(
+    font_obj: pikepdf.Object,
+    used_codes: set[CharacterCode],
+    font_data: bytes,
+) -> set[int]:
+    """Find real glyphs described by ToUnicode for codes mapped to GID 0."""
+    tounicode = _resolve_indirect(font_obj.get("/ToUnicode"))
+    if not isinstance(tounicode, Stream):
+        return set()
+    try:
+        unicode_map = parse_tounicode_cmap_sequences(tounicode.read_bytes())
+    except Exception:
+        return set()
+
+    normalized_codes = {
+        code if isinstance(code, bytes) else code.to_bytes(2, "big")
+        for code in used_codes
+        if isinstance(code, bytes) or 0 <= code <= 65_535
+    }
+    codepoints = {
+        sequence[0] for code in normalized_codes if (sequence := unicode_map.get(code))
+    }
+    if not codepoints:
+        return set()
+
+    from fontTools.ttLib import TTFont
+
+    tt_font = TTFont(BytesIO(font_data))
+    try:
+        cmap = _get_unicode_cmap(tt_font)
+        glyph_order = tt_font.getGlyphOrder()
+        glyph_ids = {name: gid for gid, name in enumerate(glyph_order)}
+        return {
+            glyph_ids[name]
+            for codepoint in codepoints
+            if (name := cmap.get(codepoint)) in glyph_ids and glyph_ids[name] != 0
+        }
+    finally:
+        tt_font.close()
+
+
 def _subset_font_data(
     font_data: bytes,
     used_codes: set[int],
     *,
     is_cid: bool,
     code_to_glyphname: dict[int, str] | None = None,
+    glyph_names_are_program: bool = False,
 ) -> bytes | None:
     """Subsets TrueType or CFF/OpenType font data using fontTools.
 
@@ -926,6 +1159,8 @@ def _subset_font_data(
             Adobe glyph names (from the PDF font's /Encoding). When
             provided, enables precise glyph selection instead of
             treating raw codes as Unicode values.
+        glyph_names_are_program: The mapping values are authoritative glyph
+            names from a TrueType byte cmap and need no AGL resolution.
 
     Returns:
         Subsetted font bytes, or None on error.
@@ -943,7 +1178,9 @@ def _subset_font_data(
         # fontTools requires a cmap table for subsetting — fonts
         # without one (bare CFF wrapped in OpenType) cannot be subset.
         cmap_table = tt_font.get("cmap")
-        if cmap_table is None or not any(t.cmap for t in cmap_table.tables):
+        if cmap_table is None or not any(
+            getattr(table, "cmap", None) for table in cmap_table.tables
+        ):
             logger.debug("Font has no cmap table, skipping subsetting")
             tt_font.close()
             return None
@@ -977,7 +1214,11 @@ def _subset_font_data(
             # the PDF encoding when available
             if code_to_glyphname:
                 _populate_from_encoding(
-                    subsetter, tt_font, used_codes, code_to_glyphname
+                    subsetter,
+                    tt_font,
+                    used_codes,
+                    code_to_glyphname,
+                    glyph_names_are_program=glyph_names_are_program,
                 )
             else:
                 # No encoding info — treat codes directly as Unicode
@@ -1008,13 +1249,13 @@ def _populate_from_encoding(
     tt_font: object,
     used_codes: set[int],
     code_to_glyphname: dict[int, str],
+    *,
+    glyph_names_are_program: bool = False,
 ) -> None:
     """Populates the fontTools subsetter using PDF encoding mappings.
 
-    Maps used character codes to glyph names via the PDF encoding,
-    then finds those glyphs in the font program. Uses direct glyph
-    name lookup first (works even without cmap), then falls back to
-    AGL-based Unicode resolution for glyph names not found in the font.
+    Maps used character codes to glyphs through explicit PDF names,
+    Unicode cmaps, and symbolic byte cmaps.
 
     Args:
         subsetter: fontTools Subsetter instance.
@@ -1022,8 +1263,12 @@ def _populate_from_encoding(
         used_codes: Character codes used in content streams.
         code_to_glyphname: Mapping from character codes to Adobe
             glyph names, derived from the font's PDF /Encoding.
+        glyph_names_are_program: Values are already resolved program glyphs.
     """
-    glyph_order_set = set(tt_font.getGlyphOrder())
+    unicode_cmap = _get_unicode_cmap(tt_font)
+    unicodes_by_glyph: dict[str, set[int]] = {}
+    for unicode_value, mapped_glyph in unicode_cmap.items():
+        unicodes_by_glyph.setdefault(mapped_glyph, set()).add(unicode_value)
 
     target_glyphs: set[str] = set()
     target_unicodes: set[int] = set()
@@ -1031,9 +1276,19 @@ def _populate_from_encoding(
     for code in used_codes:
         glyph_name = code_to_glyphname.get(code)
         if glyph_name is not None:
-            # Try direct glyph name lookup (works without cmap)
-            if glyph_name in glyph_order_set:
-                target_glyphs.add(glyph_name)
+            if glyph_names_are_program and glyph_name in tt_font.getGlyphOrder():
+                resolved = glyph_name
+            else:
+                resolved = _resolve_encoded_truetype_glyph(
+                    tt_font,
+                    code,
+                    glyph_name,
+                )
+            if resolved is not None:
+                target_glyphs.add(resolved)
+                # Retaining the corresponding Unicode entries preserves the
+                # cmap needed to migrate explicit symbolic Differences later.
+                target_unicodes.update(unicodes_by_glyph.get(resolved, ()))
                 continue
             # Glyph name not in font; resolve via AGL to Unicode
             uval = resolve_glyph_to_unicode(glyph_name)

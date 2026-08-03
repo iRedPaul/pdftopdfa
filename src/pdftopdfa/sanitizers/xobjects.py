@@ -11,6 +11,7 @@ from pikepdf import Array, Dictionary, Name, Pdf, Stream
 from pikepdf import parse_content_stream as _parse_content_stream
 from pikepdf import unparse_content_stream as _unparse_content_stream
 
+from ..fonts.glyph_usage import _iter_content_streams_with_resources
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 from .base import FORBIDDEN_XOBJECT_SUBTYPES
@@ -68,68 +69,63 @@ def _process_xobjects_for_removal(
     """
     keys_to_remove: list[str] = []
     removed_count = 0
+    pending = [(xobjects, True)]
+    while pending:
+        current_xobjects, is_root = pending.pop()
+        if not isinstance(current_xobjects, Dictionary):
+            continue
 
-    for key in xobjects.keys():
-        try:
-            xobj = xobjects.get(key)
-            if xobj is None:
-                continue
-
-            xobj = _resolve_indirect(xobj)
-
-            # Cycle detection using objgen
-            obj_key = xobj.objgen
-            if obj_key != (0, 0):
-                if obj_key in visited:
+        for key in list(current_xobjects.keys()):
+            try:
+                xobj = _resolve_indirect(current_xobjects.get(key))
+                if xobj is None:
                     continue
-                visited.add(obj_key)
 
-            # Check subtype
-            subtype = xobj.get("/Subtype")
-            if subtype is not None:
+                obj_key = xobj.objgen
+                if obj_key != (0, 0):
+                    if obj_key in visited:
+                        continue
+                    visited.add(obj_key)
+
+                subtype = xobj.get("/Subtype")
+                if subtype is None:
+                    continue
                 subtype_str = str(subtype)
 
-                # Mark forbidden subtypes for removal
                 if subtype_str in FORBIDDEN_XOBJECT_SUBTYPES:
-                    keys_to_remove.append(str(key))
+                    if is_root:
+                        keys_to_remove.append(str(key))
+                    else:
+                        del current_xobjects[key]
+                        removed_count += 1
                     logger.debug("Found forbidden XObject %s: %s", subtype_str, key)
                     continue
 
-                # Remove /Alternates from any XObject
                 if "/Alternates" in xobj:
                     del xobj["/Alternates"]
                     removed_count += 1
                     logger.debug("Removed /Alternates from XObject: %s", key)
 
-                # Remove /OPI from any XObject (ISO 19005-2, 6.2.4)
                 if "/OPI" in xobj:
                     del xobj["/OPI"]
                     removed_count += 1
                     logger.debug("Removed /OPI from XObject: %s", key)
 
-                # Recurse into Form XObjects for nested XObjects
                 if subtype_str == "/Form":
                     removed_count += _remove_forbidden_form_keys(xobj, str(key))
-                    nested_resources = xobj.get("/Resources")
-                    if nested_resources is not None:
-                        nested_resources = _resolve_indirect(nested_resources)
-                        nested_xobjects = nested_resources.get("/XObject")
-                        if nested_xobjects is not None:
-                            nested_xobjects = _resolve_indirect(nested_xobjects)
-                            nested_keys, nested_removed = _process_xobjects_for_removal(
-                                nested_xobjects, pdf, visited
-                            )
-                            # Remove forbidden XObjects from nested resources
-                            for nested_key in nested_keys:
-                                del nested_xobjects[nested_key]
-                                removed_count += 1
-                                logger.debug(
-                                    "Removed nested forbidden XObject: %s", nested_key
-                                )
-                            removed_count += nested_removed
+                    nested_resources = _resolve_indirect(xobj.get("/Resources"))
+                    if not isinstance(nested_resources, Dictionary):
+                        continue
+                    nested_xobjects = _resolve_indirect(
+                        nested_resources.get("/XObject")
+                    )
+                    if isinstance(nested_xobjects, Dictionary):
+                        pending.append((nested_xobjects, False))
 
-        except Exception as e:
-            log_suppressed_error(logger, e, "Error processing XObject %s: %s", key, e)
+            except Exception as e:
+                log_suppressed_error(
+                    logger, e, "Error processing XObject %s: %s", key, e
+                )
 
     return keys_to_remove, removed_count
 
@@ -262,6 +258,24 @@ def remove_forbidden_xobjects(pdf: Pdf) -> int:
                 logger, e, "Error processing XObjects on page %d: %s", page_num, e
             )
 
+    for page in pdf.pages:
+        for _owner, resources in _iter_content_streams_with_resources(page):
+            resources = _resolve_indirect(resources)
+            if not isinstance(resources, Dictionary):
+                continue
+            xobjects = _resolve_indirect(resources.get("/XObject"))
+            if not isinstance(xobjects, Dictionary):
+                continue
+            keys_to_remove, nested_removed = _process_xobjects_for_removal(
+                xobjects,
+                pdf,
+                visited,
+            )
+            for key in keys_to_remove:
+                del xobjects[key]
+                removed_count += 1
+            removed_count += nested_removed
+
     if removed_count > 0:
         logger.info("%d forbidden XObject element(s) removed", removed_count)
     return removed_count
@@ -274,8 +288,8 @@ def _fix_interpolate_in_xobjects(
 ) -> int:
     """Fixes /Interpolate on Image XObjects within an XObject dictionary.
 
-    Recursively processes XObjects: for each Image with Interpolate=true,
-    sets it to false. Recurses into Form XObjects for nested images.
+    Traverses XObjects iteratively: for each Image with Interpolate=true,
+    sets it to false and follows nested Form XObject resources.
 
     Args:
         xobjects: XObject dictionary from page or Form XObject resources.
@@ -285,48 +299,55 @@ def _fix_interpolate_in_xobjects(
         Number of images fixed.
     """
     fixed_count = 0
+    pending = [xobjects]
+    while pending:
+        current_xobjects = pending.pop()
+        if not isinstance(current_xobjects, Dictionary):
+            continue
 
-    for key in xobjects.keys():
-        try:
-            xobj = xobjects.get(key)
-            if xobj is None:
-                continue
-
-            xobj = _resolve_indirect(xobj)
-
-            # Cycle detection using objgen
-            obj_key = xobj.objgen
-            if obj_key != (0, 0):
-                if obj_key in visited:
+        for key in list(current_xobjects.keys()):
+            try:
+                xobj = _resolve_indirect(current_xobjects.get(key))
+                if xobj is None:
                     continue
-                visited.add(obj_key)
 
-            subtype = xobj.get("/Subtype")
-            if subtype is None:
-                continue
-            subtype_str = str(subtype)
+                obj_key = xobj.objgen
+                if obj_key != (0, 0):
+                    if obj_key in visited:
+                        continue
+                    visited.add(obj_key)
 
-            if subtype_str == "/Image":
-                fixed_count += _fix_interpolate_in_image_stream(xobj, str(key), visited)
+                subtype = xobj.get("/Subtype")
+                if subtype is None:
+                    continue
+                subtype_str = str(subtype)
 
-            elif subtype_str == "/Form":
-                fixed_count += _fix_inline_interpolate_in_stream_once(
-                    xobj, visited_inline_streams
+                if subtype_str == "/Image":
+                    fixed_count += _fix_interpolate_in_image_stream(
+                        xobj, str(key), visited
+                    )
+
+                elif subtype_str == "/Form":
+                    fixed_count += _fix_inline_interpolate_in_stream_once(
+                        xobj, visited_inline_streams
+                    )
+                    nested_resources = _resolve_indirect(xobj.get("/Resources"))
+                    if not isinstance(nested_resources, Dictionary):
+                        continue
+                    nested_xobjects = _resolve_indirect(
+                        nested_resources.get("/XObject")
+                    )
+                    if isinstance(nested_xobjects, Dictionary):
+                        pending.append(nested_xobjects)
+
+            except Exception as e:
+                log_suppressed_error(
+                    logger,
+                    e,
+                    "Error checking /Interpolate on XObject %s: %s",
+                    key,
+                    e,
                 )
-                nested_resources = xobj.get("/Resources")
-                if nested_resources is not None:
-                    nested_resources = _resolve_indirect(nested_resources)
-                    nested_xobjects = nested_resources.get("/XObject")
-                    if nested_xobjects is not None:
-                        nested_xobjects = _resolve_indirect(nested_xobjects)
-                        fixed_count += _fix_interpolate_in_xobjects(
-                            nested_xobjects, visited, visited_inline_streams
-                        )
-
-        except Exception as e:
-            log_suppressed_error(
-                logger, e, "Error checking /Interpolate on XObject %s: %s", key, e
-            )
 
     return fixed_count
 
@@ -338,36 +359,35 @@ def _fix_interpolate_in_image_stream(
 ) -> int:
     """Fix /Interpolate on an image stream and its image-mask descendants."""
     fixed = 0
+    pending = [(image, image_name)]
+    while pending:
+        current, current_name = pending.pop()
 
-    interp = image.get("/Interpolate")
-    if interp is not None and bool(interp):
-        image["/Interpolate"] = False
-        fixed += 1
-        logger.debug("Set /Interpolate to false on Image XObject: %s", image_name)
+        interp = current.get("/Interpolate")
+        if interp is not None and bool(interp):
+            current["/Interpolate"] = False
+            fixed += 1
+            logger.debug("Set /Interpolate to false on Image XObject: %s", current_name)
 
-    for mask_key in ("/SMask", "/Mask"):
-        mask = image.get(mask_key)
-        if mask is None:
-            continue
-
-        mask = _resolve_indirect(mask)
-        if not isinstance(mask, Stream):
-            continue
-
-        obj_key = mask.objgen
-        if obj_key != (0, 0):
-            if obj_key in visited:
+        for mask_key in ("/SMask", "/Mask"):
+            mask = current.get(mask_key)
+            if mask is None:
                 continue
-            visited.add(obj_key)
 
-        if str(mask.get("/Subtype")) != "/Image":
-            continue
+            mask = _resolve_indirect(mask)
+            if not isinstance(mask, Stream):
+                continue
 
-        fixed += _fix_interpolate_in_image_stream(
-            mask,
-            f"{image_name}{mask_key}",
-            visited,
-        )
+            obj_key = mask.objgen
+            if obj_key != (0, 0):
+                if obj_key in visited:
+                    continue
+                visited.add(obj_key)
+
+            if str(mask.get("/Subtype")) != "/Image":
+                continue
+
+            pending.append((mask, f"{current_name}{mask_key}"))
 
     return fixed
 
@@ -491,7 +511,7 @@ def _fix_inline_image_interpolate_in_stream(stream: Stream) -> int:
         # holds the inline image's metadata key/value token tuple.
         image_tokens = list(inline_image._image_object)
 
-        local_changed = False
+        local_fixed_count = 0
         for token_idx in range(0, len(image_tokens) - 1, 2):
             key = image_tokens[token_idx]
             if not isinstance(key, Name):
@@ -503,10 +523,9 @@ def _fix_inline_image_interpolate_in_stream(stream: Stream) -> int:
             value = image_tokens[token_idx + 1]
             if bool(value):
                 image_tokens[token_idx + 1] = False
-                fixed_count += 1
-                local_changed = True
+                local_fixed_count += 1
 
-        if not local_changed:
+        if local_fixed_count == 0:
             continue
 
         payload = _extract_inline_image_payload(inline_image)
@@ -518,6 +537,7 @@ def _fix_inline_image_interpolate_in_stream(stream: Stream) -> int:
             continue
 
         instructions[index] = replacement
+        fixed_count += local_fixed_count
         changed = True
 
     if changed:
@@ -624,6 +644,22 @@ def fix_image_interpolate(pdf: Pdf) -> int:
             log_suppressed_error(
                 logger, e, "Error checking /Interpolate on page %d: %s", page_num, e
             )
+
+    for page in pdf.pages:
+        for owner, resources in _iter_content_streams_with_resources(page):
+            owner = _resolve_indirect(owner)
+            resources = _resolve_indirect(resources)
+            if isinstance(owner, Stream):
+                fixed_count += _fix_inline_interpolate_in_stream_once(
+                    owner, visited_inline_streams
+                )
+            if not isinstance(resources, Dictionary):
+                continue
+            xobjects = _resolve_indirect(resources.get("/XObject"))
+            if isinstance(xobjects, Dictionary):
+                fixed_count += _fix_interpolate_in_xobjects(
+                    xobjects, visited, visited_inline_streams
+                )
 
     if fixed_count > 0:
         logger.info("%d image(s) had /Interpolate set to false", fixed_count)
@@ -888,30 +924,44 @@ def _fix_bpc_in_xobjects(
         Dictionary with invalid_bpc_fixed and mask_bpc_fixed counts.
     """
     result = {"invalid_bpc_fixed": 0, "mask_bpc_fixed": 0}
+    pending = [xobjects]
+    while pending:
+        current_xobjects = pending.pop()
+        if not isinstance(current_xobjects, Dictionary):
+            continue
 
-    for key in xobjects.keys():
-        try:
-            xobj = xobjects.get(key)
-            if xobj is None:
-                continue
-
-            xobj = _resolve_indirect(xobj)
-
-            # Cycle detection using objgen
-            obj_key = xobj.objgen
-            if obj_key != (0, 0):
-                if obj_key in visited:
+        for key in list(current_xobjects.keys()):
+            try:
+                xobj = _resolve_indirect(current_xobjects.get(key))
+                if xobj is None:
                     continue
-                visited.add(obj_key)
 
-            subtype = xobj.get("/Subtype")
-            if subtype is None:
-                continue
-            subtype_str = str(subtype)
+                obj_key = xobj.objgen
+                if obj_key != (0, 0):
+                    if obj_key in visited:
+                        continue
+                    visited.add(obj_key)
 
-            if subtype_str == "/Image":
-                bpc = xobj.get("/BitsPerComponent")
-                if bpc is not None:
+                subtype = xobj.get("/Subtype")
+                if subtype is None:
+                    continue
+                subtype_str = str(subtype)
+
+                if subtype_str == "/Image":
+                    image_masks = Dictionary()
+                    for mask_key in (Name.SMask, Name.Mask):
+                        mask = _resolve_indirect(xobj.get(mask_key))
+                        if (
+                            isinstance(mask, Stream)
+                            and mask.get(Name.Subtype) == Name.Image
+                        ):
+                            image_masks[mask_key] = mask
+                    if len(image_masks) > 0:
+                        pending.append(image_masks)
+
+                    bpc = xobj.get("/BitsPerComponent")
+                    if bpc is None:
+                        continue
                     try:
                         bpc_val = int(bpc)
                     except (ValueError, TypeError):
@@ -920,14 +970,12 @@ def _fix_bpc_in_xobjects(
                             key,
                             bpc,
                         )
-                        # Can't unpack with non-integer source — skip
                         continue
 
                     is_mask = xobj.get("/ImageMask")
                     is_mask_flag = is_mask is not None and bool(is_mask)
 
                     if is_mask_flag and bpc_val != 1:
-                        # Image mask must have BPC == 1
                         if bpc_val == 0:
                             logger.warning(
                                 "Image mask %s has BitsPerComponent 0, cannot fix",
@@ -944,7 +992,6 @@ def _fix_bpc_in_xobjects(
                                 bpc_val,
                             )
                     elif not is_mask_flag and bpc_val not in VALID_BITS_PER_COMPONENT:
-                        # Invalid BPC for non-mask image
                         if bpc_val == 0:
                             logger.warning(
                                 "Image XObject %s has BitsPerComponent 0, cannot fix",
@@ -963,21 +1010,20 @@ def _fix_bpc_in_xobjects(
                                 bpc_val,
                             )
 
-            elif subtype_str == "/Form":
-                nested_resources = xobj.get("/Resources")
-                if nested_resources is not None:
-                    nested_resources = _resolve_indirect(nested_resources)
-                    nested_xobjects = nested_resources.get("/XObject")
-                    if nested_xobjects is not None:
-                        nested_xobjects = _resolve_indirect(nested_xobjects)
-                        nested = _fix_bpc_in_xobjects(nested_xobjects, visited)
-                        result["invalid_bpc_fixed"] += nested["invalid_bpc_fixed"]
-                        result["mask_bpc_fixed"] += nested["mask_bpc_fixed"]
+                elif subtype_str == "/Form":
+                    nested_resources = _resolve_indirect(xobj.get("/Resources"))
+                    if not isinstance(nested_resources, Dictionary):
+                        continue
+                    nested_xobjects = _resolve_indirect(
+                        nested_resources.get("/XObject")
+                    )
+                    if isinstance(nested_xobjects, Dictionary):
+                        pending.append(nested_xobjects)
 
-        except Exception as e:
-            log_suppressed_error(
-                logger, e, "Error fixing BPC on XObject %s: %s", key, e
-            )
+            except Exception as e:
+                log_suppressed_error(
+                    logger, e, "Error fixing BPC on XObject %s: %s", key, e
+                )
 
     return result
 
@@ -1085,6 +1131,18 @@ def fix_bits_per_component(pdf: Pdf) -> dict[str, int]:
             log_suppressed_error(
                 logger, e, "Error fixing BPC on page %d: %s", page_num, e
             )
+
+    for page in pdf.pages:
+        for _owner, resources in _iter_content_streams_with_resources(page):
+            resources = _resolve_indirect(resources)
+            if not isinstance(resources, Dictionary):
+                continue
+            xobjects = _resolve_indirect(resources.get("/XObject"))
+            if not isinstance(xobjects, Dictionary):
+                continue
+            result = _fix_bpc_in_xobjects(xobjects, visited)
+            total["invalid_bpc_fixed"] += result["invalid_bpc_fixed"]
+            total["mask_bpc_fixed"] += result["mask_bpc_fixed"]
 
     fixed = total["invalid_bpc_fixed"] + total["mask_bpc_fixed"]
     if fixed > 0:

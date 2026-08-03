@@ -12,13 +12,32 @@ to PUA via the font's ToUnicode CMap.
 """
 
 import logging
+from dataclasses import dataclass, field
+from io import BytesIO
 
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
 
-from ..fonts.subsetter import _resolve_simple_font_encoding
-from ..fonts.tounicode import parse_tounicode_cmap, resolve_glyph_to_unicode
-from ..utils import iter_type3_fonts as _iter_type3_fonts
+from ..fonts.cid_unicode import get_cid_to_unicode
+from ..fonts.encodings import SYMBOL_ENCODING
+from ..fonts.glyph_mapping import ZAPFDINGBATS_GLYPH_TO_UNICODE
+from ..fonts.glyph_usage import _iter_content_streams_with_resources
+from ..fonts.subsetter import _get_unicode_cmap, _resolve_simple_font_encoding
+from ..fonts.tounicode import (
+    CIDEncodingMap,
+    get_font_code_space_ranges,
+    get_type0_cid_encoding_map,
+    parse_cidtogidmap_stream,
+    parse_tounicode_cmap_sequences,
+    resolve_glyph_to_unicode,
+    resolve_symbol_glyph_to_unicode,
+    split_cmap_codes,
+)
+from ..fonts.utils import (
+    get_truetype_byte_encoding,
+    safe_str,
+    symbol_cmap_code_to_byte,
+)
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
@@ -26,6 +45,29 @@ logger = logging.getLogger(__name__)
 
 # Text-showing operators whose string operands may reference PUA
 _TEXT_OPERATORS = frozenset({"Tj", "'", '"'})
+
+_CodeSpaceRanges = tuple[tuple[bytes, bytes], ...]
+_ToUnicodeMap = dict[bytes, tuple[int, ...]]
+_ToUnicodeInfo = tuple[_ToUnicodeMap, _CodeSpaceRanges]
+_ObjectKey = tuple[int, int]
+_Type0Resolver = tuple[CIDEncodingMap, dict[int, int] | None, dict[int, int]]
+_SimpleSymbolResolver = dict[int, int]
+_StructuralActualTextReferences = frozenset[tuple[_ObjectKey, int]]
+
+# Unicode WG2 N4363 mappings for Wingdings slots observed in office documents.
+_WINGDINGS_UNICODE = {
+    0x28: 0x1F57F,
+    0x2A: 0x1F582,
+    0x6E: 0x25FC,
+}
+
+
+@dataclass
+class _ContentState:
+    current_font_name: str | None = None
+    font_stack: list[str | None] = field(default_factory=list)
+    actualtext_stack: list[bool] = field(default_factory=list)
+    actualtext_depth: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -67,73 +109,45 @@ def sanitize_pua_actualtext(pdf: Pdf) -> dict[str, int]:
     """
     total_added = 0
     total_warnings = 0
-    visited: set[tuple[int, int]] = set()
-    tounicode_cache: dict[tuple[int, int], dict[int, int]] = {}
+    tounicode_cache: dict[tuple[int, int], _ToUnicodeInfo] = {}
     encoding_cache: dict[tuple[int, int], dict[int, str] | None] = {}
+    type0_cache: dict[_ObjectKey, _Type0Resolver | None] = {}
+    simple_symbol_cache: dict[_ObjectKey, _SimpleSymbolResolver] = {}
+    from ..tagging import get_structural_actualtext_references
+
+    structural_actualtext_references = get_structural_actualtext_references(pdf)
 
     for page_num, page in enumerate(pdf.pages, start=1):
         try:
-            page_dict = _resolve(page.obj)
-
-            resources = page_dict.get("/Resources")
-            if resources is not None:
-                resources = _resolve(resources)
-            font_map = _build_font_map(resources) if resources else {}
-
-            # 1. Page Contents
-            a, w = _fix_pua_in_page_contents(
-                page_dict, font_map, tounicode_cache, encoding_cache
-            )
-            total_added += a
-            total_warnings += w
-
-            # 2. Form XObjects (recursive)
-            if resources is not None:
-                a, w = _fix_pua_in_form_xobjects(
-                    resources, visited, tounicode_cache, encoding_cache
-                )
-                total_added += a
-                total_warnings += w
-
-                # 3. Tiling Patterns (recursive)
-                a, w = _fix_pua_in_patterns(
-                    resources, visited, tounicode_cache, encoding_cache
-                )
-                total_added += a
-                total_warnings += w
-
-                # 4. Type3 CharProcs
-                a, w = _fix_pua_in_type3_charprocs(
-                    resources, visited, tounicode_cache, encoding_cache
-                )
-                total_added += a
-                total_warnings += w
-
-            # 5. Annotation AP streams
-            annots = page_dict.get("/Annots")
-            if annots:
-                annots = _resolve(annots)
-                for annot_ref in annots:
-                    annot = _resolve(annot_ref)
-                    if not isinstance(annot, Dictionary):
-                        continue
-                    ap = annot.get("/AP")
-                    if not ap:
-                        continue
-                    ap = _resolve(ap)
-                    if not isinstance(ap, Dictionary):
-                        continue
-                    for ap_key in ("/N", "/R", "/D"):
-                        ap_entry = ap.get(ap_key)
-                        if ap_entry:
-                            a, w = _fix_pua_in_ap_stream(
-                                ap_entry,
-                                visited,
-                                tounicode_cache,
-                                encoding_cache,
-                            )
-                            total_added += a
-                            total_warnings += w
+            for owner, resources in _iter_content_streams_with_resources(page):
+                font_map = _build_font_map(resources)
+                if isinstance(owner, Stream):
+                    added, warnings = _fix_pua_in_stream(
+                        owner,
+                        font_map,
+                        tounicode_cache,
+                        encoding_cache,
+                        type0_cache,
+                        simple_symbol_cache,
+                        resources=resources,
+                        allow_unset_font=True,
+                        structural_actualtext_references=(
+                            structural_actualtext_references
+                        ),
+                    )
+                else:
+                    added, warnings = _fix_pua_in_page_contents(
+                        owner,
+                        font_map,
+                        tounicode_cache,
+                        encoding_cache,
+                        type0_cache,
+                        simple_symbol_cache,
+                        resources,
+                        structural_actualtext_references,
+                    )
+                total_added += added
+                total_warnings += warnings
 
         except Exception as e:
             log_suppressed_error(
@@ -202,14 +216,14 @@ def _is_cidfont(font_obj: pikepdf.Object) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _get_tounicode_map(
+def _get_tounicode_info(
     font_obj: pikepdf.Object,
-    cache: dict[tuple[int, int], dict[int, int]],
-) -> dict[int, int]:
-    """Returns the ToUnicode mapping for a font, cached by objgen."""
+    cache: dict[tuple[int, int], _ToUnicodeInfo],
+) -> _ToUnicodeInfo:
+    """Return a font's width-preserving ToUnicode data, cached by objgen."""
     font_obj = _resolve(font_obj)
     if not isinstance(font_obj, Dictionary):
-        return {}
+        return {}, ()
 
     objgen = font_obj.objgen
     if objgen != (0, 0) and objgen in cache:
@@ -217,14 +231,17 @@ def _get_tounicode_map(
 
     tounicode = font_obj.get("/ToUnicode")
     if tounicode is None:
-        result: dict[int, int] = {}
+        data = None
+        mapping: _ToUnicodeMap = {}
     else:
         tounicode = _resolve(tounicode)
         try:
             data = bytes(tounicode.read_bytes())
-            result = parse_tounicode_cmap(data)
+            mapping = parse_tounicode_cmap_sequences(data)
         except Exception:
-            result = {}
+            data = None
+            mapping = {}
+    result = mapping, get_font_code_space_ranges(font_obj, data)
 
     if objgen != (0, 0):
         cache[objgen] = result
@@ -232,20 +249,27 @@ def _get_tounicode_map(
 
 
 def _resolve_pua_to_actual_unicode(
-    code: int,
+    code_bytes: bytes,
+    pua_value: int,
     font_obj: pikepdf.Object,
     encoding_cache: dict[tuple[int, int], dict[int, str] | None],
+    type0_cache: dict[_ObjectKey, _Type0Resolver | None],
+    simple_symbol_cache: dict[_ObjectKey, _SimpleSymbolResolver],
 ) -> int | None:
     """Try to find real Unicode for a PUA character code via encoding.
 
-    For simple fonts, resolves code -> glyph name -> Unicode via AGL.
-    For CIDFonts, returns None (no encoding-based resolution possible).
+    Simple fonts resolve code -> glyph name -> Unicode via AGL. Type 0 fonts
+    resolve character code -> CID -> GID -> embedded-font Unicode.
     """
     if _is_cidfont(font_obj):
-        return None
+        resolved = _resolve_type0_unicode(code_bytes, font_obj, type0_cache)
+        if resolved is not None:
+            return resolved
+        return _resolve_named_type0_pua(font_obj, pua_value)
 
     font_obj = _resolve(font_obj)
     objgen = font_obj.objgen
+    code = int.from_bytes(code_bytes, "big")
 
     if objgen != (0, 0) and objgen in encoding_cache:
         encoding = encoding_cache[objgen]
@@ -254,17 +278,337 @@ def _resolve_pua_to_actual_unicode(
         if objgen != (0, 0):
             encoding_cache[objgen] = encoding
 
+    if encoding is not None:
+        glyph_name = encoding.get(code)
+        if glyph_name is not None:
+            unicode_val = resolve_glyph_to_unicode(glyph_name)
+            if unicode_val is not None and not _is_pua(unicode_val):
+                return unicode_val
+    if len(code_bytes) == 1:
+        return _resolve_windows_symbol_code(
+            font_obj,
+            code_bytes[0],
+            simple_symbol_cache,
+        )
+    return None
+
+
+def _object_key(obj: pikepdf.Object) -> _ObjectKey | None:
+    """Return a stable cache key for an indirect PDF object."""
+    objgen = obj.objgen
+    return objgen if objgen != (0, 0) else None
+
+
+def _font_names(font_obj: pikepdf.Object) -> list[str]:
+    """Collect normalized font names used for narrow font fallbacks."""
+    names: list[str] = []
+
+    def add_name(value: object) -> None:
+        if value is None:
+            return
+        normalized = str(value).lstrip("/").split("+")[-1].lower()
+        normalized = normalized.replace(" ", "").replace("-", "").replace("_", "")
+        if normalized:
+            names.append(normalized)
+
+    font_obj = _resolve(font_obj)
+    if not isinstance(font_obj, Dictionary):
+        return names
+    add_name(font_obj.get("/BaseFont"))
+
+    descendants = _resolve(font_obj.get("/DescendantFonts"))
+    descendant = (
+        _resolve(descendants[0])
+        if isinstance(descendants, Array) and descendants
+        else None
+    )
+    if isinstance(descendant, Dictionary):
+        add_name(descendant.get("/BaseFont"))
+        descriptor = _resolve(descendant.get("/FontDescriptor"))
+    else:
+        descriptor = _resolve(font_obj.get("/FontDescriptor"))
+    if isinstance(descriptor, Dictionary):
+        add_name(descriptor.get("/FontName"))
+    return names
+
+
+def _resolve_named_type0_pua(
+    font_obj: pikepdf.Object,
+    pua_value: int,
+) -> int | None:
+    """Resolve legacy Type 0 PUA conventions for known symbol font families."""
+    names = _font_names(font_obj)
+    slot = symbol_cmap_code_to_byte(pua_value)
+    if slot is None:
+        return None
+    if 0x20 <= slot <= 0x7E and any(
+        "code39" in name or "barcode39" in name for name in names
+    ):
+        return slot
+
+    if any("wingdings" in name for name in names):
+        return _WINGDINGS_UNICODE.get(slot)
+
+    if any(name in {"symbol", "symbolmt"} for name in names):
+        glyph_name = SYMBOL_ENCODING.get(slot)
+        if glyph_name is not None:
+            unicode_val = resolve_symbol_glyph_to_unicode(glyph_name)
+            if unicode_val is not None and not _is_pua(unicode_val):
+                return unicode_val
+    return None
+
+
+def _build_simple_symbol_resolver(
+    font_obj: pikepdf.Object,
+) -> _SimpleSymbolResolver:
+    """Resolve simple-font bytes from an authoritative program byte cmap."""
+    names = _font_names(font_obj)
+    font_obj = _resolve(font_obj)
+    descriptor = (
+        _resolve(font_obj.get("/FontDescriptor"))
+        if isinstance(font_obj, Dictionary)
+        else None
+    )
+    if not isinstance(descriptor, Dictionary):
+        return {}
+    font_file = descriptor.get("/FontFile2")
+    if font_file is None:
+        font_file = descriptor.get("/FontFile3")
+    font_file = _resolve(font_file)
+    if not isinstance(font_file, Stream):
+        return {}
+
+    try:
+        from fontTools.ttLib import TTFont
+
+        tt_font = TTFont(BytesIO(bytes(font_file.read_bytes())))
+        try:
+            byte_encoding = get_truetype_byte_encoding(tt_font)
+            if byte_encoding is None:
+                return {}
+            byte_mapping = byte_encoding[2]
+            unicode_cmap = _get_unicode_cmap(tt_font)
+        finally:
+            tt_font.close()
+    except Exception:
+        return {}
+
+    result: _SimpleSymbolResolver = {}
+    unicode_by_glyph: dict[str, set[int]] = {}
+    for unicode_value, glyph_name in unicode_cmap.items():
+        if not _is_pua(unicode_value):
+            unicode_by_glyph.setdefault(glyph_name, set()).add(unicode_value)
+
+    for code, glyph_name in byte_mapping.items():
+        candidates = unicode_by_glyph.get(glyph_name, set())
+        if len(candidates) == 1:
+            result[code] = next(iter(candidates))
+            continue
+
+        unicode_value = resolve_symbol_glyph_to_unicode(glyph_name)
+        if (
+            unicode_value is not None
+            and not _is_pua(unicode_value)
+            and (not candidates or unicode_value in candidates)
+        ):
+            result[code] = unicode_value
+            continue
+
+        zapf_value = ZAPFDINGBATS_GLYPH_TO_UNICODE.get(glyph_name)
+        if zapf_value is not None and (not candidates or zapf_value in candidates):
+            result[code] = zapf_value
+            continue
+
+        if candidates:
+            continue
+
+        if any("wingdings" in name for name in names):
+            unicode_value = _WINGDINGS_UNICODE.get(code)
+        elif any(name in {"symbol", "symbolmt"} for name in names):
+            encoded_name = SYMBOL_ENCODING.get(code)
+            unicode_value = (
+                resolve_symbol_glyph_to_unicode(encoded_name)
+                if encoded_name is not None
+                else None
+            )
+        elif any("code39" in name or "barcode39" in name for name in names):
+            unicode_value = code if 0x20 <= code <= 0x7E else None
+        else:
+            unicode_value = None
+        if unicode_value is not None and not _is_pua(unicode_value):
+            result[code] = unicode_value
+    return result
+
+
+def _resolve_windows_symbol_code(
+    font_obj: pikepdf.Object,
+    code: int,
+    cache: dict[_ObjectKey, _SimpleSymbolResolver],
+) -> int | None:
+    """Resolve a simple-font byte through its authoritative program cmap."""
+    font_obj = _resolve(font_obj)
+    if not isinstance(font_obj, Dictionary):
+        return None
+    key = _object_key(font_obj)
+    if key is None:
+        return _build_simple_symbol_resolver(font_obj).get(code)
+    if key not in cache:
+        cache[key] = _build_simple_symbol_resolver(font_obj)
+    return cache[key].get(code)
+
+
+def _build_type0_resolver(
+    font_obj: pikepdf.Object,
+) -> _Type0Resolver | None:
+    """Build the data needed to resolve Type 0 character codes to Unicode."""
+    font_obj = _resolve(font_obj)
+    if not isinstance(font_obj, Dictionary):
+        return None
+
+    encoding = get_type0_cid_encoding_map(font_obj)
     if encoding is None:
         return None
 
-    glyph_name = encoding.get(code)
-    if glyph_name is None:
+    descendants = _resolve(font_obj.get("/DescendantFonts"))
+    if not isinstance(descendants, Array) or not descendants:
+        return None
+    descendant = _resolve(descendants[0])
+    if not isinstance(descendant, Dictionary):
+        return None
+    descendant_subtype = str(descendant.get("/Subtype") or "")
+
+    cid_to_gid: dict[int, int] | None
+    if descendant_subtype == "/CIDFontType0":
+        # CID-keyed CFF fonts select glyphs through their CFF charset. A
+        # CIDToGIDMap entry has no meaning for this subtype.
+        cid_to_gid = None
+    elif descendant_subtype == "/CIDFontType2":
+        cid_to_gid_obj = descendant.get("/CIDToGIDMap")
+        if cid_to_gid_obj is None:
+            cid_to_gid = None
+        else:
+            cid_to_gid_obj = _resolve(cid_to_gid_obj)
+            if isinstance(cid_to_gid_obj, Name):
+                if str(cid_to_gid_obj) != "/Identity":
+                    return None
+                cid_to_gid = None
+            elif isinstance(cid_to_gid_obj, Stream):
+                try:
+                    cid_to_gid = parse_cidtogidmap_stream(
+                        bytes(cid_to_gid_obj.read_bytes())
+                    )
+                except Exception:
+                    return None
+            else:
+                return None
+    else:
         return None
 
-    unicode_val = resolve_glyph_to_unicode(glyph_name)
-    if unicode_val is not None and not _is_pua(unicode_val):
-        return unicode_val
-    return None
+    descriptor = _resolve(descendant.get("/FontDescriptor"))
+    if not isinstance(descriptor, Dictionary):
+        return None
+    font_file = descriptor.get("/FontFile2")
+    if font_file is None:
+        font_file = descriptor.get("/FontFile3")
+    font_file = _resolve(font_file)
+    if not isinstance(font_file, Stream):
+        return None
+
+    try:
+        from fontTools.ttLib import TTFont
+
+        font_data = bytes(font_file.read_bytes())
+        try:
+            tt_font = TTFont(BytesIO(font_data))
+        except Exception:
+            if descendant_subtype != "/CIDFontType0":
+                raise
+            from .glyph_coverage import _wrap_cff_in_otf
+
+            tt_font = TTFont(BytesIO(_wrap_cff_in_otf(font_data)))
+        try:
+            glyph_order = tt_font.getGlyphOrder()
+            glyph_to_gid = {name: gid for gid, name in enumerate(glyph_order)}
+            unicode_by_gid: dict[int, set[int]] = {}
+            for unicode_value, glyph_name in sorted(_get_unicode_cmap(tt_font).items()):
+                if _is_pua(unicode_value):
+                    continue
+                gid = glyph_to_gid.get(glyph_name)
+                if gid is not None:
+                    unicode_by_gid.setdefault(gid, set()).add(unicode_value)
+
+            if descendant_subtype == "/CIDFontType0":
+                cid_to_gid = {}
+                for gid, glyph_name in enumerate(glyph_order):
+                    if glyph_name == ".notdef":
+                        cid_to_gid[0] = gid
+                    elif glyph_name.startswith("cid"):
+                        try:
+                            cid_to_gid[int(glyph_name[3:])] = gid
+                        except ValueError:
+                            continue
+                if not cid_to_gid:
+                    return None
+
+                cid_system_info = _resolve(descendant.get("/CIDSystemInfo"))
+                if isinstance(cid_system_info, Dictionary):
+                    ordering_obj = cid_system_info.get("/Ordering")
+                    ordering = (
+                        safe_str(ordering_obj).lstrip("/")
+                        if ordering_obj is not None
+                        else ""
+                    )
+                    collection_mapping = get_cid_to_unicode(ordering)
+                    if collection_mapping:
+                        for cid, gid in cid_to_gid.items():
+                            unicode_value = collection_mapping.get(cid)
+                            if unicode_value is not None and not _is_pua(unicode_value):
+                                unicode_by_gid.setdefault(gid, set()).add(unicode_value)
+
+            gid_to_unicode: dict[int, int] = {}
+            for gid, glyph_name in enumerate(glyph_order):
+                candidates = unicode_by_gid.get(gid, set())
+                if len(candidates) == 1:
+                    gid_to_unicode[gid] = next(iter(candidates))
+                    continue
+                unicode_value = resolve_symbol_glyph_to_unicode(glyph_name)
+                if (
+                    unicode_value is not None
+                    and not _is_pua(unicode_value)
+                    and (not candidates or unicode_value in candidates)
+                ):
+                    gid_to_unicode[gid] = unicode_value
+        finally:
+            tt_font.close()
+    except Exception:
+        return None
+
+    return encoding, cid_to_gid, gid_to_unicode
+
+
+def _resolve_type0_unicode(
+    code_bytes: bytes,
+    font_obj: pikepdf.Object,
+    cache: dict[_ObjectKey, _Type0Resolver | None],
+) -> int | None:
+    """Resolve one encoded Type 0 character through its embedded font."""
+    font_obj = _resolve(font_obj)
+    if not isinstance(font_obj, Dictionary):
+        return None
+    key = _object_key(font_obj)
+    if key is None:
+        resolver = _build_type0_resolver(font_obj)
+    else:
+        if key not in cache:
+            cache[key] = _build_type0_resolver(font_obj)
+        resolver = cache[key]
+    if resolver is None:
+        return None
+
+    encoding, cid_to_gid, gid_to_unicode = resolver
+    cid = encoding.map_code(code_bytes)
+    gid = cid if cid_to_gid is None else cid_to_gid.get(cid, 0)
+    return gid_to_unicode.get(gid)
 
 
 # ---------------------------------------------------------------------------
@@ -277,20 +621,16 @@ def _encode_actualtext(text: str) -> bytes:
     return b"\xfe\xff" + text.encode("utf-16-be")
 
 
-def _has_pua_codes(raw: bytes, tounicode: dict[int, int], is_cid: bool) -> bool:
+def _has_pua_codes(
+    raw: bytes,
+    tounicode: _ToUnicodeMap,
+    code_space_ranges: _CodeSpaceRanges,
+) -> bool:
     """Check if any character codes in raw bytes map to PUA."""
-    if is_cid:
-        for i in range(0, len(raw) - 1, 2):
-            code = (raw[i] << 8) | raw[i + 1]
-            unicode_val = tounicode.get(code)
-            if unicode_val is not None and _is_pua(unicode_val):
-                return True
-    else:
-        for byte_val in raw:
-            unicode_val = tounicode.get(byte_val)
-            if unicode_val is not None and _is_pua(unicode_val):
-                return True
-    return False
+    return any(
+        any(_is_pua(value) for value in tounicode.get(code, ()))
+        for code in split_cmap_codes(raw, code_space_ranges)
+    )
 
 
 def _extract_text_bytes(op_str: str, operands: list) -> bytes | None:
@@ -314,17 +654,71 @@ def _extract_text_bytes(op_str: str, operands: list) -> bytes | None:
         return None
 
 
+def _get_bdc_properties(
+    operands: list,
+    resources: pikepdf.Object | None,
+) -> Dictionary | None:
+    """Resolve a BDC property dictionary, including named resources."""
+    if len(operands) < 2:
+        return None
+    properties = _resolve(operands[1])
+    if isinstance(properties, Name):
+        resources = _resolve(resources)
+        if not isinstance(resources, Dictionary):
+            return None
+        property_dict = _resolve(resources.get("/Properties"))
+        if not isinstance(property_dict, Dictionary):
+            return None
+        properties = _resolve(property_dict.get(str(properties)))
+    if not isinstance(properties, Dictionary):
+        return None
+    return properties
+
+
+def _has_actualtext_property(
+    operands: list,
+    resources: pikepdf.Object | None,
+) -> bool:
+    """Return whether BDC operands resolve to an ActualText string."""
+    properties = _get_bdc_properties(operands, resources)
+    if properties is None:
+        return False
+    try:
+        return isinstance(_resolve(properties.get("/ActualText")), String)
+    except Exception:
+        return False
+
+
+def _get_mcid_property(
+    operands: list,
+    resources: pikepdf.Object | None,
+) -> int | None:
+    """Return a BDC marked-content identifier when it is well formed."""
+    properties = _get_bdc_properties(operands, resources)
+    if properties is None:
+        return None
+    mcid = _resolve(properties.get("/MCID"))
+    if isinstance(mcid, int) and not isinstance(mcid, bool) and mcid >= 0:
+        return mcid
+    return None
+
+
 def _build_actualtext_value(
     raw: bytes,
-    tounicode: dict[int, int],
-    is_cid: bool,
+    tounicode: _ToUnicodeMap,
+    code_space_ranges: _CodeSpaceRanges,
     font_obj: pikepdf.Object,
     encoding_cache: dict[tuple[int, int], dict[int, str] | None],
-) -> tuple[str, int]:
+    type0_cache: dict[_ObjectKey, _Type0Resolver | None],
+    simple_symbol_cache: dict[_ObjectKey, _SimpleSymbolResolver],
+) -> tuple[str | None, int]:
     """Build the ActualText string for a text operand.
 
     For each character code: if non-PUA Unicode, use it; if PUA, try
-    to resolve via font encoding and AGL; if unresolvable, omit.
+    to resolve via the font program. If a PUA value has no authoritative
+    replacement, preserve that value in ActualText instead of inventing text
+    or changing the document's existing extraction semantics. A character
+    code without any Unicode mapping still prevents a safe replacement.
 
     Returns:
         Tuple of (actualtext_string, num_unresolvable_pua).
@@ -332,39 +726,31 @@ def _build_actualtext_value(
     chars: list[str] = []
     warnings = 0
 
-    if is_cid:
-        for i in range(0, len(raw) - 1, 2):
-            code = (raw[i] << 8) | raw[i + 1]
-            unicode_val = tounicode.get(code)
-            if unicode_val is None:
-                continue
+    for code_bytes in split_cmap_codes(raw, code_space_ranges):
+        unicode_values = tounicode.get(code_bytes)
+        if not unicode_values:
+            warnings += 1
+            continue
+        for unicode_val in unicode_values:
             if _is_pua(unicode_val):
                 resolved = _resolve_pua_to_actual_unicode(
-                    code, font_obj, encoding_cache
+                    code_bytes,
+                    unicode_val,
+                    font_obj,
+                    encoding_cache,
+                    type0_cache,
+                    simple_symbol_cache,
                 )
                 if resolved is not None:
                     chars.append(chr(resolved))
                 else:
-                    warnings += 1
-            else:
-                chars.append(chr(unicode_val))
-    else:
-        for byte_val in raw:
-            unicode_val = tounicode.get(byte_val)
-            if unicode_val is None:
-                continue
-            if _is_pua(unicode_val):
-                resolved = _resolve_pua_to_actual_unicode(
-                    byte_val, font_obj, encoding_cache
-                )
-                if resolved is not None:
-                    chars.append(chr(resolved))
-                else:
-                    warnings += 1
+                    chars.append(chr(unicode_val))
             else:
                 chars.append(chr(unicode_val))
 
-    return "".join(chars), warnings
+    if warnings or not chars:
+        return None, max(warnings, 1)
+    return "".join(chars), 0
 
 
 # ---------------------------------------------------------------------------
@@ -375,8 +761,15 @@ def _build_actualtext_value(
 def _fix_pua_in_stream(
     stream_obj: Stream,
     font_map: dict[str, pikepdf.Object],
-    tounicode_cache: dict[tuple[int, int], dict[int, int]],
+    tounicode_cache: dict[tuple[int, int], _ToUnicodeInfo],
     encoding_cache: dict[tuple[int, int], dict[int, str] | None],
+    type0_cache: dict[_ObjectKey, _Type0Resolver | None],
+    simple_symbol_cache: dict[_ObjectKey, _SimpleSymbolResolver],
+    state: _ContentState | None = None,
+    resources: pikepdf.Object | None = None,
+    allow_unset_font: bool = False,
+    structural_actualtext_references: _StructuralActualTextReferences = frozenset(),
+    structural_container_key: _ObjectKey | None = None,
 ) -> tuple[int, int]:
     """Core stream processor.
 
@@ -391,47 +784,14 @@ def _fix_pua_in_stream(
     except Exception:
         return 0, 0
 
-    # First pass: find text operator indices inside /ActualText BDC
-    covered: set[int] = set()
-    stack: list[bool] = []
-    actualtext_depth = 0
-
-    for idx, item in enumerate(instructions):
-        if isinstance(item, pikepdf.ContentStreamInlineImage):
-            continue
-
-        op_str = str(item.operator)
-
-        if op_str == "BDC":
-            has_actualtext = False
-            if len(item.operands) >= 2:
-                props = item.operands[1]
-                if isinstance(props, Dictionary):
-                    try:
-                        if props.get("/ActualText") is not None:
-                            has_actualtext = True
-                    except Exception:
-                        pass
-            if has_actualtext:
-                actualtext_depth += 1
-            stack.append(has_actualtext)
-        elif op_str == "BMC":
-            stack.append(False)
-        elif op_str == "EMC":
-            if stack:
-                if stack.pop():
-                    actualtext_depth -= 1
-        elif actualtext_depth > 0:
-            if op_str in _TEXT_OPERATORS or op_str == "TJ":
-                covered.add(idx)
-
-    # Second pass: wrap PUA text operators
+    if state is None:
+        state = _ContentState()
+    container_key = structural_container_key or _object_key(stream_obj)
     new_instructions: list = []
-    current_font_name: str | None = None
     wrapped_count = 0
     warning_count = 0
 
-    for idx, item in enumerate(instructions):
+    for item in instructions:
         if isinstance(item, pikepdf.ContentStreamInlineImage):
             new_instructions.append(item)
             continue
@@ -439,60 +799,110 @@ def _fix_pua_in_stream(
         operands, operator = item.operands, item.operator
         op_str = str(operator)
 
-        # Track font changes
+        if op_str == "BDC":
+            has_actualtext = _has_actualtext_property(operands, resources)
+            if not has_actualtext:
+                mcid = _get_mcid_property(operands, resources)
+                has_actualtext = (
+                    container_key is not None
+                    and mcid is not None
+                    and (container_key, mcid) in structural_actualtext_references
+                )
+            state.actualtext_stack.append(has_actualtext)
+            state.actualtext_depth += int(has_actualtext)
+            new_instructions.append(item)
+            continue
+        if op_str == "BMC":
+            state.actualtext_stack.append(False)
+            new_instructions.append(item)
+            continue
+        if op_str == "EMC":
+            if state.actualtext_stack and state.actualtext_stack.pop():
+                state.actualtext_depth -= 1
+            new_instructions.append(item)
+            continue
+        if op_str == "q":
+            state.font_stack.append(state.current_font_name)
+            new_instructions.append(item)
+            continue
+        if op_str == "Q":
+            state.current_font_name = (
+                state.font_stack.pop() if state.font_stack else None
+            )
+            new_instructions.append(item)
+            continue
         if op_str == "Tf" and len(operands) >= 1:
             try:
-                current_font_name = str(operands[0])
+                state.current_font_name = str(operands[0])
             except Exception:
-                current_font_name = None
+                state.current_font_name = None
             new_instructions.append(item)
             continue
 
-        # Skip non-text operators
         if op_str not in _TEXT_OPERATORS and op_str != "TJ":
             new_instructions.append(item)
             continue
-
-        # Skip if already covered by existing /ActualText
-        if idx in covered:
+        if state.actualtext_depth > 0:
             new_instructions.append(item)
             continue
 
-        # Skip if no font context
-        if current_font_name is None:
-            new_instructions.append(item)
-            continue
-
-        font_obj = font_map.get(current_font_name)
-        if font_obj is None:
-            new_instructions.append(item)
-            continue
-
-        tounicode = _get_tounicode_map(font_obj, tounicode_cache)
-        if not tounicode:
-            new_instructions.append(item)
-            continue
-
-        is_cid = _is_cidfont(font_obj)
-
-        # Collect raw bytes from the text operand
         raw = _extract_text_bytes(op_str, operands)
         if raw is None:
             new_instructions.append(item)
             continue
 
-        # Check if any codes map to PUA
-        if not _has_pua_codes(raw, tounicode, is_cid):
+        font_obj = (
+            font_map.get(state.current_font_name)
+            if state.current_font_name is not None
+            else None
+        )
+        if font_obj is None and state.current_font_name is None and allow_unset_font:
+            unique_fonts: list[pikepdf.Object] = []
+            seen_indirect: set[_ObjectKey] = set()
+            for candidate in font_map.values():
+                key = _object_key(candidate)
+                if key is not None:
+                    if key in seen_indirect:
+                        continue
+                    seen_indirect.add(key)
+                unique_fonts.append(candidate)
+            if len(unique_fonts) == 1:
+                font_obj = unique_fonts[0]
+        if font_obj is None:
+            for candidate in font_map.values():
+                tounicode, code_space_ranges = _get_tounicode_info(
+                    candidate,
+                    tounicode_cache,
+                )
+                if tounicode and _has_pua_codes(raw, tounicode, code_space_ranges):
+                    warning_count += 1
+                    break
             new_instructions.append(item)
             continue
 
-        # Build ActualText
+        tounicode, code_space_ranges = _get_tounicode_info(font_obj, tounicode_cache)
+        if not tounicode:
+            new_instructions.append(item)
+            continue
+
+        if not _has_pua_codes(raw, tounicode, code_space_ranges):
+            new_instructions.append(item)
+            continue
+
         text, warnings = _build_actualtext_value(
-            raw, tounicode, is_cid, font_obj, encoding_cache
+            raw,
+            tounicode,
+            code_space_ranges,
+            font_obj,
+            encoding_cache,
+            type0_cache,
+            simple_symbol_cache,
         )
         warning_count += warnings
+        if text is None:
+            new_instructions.append(item)
+            continue
 
-        # Create BDC/EMC wrapper
         actualtext_bytes = _encode_actualtext(text)
         props = Dictionary()
         props[Name("/ActualText")] = String(actualtext_bytes)
@@ -512,16 +922,15 @@ def _fix_pua_in_stream(
     return wrapped_count, warning_count
 
 
-# ---------------------------------------------------------------------------
-# Traversal helpers
-# ---------------------------------------------------------------------------
-
-
 def _fix_pua_in_page_contents(
     page_dict: Dictionary,
     font_map: dict[str, pikepdf.Object],
-    tounicode_cache: dict[tuple[int, int], dict[int, int]],
+    tounicode_cache: dict[tuple[int, int], _ToUnicodeInfo],
     encoding_cache: dict[tuple[int, int], dict[int, str] | None],
+    type0_cache: dict[_ObjectKey, _Type0Resolver | None],
+    simple_symbol_cache: dict[_ObjectKey, _SimpleSymbolResolver],
+    resources: pikepdf.Object,
+    structural_actualtext_references: _StructuralActualTextReferences = frozenset(),
 ) -> tuple[int, int]:
     """Fixes PUA references in page Contents."""
     contents = page_dict.get("/Contents")
@@ -531,9 +940,22 @@ def _fix_pua_in_page_contents(
     contents = _resolve(contents)
     total_added = 0
     total_warnings = 0
+    state = _ContentState()
+    container_key = _object_key(page_dict)
 
     if isinstance(contents, Stream):
-        a, w = _fix_pua_in_stream(contents, font_map, tounicode_cache, encoding_cache)
+        a, w = _fix_pua_in_stream(
+            contents,
+            font_map,
+            tounicode_cache,
+            encoding_cache,
+            type0_cache,
+            simple_symbol_cache,
+            state,
+            resources,
+            structural_actualtext_references=structural_actualtext_references,
+            structural_container_key=container_key,
+        )
         total_added += a
         total_warnings += w
     elif isinstance(contents, Array):
@@ -541,251 +963,16 @@ def _fix_pua_in_page_contents(
             item = _resolve(item)
             if isinstance(item, Stream):
                 a, w = _fix_pua_in_stream(
-                    item, font_map, tounicode_cache, encoding_cache
-                )
-                total_added += a
-                total_warnings += w
-
-    return total_added, total_warnings
-
-
-def _fix_pua_in_form_xobjects(
-    resources: pikepdf.Object,
-    visited: set[tuple[int, int]],
-    tounicode_cache: dict[tuple[int, int], dict[int, int]],
-    encoding_cache: dict[tuple[int, int], dict[int, str] | None],
-) -> tuple[int, int]:
-    """Recurses into Form XObjects to fix PUA references."""
-    total_added = 0
-    total_warnings = 0
-    resources = _resolve(resources)
-    if not isinstance(resources, Dictionary):
-        return 0, 0
-
-    xobjects = resources.get("/XObject")
-    if not xobjects:
-        return 0, 0
-    xobjects = _resolve(xobjects)
-    if not isinstance(xobjects, Dictionary):
-        return 0, 0
-
-    for xobj_name in list(xobjects.keys()):
-        xobj = _resolve(xobjects[xobj_name])
-        if not isinstance(xobj, Stream):
-            continue
-
-        subtype = xobj.get("/Subtype")
-        if subtype is None or str(subtype) != "/Form":
-            continue
-
-        objgen = xobj.objgen
-        if objgen != (0, 0):
-            if objgen in visited:
-                continue
-            visited.add(objgen)
-
-        # Build font map from Form XObject's own resources
-        form_resources = xobj.get("/Resources")
-        if form_resources:
-            form_resources = _resolve(form_resources)
-            form_font_map = _build_font_map(form_resources)
-        else:
-            form_font_map = {}
-
-        a, w = _fix_pua_in_stream(xobj, form_font_map, tounicode_cache, encoding_cache)
-        total_added += a
-        total_warnings += w
-
-        # Recurse into nested Form XObjects and Patterns
-        if form_resources:
-            a, w = _fix_pua_in_form_xobjects(
-                form_resources, visited, tounicode_cache, encoding_cache
-            )
-            total_added += a
-            total_warnings += w
-            a, w = _fix_pua_in_patterns(
-                form_resources, visited, tounicode_cache, encoding_cache
-            )
-            total_added += a
-            total_warnings += w
-
-    return total_added, total_warnings
-
-
-def _fix_pua_in_patterns(
-    resources: pikepdf.Object,
-    visited: set[tuple[int, int]],
-    tounicode_cache: dict[tuple[int, int], dict[int, int]],
-    encoding_cache: dict[tuple[int, int], dict[int, str] | None],
-) -> tuple[int, int]:
-    """Recurses into Tiling Patterns to fix PUA references."""
-    total_added = 0
-    total_warnings = 0
-    resources = _resolve(resources)
-    if not isinstance(resources, Dictionary):
-        return 0, 0
-
-    patterns = resources.get("/Pattern")
-    if not patterns:
-        return 0, 0
-    patterns = _resolve(patterns)
-    if not isinstance(patterns, Dictionary):
-        return 0, 0
-
-    for pat_name in list(patterns.keys()):
-        try:
-            pattern = _resolve(patterns[pat_name])
-            if not isinstance(pattern, Stream):
-                continue
-
-            # Only process Tiling Patterns (PatternType 1)
-            pattern_type = pattern.get("/PatternType")
-            if pattern_type is None or int(pattern_type) != 1:
-                continue
-
-            objgen = pattern.objgen
-            if objgen != (0, 0):
-                if objgen in visited:
-                    continue
-                visited.add(objgen)
-
-            # Build font map from pattern's own resources
-            pat_resources = pattern.get("/Resources")
-            if pat_resources:
-                pat_resources = _resolve(pat_resources)
-                pat_font_map = _build_font_map(pat_resources)
-            else:
-                pat_font_map = {}
-
-            a, w = _fix_pua_in_stream(
-                pattern,
-                pat_font_map,
-                tounicode_cache,
-                encoding_cache,
-            )
-            total_added += a
-            total_warnings += w
-
-            # Recurse into nested Form XObjects and Patterns
-            if pat_resources:
-                a, w = _fix_pua_in_form_xobjects(
-                    pat_resources,
-                    visited,
+                    item,
+                    font_map,
                     tounicode_cache,
                     encoding_cache,
-                )
-                total_added += a
-                total_warnings += w
-                a, w = _fix_pua_in_patterns(
-                    pat_resources,
-                    visited,
-                    tounicode_cache,
-                    encoding_cache,
-                )
-                total_added += a
-                total_warnings += w
-        except Exception:
-            continue
-
-    return total_added, total_warnings
-
-
-def _fix_pua_in_ap_stream(
-    ap_entry: pikepdf.Object,
-    visited: set[tuple[int, int]],
-    tounicode_cache: dict[tuple[int, int], dict[int, int]],
-    encoding_cache: dict[tuple[int, int], dict[int, str] | None],
-) -> tuple[int, int]:
-    """Fixes PUA references in an annotation appearance stream entry."""
-    total_added = 0
-    total_warnings = 0
-    ap_entry = _resolve(ap_entry)
-
-    if isinstance(ap_entry, Stream):
-        ap_resources = ap_entry.get("/Resources")
-        ap_font_map = _build_font_map(ap_resources) if ap_resources else {}
-        a, w = _fix_pua_in_stream(
-            ap_entry, ap_font_map, tounicode_cache, encoding_cache
-        )
-        total_added += a
-        total_warnings += w
-        if ap_resources:
-            ap_resources = _resolve(ap_resources)
-            a, w = _fix_pua_in_form_xobjects(
-                ap_resources, visited, tounicode_cache, encoding_cache
-            )
-            total_added += a
-            total_warnings += w
-            a, w = _fix_pua_in_patterns(
-                ap_resources, visited, tounicode_cache, encoding_cache
-            )
-            total_added += a
-            total_warnings += w
-    elif isinstance(ap_entry, Dictionary):
-        for state_name in list(ap_entry.keys()):
-            state_stream = _resolve(ap_entry[state_name])
-            if isinstance(state_stream, Stream):
-                st_resources = state_stream.get("/Resources")
-                st_font_map = _build_font_map(st_resources) if st_resources else {}
-                a, w = _fix_pua_in_stream(
-                    state_stream,
-                    st_font_map,
-                    tounicode_cache,
-                    encoding_cache,
-                )
-                total_added += a
-                total_warnings += w
-                if st_resources:
-                    st_resources = _resolve(st_resources)
-                    a, w = _fix_pua_in_form_xobjects(
-                        st_resources,
-                        visited,
-                        tounicode_cache,
-                        encoding_cache,
-                    )
-                    total_added += a
-                    total_warnings += w
-                    a, w = _fix_pua_in_patterns(
-                        st_resources,
-                        visited,
-                        tounicode_cache,
-                        encoding_cache,
-                    )
-                    total_added += a
-                    total_warnings += w
-
-    return total_added, total_warnings
-
-
-def _fix_pua_in_type3_charprocs(
-    resources: pikepdf.Object,
-    visited: set[tuple[int, int]],
-    tounicode_cache: dict[tuple[int, int], dict[int, int]],
-    encoding_cache: dict[tuple[int, int], dict[int, str] | None],
-) -> tuple[int, int]:
-    """Fixes PUA references in Type3 font CharProcs."""
-    total_added = 0
-    total_warnings = 0
-
-    for _font_name, font in _iter_type3_fonts(resources, visited):
-        charprocs = font.get("/CharProcs")
-        if charprocs is None:
-            continue
-        charprocs = _resolve(charprocs)
-        if not isinstance(charprocs, Dictionary):
-            continue
-
-        font_resources = font.get("/Resources")
-        cp_font_map = _build_font_map(font_resources) if font_resources else {}
-
-        for cp_name in list(charprocs.keys()):
-            cp_stream = _resolve(charprocs[cp_name])
-            if isinstance(cp_stream, Stream):
-                a, w = _fix_pua_in_stream(
-                    cp_stream,
-                    cp_font_map,
-                    tounicode_cache,
-                    encoding_cache,
+                    type0_cache,
+                    simple_symbol_cache,
+                    state,
+                    resources,
+                    structural_actualtext_references=(structural_actualtext_references),
+                    structural_container_key=container_key,
                 )
                 total_added += a
                 total_warnings += w

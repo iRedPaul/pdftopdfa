@@ -4,6 +4,7 @@
 
 """Tests for JBIG2 external globals inlining and refinement detection."""
 
+import logging
 import struct
 import zlib
 from collections.abc import Generator
@@ -261,6 +262,17 @@ class TestConvertJbig2ExternalGlobals:
         assert result["failed"] == 0
         # Stream should be untouched
         assert stream.read_raw_bytes() == b"\x10\x11"
+
+    def test_skips_indirect_integer_without_warning(
+        self, pdf: Pdf, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pdf.make_indirect(42)
+        caplog.set_level(logging.WARNING, logger="pdftopdfa.sanitizers.jbig2")
+
+        result = convert_jbig2_external_globals(pdf)
+
+        assert result == {"converted": 0, "reencoded": 0, "failed": 0}
+        assert "Error processing object" not in caplog.text
 
     def test_mixed_streams(self, pdf: Pdf) -> None:
         """Mix of single filter, single-element array, and no-globals."""

@@ -22,6 +22,13 @@ from typing import Any
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
+from ..exceptions import ConversionError
+from ..fonts.glyph_usage import CharacterCode, FontUsageCache
+from ..fonts.tounicode import (
+    flatten_cid_encoding_cmap,
+    get_type0_cid_encoding_map,
+    parse_cid_encoding_cmap,
+)
 from ..fonts.traversal import iter_all_page_fonts
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
@@ -33,12 +40,63 @@ logger = logging.getLogger(__name__)
 _NAMED_CMAP_CIDSYSTEMINFO: dict[str, tuple[str, str, int]] = {
     "Identity-H": ("Adobe", "Identity", 0),
     "Identity-V": ("Adobe", "Identity", 0),
-    "UniGB-UTF16-H": ("Adobe", "GB1", 5),
-    "UniGB-UTF16-V": ("Adobe", "GB1", 5),
-    "UniJIS-UTF16-H": ("Adobe", "Japan1", 6),
-    "UniJIS-UTF16-V": ("Adobe", "Japan1", 6),
-    "UniCNS-UTF16-H": ("Adobe", "CNS1", 6),
-    "UniCNS-UTF16-V": ("Adobe", "CNS1", 6),
+    "83pv-RKSJ-H": ("Adobe", "Japan1", 1),
+    "90ms-RKSJ-H": ("Adobe", "Japan1", 2),
+    "90ms-RKSJ-V": ("Adobe", "Japan1", 2),
+    "90msp-RKSJ-H": ("Adobe", "Japan1", 2),
+    "90msp-RKSJ-V": ("Adobe", "Japan1", 2),
+    "90pv-RKSJ-H": ("Adobe", "Japan1", 1),
+    "Add-RKSJ-H": ("Adobe", "Japan1", 1),
+    "Add-RKSJ-V": ("Adobe", "Japan1", 1),
+    "EUC-H": ("Adobe", "Japan1", 1),
+    "EUC-V": ("Adobe", "Japan1", 1),
+    "Ext-RKSJ-H": ("Adobe", "Japan1", 2),
+    "Ext-RKSJ-V": ("Adobe", "Japan1", 2),
+    "H": ("Adobe", "Japan1", 1),
+    "V": ("Adobe", "Japan1", 1),
+    "UniJIS-UCS2-H": ("Adobe", "Japan1", 4),
+    "UniJIS-UCS2-V": ("Adobe", "Japan1", 4),
+    "UniJIS-UCS2-HW-H": ("Adobe", "Japan1", 4),
+    "UniJIS-UCS2-HW-V": ("Adobe", "Japan1", 4),
+    "UniJIS-UTF16-H": ("Adobe", "Japan1", 5),
+    "UniJIS-UTF16-V": ("Adobe", "Japan1", 5),
+    "GB-EUC-H": ("Adobe", "GB1", 0),
+    "GB-EUC-V": ("Adobe", "GB1", 0),
+    "GBpc-EUC-H": ("Adobe", "GB1", 0),
+    "GBpc-EUC-V": ("Adobe", "GB1", 0),
+    "GBK-EUC-H": ("Adobe", "GB1", 2),
+    "GBK-EUC-V": ("Adobe", "GB1", 2),
+    "GBKp-EUC-H": ("Adobe", "GB1", 2),
+    "GBKp-EUC-V": ("Adobe", "GB1", 2),
+    "GBK2K-H": ("Adobe", "GB1", 4),
+    "GBK2K-V": ("Adobe", "GB1", 4),
+    "UniGB-UCS2-H": ("Adobe", "GB1", 4),
+    "UniGB-UCS2-V": ("Adobe", "GB1", 4),
+    "UniGB-UTF16-H": ("Adobe", "GB1", 4),
+    "UniGB-UTF16-V": ("Adobe", "GB1", 4),
+    "B5pc-H": ("Adobe", "CNS1", 0),
+    "B5pc-V": ("Adobe", "CNS1", 0),
+    "HKscs-B5-H": ("Adobe", "CNS1", 3),
+    "HKscs-B5-V": ("Adobe", "CNS1", 3),
+    "ETen-B5-H": ("Adobe", "CNS1", 0),
+    "ETen-B5-V": ("Adobe", "CNS1", 0),
+    "ETenms-B5-H": ("Adobe", "CNS1", 0),
+    "ETenms-B5-V": ("Adobe", "CNS1", 0),
+    "CNS-EUC-H": ("Adobe", "CNS1", 0),
+    "CNS-EUC-V": ("Adobe", "CNS1", 0),
+    "UniCNS-UCS2-H": ("Adobe", "CNS1", 3),
+    "UniCNS-UCS2-V": ("Adobe", "CNS1", 3),
+    "UniCNS-UTF16-H": ("Adobe", "CNS1", 4),
+    "UniCNS-UTF16-V": ("Adobe", "CNS1", 4),
+    "KSC-EUC-H": ("Adobe", "Korea1", 0),
+    "KSC-EUC-V": ("Adobe", "Korea1", 0),
+    "KSCms-UHC-H": ("Adobe", "Korea1", 1),
+    "KSCms-UHC-V": ("Adobe", "Korea1", 1),
+    "KSCms-UHC-HW-H": ("Adobe", "Korea1", 1),
+    "KSCms-UHC-HW-V": ("Adobe", "Korea1", 1),
+    "KSCpc-EUC-H": ("Adobe", "Korea1", 0),
+    "UniKS-UCS2-H": ("Adobe", "Korea1", 1),
+    "UniKS-UCS2-V": ("Adobe", "Korea1", 1),
     "UniKS-UTF16-H": ("Adobe", "Korea1", 2),
     "UniKS-UTF16-V": ("Adobe", "Korea1", 2),
 }
@@ -160,7 +218,7 @@ def _fix_cidsysteminfo(
     cidfont_dict: Dictionary,
     expected: tuple[str, str, int],
 ) -> bool:
-    """Fix CIDSystemInfo in a CIDFont dictionary to match the expected values.
+    """Make CIDSystemInfo compatible with the CMap's system information.
 
     Args:
         cidfont_dict: The CIDFont dictionary (modified in place).
@@ -169,27 +227,42 @@ def _fix_cidsysteminfo(
     Returns:
         True if CIDSystemInfo was modified.
     """
-    registry, ordering, supplement = expected
+    registry, ordering, maximum_supplement = expected
 
     existing = cidfont_dict.get("/CIDSystemInfo")
+    existing_supplement: int | None = None
     if existing is not None:
         existing = _resolve(existing)
         if isinstance(existing, Dictionary):
             existing_reg = str(existing.get("/Registry", ""))
             existing_ord = str(existing.get("/Ordering", ""))
-            existing_sup = int(existing.get("/Supplement", -1))
+            try:
+                existing_supplement = int(existing.get("/Supplement", -1))
+            except (TypeError, ValueError):
+                existing_supplement = None
+
+            target_supplement = (
+                existing_supplement
+                if existing_supplement is not None
+                and 0 <= existing_supplement <= maximum_supplement
+                else maximum_supplement
+            )
 
             if (
                 existing_reg == registry
                 and existing_ord == ordering
-                and existing_sup == supplement
+                and existing_supplement == target_supplement
             ):
                 return False
+        else:
+            target_supplement = maximum_supplement
+    else:
+        target_supplement = maximum_supplement
 
     cidfont_dict[Name.CIDSystemInfo] = Dictionary(
         Registry=registry,
         Ordering=ordering,
-        Supplement=supplement,
+        Supplement=target_supplement,
     )
     return True
 
@@ -285,6 +358,7 @@ def _iter_embedded_type1_fonts(
 def _sanitize_cmap_encoding(
     font_dict: Dictionary,
     font_name: str,
+    usage_cache: FontUsageCache,
 ) -> dict[str, int]:
     """Fix CMap encoding issues for PDF/A-2 compliance (6.2.11.3.3).
 
@@ -363,34 +437,46 @@ def _sanitize_cmap_encoding(
                 replace = True
 
         if replace:
-            # Try stripping only the /UseCMap entry to preserve real
-            # character mappings (e.g. Shift-JIS → CIDs).
             try:
+                effective_mapping = get_type0_cid_encoding_map(font_dict)
+                if effective_mapping is None:
+                    used_codes: set[CharacterCode] | None = None
+                    if font_dict.objgen != (0, 0):
+                        used_codes = usage_cache.get().get(font_dict.objgen)
+                    local_mapping = parse_cid_encoding_cmap(data.encode("latin-1"))
+                    if (
+                        not used_codes
+                        or not local_mapping.code_space_ranges
+                        or not all(
+                            local_mapping.has_mapping(code) for code in used_codes
+                        )
+                    ):
+                        raise ConversionError(
+                            f"Cannot resolve inherited CMap for font {font_name}"
+                        )
+                    effective_mapping = local_mapping
+                new_data = flatten_cid_encoding_cmap(
+                    data.encode("latin-1"),
+                    effective_mapping,
+                )
+                if new_data is None:
+                    raise ConversionError(
+                        f"Cannot materialize inherited CMap for font {font_name}"
+                    )
+                encoding.write(new_data)
                 del encoding["/UseCMap"]
-                # Remove the `usecmap` operator from the CMap program text
-                new_data = re.sub(r"(?m)^\s*\S+\s+usecmap\s*$", "", data)
-                if new_data != data:
-                    encoding.write(new_data.encode("latin-1"))
                 counts["cmap_encoding_fixed"] = 1
-                logger.warning(
-                    "Stripped non-standard /UseCMap from CMap for font %s; "
-                    "character mappings may be affected",
+                logger.info(
+                    "Materialized inherited mappings and removed non-standard "
+                    "/UseCMap from CMap for font %s",
                     font_name,
                 )
-            except Exception as strip_err:
-                # Fallback: wholesale replacement (destroys mappings)
-                wmode = int(wmode_match.group(1)) if wmode_match else 0
-                replacement = "Identity-V" if wmode == 1 else "Identity-H"
-                font_dict[Name.Encoding] = Name("/" + replacement)
-                counts["cmap_encoding_fixed"] = 1
-                logger.warning(
-                    "Replaced CMap with /%s for font %s "
-                    "(stripping /UseCMap failed: %s); "
-                    "character mappings were destroyed",
-                    replacement,
-                    font_name,
-                    strip_err,
-                )
+            except ConversionError:
+                raise
+            except Exception as exc:
+                raise ConversionError(
+                    f"Cannot safely flatten inherited CMap for font {font_name}: {exc}"
+                ) from exc
 
     return counts
 
@@ -510,14 +596,9 @@ def sanitize_fontname_consistency(pdf: Pdf) -> dict[str, int]:
     return {"fontname_fixed": total_fixed}
 
 
-def _check_cid_values_over_65535(cidfont: Dictionary, font_name: str) -> int:
-    """Check /W, /W2, and /CIDToGIDMap for CID values exceeding 65535.
-
-    Logs a warning for each violation found and returns the count.
-    Cannot fix these automatically — out-of-range CID values indicate a
-    severely malformed font (ISO 19005-2 rule 6.1.13-10).
-    """
-    warned = 0
+def _sanitize_cid_values_over_65535(cidfont: Dictionary, font_name: str) -> int:
+    """Remove out-of-range CID data while preserving every valid CID entry."""
+    fixed = 0
     for key in ("/W", "/W2"):
         w = cidfont.get(key)
         if w is None:
@@ -526,80 +607,104 @@ def _check_cid_values_over_65535(cidfont: Dictionary, font_name: str) -> int:
         if not isinstance(w, Array):
             continue
         items = list(w)
+        rewritten: list[pikepdf.Object] = []
+        values_per_cid = 1 if key == "/W" else 3
+        range_entry_size = 3 if key == "/W" else 5
+        changed = False
         i = 0
         while i < len(items):
             item = _resolve(items[i])
             if isinstance(item, Array):
-                # Unexpected array at top level; skip
+                rewritten.append(items[i])
                 i += 1
                 continue
             try:
                 cid = int(item)
             except Exception:
+                rewritten.append(items[i])
                 i += 1
                 continue
-            if i + 1 < len(items):
-                nxt = _resolve(items[i + 1])
-                if isinstance(nxt, Array):
-                    # Format 1: cid [w1 w2 ...]
-                    if cid > 65535:
-                        logger.warning(
-                            "CIDFont %s: CID %d in /%s exceeds 65535"
-                            " (ISO 19005-2 rule 6.1.13-10); cannot fix automatically",
-                            font_name,
-                            cid,
-                            key[1:],
-                        )
-                        warned += 1
-                    i += 2
-                else:
-                    # Format 2: cid_first cid_last width
-                    try:
-                        cid_last = int(nxt)
-                    except Exception:
-                        i += 1
-                        continue
-                    if cid > 65535 or cid_last > 65535:
-                        logger.warning(
-                            "CIDFont %s: CID range %d\u2013%d in /%s exceeds 65535"
-                            " (ISO 19005-2 rule 6.1.13-10); cannot fix automatically",
-                            font_name,
-                            cid,
-                            cid_last,
-                            key[1:],
-                        )
-                        warned += 1
-                    i += 3
-            else:
+            if i + 1 >= len(items):
+                rewritten.append(items[i])
                 i += 1
+                continue
 
-    # /CIDToGIDMap stream: 2 bytes per CID entry; > 131072 bytes means CIDs > 65535
+            nxt = _resolve(items[i + 1])
+            if isinstance(nxt, Array):
+                if cid > 65_535:
+                    changed = True
+                    fixed += 1
+                    i += 2
+                    continue
+                allowed_values = (65_535 - cid + 1) * values_per_cid
+                if len(nxt) > allowed_values:
+                    rewritten.extend([items[i], Array(list(nxt)[:allowed_values])])
+                    changed = True
+                    fixed += 1
+                else:
+                    rewritten.extend(items[i : i + 2])
+                i += 2
+                continue
+
+            if i + range_entry_size > len(items):
+                rewritten.extend(items[i:])
+                break
+            try:
+                cid_last = int(nxt)
+            except Exception:
+                rewritten.append(items[i])
+                i += 1
+                continue
+            if cid > 65_535:
+                changed = True
+                fixed += 1
+                i += range_entry_size
+                continue
+            rewritten.append(items[i])
+            if cid_last > 65_535:
+                rewritten.append(65_535)
+                changed = True
+                fixed += 1
+            else:
+                rewritten.append(items[i + 1])
+            rewritten.extend(items[i + 2 : i + range_entry_size])
+            i += range_entry_size
+
+        if changed:
+            cidfont[key] = Array(rewritten)
+
+    # A stream has one two-byte GID per CID, starting at CID 0.
     cidtogidmap = cidfont.get("/CIDToGIDMap")
     if cidtogidmap is not None:
         resolved = _resolve(cidtogidmap)
         if isinstance(resolved, Stream):
             data = resolved.read_bytes()
-            if len(data) > 131072:
-                logger.warning(
-                    "CIDFont %s: /CIDToGIDMap stream length %d implies CID values"
-                    " > 65535 (ISO 19005-2 rule 6.1.13-10); cannot fix automatically",
-                    font_name,
-                    len(data),
-                )
-                warned += 1
+            if len(data) > 131_072:
+                resolved.write(data[:131_072])
+                fixed += 1
 
-    return warned
+    if fixed:
+        logger.warning(
+            "Removed or clipped %d CIDFont entr(y/ies) above CID 65535 for %s",
+            fixed,
+            font_name,
+        )
+    return fixed
 
 
-def sanitize_cidfont_structures(pdf: Pdf) -> dict[str, int]:
+def sanitize_cidfont_structures(
+    pdf: Pdf,
+    usage_cache: FontUsageCache | None = None,
+) -> dict[str, int]:
     """Sanitize CIDFont structures for PDF/A-2 compliance.
 
     Fixes:
     1. CMap encoding issues — non-standard names, WMode, UseCMap (6.2.11.3.3)
     2. CIDSystemInfo consistency between CMap and CIDFont dict (6.2.11.3.1)
     3. Missing/invalid CIDToGIDMap on CIDFontType2 fonts (6.2.11.3.2)
-    4. Removes CIDSet entries that may be incorrect (6.2.11.4.2)
-    5. Removes Type1/MMType1 FontDescriptor /CharSet (allowed in PDF/A-2/3)
+    4. Out-of-range CID width and CIDToGIDMap entries (6.1.13-10)
+    5. Removes CIDSet entries that may be incorrect (6.2.11.4.2)
+    6. Removes Type1/MMType1 FontDescriptor /CharSet (allowed in PDF/A-2/3)
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
@@ -614,8 +719,10 @@ def sanitize_cidfont_structures(pdf: Pdf) -> dict[str, int]:
         "type1_charset_removed": 0,
         "cmap_encoding_fixed": 0,
         "cmap_wmode_fixed": 0,
+        "cid_values_over_65535_fixed": 0,
         "cid_values_over_65535_warned": 0,
     }
+    usage_cache = usage_cache or FontUsageCache(pdf)
 
     for font_name, font_dict in _iter_type0_fonts(pdf):
         descendant_fonts = font_dict.get("/DescendantFonts")
@@ -637,7 +744,7 @@ def sanitize_cidfont_structures(pdf: Pdf) -> dict[str, int]:
 
         # 1. Fix CMap encoding issues (6.2.11.3.3) — must run before
         #    CIDSystemInfo fix so the encoding is correct when we look it up.
-        cmap_counts = _sanitize_cmap_encoding(font_dict, font_name)
+        cmap_counts = _sanitize_cmap_encoding(font_dict, font_name, usage_cache)
         result["cmap_encoding_fixed"] += cmap_counts["cmap_encoding_fixed"]
         result["cmap_wmode_fixed"] += cmap_counts["cmap_wmode_fixed"]
 
@@ -648,11 +755,22 @@ def sanitize_cidfont_structures(pdf: Pdf) -> dict[str, int]:
         if encoding is not None:
             expected_info = _get_cidsysteminfo_from_cmap(encoding)
             if expected_info is not None:
+                cidsysteminfo_fixed = False
+                resolved_encoding = _resolve(encoding)
+                if isinstance(resolved_encoding, Stream):
+                    cidsysteminfo_fixed = _fix_cidsysteminfo(
+                        resolved_encoding,
+                        expected_info,
+                    )
+
                 # Don't force Identity-0 on CIDFontType0 — these fonts use
                 # their CFF program's internal CID ordering, not GID mapping.
                 _registry, ordering, _supplement = expected_info
                 skip = ordering == "Identity" and cidfont_subtype_str == "/CIDFontType0"
                 if not skip and _fix_cidsysteminfo(cidfont, expected_info):
+                    cidsysteminfo_fixed = True
+
+                if cidsysteminfo_fixed:
                     result["cidsysteminfo_fixed"] += 1
                     logger.info(
                         "Fixed CIDSystemInfo for font %s: %s-%s-%d",
@@ -678,8 +796,8 @@ def sanitize_cidfont_structures(pdf: Pdf) -> dict[str, int]:
                     font_name,
                 )
 
-        # 4. Check for CID values > 65535 (6.1.13-10) — warn only, cannot fix
-        result["cid_values_over_65535_warned"] += _check_cid_values_over_65535(
+        # 4. Remove entries beyond the maximum CID (6.1.13-10).
+        result["cid_values_over_65535_fixed"] += _sanitize_cid_values_over_65535(
             cidfont, font_name
         )
 
@@ -713,13 +831,15 @@ def sanitize_cidfont_structures(pdf: Pdf) -> dict[str, int]:
             "CIDFont sanitization: %d CIDSystemInfo fixed, "
             "%d CIDToGIDMap fixed, %d CIDSet removed, "
             "%d Type1 /CharSet removed, %d CMap encoding fixed, "
-            "%d CMap WMode fixed, %d CID-value-over-65535 warned",
+            "%d CMap WMode fixed, %d CID-value-over-65535 fixed, "
+            "%d warned",
             result["cidsysteminfo_fixed"],
             result["cidtogidmap_fixed"],
             result["cidset_removed"],
             result["type1_charset_removed"],
             result["cmap_encoding_fixed"],
             result["cmap_wmode_fixed"],
+            result["cid_values_over_65535_fixed"],
             result["cid_values_over_65535_warned"],
         )
 

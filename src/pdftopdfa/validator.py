@@ -258,10 +258,14 @@ def _detect_iso_standard(
 
 
 _ISO_STANDARD_DEFS = [
-    ("pdfxid", "GTS_PDFXVersion", "PDF/X"),
-    ("pdfuaid", "part", "PDF/UA"),
-    ("pdfeid", "part", "PDF/E"),
-    ("pdfvtid", "GTS_PDFVTVersion", "PDF/VT"),
+    ("pdfxid", ("GTS_PDFXVersion",), "PDF/X"),
+    ("pdfuaid", ("part",), "PDF/UA"),
+    (
+        "pdfeid",
+        ("ISO_PDFEVersion", "GTS_PDFEVersion", "part"),
+        "PDF/E",
+    ),
+    ("pdfvtid", ("GTS_PDFVTVersion",), "PDF/VT"),
 ]
 
 
@@ -284,13 +288,15 @@ def detect_iso_standards(pdf: pikepdf.Pdf) -> list[ISOStandardInfo]:
 
     standards: list[ISOStandardInfo] = []
 
-    for ns_key, element_name, standard in _ISO_STANDARD_DEFS:
-        try:
-            result = _detect_iso_standard(tree, ns_key, element_name, standard)
-            if result is not None:
-                standards.append(result)
-        except (AttributeError, KeyError, TypeError, ValueError) as e:
-            logger.debug("Error detecting ISO standard: %s", e)
+    for ns_key, element_names, standard in _ISO_STANDARD_DEFS:
+        for element_name in element_names:
+            try:
+                result = _detect_iso_standard(tree, ns_key, element_name, standard)
+                if result is not None:
+                    standards.append(result)
+                    break
+            except (AttributeError, KeyError, TypeError, ValueError) as e:
+                logger.debug("Error detecting ISO standard: %s", e)
 
     if standards:
         logger.debug(

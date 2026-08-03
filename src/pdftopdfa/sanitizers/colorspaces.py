@@ -17,6 +17,7 @@ from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
 
 from ..color_profile import get_cmyk_profile, get_gray_profile, get_srgb_profile
 from ..exceptions import ConversionError
+from ..fonts.glyph_usage import _iter_content_streams_with_resources
 from ..utils import iter_type3_fonts as _iter_type3_fonts
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
@@ -99,7 +100,7 @@ def _validate_icc_in_resources(resources, location_prefix: str, validate_icc_str
 def _validate_icc_in_form_xobjects_recursive(
     resources, visited: set, location_prefix: str, validate_icc_stream
 ):
-    """Recurse into Form XObjects' nested Resources for ICCBased profiles.
+    """Traverse Form XObjects' nested Resources for ICCBased profiles.
 
     Args:
         resources: A resolved Resources dictionary.
@@ -107,46 +108,34 @@ def _validate_icc_in_form_xobjects_recursive(
         location_prefix: String prefix for log/warning locations.
         validate_icc_stream: Closure that validates a single ICC stream.
     """
-    resources = _resolve_indirect(resources)
-
-    if not isinstance(resources, Dictionary):
-        return
-
-    xobjects = resources.get("/XObject")
-    if not xobjects:
-        return
-
-    xobjects = _resolve_indirect(xobjects)
-    if not isinstance(xobjects, Dictionary):
-        return
-
-    for xobj_name in list(xobjects.keys()):
-        xobj = _resolve_indirect(xobjects[xobj_name])
-
-        if not isinstance(xobj, Stream):
+    pending = [(resources, location_prefix)]
+    while pending:
+        current_resources, current_location = pending.pop()
+        current_resources = _resolve_indirect(current_resources)
+        if not isinstance(current_resources, Dictionary):
             continue
 
-        subtype = xobj.get("/Subtype")
-        if subtype is None or str(subtype) != "/Form":
+        xobjects = _resolve_indirect(current_resources.get("/XObject"))
+        if not isinstance(xobjects, Dictionary):
             continue
 
-        # Cycle detection using objgen for indirect objects
-        objgen = xobj.objgen
-        if objgen != (0, 0):
-            if objgen in visited:
+        for xobj_name in list(xobjects.keys()):
+            xobj = _resolve_indirect(xobjects[xobj_name])
+            if not isinstance(xobj, Stream) or xobj.get("/Subtype") != Name.Form:
                 continue
-            visited.add(objgen)
 
-        # Process this Form XObject's own Resources
-        form_resources = xobj.get("/Resources")
-        if form_resources:
-            form_resources = _resolve_indirect(form_resources)
-            form_loc = f"{location_prefix}/XObject/{xobj_name}"
+            objgen = xobj.objgen
+            if objgen != (0, 0):
+                if objgen in visited:
+                    continue
+                visited.add(objgen)
+
+            form_resources = _resolve_indirect(xobj.get("/Resources"))
+            if not isinstance(form_resources, Dictionary):
+                continue
+            form_loc = f"{current_location}/XObject/{xobj_name}"
             _validate_icc_in_resources(form_resources, form_loc, validate_icc_stream)
-            # Recurse into nested Form XObjects
-            _validate_icc_in_form_xobjects_recursive(
-                form_resources, visited, form_loc, validate_icc_stream
-            )
+            pending.append((form_resources, form_loc))
 
 
 def _validate_icc_in_ap_stream(
@@ -325,7 +314,7 @@ def validate_embedded_icc_profiles(
 
     Args:
         pdf: pikepdf Pdf object.
-        level: PDF/A conformance level ('2b' or '3b').
+        level: PDF/A conformance level.
         repair: If True, replace invalid ICC profiles in-place.
 
     Returns:
@@ -554,6 +543,20 @@ def validate_embedded_icc_profiles(
                                     ap_entry, visited, ap_loc, validate_icc_stream
                                 )
 
+            for owner, nested_resources in _iter_content_streams_with_resources(page):
+                owner = _resolve_indirect(owner)
+                owner_objgen = getattr(owner, "objgen", (0, 0))
+                nested_loc = (
+                    f"{page_loc}/ResourceContext/{owner_objgen[0]}"
+                    if owner_objgen != (0, 0)
+                    else f"{page_loc}/ResourceContext"
+                )
+                _validate_icc_in_resources(
+                    nested_resources,
+                    nested_loc,
+                    validate_icc_stream,
+                )
+
         except Exception as e:
             log_suppressed_error(
                 logger, e, "Error validating ICC on page %d: %s", page_num, e
@@ -619,9 +622,6 @@ def _normalize_pdf_name(value) -> str | None:
 def _normalized_object_signature(
     obj,
     seen: set[tuple[int, int]] | None = None,
-    *,
-    _depth: int = 0,
-    _max_depth: int = 50,
 ):
     """Build a structure-preserving signature for PDF object comparison.
 
@@ -632,87 +632,71 @@ def _normalized_object_signature(
     if seen is None:
         seen = set()
 
-    if _depth >= _max_depth:
-        return ("truncated",)
+    signature = []
+    pending = [("value", obj)]
+    while pending:
+        kind, value = pending.pop()
+        if kind != "value":
+            signature.append((kind, value))
+            continue
 
-    obj = _resolve_indirect(obj)
-    objgen = getattr(obj, "objgen", (0, 0))
-    if objgen != (0, 0):
-        if objgen in seen:
-            return ("ref", objgen)
-        seen.add(objgen)
-
-    if isinstance(obj, Name):
-        return ("name", str(obj))
-
-    next_depth = _depth + 1
-
-    if isinstance(obj, Stream):
-        d_items = []
-        for k in sorted(obj.keys(), key=str):
-            k_str = str(k)
-            if k_str in _STREAM_COMPARE_IGNORED_KEYS:
+        value = _resolve_indirect(value)
+        objgen = getattr(value, "objgen", (0, 0))
+        if objgen != (0, 0):
+            if objgen in seen:
+                signature.append(("ref", objgen))
                 continue
-            d_items.append(
-                (
-                    k_str,
-                    _normalized_object_signature(
-                        obj[k],
-                        seen,
-                        _depth=next_depth,
-                        _max_depth=_max_depth,
-                    ),
-                )
-            )
-        try:
-            data = bytes(obj.read_bytes())
-        except Exception:
-            data = b""
-        return ("stream", tuple(d_items), data)
+            seen.add(objgen)
 
-    if isinstance(obj, Dictionary):
-        items = []
-        for k in sorted(obj.keys(), key=str):
-            items.append(
-                (
-                    str(k),
-                    _normalized_object_signature(
-                        obj[k],
-                        seen,
-                        _depth=next_depth,
-                        _max_depth=_max_depth,
-                    ),
-                )
-            )
-        return ("dict", tuple(items))
+        if isinstance(value, Name):
+            signature.append(("name", str(value)))
+            continue
 
-    if isinstance(obj, Array):
-        return (
-            "array",
-            tuple(
-                _normalized_object_signature(
-                    item,
-                    seen,
-                    _depth=next_depth,
-                    _max_depth=_max_depth,
-                )
-                for item in obj
-            ),
-        )
+        if isinstance(value, Stream):
+            keys = [
+                key
+                for key in sorted(value.keys(), key=str)
+                if str(key) not in _STREAM_COMPARE_IGNORED_KEYS
+            ]
+            try:
+                data = bytes(value.read_bytes())
+            except Exception:
+                data = b""
+            signature.append(("stream", None))
+            pending.append(("end-stream", data))
+            for key in reversed(keys):
+                pending.append(("value", value[key]))
+                pending.append(("key", str(key)))
+            continue
 
-    if isinstance(obj, bytes):
-        return ("bytes", obj)
+        if isinstance(value, Dictionary):
+            keys = sorted(value.keys(), key=str)
+            signature.append(("dict", None))
+            pending.append(("end-dict", None))
+            for key in reversed(keys):
+                pending.append(("value", value[key]))
+                pending.append(("key", str(key)))
+            continue
 
-    if isinstance(obj, str):
-        return ("str", obj)
+        if isinstance(value, Array):
+            signature.append(("array", None))
+            pending.append(("end-array", None))
+            for item in reversed(list(value)):
+                pending.append(("value", item))
+            continue
 
-    if isinstance(obj, bool):
-        return ("bool", obj)
+        if isinstance(value, bytes):
+            signature.append(("bytes", value))
+        elif isinstance(value, str):
+            signature.append(("str", value))
+        elif isinstance(value, bool):
+            signature.append(("bool", value))
+        elif isinstance(value, (int, float)):
+            signature.append(("number", value))
+        else:
+            signature.append(("scalar", str(value)))
 
-    if isinstance(obj, (int, float)):
-        return ("number", obj)
-
-    return ("scalar", str(obj))
+    return tuple(signature)
 
 
 def _register_or_fix_separation(
@@ -756,7 +740,7 @@ def _register_or_fix_separation(
 def _sanitize_colorspace_array(
     cs,
     canonical_by_name: dict[str, tuple[object, object, object]],
-    visited_cs: set[tuple[int, int]],
+    visited_cs: dict[tuple[int, int], object | None],
 ) -> tuple[int, int, object | None]:
     """Sanitize DeviceN/Separation consistency inside a color space object.
 
@@ -767,153 +751,141 @@ def _sanitize_colorspace_array(
     """
     colorants_added = 0
     separations_normalized = 0
+    replacement = None
+    pending = [(cs, None, None)]
 
-    cs = _resolve_indirect(cs)
-    if not isinstance(cs, Array) or len(cs) == 0:
-        return 0, 0, None
+    while pending:
+        current, parent, parent_key = pending.pop()
+        current = _resolve_indirect(current)
+        if not isinstance(current, Array) or len(current) == 0:
+            continue
 
-    objgen = getattr(cs, "objgen", (0, 0))
-    if objgen != (0, 0):
-        if objgen in visited_cs:
-            return 0, 0, None
-        visited_cs.add(objgen)
+        objgen = getattr(current, "objgen", (0, 0))
+        if objgen != (0, 0):
+            if objgen in visited_cs:
+                cached_replacement = visited_cs[objgen]
+                if cached_replacement is not None:
+                    if parent is None:
+                        replacement = cached_replacement
+                    else:
+                        parent[parent_key] = cached_replacement
+                continue
+            visited_cs[objgen] = None
 
-    cs_type = str(cs[0])
+        cs_type = str(current[0])
 
-    if cs_type == "/Separation":
-        separations_normalized += _register_or_fix_separation(cs, canonical_by_name)
-        if len(cs) >= 3:
-            alt = _resolve_indirect(cs[2])
-            if isinstance(alt, Array):
-                a, b, repl = _sanitize_colorspace_array(
-                    alt, canonical_by_name, visited_cs
-                )
-                colorants_added += a
-                separations_normalized += b
-                if repl is not None:
-                    cs[2] = repl
-        return colorants_added, separations_normalized, None
+        if cs_type == "/Separation":
+            separations_normalized += _register_or_fix_separation(
+                current, canonical_by_name
+            )
+            if len(current) >= 3:
+                alternate = _resolve_indirect(current[2])
+                if isinstance(alternate, Array):
+                    pending.append((alternate, current, 2))
+            continue
 
-    if cs_type == "/DeviceN":
-        names = _resolve_indirect(cs[1]) if len(cs) >= 2 else None
-        if not isinstance(names, Array):
-            return colorants_added, separations_normalized, None
+        if cs_type == "/DeviceN":
+            names = _resolve_indirect(current[1]) if len(current) >= 2 else None
+            if not isinstance(names, Array):
+                continue
 
-        if len(names) > 32:
-            alternate = _resolve_indirect(cs[2]) if len(cs) >= 3 else None
-            if alternate is None:
-                raise ConversionError(
-                    f"PDF contains a DeviceN colour space with {len(names)} colorants "
-                    "(exceeds 32 per ISO 19005-2 rule 6.1.13-9) and has no alternate "
-                    "colour space; cannot repair"
-                )
-            if isinstance(alternate, Array):
-                if len(alternate) >= 1 and str(alternate[0]) == "/DeviceN":
+            if len(names) > 32:
+                alternate = _resolve_indirect(current[2]) if len(current) >= 3 else None
+                if alternate is None:
+                    raise ConversionError(
+                        "PDF contains a DeviceN colour space with "
+                        f"{len(names)} colorants (exceeds 32 per ISO 19005-2 "
+                        "rule 6.1.13-9) and has no alternate colour space; "
+                        "cannot repair"
+                    )
+                if (
+                    isinstance(alternate, Array)
+                    and len(alternate) >= 1
+                    and str(alternate[0]) == "/DeviceN"
+                ):
                     alt_names = (
                         _resolve_indirect(alternate[1]) if len(alternate) >= 2 else None
                     )
                     if isinstance(alt_names, Array) and len(alt_names) > 32:
                         raise ConversionError(
-                            f"PDF contains a DeviceN colour space with {len(names)} "
-                            "colorants (exceeds 32 per ISO 19005-2 rule 6.1.13-9); "
-                            "its alternate is also a DeviceN with too many colorants; "
-                            "cannot repair"
+                            "PDF contains a DeviceN colour space with "
+                            f"{len(names)} colorants (exceeds 32 per ISO 19005-2 "
+                            "rule 6.1.13-9); its alternate is also a DeviceN "
+                            "with too many colorants; cannot repair"
                         )
-            logger.warning(
-                "DeviceN colour space has %d colorants (exceeds 32, ISO 19005-2 "
-                "rule 6.1.13-9); replacing with alternate colour space (lossy)",
-                len(names),
-            )
-            return 0, 0, cs[2]
-
-        if len(cs) < 4:
-            return colorants_added, separations_normalized, None
-
-        # DeviceN attributes dictionary (index 4) is optional.
-        attrs = _resolve_indirect(cs[4]) if len(cs) >= 5 else None
-        if not isinstance(attrs, Dictionary):
-            attrs = Dictionary()
-            if len(cs) >= 5:
-                cs[4] = attrs
-            else:
-                cs.append(attrs)
-            colorants_added += 1
-
-        colorants = _resolve_indirect(attrs.get("/Colorants"))
-        if not isinstance(colorants, Dictionary):
-            colorants = Dictionary()
-            attrs[Name.Colorants] = colorants
-            colorants_added += 1
-
-        alternate = cs[2]
-        tint_transform = cs[3]
-
-        # Add missing Colorants entries for spot components.
-        for component in names:
-            comp_name = _normalize_pdf_name(component)
-            if not comp_name or comp_name in _PROCESS_COLOR_NAMES:
+                logger.warning(
+                    "DeviceN colour space has %d colorants (exceeds 32, ISO "
+                    "19005-2 rule 6.1.13-9); replacing with alternate colour "
+                    "space (lossy)",
+                    len(names),
+                )
+                if parent is None:
+                    replacement = current[2]
+                else:
+                    parent[parent_key] = current[2]
+                if objgen != (0, 0):
+                    visited_cs[objgen] = current[2]
                 continue
 
-            if comp_name not in colorants:
-                separation = Array(
-                    [
-                        Name.Separation,
-                        Name(comp_name),
-                        alternate,
-                        tint_transform,
-                    ]
-                )
-                colorants[Name(comp_name)] = separation
+            if len(current) < 4:
+                continue
+
+            attrs = _resolve_indirect(current[4]) if len(current) >= 5 else None
+            if not isinstance(attrs, Dictionary):
+                attrs = Dictionary()
+                if len(current) >= 5:
+                    current[4] = attrs
+                else:
+                    current.append(attrs)
                 colorants_added += 1
-                logger.debug("Added missing DeviceN Colorants entry for %s", comp_name)
 
-        # Consistency: all Separation arrays of same name must match.
-        for cname in list(colorants.keys()):
-            cspace = _resolve_indirect(colorants[cname])
-            if isinstance(cspace, Array):
-                a, b, repl = _sanitize_colorspace_array(
-                    cspace, canonical_by_name, visited_cs
-                )
-                colorants_added += a
-                separations_normalized += b
-                if repl is not None:
-                    colorants[Name(cname)] = repl
+            colorants = _resolve_indirect(attrs.get("/Colorants"))
+            if not isinstance(colorants, Dictionary):
+                colorants = Dictionary()
+                attrs[Name.Colorants] = colorants
+                colorants_added += 1
 
-        alt = _resolve_indirect(alternate)
-        if isinstance(alt, Array):
-            a, b, repl = _sanitize_colorspace_array(alt, canonical_by_name, visited_cs)
-            colorants_added += a
-            separations_normalized += b
-            if repl is not None:
-                cs[2] = repl
+            alternate = current[2]
+            tint_transform = current[3]
+            for component in names:
+                comp_name = _normalize_pdf_name(component)
+                if not comp_name or comp_name in _PROCESS_COLOR_NAMES:
+                    continue
+                if comp_name not in colorants:
+                    colorants[Name(comp_name)] = Array(
+                        [
+                            Name.Separation,
+                            Name(comp_name),
+                            alternate,
+                            tint_transform,
+                        ]
+                    )
+                    colorants_added += 1
+                    logger.debug(
+                        "Added missing DeviceN Colorants entry for %s", comp_name
+                    )
 
-        return colorants_added, separations_normalized, None
+            alternate = _resolve_indirect(alternate)
+            if isinstance(alternate, Array):
+                pending.append((alternate, current, 2))
+            for colorant_name in reversed(list(colorants.keys())):
+                colorant = _resolve_indirect(colorants[colorant_name])
+                if isinstance(colorant, Array):
+                    pending.append((colorant, colorants, colorant_name))
+            continue
 
-    if cs_type == "/Indexed" and len(cs) >= 2:
-        base = _resolve_indirect(cs[1])
-        if isinstance(base, Array):
-            a, b, repl = _sanitize_colorspace_array(base, canonical_by_name, visited_cs)
-            if repl is not None:
-                cs[1] = repl
-            return a, b, None
-        return 0, 0, None
+        if cs_type in ("/Indexed", "/Pattern") and len(current) >= 2:
+            base = _resolve_indirect(current[1])
+            if isinstance(base, Array):
+                pending.append((base, current, 1))
 
-    if cs_type == "/Pattern" and len(cs) >= 2:
-        base = _resolve_indirect(cs[1])
-        if isinstance(base, Array):
-            a, b, repl = _sanitize_colorspace_array(base, canonical_by_name, visited_cs)
-            if repl is not None:
-                cs[1] = repl
-            return a, b, None
-        return 0, 0, None
-
-    return 0, 0, None
+    return colorants_added, separations_normalized, replacement
 
 
 def _sanitize_special_colorspaces_in_resources(
     resources,
     canonical_by_name: dict[str, tuple[object, object, object]],
-    visited_cs: set[tuple[int, int]],
+    visited_cs: dict[tuple[int, int], object | None],
 ) -> tuple[int, int]:
     """Sanitize DeviceN/Separation rules in one Resources dictionary."""
     colorants_added = 0
@@ -958,50 +930,43 @@ def _sanitize_special_colorspaces_in_forms_recursive(
     resources,
     visited_forms: set[tuple[int, int]],
     canonical_by_name: dict[str, tuple[object, object, object]],
-    visited_cs: set[tuple[int, int]],
+    visited_cs: dict[tuple[int, int], object | None],
 ) -> tuple[int, int]:
-    """Recurse into Form XObjects and sanitize their nested resources."""
+    """Traverse Form XObjects and sanitize their nested resources."""
     colorants_added = 0
     separations_normalized = 0
 
-    resources = _resolve_indirect(resources)
-    if not isinstance(resources, Dictionary):
-        return 0, 0
-
-    xobjects = _resolve_indirect(resources.get("/XObject"))
-    if not isinstance(xobjects, Dictionary):
-        return 0, 0
-
-    for xobj_name in list(xobjects.keys()):
-        xobj = _resolve_indirect(xobjects[xobj_name])
-        if not isinstance(xobj, Stream):
-            continue
-        subtype = xobj.get("/Subtype")
-        if subtype is None or str(subtype) != "/Form":
+    pending = [resources]
+    while pending:
+        current_resources = _resolve_indirect(pending.pop())
+        if not isinstance(current_resources, Dictionary):
             continue
 
-        objgen = xobj.objgen
-        if objgen != (0, 0):
-            if objgen in visited_forms:
+        xobjects = _resolve_indirect(current_resources.get("/XObject"))
+        if not isinstance(xobjects, Dictionary):
+            continue
+
+        for xobj_name in list(xobjects.keys()):
+            xobj = _resolve_indirect(xobjects[xobj_name])
+            if not isinstance(xobj, Stream) or xobj.get("/Subtype") != Name.Form:
                 continue
-            visited_forms.add(objgen)
 
-        form_resources = xobj.get("/Resources")
-        if not form_resources:
-            continue
-        form_resources = _resolve_indirect(form_resources)
+            objgen = xobj.objgen
+            if objgen != (0, 0):
+                if objgen in visited_forms:
+                    continue
+                visited_forms.add(objgen)
 
-        a, b = _sanitize_special_colorspaces_in_resources(
-            form_resources, canonical_by_name, visited_cs
-        )
-        colorants_added += a
-        separations_normalized += b
+            form_resources = _resolve_indirect(xobj.get("/Resources"))
+            if not isinstance(form_resources, Dictionary):
+                continue
 
-        a, b = _sanitize_special_colorspaces_in_forms_recursive(
-            form_resources, visited_forms, canonical_by_name, visited_cs
-        )
-        colorants_added += a
-        separations_normalized += b
+            a, b = _sanitize_special_colorspaces_in_resources(
+                form_resources, canonical_by_name, visited_cs
+            )
+            colorants_added += a
+            separations_normalized += b
+            pending.append(form_resources)
 
     return colorants_added, separations_normalized
 
@@ -1010,7 +975,7 @@ def _sanitize_special_colorspaces_in_ap_stream(
     ap_entry,
     visited_forms: set[tuple[int, int]],
     canonical_by_name: dict[str, tuple[object, object, object]],
-    visited_cs: set[tuple[int, int]],
+    visited_cs: dict[tuple[int, int], object | None],
 ) -> tuple[int, int]:
     """Sanitize DeviceN/Separation rules in annotation AP stream resources."""
     colorants_added = 0
@@ -1059,7 +1024,7 @@ def _sanitize_special_colorspaces_in_type3_fonts(
     resources,
     visited_forms: set[tuple[int, int]],
     canonical_by_name: dict[str, tuple[object, object, object]],
-    visited_cs: set[tuple[int, int]],
+    visited_cs: dict[tuple[int, int], object | None],
 ) -> tuple[int, int]:
     """Sanitize DeviceN/Separation rules in Type3 font resources."""
     colorants_added = 0
@@ -1097,7 +1062,7 @@ def sanitize_special_colorspace_consistency(pdf: Pdf) -> tuple[int, int]:
     colorants_added = 0
     separations_normalized = 0
     visited_forms: set[tuple[int, int]] = set()
-    visited_cs: set[tuple[int, int]] = set()
+    visited_cs: dict[tuple[int, int], object | None] = {}
     canonical_by_name: dict[str, tuple[object, object, object]] = {}
 
     for page_num, page in enumerate(pdf.pages, start=1):
@@ -1147,6 +1112,15 @@ def sanitize_special_colorspace_consistency(pdf: Pdf) -> tuple[int, int]:
                             )
                             colorants_added += a
                             separations_normalized += b
+
+            for _owner, nested_resources in _iter_content_streams_with_resources(page):
+                a, b = _sanitize_special_colorspaces_in_resources(
+                    nested_resources,
+                    canonical_by_name,
+                    visited_cs,
+                )
+                colorants_added += a
+                separations_normalized += b
 
         except ConversionError:
             raise
@@ -1248,7 +1222,7 @@ def sanitize_colorspaces(pdf: Pdf, level: str = "3b") -> dict[str, Any]:
 
     Args:
         pdf: pikepdf Pdf object.
-        level: PDF/A conformance level ('2b', '2u', '3b', or '3u').
+        level: PDF/A conformance level.
 
     Returns:
         Dict with statistics:

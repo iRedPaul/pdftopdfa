@@ -7,7 +7,7 @@
 from typing import TYPE_CHECKING
 
 from .glyph_mapping import resolve_glyph_name
-from .utils import get_any_cmap
+from .utils import get_any_cmap, get_truetype_byte_encoding
 
 if TYPE_CHECKING:
     from fontTools.ttLib import TTFont
@@ -143,6 +143,8 @@ class FontMetricsExtractor:
         head = tt_font["head"]
         hmtx = tt_font["hmtx"]
         cmap = get_any_cmap(tt_font)
+        byte_encoding = get_truetype_byte_encoding(tt_font)
+        byte_mapping = byte_encoding[2] if byte_encoding is not None else {}
         units_per_em = head.unitsPerEm
         scale = 1000.0 / units_per_em
 
@@ -152,7 +154,7 @@ class FontMetricsExtractor:
 
         widths = []
         for char_code in range(256):
-            glyph_name = cmap.get(char_code)
+            glyph_name = cmap.get(char_code) or byte_mapping.get(char_code)
             if glyph_name and glyph_name in hmtx.metrics:
                 width = round(hmtx.metrics[glyph_name][0] * scale)
             else:
@@ -238,29 +240,14 @@ class FontMetricsExtractor:
         cmap = get_any_cmap(tt_font)
         if not cmap:
             return {}
+        byte_encoding = get_truetype_byte_encoding(tt_font)
+        byte_mapping = byte_encoding[2] if byte_encoding is not None else {}
 
         result: dict[int, int] = {}
         for code, unicode_val in code_to_unicode.items():
-            glyph_name = cmap.get(unicode_val)
+            glyph_name = cmap.get(unicode_val) or byte_mapping.get(code)
             if glyph_name and glyph_name in hmtx.metrics:
                 result[code] = round(hmtx.metrics[glyph_name][0] * scale)
-
-        # Fallback for symbol fonts (e.g. Wingdings, Symbol): try the
-        # Microsoft Symbol encoding convention where codepoints are
-        # mapped at 0xF000 + charcode.
-        if not result:
-            for code, unicode_val in code_to_unicode.items():
-                sym_val = 0xF000 + unicode_val
-                glyph_name = cmap.get(sym_val)
-                if glyph_name and glyph_name in hmtx.metrics:
-                    result[code] = round(hmtx.metrics[glyph_name][0] * scale)
-            # Also try direct charcode lookup (some symbol fonts map
-            # directly from charcode without Unicode indirection)
-            if not result:
-                for code, _unicode_val in code_to_unicode.items():
-                    glyph_name = cmap.get(code)
-                    if glyph_name and glyph_name in hmtx.metrics:
-                        result[code] = round(hmtx.metrics[glyph_name][0] * scale)
 
         return result
 
@@ -293,7 +280,11 @@ class FontMetricsExtractor:
 
         return result
 
-    def build_cidfont_w_array(self, tt_font: "TTFont") -> list:
+    def build_cidfont_w_array(
+        self,
+        tt_font: "TTFont",
+        cid_to_gid: dict[int, int] | None = None,
+    ) -> list:
         """Creates /W array for CIDFont (sparse format).
 
         The /W array contains character widths in CIDFont-specific format:
@@ -302,6 +293,7 @@ class FontMetricsExtractor:
 
         Args:
             tt_font: fonttools TTFont object.
+            cid_to_gid: Optional explicit mapping used to key widths by CID.
 
         Returns:
             List in sparse format for the /W array.
@@ -315,12 +307,21 @@ class FontMetricsExtractor:
 
         # Collect all widths
         widths: list[tuple[int, int]] = []
-        for gid, glyph_name in enumerate(glyph_order):
+        glyphs = (
+            enumerate(glyph_order)
+            if cid_to_gid is None
+            else (
+                (cid, glyph_order[gid])
+                for cid, gid in sorted(cid_to_gid.items())
+                if 0 <= gid < len(glyph_order)
+            )
+        )
+        for cid, glyph_name in glyphs:
             if glyph_name in hmtx.metrics:
                 width = round(hmtx.metrics[glyph_name][0] * scale)
             else:
                 width = round(hmtx.metrics.get(".notdef", (500, 0))[0] * scale)
-            widths.append((gid, width))
+            widths.append((cid, width))
 
         # Create W array using both PDF formats:
         #   Format 1: start_cid [w1 w2 ...] — individual widths

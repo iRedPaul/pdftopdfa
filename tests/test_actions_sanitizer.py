@@ -436,6 +436,27 @@ class TestNextChainSanitization:
         assert str(level2.get("/S")) == "/GoTo"
         assert "/Next" not in level2
 
+    def test_next_chain_beyond_python_recursion_limit(self, make_pdf_with_page):
+        """A forbidden action is removed from an exceptionally deep chain."""
+        pdf = make_pdf_with_page()
+        action = pdf.make_indirect(Dictionary(S=Name.Launch, F="evil.exe"))
+        for _ in range(1200):
+            action = pdf.make_indirect(
+                Dictionary(
+                    S=Name.GoTo,
+                    D=Array([pdf.pages[0].obj, Name.Fit]),
+                    Next=action,
+                )
+            )
+        pdf.Root["/OpenAction"] = action
+
+        assert remove_actions(pdf) == 1
+
+        parent = pdf.Root.OpenAction
+        for _ in range(1199):
+            parent = parent.Next
+        assert "/Next" not in parent
+
     def test_annotation_action_with_non_compliant_next(self, make_pdf_with_page):
         """Annotation compliant /A with forbidden /Next is sanitized."""
         pdf = make_pdf_with_page()
@@ -556,6 +577,21 @@ class TestRemoveActionsFromFields:
             pass
         assert "/A" not in field
         assert "/AA" not in field
+
+    def test_field_tree_beyond_python_recursion_limit(self, make_pdf_with_page):
+        """Actions are removed from an exceptionally deep field tree."""
+        pdf = make_pdf_with_page()
+        field = pdf.make_indirect(
+            Dictionary(T="leaf", AA=Dictionary(K=Dictionary(S=Name.Launch)))
+        )
+        leaf = field
+        for index in range(1200):
+            field = pdf.make_indirect(
+                Dictionary(T=f"field-{index}", Kids=Array([field]))
+            )
+
+        assert _remove_actions_from_fields(Array([field])) == 1
+        assert "/AA" not in leaf
 
 
 class TestWidgetFieldActionsRule641:
@@ -865,6 +901,18 @@ class TestRemoveActionsFromOutlines:
         item["/Parent"] = root
         result = _remove_actions_from_outlines(root)
         assert result == 0
+
+    def test_outline_tree_beyond_python_recursion_limit(self):
+        """Actions are removed from an exceptionally deep outline tree."""
+        pdf = new_pdf()
+        item = pdf.make_indirect(Dictionary(Title="leaf", A=Dictionary(S=Name.Launch)))
+        leaf = item
+        for index in range(1200):
+            item = pdf.make_indirect(Dictionary(Title=f"item-{index}", First=item))
+        root = pdf.make_indirect(Dictionary(Type=Name.Outlines, First=item))
+
+        assert _remove_actions_from_outlines(root) == 1
+        assert "/A" not in leaf
 
 
 class TestNamedActions:
@@ -1304,6 +1352,30 @@ class TestValidateDestinations:
         names_arr = pdf.Root.Names.Dests.Names
         assert len(names_arr) == 2
         assert str(names_arr[0]) == "valid"
+
+    def test_named_dest_tree_beyond_python_recursion_limit(self):
+        """An invalid destination is pruned from an exceptionally deep name tree."""
+        pdf = new_pdf()
+        pdf.pages.append(
+            pikepdf.Page(Dictionary(Type=Name.Page, MediaBox=Array([0, 0, 612, 792])))
+        )
+        leaf = pdf.make_indirect(
+            Dictionary(
+                Names=Array(
+                    [
+                        pikepdf.String("invalid"),
+                        Array([_make_fake_page_ref(pdf), Name.Fit]),
+                    ]
+                )
+            )
+        )
+        node = leaf
+        for _ in range(1200):
+            node = pdf.make_indirect(Dictionary(Kids=Array([node])))
+        pdf.Root["/Names"] = Dictionary(Dests=node)
+
+        assert validate_destinations(pdf) == 1
+        assert len(leaf.Names) == 0
 
     def test_legacy_dests_dict_pruned(self):
         """Legacy /Root/Dests dict entries with invalid refs are removed."""

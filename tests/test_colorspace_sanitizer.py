@@ -20,9 +20,30 @@ from pdftopdfa.color_profile import (
 )
 from pdftopdfa.exceptions import ConversionError
 from pdftopdfa.sanitizers.colorspaces import (
+    _normalized_object_signature,
     sanitize_colorspaces,
     validate_embedded_icc_profiles,
 )
+
+
+def _wrap_resources_in_form_chain(
+    pdf: Pdf, leaf_resources: Dictionary, depth: int
+) -> Dictionary:
+    nested = pdf.make_stream(b"q Q")
+    nested[Name.Type] = Name.XObject
+    nested[Name.Subtype] = Name.Form
+    nested[Name.BBox] = Array([0, 0, 1, 1])
+    nested[Name.Resources] = leaf_resources
+
+    for _ in range(depth):
+        parent = pdf.make_stream(b"/Nested Do")
+        parent[Name.Type] = Name.XObject
+        parent[Name.Subtype] = Name.Form
+        parent[Name.BBox] = Array([0, 0, 1, 1])
+        parent[Name.Resources] = Dictionary(XObject=Dictionary(Nested=nested))
+        nested = parent
+
+    return Dictionary(XObject=Dictionary(Nested=nested))
 
 
 class TestColorSpaceAnalysisExtensions:
@@ -971,6 +992,77 @@ class TestFormXObjectAndAPStreamTraversal:
         assert validated == 1
         assert len(warnings) == 0
 
+    def test_invalid_icc_through_1200_nested_forms_is_repaired(self):
+        """ICC validation reaches resources beyond Python's recursion limit."""
+        pdf = new_pdf()
+        icc_stream = pdf.make_stream(b"invalid")
+        icc_stream[Name.N] = 3
+        leaf_resources = Dictionary(
+            ColorSpace=Dictionary(
+                CS0=Array([Name.ICCBased, icc_stream]),
+            )
+        )
+        page = pdf.add_blank_page(page_size=(10, 10))
+        page.obj[Name.Resources] = _wrap_resources_in_form_chain(
+            pdf, leaf_resources, 1200
+        )
+
+        validated, warnings, repaired = validate_embedded_icc_profiles(
+            pdf, "3b", repair=True
+        )
+
+        assert validated == 0
+        assert len(warnings) == 1
+        assert repaired == 1
+        assert len(icc_stream.read_bytes()) > 128
+
+    def test_invalid_icc_through_1200_soft_masks_is_repaired(self):
+        """ICC validation reaches deeply nested soft-mask resources."""
+        pdf = new_pdf()
+        icc_stream = pdf.make_stream(b"invalid")
+        icc_stream[Name.N] = 3
+        nested = pdf.make_stream(b"q Q")
+        nested[Name.Type] = Name.XObject
+        nested[Name.Subtype] = Name.Form
+        nested[Name.BBox] = Array([0, 0, 1, 1])
+        nested[Name.Resources] = Dictionary(
+            ColorSpace=Dictionary(
+                CS0=Array([Name.ICCBased, icc_stream]),
+            )
+        )
+        for _ in range(1200):
+            parent = pdf.make_stream(b"/GS gs")
+            parent[Name.Type] = Name.XObject
+            parent[Name.Subtype] = Name.Form
+            parent[Name.BBox] = Array([0, 0, 1, 1])
+            parent[Name.Resources] = Dictionary(
+                ExtGState=Dictionary(
+                    GS=Dictionary(
+                        Type=Name.ExtGState,
+                        SMask=Dictionary(S=Name.Luminosity, G=nested),
+                    )
+                )
+            )
+            nested = parent
+        page = pdf.add_blank_page(page_size=(10, 10))
+        page.obj[Name.Resources] = Dictionary(
+            ExtGState=Dictionary(
+                GS=Dictionary(
+                    Type=Name.ExtGState,
+                    SMask=Dictionary(S=Name.Luminosity, G=nested),
+                )
+            )
+        )
+
+        validated, warnings, repaired = validate_embedded_icc_profiles(
+            pdf, "3b", repair=True
+        )
+
+        assert validated == 0
+        assert len(warnings) == 1
+        assert repaired == 1
+        assert len(icc_stream.read_bytes()) > 128
+
     def test_icc_in_annotation_ap_stream(self, pdf_with_icc_in_ap_stream: Pdf):
         """ICC in AP /N stream resources is validated."""
         validated, warnings, _ = validate_embedded_icc_profiles(
@@ -1204,6 +1296,16 @@ class TestICCProfileRepair:
 class TestSpecialColorSpaceConsistency:
     """Tests for DeviceN Colorants and Separation consistency fixes."""
 
+    def test_object_signature_preserves_difference_beyond_1200_levels(self):
+        """Tint signatures are complete and do not truncate deep objects."""
+        left = Name("/Left")
+        right = Name("/Right")
+        for _ in range(1200):
+            left = Array([left])
+            right = Array([right])
+
+        assert _normalized_object_signature(left) != _normalized_object_signature(right)
+
     def test_missing_devicen_colorants_entry_added(self):
         """Adds missing /Colorants entries for DeviceN spot names."""
         pdf = new_pdf()
@@ -1246,6 +1348,93 @@ class TestSpecialColorSpaceConsistency:
         assert "/SpotA" in colorants
         assert "/SpotB" in colorants
         assert str(colorants["/SpotB"][0]) == "/Separation"
+
+    def test_devicen_through_1200_nested_forms_is_sanitized(self):
+        """DeviceN repair reaches resources beyond Python's recursion limit."""
+        pdf = new_pdf()
+        tint_func = pdf.make_stream(b"{ pop pop 0 0 0 1 }")
+        tint_func[Name.FunctionType] = 4
+        tint_func[Name.Domain] = Array([0, 1, 0, 1])
+        tint_func[Name.Range] = Array([0, 1, 0, 1, 0, 1, 0, 1])
+        devicen_cs = Array(
+            [
+                Name.DeviceN,
+                Array([Name("/SpotA"), Name("/SpotB")]),
+                Name.DeviceCMYK,
+                tint_func,
+                Dictionary(
+                    Colorants=Dictionary(
+                        SpotA=Array(
+                            [
+                                Name.Separation,
+                                Name("/SpotA"),
+                                Name.DeviceCMYK,
+                                tint_func,
+                            ]
+                        )
+                    )
+                ),
+            ]
+        )
+        leaf_resources = Dictionary(ColorSpace=Dictionary(CS0=devicen_cs))
+        page = pdf.add_blank_page(page_size=(10, 10))
+        page.obj[Name.Resources] = _wrap_resources_in_form_chain(
+            pdf, leaf_resources, 1200
+        )
+
+        result = sanitize_colorspaces(pdf, "3b")
+
+        assert result["devicen_colorants_added"] == 1
+        assert "/SpotB" in devicen_cs[4].Colorants
+
+    def test_devicen_through_1200_nested_colorspaces_is_sanitized(self):
+        """Nested color-space arrays are walked without Python recursion."""
+        pdf = new_pdf()
+        tint_func = pdf.make_stream(b"{ dup dup dup }")
+        tint_func[Name.FunctionType] = 4
+        tint_func[Name.Domain] = Array([0, 1])
+        tint_func[Name.Range] = Array([0, 1, 0, 1, 0, 1, 0, 1])
+        devicen_cs = Array(
+            [
+                Name.DeviceN,
+                Array([Name("/SpotA")]),
+                Name.DeviceCMYK,
+                tint_func,
+            ]
+        )
+        nested = devicen_cs
+        for _ in range(1200):
+            nested = Array([Name.Pattern, nested])
+
+        page = pdf.add_blank_page(page_size=(10, 10))
+        page.obj[Name.Resources] = Dictionary(ColorSpace=Dictionary(Deep=nested))
+
+        result = sanitize_colorspaces(pdf, "3b")
+
+        assert result["devicen_colorants_added"] == 3
+        assert "/SpotA" in devicen_cs[4].Colorants
+
+    def test_shared_indirect_overfull_devicen_is_replaced_at_every_reference(self):
+        """A cached shared DeviceN replacement is applied at all use sites."""
+        pdf = new_pdf()
+        names = Array([Name(f"/Spot{i}") for i in range(33)])
+        tint_func = pdf.make_stream(b"{ 0 0 0 1 }")
+        tint_func[Name.FunctionType] = 4
+        tint_func[Name.Domain] = Array([0, 1] * 33)
+        tint_func[Name.Range] = Array([0, 1, 0, 1, 0, 1, 0, 1])
+        shared = pdf.make_indirect(
+            Array([Name.DeviceN, names, Name.DeviceCMYK, tint_func])
+        )
+        page = pdf.add_blank_page(page_size=(10, 10))
+        page.obj[Name.Resources] = Dictionary(
+            ColorSpace=Dictionary(First=shared, Second=shared)
+        )
+
+        sanitize_colorspaces(pdf, "3b")
+
+        colorspaces = page.obj[Name.Resources][Name.ColorSpace]
+        assert colorspaces[Name.First] == Name.DeviceCMYK
+        assert colorspaces[Name.Second] == Name.DeviceCMYK
 
     def test_separation_arrays_with_same_name_are_normalized(self):
         """Normalizes alternate/tintTransform for matching Separation names."""

@@ -127,6 +127,24 @@ def encrypted_pdf(tmp_dir: Path) -> Path:
 
 
 @pytest.fixture
+def password_encrypted_pdf(tmp_dir: Path) -> Path:
+    """Encrypted PDF that requires a non-empty user password to open."""
+    pdf = new_pdf()
+    page = pikepdf.Page(Dictionary(Type=Name.Page, MediaBox=Array([0, 0, 612, 792])))
+    pdf.pages.append(page)
+
+    encrypted_path = tmp_dir / "password_encrypted.pdf"
+    pdf.save(
+        encrypted_path,
+        encryption=pikepdf.Encryption(
+            owner="owner-secret",
+            user="user-secret",
+        ),
+    )
+    return encrypted_path
+
+
+@pytest.fixture
 def pdf_with_metadata(tmp_dir: Path) -> Path:
     """PDF with Info-Dictionary metadata.
 
@@ -302,6 +320,54 @@ def pdf_with_text_obj(pdf_with_text: Path) -> Generator[Pdf, None, None]:
     pdf = Pdf.open(pdf_with_text)
     yield pdf
     pdf.close()
+
+
+@pytest.fixture
+def tagged_pdf(tmp_dir: Path, pdf_with_text: Path) -> Path:
+    """Create a minimal tagged PDF with one paragraph."""
+    output_path = tmp_dir / "tagged.pdf"
+    with Pdf.open(pdf_with_text) as pdf:
+        page = pdf.pages[0]
+        original_contents = page.obj[Name.Contents]
+        page.obj[Name.Contents] = Array(
+            [
+                pdf.make_stream(b"/P <</MCID 0>> BDC\n"),
+                original_contents,
+                pdf.make_stream(b"\nEMC\n"),
+            ]
+        )
+        page.obj[Name.StructParents] = 0
+
+        structure_root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+        document = pdf.make_indirect(
+            Dictionary(
+                Type=Name.StructElem,
+                S=Name.Document,
+                P=structure_root,
+            )
+        )
+        paragraph = pdf.make_indirect(
+            Dictionary(
+                Type=Name.StructElem,
+                S=Name.P,
+                P=document,
+                Pg=page.obj,
+                K=0,
+            )
+        )
+        document[Name.K] = Array([paragraph])
+        structure_root[Name.K] = Array([document])
+        structure_root[Name.ParentTree] = pdf.make_indirect(
+            Dictionary(Nums=Array([0, Array([paragraph])]))
+        )
+        structure_root[Name.ParentTreeNextKey] = 1
+
+        pdf.Root[Name.StructTreeRoot] = structure_root
+        pdf.Root[Name.MarkInfo] = Dictionary(Marked=True)
+        pdf.Root[Name.Lang] = pikepdf.String("en")
+        pdf.save(output_path)
+
+    return output_path
 
 
 @pytest.fixture

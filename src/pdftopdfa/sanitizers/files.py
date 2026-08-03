@@ -105,7 +105,9 @@ def _is_pdfa_compliant_embedded(filespec: object) -> bool:
             if level[0] not in ("1", "2"):
                 return False
 
-        # XMP claims PDF/A compliance — verify with veraPDF if available
+        # An XMP claim is not proof of conformance. Keep the attachment only
+        # after successful veraPDF validation; otherwise use the conversion
+        # path so an unverifiable claim cannot make the container non-compliant.
         if is_verapdf_available():
             tmp_path = None
             try:
@@ -116,16 +118,16 @@ def _is_pdfa_compliant_embedded(filespec: object) -> bool:
                 return result.compliant
             except Exception as e:
                 logger.warning(
-                    "veraPDF validation failed for embedded file, "
-                    "falling back to XMP result: %s",
+                    "veraPDF validation failed for embedded file; "
+                    "treating its PDF/A claim as unverified: %s",
                     e,
                 )
-                return True
+                return False
             finally:
                 if tmp_path is not None:
                     tmp_path.unlink(missing_ok=True)
 
-        return True
+        return False
 
     except Exception as e:
         log_suppressed_error(
@@ -249,10 +251,7 @@ def _update_embedded_stream(ef: object, new_data: bytes) -> None:
             params[Name.ModDate] = pikepdf.String(_format_pdf_date(datetime.now(UTC)))
 
 
-_MAX_NAME_TREE_DEPTH = 32
-
-
-def _iter_name_tree_values(node: object, *, _depth: int = 0) -> Iterator[object]:
+def _iter_name_tree_values(node: object) -> Iterator[object]:
     """Yield all values from a PDF Name Tree node.
 
     Name Trees (PDF spec §7.9.6) can be hierarchical: intermediate nodes
@@ -262,39 +261,12 @@ def _iter_name_tree_values(node: object, *, _depth: int = 0) -> Iterator[object]
 
     Args:
         node: A pikepdf Dictionary representing a Name Tree node.
-        _depth: Internal recursion depth counter (stops at _MAX_NAME_TREE_DEPTH).
     """
-    if _depth >= _MAX_NAME_TREE_DEPTH:
-        logger.debug("Name Tree depth limit reached (%d)", _MAX_NAME_TREE_DEPTH)
-        return
-
-    try:
-        resolved = _resolve_indirect(node)
-    except Exception:
-        return
-
-    # Leaf node: /Names array with [name, value, name, value, ...]
-    names_array = resolved.get("/Names")
-    if names_array is not None:
-        try:
-            for i in range(1, len(names_array), 2):
-                yield names_array[i]
-        except Exception:
-            pass
-
-    # Intermediate node: /Kids array of child nodes
-    kids = resolved.get("/Kids")
-    if kids is not None:
-        try:
-            for child in kids:
-                yield from _iter_name_tree_values(child, _depth=_depth + 1)
-        except Exception:
-            pass
+    for _, value in _iter_name_tree_pairs(node):
+        yield value
 
 
-def _iter_name_tree_pairs(
-    node: object, *, _depth: int = 0
-) -> Iterator[tuple[object, object]]:
+def _iter_name_tree_pairs(node: object) -> Iterator[tuple[object, object]]:
     """Yield (name, value) pairs from a PDF Name Tree node.
 
     Same traversal as _iter_name_tree_values but yields both the key and value.
@@ -302,42 +274,179 @@ def _iter_name_tree_pairs(
 
     Args:
         node: A pikepdf Dictionary representing a Name Tree node.
-        _depth: Internal recursion depth counter (stops at _MAX_NAME_TREE_DEPTH).
     """
-    if _depth >= _MAX_NAME_TREE_DEPTH:
-        logger.debug("Name Tree depth limit reached (%d)", _MAX_NAME_TREE_DEPTH)
-        return
+    pending = [node]
+    visited: set[tuple[int, int]] = set()
+    while pending:
+        try:
+            resolved = _resolve_indirect(pending.pop())
+        except Exception:
+            continue
 
+        try:
+            objgen = resolved.objgen
+        except Exception:
+            objgen = (0, 0)
+        if objgen != (0, 0):
+            if objgen in visited:
+                continue
+            visited.add(objgen)
+
+        names_array = resolved.get("/Names")
+        if names_array is not None:
+            try:
+                for i in range(0, len(names_array), 2):
+                    if i + 1 < len(names_array):
+                        yield (names_array[i], names_array[i + 1])
+            except Exception:
+                pass
+
+        kids = resolved.get("/Kids")
+        if kids is not None:
+            try:
+                pending.extend(reversed(kids))
+            except Exception:
+                pass
+
+
+def _as_indirect_filespec(pdf: Pdf, obj: object) -> object | None:
+    """Return a valid FileSpec as an indirect object."""
     try:
-        resolved = _resolve_indirect(node)
+        resolved = _resolve_indirect(obj)
+        if not isinstance(resolved, Dictionary):
+            return None
+        type_value = resolved.get("/Type")
+        if type_value is not None and str(type_value) != "/Filespec":
+            return None
+        if not any(key in resolved for key in ("/F", "/UF", "/EF")):
+            return None
+        try:
+            objgen = resolved.objgen
+        except (AttributeError, ValueError, TypeError):
+            objgen = (0, 0)
+        if objgen == (0, 0):
+            resolved = pdf.make_indirect(resolved)
+        return resolved
+    except Exception:
+        return None
+
+
+def _normalize_embedded_files_name_tree(pdf: Pdf) -> None:
+    """Flatten and validate the EmbeddedFiles name tree.
+
+    Flattening removes malformed branches and cycles while producing the
+    sorted, unique key array required by the PDF name-tree syntax.
+    """
+    try:
+        names = _resolve_indirect(pdf.Root.get("/Names"))
+        if not isinstance(names, Dictionary) or "/EmbeddedFiles" not in names:
+            return
+        embedded = _resolve_indirect(names.get("/EmbeddedFiles"))
+        if not isinstance(embedded, Dictionary):
+            del names["/EmbeddedFiles"]
+            return
+        try:
+            if embedded.objgen == (0, 0):
+                embedded = pdf.make_indirect(embedded)
+                names["/EmbeddedFiles"] = embedded
+        except (AttributeError, ValueError, TypeError):
+            embedded = pdf.make_indirect(embedded)
+            names["/EmbeddedFiles"] = embedded
     except Exception:
         return
 
-    # Leaf node: /Names array with [name, value, name, value, ...]
-    names_array = resolved.get("/Names")
-    if names_array is not None:
+    pairs: list[tuple[bytes, object, object]] = []
+    pending = [embedded]
+    visited: set[tuple[int, int]] = set()
+    while pending:
         try:
-            for i in range(0, len(names_array), 2):
-                if i + 1 < len(names_array):
-                    yield (names_array[i], names_array[i + 1])
-        except Exception:
-            pass
+            node = _resolve_indirect(pending.pop())
+            if not isinstance(node, Dictionary):
+                continue
+            try:
+                if node.objgen == (0, 0):
+                    node = pdf.make_indirect(node)
+                objgen = node.objgen
+            except (AttributeError, ValueError, TypeError):
+                continue
+            if objgen in visited:
+                continue
+            visited.add(objgen)
 
-    # Intermediate node: /Kids array of child nodes
-    kids = resolved.get("/Kids")
-    if kids is not None:
-        try:
-            for child in kids:
-                yield from _iter_name_tree_pairs(child, _depth=_depth + 1)
+            names_array = _resolve_indirect(node.get("/Names"))
+            if isinstance(names_array, Array):
+                for index in range(0, len(names_array) - 1, 2):
+                    key = names_array[index]
+                    if not isinstance(key, pikepdf.String):
+                        continue
+                    filespec = _as_indirect_filespec(pdf, names_array[index + 1])
+                    if filespec is not None:
+                        pairs.append((bytes(key), key, filespec))
+
+            kids = _resolve_indirect(node.get("/Kids"))
+            if isinstance(kids, Array):
+                pending.extend(reversed(kids))
+            elif isinstance(kids, Dictionary):
+                pending.append(kids)
         except Exception:
-            pass
+            continue
+
+    flattened: list[object] = []
+    seen_keys: set[bytes] = set()
+    for raw_key, key, filespec in sorted(pairs, key=lambda pair: pair[0]):
+        if raw_key in seen_keys:
+            continue
+        seen_keys.add(raw_key)
+        flattened.extend((key, filespec))
+
+    if not flattened:
+        del names["/EmbeddedFiles"]
+        return
+
+    embedded["/Names"] = Array(flattened)
+    for key in ("/Kids", "/Limits"):
+        if key in embedded:
+            del embedded[key]
+
+
+def _iter_normalized_af_entries(pdf: Pdf, owner: object) -> Iterator[object]:
+    """Normalize an owner's /AF value and yield its valid FileSpecs."""
+    try:
+        resolved_owner = _resolve_indirect(owner)
+        af = _resolve_indirect(resolved_owner.get("/AF"))
+        if isinstance(af, Dictionary):
+            candidates = [af]
+        elif isinstance(af, Array):
+            candidates = list(af)
+        else:
+            candidates = []
+
+        normalized: list[object] = []
+        seen_objgen: set[tuple[int, int]] = set()
+        for candidate in candidates:
+            filespec = _as_indirect_filespec(pdf, candidate)
+            if filespec is None:
+                continue
+            objgen = filespec.objgen
+            if objgen in seen_objgen:
+                continue
+            seen_objgen.add(objgen)
+            normalized.append(filespec)
+
+        if normalized:
+            resolved_owner["/AF"] = Array(normalized)
+        elif "/AF" in resolved_owner:
+            del resolved_owner["/AF"]
+        yield from normalized
+    except Exception:
+        return
 
 
 def _iter_all_filespecs_by_scan(pdf: Pdf) -> Iterator[object]:
-    """Yield all FileSpec objects by scanning every object in the PDF.
+    """Yield embedded FileSpec objects by scanning every object in the PDF.
 
-    Finds FileSpecs that may be missed by Name Tree / annotation traversal,
-    such as those referenced only from page-level /AF arrays or other objects.
+    Finds embedded FileSpecs that may be missed by Name Tree / annotation
+    traversal, such as those referenced only from page-level /AF arrays.
 
     Args:
         pdf: Opened pikepdf PDF object.
@@ -348,11 +457,11 @@ def _iter_all_filespecs_by_scan(pdf: Pdf) -> Iterator[object]:
             resolved = _resolve_indirect(obj)
             if not isinstance(resolved, Dictionary):
                 continue
-            # FileSpec: has /Type /Filespec or contains /EF
-            type_val = resolved.get("/Type")
-            is_filespec = type_val is not None and str(type_val) == "/Filespec"
+            # Only embedded FileSpecs are safe to recover by a full object
+            # scan. A type-only FileSpec may be an unreachable object left
+            # behind after its embedded stream was removed.
             has_ef = resolved.get("/EF") is not None
-            if not is_filespec and not has_ef:
+            if not has_ef:
                 continue
             # Deduplicate
             try:
@@ -371,31 +480,29 @@ def _iter_all_filespecs_by_scan(pdf: Pdf) -> Iterator[object]:
 def _iter_all_filespecs(pdf: Pdf) -> Iterator[object]:
     """Yield all FileSpec objects found in the PDF.
 
-    Combines Name Tree traversal, FileAttachment annotation scanning,
-    and full pdf.objects scan to find all FileSpec dictionaries.
-    The full scan catches indirect FileSpecs in page-level /AF arrays
-    and other locations; the traversal catches direct (inline) FileSpecs
-    in the Name Tree or annotations.
+    Combines Name Tree traversal, associated-file arrays, FileAttachment
+    annotation scanning, and a full pdf.objects scan. The explicit traversals
+    include direct FileSpecs and reachable type-only FileSpecs; the full scan
+    recovers only embedded FileSpecs so unreachable stale objects stay ignored.
 
     Args:
         pdf: Opened pikepdf PDF object.
     """
+    _normalize_embedded_files_name_tree(pdf)
     seen_objgen: set[tuple[int, int]] = set()
 
     def _dedup(obj: object) -> object | None:
-        try:
-            resolved = _resolve_indirect(obj)
-            try:
-                og = resolved.objgen
-            except (AttributeError, ValueError, TypeError):
-                og = (0, 0)
-            if og != (0, 0):
-                if og in seen_objgen:
-                    return None
-                seen_objgen.add(og)
-            return obj
-        except Exception:
+        resolved = _as_indirect_filespec(pdf, obj)
+        if resolved is None:
             return None
+        try:
+            objgen = resolved.objgen
+        except (AttributeError, ValueError, TypeError):
+            return None
+        if objgen in seen_objgen:
+            return None
+        seen_objgen.add(objgen)
+        return resolved
 
     # 1. FileSpecs from /Root/Names/EmbeddedFiles (traverse Name Tree)
     try:
@@ -410,8 +517,19 @@ def _iter_all_filespecs(pdf: Pdf) -> Iterator[object]:
     except Exception as e:
         log_suppressed_error(logger, e, "Error reading EmbeddedFiles: %s", e)
 
-    # 2. FileSpecs from FileAttachment annotations on all pages
+    # 2. FileSpecs explicitly associated with the document catalog
+    for obj in _iter_normalized_af_entries(pdf, pdf.Root):
+        result = _dedup(obj)
+        if result is not None:
+            yield result
+
+    # 3. FileSpecs associated with pages or annotations, plus FileAttachment /FS
     for page_num, page in enumerate(pdf.pages, start=1):
+        for obj in _iter_normalized_af_entries(pdf, page):
+            result = _dedup(obj)
+            if result is not None:
+                yield result
+
         try:
             annots = page.get("/Annots")
             if annots is None:
@@ -419,12 +537,17 @@ def _iter_all_filespecs(pdf: Pdf) -> Iterator[object]:
             for annot in annots:
                 try:
                     resolved = _resolve_indirect(annot)
+                    for obj in _iter_normalized_af_entries(pdf, resolved):
+                        result = _dedup(obj)
+                        if result is not None:
+                            yield result
                     subtype = resolved.get("/Subtype")
                     if subtype is not None and str(subtype) == "/FileAttachment":
                         fs = resolved.get("/FS")
                         if fs is not None:
                             result = _dedup(fs)
                             if result is not None:
+                                resolved["/FS"] = result
                                 yield result
                 except Exception:
                     continue
@@ -433,7 +556,7 @@ def _iter_all_filespecs(pdf: Pdf) -> Iterator[object]:
                 logger, e, "Error processing annotations on page %d: %s", page_num, e
             )
 
-    # 3. Full pdf.objects scan for orphan indirect FileSpecs
+    # 4. Full pdf.objects scan for indirect embedded FileSpecs
     for obj in _iter_all_filespecs_by_scan(pdf):
         result = _dedup(obj)
         if result is not None:
@@ -458,7 +581,7 @@ def _cleanup_af_arrays(pdf: Pdf, removed_objgens: set[tuple[int, int]]) -> None:
             if af is None:
                 return
             af = _resolve_indirect(af)
-            indices_to_remove = []
+            indices_to_remove: list[int] = []
             for i, entry in enumerate(af):
                 try:
                     resolved = _resolve_indirect(entry)
@@ -522,8 +645,69 @@ def remove_non_compliant_embedded_files(pdf: Pdf) -> dict[str, int]:
     converted = 0
     conversion_failed = 0
     processed_filespecs: set[tuple[int, int]] = set()
+    removed_objgens: set[tuple[int, int]] = set()
+    outcomes: dict[tuple[int, int], str] = {}
+
+    def _process_filespec(
+        filespec: object, description: str
+    ) -> tuple[object | None, str]:
+        nonlocal removed, kept, converted, conversion_failed
+
+        resolved = _as_indirect_filespec(pdf, filespec)
+        if resolved is None:
+            return None, "invalid"
+        objgen = resolved.objgen
+        previous = outcomes.get(objgen)
+        if previous is not None:
+            return resolved, previous
+        processed_filespecs.add(objgen)
+
+        if _is_pdfa_compliant_embedded(resolved):
+            kept += 1
+            outcomes[objgen] = "kept"
+            logger.debug("Kept compliant embedded file: %s", description)
+            return resolved, "kept"
+
+        embedded_streams = resolved.get("/EF")
+        was_converted = False
+        pdf_conversion_failed = False
+        if embedded_streams is not None:
+            try:
+                ef = _resolve_indirect(embedded_streams)
+                stream = ef.get("/UF") or ef.get("/F")
+                if stream is not None:
+                    raw = bytes(_resolve_indirect(stream).read_bytes())
+                    if raw[:5] == b"%PDF-":
+                        new_data = _try_convert_embedded_pdf_to_pdfa2(raw)
+                        if new_data is None:
+                            pdf_conversion_failed = True
+                        else:
+                            _update_embedded_stream(ef, new_data)
+                            was_converted = True
+            except Exception:
+                pdf_conversion_failed = True
+
+        if pdf_conversion_failed:
+            conversion_failed += 1
+            outcomes[objgen] = "conversion_failed"
+            logger.warning("Kept embedded PDF after conversion failed: %s", description)
+            return resolved, "conversion_failed"
+        if was_converted:
+            converted += 1
+            outcomes[objgen] = "converted"
+            logger.debug("Converted non-compliant embedded file: %s", description)
+            return resolved, "converted"
+
+        if "/EF" in resolved:
+            del resolved["/EF"]
+        removed += 1
+        removed_objgens.add(objgen)
+        outcomes[objgen] = "removed"
+        logger.debug("Removed non-compliant embedded file: %s", description)
+        return resolved, "removed"
 
     # 1. Process EmbeddedFiles from Names (traverse full Name Tree)
+    _normalize_embedded_files_name_tree(pdf)
     try:
         if "/Names" in pdf.Root:
             names = _resolve_indirect(pdf.Root.Names)
@@ -531,75 +715,12 @@ def remove_non_compliant_embedded_files(pdf: Pdf) -> dict[str, int]:
                 embedded = _resolve_indirect(names.EmbeddedFiles)
                 new_names: list[object] = []
                 for name, filespec in _iter_name_tree_pairs(embedded):
-                    try:
-                        fs_resolved = _resolve_indirect(filespec)
-                        og = fs_resolved.objgen
-                    except (AttributeError, ValueError, TypeError):
-                        og = (0, 0)
-                    if og != (0, 0):
-                        processed_filespecs.add(og)
-                    if _is_pdfa_compliant_embedded(filespec):
-                        new_names.append(name)
-                        new_names.append(filespec)
-                        kept += 1
-                        logger.debug("Kept compliant embedded file: %s", str(name))
-                    else:
-                        # Not compliant — try to convert it to PDF/A-2b first
-                        _converted = False
-                        _pdf_conversion_failed = False
-                        try:
-                            ef_obj = fs_resolved.get("/EF")
-                            if ef_obj is not None:
-                                ef = _resolve_indirect(ef_obj)
-                                stream = ef.get("/UF") or ef.get("/F")
-                                if stream is not None:
-                                    raw = bytes(_resolve_indirect(stream).read_bytes())
-                                    if raw[:5] == b"%PDF-":
-                                        new_data = _try_convert_embedded_pdf_to_pdfa2(
-                                            raw
-                                        )
-                                        if new_data is not None:
-                                            _update_embedded_stream(ef, new_data)
-                                            new_names.append(name)
-                                            new_names.append(filespec)
-                                            converted += 1
-                                            logger.debug(
-                                                "Converted non-compliant embedded "
-                                                "file: %s",
-                                                str(name),
-                                            )
-                                            _converted = True
-                                        else:
-                                            _pdf_conversion_failed = True
-                        except Exception:
-                            _pdf_conversion_failed = True
-                        if _pdf_conversion_failed:
-                            new_names.append(name)
-                            new_names.append(filespec)
-                            conversion_failed += 1
-                            logger.warning(
-                                "Kept embedded PDF after conversion failed: %s",
-                                str(name),
-                            )
-                        elif not _converted:
-                            try:
-                                if "/EF" in fs_resolved:
-                                    del fs_resolved["/EF"]
-                            except Exception:
-                                pass
-                            removed += 1
-                            logger.debug(
-                                "Removed non-compliant embedded file: %s",
-                                str(name),
-                            )
+                    resolved, outcome = _process_filespec(filespec, str(name))
+                    if outcome in {"kept", "converted", "conversion_failed"}:
+                        new_names.extend((name, resolved))
 
                 if new_names:
-                    # Flatten tree: store all entries in root /Names
                     embedded["/Names"] = Array(new_names)
-                    # Remove stale /Kids and /Limits from root node
-                    for key in ("/Kids", "/Limits"):
-                        if key in embedded:
-                            del embedded[key]
                 else:
                     del names["/EmbeddedFiles"]
                     logger.debug("All embedded files removed, deleted EmbeddedFiles")
@@ -613,82 +734,28 @@ def remove_non_compliant_embedded_files(pdf: Pdf) -> dict[str, int]:
             if annots is None:
                 continue
 
-            indices_to_remove = []
+            indices_to_remove: list[tuple[int, bool]] = []
             for i, annot in enumerate(annots):
                 try:
                     resolved = _resolve_indirect(annot)
                     subtype = resolved.get("/Subtype")
                     if subtype is not None and str(subtype) == "/FileAttachment":
                         fs = resolved.get("/FS")
-                        if fs is not None:
-                            try:
-                                fs_resolved = _resolve_indirect(fs)
-                                og = fs_resolved.objgen
-                            except (AttributeError, ValueError, TypeError):
-                                og = (0, 0)
-                            if og != (0, 0) and og in processed_filespecs:
-                                continue
-                            if og != (0, 0):
-                                processed_filespecs.add(og)
-                        if fs is not None and _is_pdfa_compliant_embedded(fs):
-                            kept += 1
-                        else:
-                            # Not compliant — try to convert it to PDF/A-2b first
-                            _converted = False
-                            _pdf_conversion_failed = False
-                            if fs is not None:
-                                try:
-                                    ef_obj = fs_resolved.get("/EF")
-                                    if ef_obj is not None:
-                                        ef = _resolve_indirect(ef_obj)
-                                        stream = ef.get("/UF") or ef.get("/F")
-                                        if stream is not None:
-                                            raw = bytes(
-                                                _resolve_indirect(stream).read_bytes()
-                                            )
-                                            if raw[:5] == b"%PDF-":
-                                                new_data = (
-                                                    _try_convert_embedded_pdf_to_pdfa2(
-                                                        raw
-                                                    )
-                                                )
-                                                if new_data is not None:
-                                                    _update_embedded_stream(
-                                                        ef, new_data
-                                                    )
-                                                    converted += 1
-                                                    logger.debug(
-                                                        "Converted non-compliant "
-                                                        "FileAttachment: page %d",
-                                                        page_num,
-                                                    )
-                                                    _converted = True
-                                                else:
-                                                    _pdf_conversion_failed = True
-                                except Exception:
-                                    _pdf_conversion_failed = True
-                            if _pdf_conversion_failed:
-                                conversion_failed += 1
-                                logger.warning(
-                                    "Kept PDF FileAttachment on page %d after "
-                                    "conversion failed",
-                                    page_num,
-                                )
-                            elif not _converted:
-                                if fs is not None:
-                                    try:
-                                        if "/EF" in fs_resolved:
-                                            del fs_resolved["/EF"]
-                                    except Exception:
-                                        pass
-                                indices_to_remove.append(i)
+                        fs_resolved, outcome = _process_filespec(
+                            fs, f"FileAttachment on page {page_num}"
+                        )
+                        if fs_resolved is not None:
+                            resolved["/FS"] = fs_resolved
+                        if outcome in {"invalid", "removed"}:
+                            indices_to_remove.append((i, outcome == "invalid"))
                 except Exception:
                     continue
 
             # Remove from back to front
-            for i in reversed(indices_to_remove):
+            for i, count_annotation in reversed(indices_to_remove):
                 del annots[i]
-                removed += 1
+                if count_annotation:
+                    removed += 1
                 logger.debug("Removed non-compliant FileAttachment: page %d", page_num)
 
             if len(annots) == 0:
@@ -698,57 +765,13 @@ def remove_non_compliant_embedded_files(pdf: Pdf) -> dict[str, int]:
                 logger, e, "Error processing annotations on page %d: %s", page_num, e
             )
 
-    # 3. Scan ALL remaining FileSpecs for orphans not in Name Tree or annotations
-    removed_objgens: set[tuple[int, int]] = set()
-    for obj in _iter_all_filespecs_by_scan(pdf):
+    # 3. Process remaining FileSpecs reachable through /AF or the object graph
+    for obj in _iter_all_filespecs(pdf):
         try:
-            resolved = _resolve_indirect(obj)
-            try:
-                og = resolved.objgen
-            except (AttributeError, ValueError, TypeError):
-                og = (0, 0)
-            if og != (0, 0) and og in processed_filespecs:
+            objgen = _resolve_indirect(obj).objgen
+            if objgen in processed_filespecs:
                 continue
-            if og != (0, 0):
-                processed_filespecs.add(og)
-            ef = resolved.get("/EF")
-            if ef is None:
-                continue
-            if _is_pdfa_compliant_embedded(resolved):
-                kept += 1
-                continue
-            # Not compliant — try to convert it to PDF/A-2b first
-            _converted = False
-            _pdf_conversion_failed = False
-            try:
-                ef_obj = resolved.get("/EF")
-                if ef_obj is not None:
-                    ef_r = _resolve_indirect(ef_obj)
-                    stream = ef_r.get("/UF") or ef_r.get("/F")
-                    if stream is not None:
-                        raw = bytes(_resolve_indirect(stream).read_bytes())
-                        if raw[:5] == b"%PDF-":
-                            new_data = _try_convert_embedded_pdf_to_pdfa2(raw)
-                            if new_data is not None:
-                                _update_embedded_stream(ef_r, new_data)
-                                converted += 1
-                                logger.debug(
-                                    "Converted orphan non-compliant embedded FileSpec"
-                                )
-                                _converted = True
-                            else:
-                                _pdf_conversion_failed = True
-            except Exception:
-                _pdf_conversion_failed = True
-            if _pdf_conversion_failed:
-                conversion_failed += 1
-                logger.warning("Kept orphan embedded PDF after conversion failed")
-            elif not _converted:
-                del resolved["/EF"]
-                removed += 1
-                if og != (0, 0):
-                    removed_objgens.add(og)
-                logger.debug("Stripped /EF from orphan non-compliant FileSpec")
+            _process_filespec(obj, "associated or orphan FileSpec")
         except Exception:
             continue
 

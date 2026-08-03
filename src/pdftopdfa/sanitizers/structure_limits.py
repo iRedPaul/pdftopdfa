@@ -18,6 +18,7 @@ import hashlib
 import logging
 import re
 import warnings
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
@@ -26,11 +27,12 @@ from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..exceptions import UnsupportedPDFError
 from ..fonts.glyph_usage import (
+    CharacterCode,
     FontUsageCache,
     _iter_content_streams_with_resources,
     collect_font_usage,
 )
-from ..fonts.traversal import iter_all_page_fonts
+from ..fonts.traversal import get_page_resources, iter_all_page_fonts
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
 
@@ -48,9 +50,7 @@ _MAX_REAL_MAGNITUDE = Decimal("3.403e+38")
 _TEXT_OPERATORS = frozenset({"Tj", "TJ", "'", '"'})
 _HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
 _ASCII_NAME_RE = re.compile(r"[^A-Za-z0-9_.+-]+")
-_CIDS_INT_RE = re.compile(r"^<[^>]+>\s+<[^>]+>\s+(-?\d+)$")
 _CIDCHAR_INT_RE = re.compile(r"^<[^>]+>\s+(-?\d+)$")
-_CIDS_HEX_RE = re.compile(r"^<[^>]+>\s+<[^>]+>\s+<([0-9A-Fa-f]+)>$")
 _CIDS_INT_GROUP_RE = re.compile(
     r"^(?P<src><(?P<src_hex>[^>]+)>)\s+"
     r"(?P<end><(?P<end_hex>[^>]+)>)\s+"
@@ -239,75 +239,78 @@ def _fix_odd_hex_string(value: pikepdf.String) -> pikepdf.String:
 
 def _sanitize_operand(value: Any, stats: dict[str, int]) -> tuple[Any, bool]:
     """Sanitize an operand in a parsed content stream instruction."""
-    value = _resolve(value)
+    result = _resolve(value)
     changed = False
+    pending: list[tuple[Any, Dictionary | Stream | Array | None, Any]] = [
+        (value, None, None)
+    ]
+    while pending:
+        raw, parent, location = pending.pop()
+        current = _resolve(raw)
 
-    if isinstance(value, Name):
-        new_value, long_fixed, utf8_fixed = _sanitize_name_token(value)
-        if long_fixed:
-            stats["names_shortened"] += 1
-        if utf8_fixed:
-            stats["utf8_names_fixed"] += 1
-        return new_value, bool(long_fixed or utf8_fixed)
-    if isinstance(value, str) and value.startswith("/"):
-        new_value, long_fixed, utf8_fixed = _sanitize_name_token(value)
-        if long_fixed:
-            stats["names_shortened"] += 1
-        if utf8_fixed:
-            stats["utf8_names_fixed"] += 1
-        return new_value, bool(long_fixed or utf8_fixed)
-
-    new_value, string_changed = _sanitize_string(value)
-    if string_changed:
-        stats["strings_truncated"] += 1
-        return new_value, True
-
-    new_value, int_changed = _sanitize_integer(value)
-    if int_changed:
-        stats["integers_clamped"] += 1
-        return new_value, True
-
-    new_value, real_changed = _sanitize_real(value)
-    if real_changed:
-        stats["reals_normalized"] += 1
-        return new_value, True
-
-    if isinstance(value, Array):
-        items = list(value)
-        for idx, item in enumerate(items):
-            replacement, item_changed = _sanitize_operand(item, stats)
-            if item_changed:
-                value[idx] = replacement
-                changed = True
-        return value, changed
-
-    if isinstance(value, (Dictionary, Stream)):
-        keys = list(value.keys())
-        for old_key in keys:
-            new_key, long_fixed, utf8_fixed = _sanitize_name_token(old_key)
+        if isinstance(current, Name):
+            replacement, long_fixed, utf8_fixed = _sanitize_name_token(current)
             if long_fixed:
                 stats["names_shortened"] += 1
             if utf8_fixed:
                 stats["utf8_names_fixed"] += 1
-            if new_key != old_key:
-                current = value[old_key]
-                del value[old_key]
-                value[new_key] = current
-                changed = True
-
-        for key in list(value.keys()):
-            current = value[key]
-            replacement, item_changed = _sanitize_operand(current, stats)
+            item_changed = bool(long_fixed or utf8_fixed)
+        elif isinstance(current, str) and current.startswith("/"):
+            replacement, long_fixed, utf8_fixed = _sanitize_name_token(current)
+            if long_fixed:
+                stats["names_shortened"] += 1
+            if utf8_fixed:
+                stats["utf8_names_fixed"] += 1
+            item_changed = bool(long_fixed or utf8_fixed)
+        else:
+            replacement, item_changed = _sanitize_string(current)
             if item_changed:
+                stats["strings_truncated"] += 1
+            else:
+                replacement, item_changed = _sanitize_integer(current)
+                if item_changed:
+                    stats["integers_clamped"] += 1
+                else:
+                    replacement, item_changed = _sanitize_real(current)
+                    if item_changed:
+                        stats["reals_normalized"] += 1
+
+        if item_changed:
+            if parent is None:
+                result = replacement
+                changed = True
+            else:
                 try:
-                    value[key] = replacement
+                    parent[location] = replacement
                 except KeyError:
                     # Some stream dictionary keys (e.g. /Length) are immutable.
                     continue
                 changed = True
-        return value, changed
+            continue
 
-    return value, False
+        if isinstance(current, Array):
+            pending.extend(
+                (item, current, index)
+                for index, item in reversed(list(enumerate(current)))
+            )
+        elif isinstance(current, (Dictionary, Stream)):
+            for old_key in list(current.keys()):
+                new_key, long_fixed, utf8_fixed = _sanitize_name_token(old_key)
+                if long_fixed:
+                    stats["names_shortened"] += 1
+                if utf8_fixed:
+                    stats["utf8_names_fixed"] += 1
+                if new_key != old_key:
+                    child = current[old_key]
+                    del current[old_key]
+                    current[new_key] = child
+                    changed = True
+
+            pending.extend(
+                (current[key], current, key) for key in reversed(list(current.keys()))
+            )
+
+    return result, changed
 
 
 def _validate_text_operands(operator_name: str, operands: Any) -> bool:
@@ -373,10 +376,13 @@ def _strip_invalid_hex_chars(stream_data: bytes) -> tuple[bytes, int]:
 
 def _operands_contain_parse_placeholders(operand: Any) -> bool:
     """Return True when qpdf left placeholder values in parsed operands."""
-    if operand is None:
-        return True
-    if isinstance(operand, Array):
-        return any(_operands_contain_parse_placeholders(item) for item in operand)
+    pending = [operand]
+    while pending:
+        current = pending.pop()
+        if current is None:
+            return True
+        if isinstance(current, Array):
+            pending.extend(current)
     return False
 
 
@@ -393,7 +399,295 @@ def _instructions_need_hex_repair(instructions: list[Any]) -> bool:
     return False
 
 
-def _sanitize_content_stream(stream_obj: Stream, stats: dict[str, int]) -> None:
+def _clone_form_resources(resources: Dictionary) -> Dictionary:
+    """Clone a resource dictionary without linking a new Form to itself."""
+    cloned = Dictionary()
+    for key in list(resources.keys()):
+        cloned[key] = resources[key]
+
+    xobjects = _resolve(cloned.get("/XObject"))
+    if isinstance(xobjects, Dictionary):
+        cloned_xobjects = Dictionary()
+        for key in list(xobjects.keys()):
+            cloned_xobjects[key] = xobjects[key]
+        cloned[Name.XObject] = cloned_xobjects
+    return cloned
+
+
+def _add_form_resource(resources: Dictionary, form: Stream) -> Name:
+    """Add a Form XObject under a collision-free private resource name."""
+    xobjects = _resolve(resources.get("/XObject"))
+    if not isinstance(xobjects, Dictionary):
+        xobjects = Dictionary()
+        resources[Name.XObject] = xobjects
+
+    index = len(xobjects)
+    resource_name = Name(f"/FmQDepth{index}")
+    while xobjects.get(resource_name) is not None:
+        index += 1
+        resource_name = Name(f"/FmQDepth{index}")
+    xobjects[resource_name] = form
+    return resource_name
+
+
+def _validate_form_block(instructions: list[Any]) -> None:
+    """Reject operator scopes that cannot legally cross a Form boundary."""
+    text_depth = 0
+    compatibility_depth = 0
+    for instruction in instructions:
+        if isinstance(instruction, pikepdf.ContentStreamInlineImage):
+            continue
+        operator = str(instruction.operator)
+        if operator in {"BMC", "BDC", "EMC", "MP", "DP"}:
+            raise UnsupportedPDFError(
+                "Cannot safely reduce q/Q nesting across marked-content operators."
+            )
+        if operator == "BT":
+            text_depth += 1
+        elif operator == "ET":
+            text_depth -= 1
+        elif operator == "BX":
+            compatibility_depth += 1
+        elif operator == "EX":
+            compatibility_depth -= 1
+        if text_depth < 0 or compatibility_depth < 0:
+            break
+
+    if text_depth != 0 or compatibility_depth != 0:
+        raise UnsupportedPDFError(
+            "Cannot safely reduce q/Q nesting across BT/ET or BX/EX boundaries."
+        )
+
+
+def _concatenate_matrix(
+    current: tuple[float, float, float, float, float, float],
+    operand: tuple[float, float, float, float, float, float],
+) -> tuple[float, float, float, float, float, float]:
+    """Concatenate a PDF ``cm`` operand with the current transformation."""
+    a, b, c, d, e, f = current
+    oa, ob, oc, od, oe, of = operand
+    return (
+        a * oa + c * ob,
+        b * oa + d * ob,
+        a * oc + c * od,
+        b * oc + d * od,
+        a * oe + c * of + e,
+        b * oe + d * of + f,
+    )
+
+
+def _bbox_in_current_user_space(
+    bbox: Array,
+    matrix: tuple[float, float, float, float, float, float],
+) -> Array:
+    """Map owner bounds through the inverse current transformation."""
+    a, b, c, d, e, f = matrix
+    determinant = a * d - b * c
+    if abs(determinant) < 1e-15:
+        raise UnsupportedPDFError(
+            "Cannot safely reduce q/Q nesting under a singular transformation."
+        )
+
+    def inverse_point(x: float, y: float) -> tuple[float, float]:
+        translated_x = x - e
+        translated_y = y - f
+        return (
+            (d * translated_x - c * translated_y) / determinant,
+            (-b * translated_x + a * translated_y) / determinant,
+        )
+
+    try:
+        x0, y0, x1, y1 = (float(value) for value in bbox)
+    except Exception as e:
+        raise UnsupportedPDFError(
+            "Cannot safely reduce q/Q nesting with an invalid content bounding box."
+        ) from e
+
+    corners = (
+        inverse_point(x0, y0),
+        inverse_point(x0, y1),
+        inverse_point(x1, y0),
+        inverse_point(x1, y1),
+    )
+    x_values = [point[0] for point in corners]
+    y_values = [point[1] for point in corners]
+    return Array(
+        [
+            min(x_values),
+            min(y_values),
+            max(x_values),
+            max(y_values),
+        ]
+    )
+
+
+@dataclass
+class _QWrapFrame:
+    """One pending q/Q repair scope for the iterative post-order walk."""
+
+    rewritten: list[Any]
+    resources: Dictionary
+    bbox: Array
+    wrapped: int = 0
+    continuation: tuple[int, int] | None = None
+
+
+def _wrap_excess_q_nesting(
+    pdf: Pdf,
+    instructions: list[Any],
+    resources: Dictionary,
+    bbox: Array,
+) -> tuple[list[Any], int]:
+    """Replace excess q...Q blocks with equivalent Form XObject calls."""
+    frames = [_QWrapFrame(list(instructions), resources, bbox)]
+
+    while frames:
+        frame = frames[-1]
+        matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        matrix_stack: list[tuple[float, float, float, float, float, float]] = []
+        text_depth = 0
+        marked_content_depth = 0
+        compatibility_depth = 0
+        path_active = False
+        overflow_start: int | None = None
+        overflow_matrix = matrix
+        for index, instruction in enumerate(frame.rewritten):
+            if isinstance(instruction, pikepdf.ContentStreamInlineImage):
+                continue
+            operator = str(instruction.operator)
+            if operator == "q":
+                if len(matrix_stack) >= _MAX_Q_NESTING:
+                    if (
+                        text_depth != 0
+                        or marked_content_depth != 0
+                        or compatibility_depth != 0
+                        or path_active
+                    ):
+                        raise UnsupportedPDFError(
+                            "Cannot safely reduce q/Q nesting across an active "
+                            "text, marked-content, compatibility, or path scope."
+                        )
+                    overflow_start = index
+                    overflow_matrix = matrix
+                    break
+                matrix_stack.append(matrix)
+            elif operator == "Q" and matrix_stack:
+                matrix = matrix_stack.pop()
+            elif operator == "cm" and len(instruction.operands) == 6:
+                try:
+                    operand = tuple(float(value) for value in instruction.operands)
+                except Exception as e:
+                    raise UnsupportedPDFError(
+                        "Cannot safely reduce q/Q nesting with an invalid cm operand."
+                    ) from e
+                matrix = _concatenate_matrix(matrix, operand)
+            elif operator == "BT":
+                text_depth += 1
+            elif operator == "ET":
+                text_depth = max(0, text_depth - 1)
+            elif operator in {"BMC", "BDC"}:
+                marked_content_depth += 1
+            elif operator == "EMC":
+                marked_content_depth = max(0, marked_content_depth - 1)
+            elif operator == "BX":
+                compatibility_depth += 1
+            elif operator == "EX":
+                compatibility_depth = max(0, compatibility_depth - 1)
+            elif operator in {"m", "l", "c", "v", "y", "h", "re"}:
+                path_active = True
+            elif operator in {
+                "S",
+                "s",
+                "f",
+                "F",
+                "f*",
+                "B",
+                "B*",
+                "b",
+                "b*",
+                "n",
+            }:
+                path_active = False
+
+        if overflow_start is None:
+            completed = frames.pop()
+            if not frames:
+                return completed.rewritten, completed.wrapped
+
+            parent = frames[-1]
+            assert parent.continuation is not None
+            parent_start, parent_end = parent.continuation
+            form = pdf.make_stream(pikepdf.unparse_content_stream(completed.rewritten))
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.FormType] = 1
+            form[Name.BBox] = completed.bbox
+            form[Name.Resources] = completed.resources
+            resource_name = _add_form_resource(parent.resources, form)
+            invocation = pikepdf.ContentStreamInstruction(
+                [resource_name],
+                pikepdf.Operator("Do"),
+            )
+            parent.rewritten[parent_start : parent_end + 1] = [invocation]
+            parent.wrapped += completed.wrapped + 1
+            parent.continuation = None
+            continue
+
+        balance = 1
+        overflow_end: int | None = None
+        for index in range(overflow_start + 1, len(frame.rewritten)):
+            instruction = frame.rewritten[index]
+            if isinstance(instruction, pikepdf.ContentStreamInlineImage):
+                continue
+            operator = str(instruction.operator)
+            if operator == "q":
+                balance += 1
+            elif operator == "Q":
+                balance -= 1
+                if balance == 0:
+                    overflow_end = index
+                    break
+
+        if overflow_end is None:
+            raise UnsupportedPDFError(
+                "Cannot safely reduce unbalanced q/Q graphics-state nesting."
+            )
+
+        inner = frame.rewritten[overflow_start + 1 : overflow_end]
+        _validate_form_block(inner)
+        form_bbox = _bbox_in_current_user_space(frame.bbox, overflow_matrix)
+        form_resources = _clone_form_resources(frame.resources)
+        frame.continuation = (overflow_start, overflow_end)
+        frames.append(
+            _QWrapFrame(
+                rewritten=inner,
+                resources=form_resources,
+                bbox=form_bbox,
+            )
+        )
+
+    raise AssertionError("q/Q repair stack terminated without a result")
+
+
+def _content_bbox(owner: Dictionary | Stream) -> Array | None:
+    """Return the visible coordinate bounds for a content owner."""
+    owner = _resolve(owner)
+    if not isinstance(owner, (Dictionary, Stream)):
+        return None
+    for key in ("/BBox", "/MediaBox", "/CropBox"):
+        value = _resolve(owner.get(key))
+        if isinstance(value, Array) and len(value) == 4:
+            return Array(list(value))
+    return None
+
+
+def _sanitize_content_stream(
+    pdf: Pdf,
+    stream_obj: Stream,
+    stats: dict[str, int],
+    resources: Dictionary | None,
+    bbox: Array | None,
+) -> None:
     """Sanitize one parsed content stream."""
     try:
         raw = stream_obj.read_bytes()
@@ -433,7 +727,7 @@ def _sanitize_content_stream(stream_obj: Stream, stats: dict[str, int]) -> None:
         stats["hex_odd_fixed"] += odd_hex
 
     depth = 0
-    suppressed_q = 0
+    maximum_depth = 0
     changed = False
     rewritten: list[Any] = []
 
@@ -444,18 +738,9 @@ def _sanitize_content_stream(stream_obj: Stream, stats: dict[str, int]) -> None:
 
         op_name = str(instruction.operator)
         if op_name == "q":
-            if depth >= _MAX_Q_NESTING:
-                suppressed_q += 1
-                stats["q_nesting_rebalanced"] += 1
-                changed = True
-                continue
             depth += 1
+            maximum_depth = max(maximum_depth, depth)
         elif op_name == "Q":
-            if suppressed_q > 0:
-                suppressed_q -= 1
-                stats["q_nesting_rebalanced"] += 1
-                changed = True
-                continue
             if depth > 0:
                 depth -= 1
 
@@ -473,6 +758,21 @@ def _sanitize_content_stream(stream_obj: Stream, stats: dict[str, int]) -> None:
             )
         else:
             rewritten.append(instruction)
+
+    if maximum_depth > _MAX_Q_NESTING:
+        if not isinstance(resources, Dictionary) or bbox is None:
+            raise UnsupportedPDFError(
+                "Cannot safely reduce q/Q nesting without effective resources "
+                "and a finite content bounding box."
+            )
+        rewritten, wrapped = _wrap_excess_q_nesting(
+            pdf,
+            rewritten,
+            resources,
+            bbox,
+        )
+        stats["q_nesting_rebalanced"] += wrapped * 2
+        changed = changed or wrapped > 0
 
     if changed or odd_hex > 0 or invalid_hex > 0:
         stream_obj.write(pikepdf.unparse_content_stream(rewritten))
@@ -507,83 +807,88 @@ def _sanitize_object_graph(
     stats: dict[str, int],
     visited: set[tuple[int, int]],
 ) -> Any:
-    """Recursively sanitize dictionaries/arrays for implementation limits."""
-    obj = _resolve(obj)
+    """Iteratively sanitize dictionaries/arrays for implementation limits."""
+    result = _resolve(obj)
+    pending: list[tuple[Any, Dictionary | Stream | Array | None, Any]] = [
+        (obj, None, None)
+    ]
+    while pending:
+        raw, parent, location = pending.pop()
+        current = _resolve(raw)
 
-    if isinstance(obj, (Dictionary, Array, Stream)):
-        objgen = _indirect_objgen(obj)
-        if objgen is not None:
-            if objgen in visited:
-                return obj
-            visited.add(objgen)
+        if isinstance(current, (Dictionary, Array, Stream)):
+            objgen = _indirect_objgen(current)
+            if objgen is not None:
+                if objgen in visited:
+                    continue
+                visited.add(objgen)
 
-    if isinstance(obj, (Dictionary, Stream)):
-        original_keys = list(obj.keys())
-        for old_key in original_keys:
-            new_key, long_fixed, utf8_fixed = _sanitize_name_token(old_key)
+        if isinstance(current, (Dictionary, Stream)):
+            original_keys = list(current.keys())
+            for old_key in original_keys:
+                new_key, long_fixed, utf8_fixed = _sanitize_name_token(old_key)
+                if long_fixed:
+                    stats["names_shortened"] += 1
+                if utf8_fixed:
+                    stats["utf8_names_fixed"] += 1
+                if new_key != old_key:
+                    value = current[old_key]
+                    del current[old_key]
+                    current[new_key] = value
+
+            pending.extend(
+                (current[key], current, key) for key in reversed(list(current.keys()))
+            )
+            continue
+
+        if isinstance(current, Array):
+            pending.extend(
+                (item, current, index)
+                for index, item in reversed(list(enumerate(current)))
+            )
+            continue
+
+        replacement = current
+        if isinstance(current, Name):
+            replacement, long_fixed, utf8_fixed = _sanitize_name_token(current)
             if long_fixed:
                 stats["names_shortened"] += 1
             if utf8_fixed:
                 stats["utf8_names_fixed"] += 1
-            if new_key != old_key:
-                value = obj[old_key]
-                del obj[old_key]
-                obj[new_key] = value
+        elif isinstance(current, str) and current.startswith("/"):
+            replacement, long_fixed, utf8_fixed = _sanitize_name_token(current)
+            if long_fixed:
+                stats["names_shortened"] += 1
+            if utf8_fixed:
+                stats["utf8_names_fixed"] += 1
+        else:
+            if isinstance(replacement, pikepdf.String):
+                fixed_string = _fix_odd_hex_string(replacement)
+                if fixed_string is not replacement:
+                    stats["hex_odd_obj_fixed"] += 1
+                    replacement = fixed_string
 
-        for key in list(obj.keys()):
-            current = obj[key]
-            replacement = _sanitize_object_graph(current, stats, visited)
-            if replacement is current:
-                continue
+            replacement, string_changed = _sanitize_string(replacement)
+            if string_changed:
+                stats["strings_truncated"] += 1
+            else:
+                replacement, int_changed = _sanitize_integer(replacement)
+                if int_changed:
+                    stats["integers_clamped"] += 1
+                else:
+                    replacement, real_changed = _sanitize_real(replacement)
+                    if real_changed:
+                        stats["reals_normalized"] += 1
+
+        if parent is None:
+            result = replacement
+        elif replacement is not raw:
             try:
-                obj[key] = replacement
+                parent[location] = replacement
             except KeyError:
                 # Some stream dictionary keys (e.g. /Length) are immutable.
                 continue
-        return obj
-
-    if isinstance(obj, Array):
-        for idx, item in enumerate(list(obj)):
-            obj[idx] = _sanitize_object_graph(item, stats, visited)
-        return obj
-
-    if isinstance(obj, Name):
-        replacement, long_fixed, utf8_fixed = _sanitize_name_token(obj)
-        if long_fixed:
-            stats["names_shortened"] += 1
-        if utf8_fixed:
-            stats["utf8_names_fixed"] += 1
-        return replacement
-    if isinstance(obj, str) and obj.startswith("/"):
-        replacement, long_fixed, utf8_fixed = _sanitize_name_token(obj)
-        if long_fixed:
-            stats["names_shortened"] += 1
-        if utf8_fixed:
-            stats["utf8_names_fixed"] += 1
-        return replacement
-
-    if isinstance(obj, pikepdf.String):
-        fixed_string = _fix_odd_hex_string(obj)
-        if fixed_string is not obj:
-            stats["hex_odd_obj_fixed"] += 1
-            obj = fixed_string
-
-    obj, string_changed = _sanitize_string(obj)
-    if string_changed:
-        stats["strings_truncated"] += 1
-        return obj
-
-    obj, int_changed = _sanitize_integer(obj)
-    if int_changed:
-        stats["integers_clamped"] += 1
-        return obj
-
-    obj, real_changed = _sanitize_real(obj)
-    if real_changed:
-        stats["reals_normalized"] += 1
-        return obj
-
-    return obj
+    return result
 
 
 def _cmap_has_cid_overflow(cmap_stream: Stream) -> bool:
@@ -618,17 +923,23 @@ def _cmap_has_cid_overflow(cmap_stream: Stream) -> bool:
                 except ValueError:
                     continue
         elif mode == "range":
-            match_int = _CIDS_INT_RE.match(line)
+            match_int = _CIDS_INT_GROUP_RE.match(line)
             if match_int is not None:
                 try:
-                    if int(match_int.group(1)) > _MAX_CID_VALUE:
+                    start = int(match_int.group("src_hex"), 16)
+                    end = int(match_int.group("end_hex"), 16)
+                    cid_start = int(match_int.group("cid"))
+                    if cid_start + max(0, end - start) > _MAX_CID_VALUE:
                         return True
                 except ValueError:
                     continue
-            match_hex = _CIDS_HEX_RE.match(line)
+            match_hex = _CIDS_HEX_GROUP_RE.match(line)
             if match_hex is not None:
                 try:
-                    if int(match_hex.group(1), 16) > _MAX_CID_VALUE:
+                    start = int(match_hex.group("src_hex"), 16)
+                    end = int(match_hex.group("end_hex"), 16)
+                    cid_start = int(match_hex.group("cid_hex"), 16)
+                    if cid_start + max(0, end - start) > _MAX_CID_VALUE:
                         return True
                 except ValueError:
                     continue
@@ -643,11 +954,11 @@ def _rewrite_cmap_block_begin(line: str, count: int) -> str:
     return f"{match.group('indent')}{count}{match.group('suffix')}"
 
 
-def _repair_unused_cid_overflow_entries(
+def _repair_cid_overflow_entries(
     cmap_stream: Stream,
-    used_codes: set[int],
+    used_codes: set[CharacterCode],
 ) -> tuple[int, bool]:
-    """Remove or clip unused overflowing entries from an embedded CMap.
+    """Repair overflowing CMap entries, mapping used invalid codes to CID 0.
 
     Returns:
         Tuple of (number of modified/removed CMap entries, has_remaining_overflow).
@@ -656,6 +967,12 @@ def _repair_unused_cid_overflow_entries(
         data = cmap_stream.read_bytes().decode("latin-1")
     except Exception:
         return 0, False
+
+    used_raw = {code for code in used_codes if isinstance(code, bytes)}
+    used_values = {code for code in used_codes if isinstance(code, int)}
+
+    def code_is_used(source: bytes) -> bool:
+        return source in used_raw or int.from_bytes(source, "big") in used_values
 
     lines = data.splitlines()
     had_trailing_newline = data.endswith(("\n", "\r"))
@@ -672,9 +989,15 @@ def _repair_unused_cid_overflow_entries(
             block_mode = "char" if stripped.endswith("begincidchar") else "range"
             end_marker = "endcidchar" if block_mode == "char" else "endcidrange"
             begin_line = line
+            begin_match = _BLOCK_BEGIN_RE.match(begin_line)
+            declared_count = (
+                int(begin_match.group("count")) if begin_match is not None else None
+            )
+            count_delta = 0
             i += 1
 
             kept_entries: list[str] = []
+            remapped_char_entries: list[str] = []
             while i < len(lines):
                 entry_line = lines[i]
                 entry_stripped = entry_line.strip()
@@ -685,9 +1008,8 @@ def _repair_unused_cid_overflow_entries(
                     match = _CIDCHAR_INT_RE.match(entry_stripped)
                     if match is not None:
                         try:
-                            src_code = int(
-                                entry_stripped.split(None, 1)[0].strip("<>"), 16
-                            )
+                            source = entry_stripped.split(None, 1)[0]
+                            source_bytes = bytes.fromhex(source.strip("<>"))
                             cid_value = int(match.group(1))
                         except ValueError:
                             kept_entries.append(entry_line)
@@ -695,11 +1017,11 @@ def _repair_unused_cid_overflow_entries(
                             continue
 
                         if cid_value > _MAX_CID_VALUE:
-                            if src_code in used_codes:
-                                remaining_overflow = True
-                                kept_entries.append(entry_line)
+                            changed_entries += 1
+                            if code_is_used(source_bytes):
+                                kept_entries.append(f"{source} 0")
                             else:
-                                changed_entries += 1
+                                count_delta -= 1
                             i += 1
                             continue
 
@@ -727,17 +1049,33 @@ def _repair_unused_cid_overflow_entries(
                         safe_end = min(end_code, safe_limit)
                         if cid_start > _MAX_CID_VALUE or safe_end < end_code:
                             overflow_start = max(start_code, safe_end + 1)
-                            used_in_overflow = any(
-                                overflow_start <= code <= end_code
-                                for code in used_codes
+                            source_width_bytes = (
+                                len(
+                                    match_int.group("src_hex")
+                                    if match_int is not None
+                                    else match_hex.group("src_hex")
+                                )
+                                // 2
                             )
-                            if used_in_overflow:
-                                remaining_overflow = True
-                                kept_entries.append(entry_line)
-                            elif safe_end < start_code:
-                                changed_entries += 1
-                            else:
-                                changed_entries += 1
+                            used_in_overflow = sorted(
+                                {
+                                    int.from_bytes(code, "big")
+                                    for code in used_raw
+                                    if len(code) == source_width_bytes
+                                    and overflow_start
+                                    <= int.from_bytes(code, "big")
+                                    <= end_code
+                                }
+                                | {
+                                    code
+                                    for code in used_values
+                                    if overflow_start <= code <= end_code
+                                }
+                            )
+                            changed_entries += 1
+                            count_delta -= 1
+                            if safe_end >= start_code:
+                                count_delta += 1
                                 end_hex = (
                                     match_int.group("end_hex")
                                     if match_int is not None
@@ -755,16 +1093,40 @@ def _repair_unused_cid_overflow_entries(
                                     kept_entries.append(
                                         f"{src} {new_end} <{cid_hex.upper()}>"
                                     )
+                            source_width = max(
+                                len(match_int.group("src_hex"))
+                                if match_int is not None
+                                else len(match_hex.group("src_hex")),
+                                len(match_int.group("end_hex"))
+                                if match_int is not None
+                                else len(match_hex.group("end_hex")),
+                            )
+                            remapped_char_entries.extend(
+                                f"<{code:0{source_width}X}> 0"
+                                for code in used_in_overflow
+                            )
                             i += 1
                             continue
 
                 kept_entries.append(entry_line)
                 i += 1
 
-            rewritten.append(_rewrite_cmap_block_begin(begin_line, len(kept_entries)))
+            rewritten.append(
+                _rewrite_cmap_block_begin(
+                    begin_line,
+                    max(0, declared_count + count_delta)
+                    if declared_count is not None
+                    else len(kept_entries),
+                )
+            )
             rewritten.extend(kept_entries)
             if i < len(lines):
                 rewritten.append(lines[i])
+            for offset in range(0, len(remapped_char_entries), 100):
+                chunk = remapped_char_entries[offset : offset + 100]
+                rewritten.append(f"{len(chunk)} begincidchar")
+                rewritten.extend(chunk)
+                rewritten.append("endcidchar")
             i += 1
             continue
 
@@ -784,7 +1146,7 @@ def _ensure_no_cid_overflow(
     pdf: Pdf,
     usage_cache: FontUsageCache | None = None,
 ) -> int:
-    """Repair unused CMap CID overflows and raise on remaining ones."""
+    """Repair CMap CID overflows and raise on unparseable remaining ones."""
     if usage_cache is not None:
         font_usage = usage_cache.get()
     else:
@@ -810,13 +1172,14 @@ def _ensure_no_cid_overflow(
             if not isinstance(encoding, Stream):
                 continue
 
-            repaired_here, remaining_overflow = _repair_unused_cid_overflow_entries(
+            repaired_here, remaining_overflow = _repair_cid_overflow_entries(
                 encoding, font_usage.get(objgen, set())
             )
             repaired += repaired_here
             if repaired_here > 0:
                 logger.warning(
-                    "Removed or clipped %d unused CID overflow entr(y/ies) from CMap "
+                    "Removed, clipped, or remapped %d CID overflow entr(y/ies) "
+                    "from CMap "
                     "for font %s",
                     repaired_here,
                     font_name,
@@ -866,23 +1229,45 @@ def sanitize_structure_limits(
 
     processed_streams: set[tuple[int, int]] = set()
     for page in pdf.pages:
+        contents = _resolve(page.obj.get("/Contents"))
+        if isinstance(contents, Array):
+            page.contents_coalesce()
+        resources = get_page_resources(page)
+        if not isinstance(resources, Dictionary):
+            resources = Dictionary()
+            page.obj[Name.Resources] = resources
+        bbox = _content_bbox(page.obj)
+        if bbox is None:
+            try:
+                bbox = Array(list(page.mediabox))
+            except Exception:
+                bbox = None
         for stream in _iter_owner_streams(page.obj):
             objgen = _indirect_objgen(stream)
             if objgen is not None:
                 if objgen in processed_streams:
                     continue
                 processed_streams.add(objgen)
-            _sanitize_content_stream(stream, stats)
+            _sanitize_content_stream(pdf, stream, stats, resources, bbox)
 
     for page in pdf.pages:
-        for owner, _resources in _iter_content_streams_with_resources(page):
+        for owner, resources in _iter_content_streams_with_resources(page):
+            resources = _resolve(resources)
+            if not isinstance(resources, Dictionary):
+                resources = None
+            bbox = _content_bbox(owner)
+            if bbox is None and owner is page.obj:
+                try:
+                    bbox = Array(list(page.mediabox))
+                except Exception:
+                    bbox = None
             for stream in _iter_owner_streams(owner):
                 objgen = _indirect_objgen(stream)
                 if objgen is not None:
                     if objgen in processed_streams:
                         continue
                     processed_streams.add(objgen)
-                _sanitize_content_stream(stream, stats)
+                _sanitize_content_stream(pdf, stream, stats, resources, bbox)
 
     # The passes above rewrite strings, names, operands and q/Q nesting in
     # content streams, any of which can change the collected font usage.

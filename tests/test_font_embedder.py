@@ -13,6 +13,7 @@ import pytest
 from conftest import new_pdf
 from font_helpers import _liberation_fonts_available, _noto_cjk_font_available
 from fontTools.fontBuilder import FontBuilder
+from fontTools.ttLib import TTFont
 from fontTools.ttLib.tables._g_l_y_f import Glyph
 from pikepdf import Array, Dictionary, Name
 
@@ -24,9 +25,16 @@ from pdftopdfa.fonts import (
     check_font_compliance,
 )
 from pdftopdfa.fonts.analysis import is_font_embedded
-from pdftopdfa.fonts.embedder import _UTF16_ENCODING_NAMES, _is_utf16_encoding
+from pdftopdfa.fonts.embedder import (
+    _UTF16_ENCODING_NAMES,
+    _is_utf16_encoding,
+)
 from pdftopdfa.fonts.loader import FontLoader
-from pdftopdfa.fonts.tounicode import generate_tounicode_cmap_data, parse_tounicode_cmap
+from pdftopdfa.fonts.tounicode import (
+    generate_tounicode_cmap_data,
+    parse_tounicode_cmap,
+    parse_tounicode_cmap_sequences,
+)
 from pdftopdfa.utils import resolve_indirect as _resolve_indirect
 
 
@@ -37,14 +45,20 @@ def _build_test_font_file(
     style_name: str,
     postscript_name: str,
     fstype: int = 0,
+    unicode_value: int = 0x41,
+    glyph_name: str = "A",
+    additional_characters: dict[int, str] | None = None,
 ) -> None:
     """Create a tiny TrueType font file for loader tests."""
     fb = FontBuilder(1000, isTTF=True)
-    glyphs = [".notdef", "A"]
+    character_map = {unicode_value: glyph_name, **(additional_characters or {})}
+    glyphs = [".notdef", *dict.fromkeys(character_map.values())]
     fb.setupGlyphOrder(glyphs)
-    fb.setupCharacterMap({65: "A"})
+    fb.setupCharacterMap(character_map)
     fb.setupGlyf({gname: Glyph() for gname in glyphs})
-    fb.setupHorizontalMetrics({".notdef": (500, 0), "A": (600, 0)})
+    fb.setupHorizontalMetrics(
+        {".notdef": (500, 0), **dict.fromkeys(glyphs[1:], (600, 0))}
+    )
     fb.setupHorizontalHeader(ascent=800, descent=-200)
     fb.setupNameTable(
         {
@@ -60,6 +74,71 @@ def _build_test_font_file(
     buffer = BytesIO()
     fb.font.save(buffer)
     path.write_bytes(buffer.getvalue())
+
+
+def _build_unembedded_cidfont_pdf(
+    pdf: pikepdf.Pdf,
+    *,
+    cmap_data: bytes,
+    content_codes: bytes,
+    cmap_name: str = "Custom-H",
+    ordering: str = "Japan1",
+    supplement: int = 2,
+    registry: str = "Adobe",
+    tounicode_data: bytes | None = None,
+    nested: bool = False,
+) -> tuple[pikepdf.Object, pikepdf.Object]:
+    """Build a Type 0 test font with a stream CMap and shown text."""
+    descendant = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Font,
+            Subtype=Name.CIDFontType0,
+            BaseFont=Name("/MissingJapaneseFont"),
+            CIDSystemInfo=Dictionary(
+                Registry=pikepdf.String(registry),
+                Ordering=pikepdf.String(ordering),
+                Supplement=supplement,
+            ),
+        )
+    )
+    encoding = pdf.make_indirect(pdf.make_stream(cmap_data))
+    encoding[Name.Type] = Name.CMap
+    encoding[Name.CMapName] = Name(f"/{cmap_name}")
+    font = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/MissingJapaneseFont"),
+            Encoding=encoding,
+            DescendantFonts=Array([descendant]),
+        )
+    )
+    if tounicode_data is not None:
+        font[Name.ToUnicode] = pdf.make_indirect(pdf.make_stream(tounicode_data))
+
+    text = b"BT /F1 12 Tf <" + content_codes.hex().encode("ascii") + b"> Tj ET"
+    if nested:
+        form = pdf.make_stream(text)
+        form[Name.Type] = Name.XObject
+        form[Name.Subtype] = Name.Form
+        form[Name.BBox] = Array([0, 0, 100, 100])
+        form[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+        resources = Dictionary(XObject=Dictionary(Fm1=form))
+        contents = pdf.make_stream(b"q /Fm1 Do Q")
+    else:
+        resources = Dictionary(Font=Dictionary(F1=font))
+        contents = pdf.make_stream(text)
+    pdf.pages.append(
+        pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 100, 100]),
+                Resources=resources,
+                Contents=contents,
+            )
+        )
+    )
+    return font, encoding
 
 
 class TestFontReplacements:
@@ -216,7 +295,7 @@ class TestFontEmbedder:
         with patch.object(
             embedder,
             "_replace_simple_font",
-            return_value=True,
+            return_value=(True, False),
         ) as mock_replace:
             result = embedder.embed_missing_fonts()
 
@@ -280,6 +359,21 @@ class TestFontLoader:
         ),
         [
             (
+                "Times New Roman*",
+                "TimesNewRomanPSMT",
+                "Times New Roman",
+                "Regular",
+                True,
+            ),
+            (
+                "Times New Roman,BoldItalic",
+                "TimesNewRomanPS-BoldItalicMT",
+                "Times New Roman",
+                "Bold Italic",
+                True,
+            ),
+            ("Arial,Bold", "Arial-BoldMT", "Arial", "Bold", True),
+            (
                 "TimesNewRomanPS-BoldMT",
                 "TimesNewRomanPS-BoldMT",
                 "Times New Roman",
@@ -332,6 +426,82 @@ class TestFontLoader:
         finally:
             tt_font.close()
 
+    def test_system_font_alias_is_not_reported_as_fallback(self, tmp_path):
+        """A matching Windows font does not produce a fallback warning."""
+        windir, font_path = self._make_windows_font_path(tmp_path, "times.ttf")
+        _build_test_font_file(
+            font_path,
+            family_name="Times New Roman",
+            style_name="Regular",
+            postscript_name="TimesNewRomanPSMT",
+        )
+        pdf = new_pdf()
+        pdf.pages.append(
+            pikepdf.Page(
+                Dictionary(
+                    Type=Name.Page,
+                    MediaBox=Array([0, 0, 612, 792]),
+                    Resources=Dictionary(
+                        Font=Dictionary(
+                            F1=Dictionary(
+                                Type=Name.Font,
+                                Subtype=Name.TrueType,
+                                BaseFont=Name("/Times New Roman"),
+                            )
+                        )
+                    ),
+                    Contents=pdf.make_stream(b"BT /F1 12 Tf (A) Tj ET"),
+                )
+            )
+        )
+
+        embedder = FontEmbedder(pdf)
+        with (
+            patch.object(FontLoader, "_is_windows_platform", return_value=True),
+            patch.dict("os.environ", {"WINDIR": str(windir)}, clear=False),
+        ):
+            result = embedder.embed_missing_fonts()
+
+        assert result.fonts_embedded == ["Times New Roman"]
+        assert result.warnings == []
+
+    @pytest.mark.parametrize(
+        ("requested_name", "postscript_name"),
+        [
+            ("Arial", "Arial"),
+            ("Times New Roman", "TimesNewRomanPSMT*"),
+        ],
+    )
+    def test_request_aliases_do_not_expand_internal_postscript_allowlist(
+        self,
+        tmp_path,
+        requested_name,
+        postscript_name,
+    ):
+        """Request aliases do not authorize non-allowlisted internal names."""
+        windir, font_path = self._make_windows_font_path(tmp_path, "spoofed.ttf")
+        _build_test_font_file(
+            font_path,
+            family_name="Spoofed Font",
+            style_name="Regular",
+            postscript_name=postscript_name,
+        )
+
+        loader = FontLoader({})
+        with (
+            patch.object(FontLoader, "_is_windows_platform", return_value=True),
+            patch.dict("os.environ", {"WINDIR": str(windir)}, clear=False),
+        ):
+            _font_data, tt_font = loader.load_replacement_font(
+                requested_name,
+                use_fallback=True,
+            )
+
+        try:
+            assert tt_font["name"].getDebugName(1).startswith("Liberation Sans")
+        finally:
+            tt_font.close()
+
     def test_allowlisted_font_outside_windows_fonts_is_ignored(self, tmp_path):
         """Allowlisted fonts outside ``%WINDIR%\\Fonts`` are never used."""
         outside_font = tmp_path / "external" / "Calibri.ttf"
@@ -364,14 +534,22 @@ class TestFontLoader:
         finally:
             tt_font.close()
 
-    def test_resolved_postscript_name_must_still_be_allowlisted(self, tmp_path):
+    @pytest.mark.parametrize(
+        "postscript_name",
+        ["Helvetica", "Arial", "TimesNewRomanPSMT*"],
+    )
+    def test_resolved_postscript_name_must_still_be_allowlisted(
+        self,
+        tmp_path,
+        postscript_name,
+    ):
         """The matched file's actual PostScript name is rechecked after lookup."""
         windir, font_path = self._make_windows_font_path(tmp_path, "spoofed.ttf")
         _build_test_font_file(
             font_path,
-            family_name="Helvetica",
+            family_name="Spoofed Font",
             style_name="Regular",
-            postscript_name="Helvetica",
+            postscript_name=postscript_name,
         )
 
         loader = FontLoader({})
@@ -921,6 +1099,362 @@ class TestCIDFontEmbedding:
         )
         assert parsed_mapping == custom_mapping
 
+    @pytest.mark.parametrize(
+        (
+            "encoding_name",
+            "source_code",
+            "code_space_start",
+            "code_space_end",
+            "unicode_value",
+            "glyph_name",
+            "cid",
+        ),
+        [
+            (
+                "UniJIS-UCS2-H",
+                b"\x00A",
+                b"\x00\x00",
+                b"\xff\xff",
+                0x41,
+                "A",
+                5,
+            ),
+            (
+                "UniJIS-UTF16-H",
+                b"\xd8@\xdc\x00",
+                b"\xd8\x00\xdc\x00",
+                b"\xdb\xff\xdf\xff",
+                0x20000,
+                "u20000",
+                17,
+            ),
+        ],
+    )
+    def test_unicode_cmap_is_remapped_to_replacement_gids(
+        self,
+        tmp_path,
+        encoding_name,
+        source_code,
+        code_space_start,
+        code_space_end,
+        unicode_value,
+        glyph_name,
+        cid,
+    ):
+        """Unicode CMap codes keep their text semantics after substitution."""
+        font_path = tmp_path / "replacement.ttf"
+        _build_test_font_file(
+            font_path,
+            family_name="Replacement",
+            style_name="Regular",
+            postscript_name="Replacement-Regular",
+            unicode_value=unicode_value,
+            glyph_name=glyph_name,
+        )
+        font_data = font_path.read_bytes()
+        tt_font = TTFont(BytesIO(font_data))
+        pdf = new_pdf()
+        cid_system_info = Dictionary(
+            Registry=pikepdf.String("Adobe"),
+            Ordering=pikepdf.String("Japan1"),
+            Supplement=2,
+        )
+        descendant = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.CIDFontType0,
+                BaseFont=Name("/MissingJapaneseFont"),
+                CIDSystemInfo=cid_system_info,
+            )
+        )
+        encoding = pdf.make_indirect(
+            pdf.make_stream(
+                (
+                    "begincmap\n"
+                    "1 begincodespacerange\n"
+                    f"<{code_space_start.hex()}> <{code_space_end.hex()}>\n"
+                    "endcodespacerange\n"
+                    "1 begincidchar\n"
+                    f"<{source_code.hex()}> {cid}\n"
+                    "endcidchar\n"
+                    "endcmap\n"
+                ).encode("ascii")
+            )
+        )
+        encoding[Name.Type] = Name.CMap
+        encoding[Name.CMapName] = Name(f"/{encoding_name}")
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type0,
+                BaseFont=Name("/MissingJapaneseFont"),
+                Encoding=encoding,
+                DescendantFonts=Array([descendant]),
+            )
+        )
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 100, 100]),
+                Resources=Dictionary(Font=Dictionary(F1=font)),
+                Contents=pdf.make_stream(
+                    b"BT /F1 12 Tf <" + source_code.hex().encode("ascii") + b"> Tj ET"
+                ),
+            )
+        )
+        pdf.pages.append(page)
+
+        embedder = FontEmbedder(pdf)
+        try:
+            with patch.object(
+                embedder._loader,
+                "load_cidfont_replacement_by_ordering",
+                return_value=(font_data, tt_font),
+            ):
+                result = embedder.embed_missing_fonts()
+
+            assert result.fonts_failed == []
+            assert font["/Encoding"].objgen == encoding.objgen
+            rebuilt_descendant = _resolve_indirect(font["/DescendantFonts"][0])
+            assert str(rebuilt_descendant.CIDSystemInfo.Ordering) == "Japan1"
+            cidtogid = bytes(rebuilt_descendant.CIDToGIDMap.read_bytes())
+            offset = cid * 2
+            assert int.from_bytes(
+                cidtogid[offset : offset + 2], "big"
+            ) == tt_font.getGlyphID(glyph_name)
+            assert int(rebuilt_descendant.W[0]) == cid
+            assert parse_tounicode_cmap_sequences(
+                bytes(font.ToUnicode.read_bytes())
+            ) == {source_code: (unicode_value,)}
+        finally:
+            tt_font.close()
+
+    def test_custom_vertical_unicode_usecmap_is_remapped_in_nested_form(
+        self,
+        tmp_path,
+    ):
+        """A custom Unicode usecmap keeps its CIDs, direction, and semantics."""
+        font_path = tmp_path / "replacement.ttf"
+        _build_test_font_file(
+            font_path,
+            family_name="Replacement",
+            style_name="Regular",
+            postscript_name="Replacement-Regular",
+        )
+        font_data = font_path.read_bytes()
+        tt_font = TTFont(BytesIO(font_data))
+        pdf = new_pdf()
+        source_code = b"\x00A"
+        cid = 65535
+        cmap_data = (
+            b"begincmap\n"
+            b"/UniJIS-UCS2-V usecmap\n"
+            b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n"
+            b"1 begincidchar\n<0041> 65535\nendcidchar\n"
+            b"endcmap\n"
+        )
+        font, original_encoding = _build_unembedded_cidfont_pdf(
+            pdf,
+            cmap_data=cmap_data,
+            content_codes=source_code,
+            cmap_name="Custom-V",
+            nested=True,
+        )
+
+        embedder = FontEmbedder(pdf)
+        try:
+            with patch.object(
+                embedder._loader,
+                "load_cidfont_replacement_by_ordering",
+                return_value=(font_data, tt_font),
+            ):
+                result = embedder.embed_missing_fonts()
+
+            assert result.fonts_failed == []
+            assert font["/Encoding"].objgen == original_encoding.objgen
+            descendant = _resolve_indirect(font["/DescendantFonts"][0])
+            cidtogid = bytes(descendant.CIDToGIDMap.read_bytes())
+            assert int.from_bytes(cidtogid[cid * 2 : cid * 2 + 2], "big") == 1
+            assert int(descendant.W[0]) == cid
+            assert parse_tounicode_cmap_sequences(
+                bytes(font.ToUnicode.read_bytes())
+            ) == {source_code: (ord("A"),)}
+        finally:
+            tt_font.close()
+
+    @pytest.mark.parametrize(
+        ("source_code", "unicode_value"),
+        [(b"\x00B", ord("B")), (b"\xd8\x00", 0xFFFD)],
+    )
+    def test_unicode_cmap_missing_or_invalid_glyph_uses_fallback(
+        self,
+        tmp_path,
+        source_code,
+        unicode_value,
+    ):
+        """Missing glyphs and invalid Unicode codes use an explicit fallback."""
+        font_path = tmp_path / "replacement.ttf"
+        _build_test_font_file(
+            font_path,
+            family_name="Replacement",
+            style_name="Regular",
+            postscript_name="Replacement-Regular",
+            additional_characters={ord("?"): "question"},
+        )
+        font_data = font_path.read_bytes()
+        tt_font = TTFont(BytesIO(font_data))
+        pdf = new_pdf()
+        font, original_encoding = _build_unembedded_cidfont_pdf(
+            pdf,
+            cmap_data=(
+                b"begincmap\n"
+                b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n"
+                b"1 begincidchar\n<"
+                + source_code.hex().encode("ascii")
+                + b"> 9\nendcidchar\n"
+                b"endcmap\n"
+            ),
+            content_codes=source_code,
+            cmap_name="UniJIS-UCS2-H",
+        )
+
+        embedder = FontEmbedder(pdf)
+        try:
+            with patch.object(
+                embedder._loader,
+                "load_cidfont_replacement_by_ordering",
+                return_value=(font_data, tt_font),
+            ):
+                result = embedder.embed_missing_fonts()
+
+            assert result.fonts_failed == []
+            assert font["/Encoding"].objgen == original_encoding.objgen
+            descendant = _resolve_indirect(font["/DescendantFonts"][0])
+            cidtogid = bytes(descendant.CIDToGIDMap.read_bytes())
+            assert int.from_bytes(cidtogid[18:20], "big") == tt_font.getGlyphID(
+                "question"
+            )
+            assert parse_tounicode_cmap_sequences(
+                bytes(font.ToUnicode.read_bytes())
+            ) == {source_code: (unicode_value,)}
+        finally:
+            tt_font.close()
+
+    def test_arbitrary_mixed_cmap_uses_authoritative_tounicode(self, tmp_path):
+        """Authoritative Unicode drives arbitrary and colliding CID mappings."""
+        font_path = tmp_path / "replacement.ttf"
+        _build_test_font_file(
+            font_path,
+            family_name="Replacement",
+            style_name="Regular",
+            postscript_name="Replacement-Regular",
+            additional_characters={ord("B"): "B", ord("?"): "question"},
+        )
+        font_data = font_path.read_bytes()
+        tt_font = TTFont(BytesIO(font_data))
+        pdf = new_pdf()
+        cmap_data = (
+            b"begincmap\n"
+            b"2 begincodespacerange\n<20> <7F>\n<0100> <01FF>\n"
+            b"endcodespacerange\n"
+            b"3 begincidchar\n<41> 7\n<42> 7\n<0123> 8\nendcidchar\n"
+            b"endcmap\n"
+        )
+        tounicode_data = (
+            b"begincmap\n"
+            b"2 begincodespacerange\n<20> <7F>\n<0100> <01FF>\n"
+            b"endcodespacerange\n"
+            b"3 beginbfchar\n"
+            b"<41> <0041>\n<42> <0042>\n<0123> <00660069>\n"
+            b"endbfchar\nendcmap\n"
+        )
+        font, original_encoding = _build_unembedded_cidfont_pdf(
+            pdf,
+            cmap_data=cmap_data,
+            content_codes=b"AB\x01#",
+            tounicode_data=tounicode_data,
+        )
+
+        embedder = FontEmbedder(pdf)
+        try:
+            with patch.object(
+                embedder._loader,
+                "load_cidfont_replacement_by_ordering",
+                return_value=(font_data, tt_font),
+            ):
+                result = embedder.embed_missing_fonts()
+
+            assert result.fonts_failed == []
+            assert font["/Encoding"].objgen == original_encoding.objgen
+            descendant = _resolve_indirect(font["/DescendantFonts"][0])
+            cidtogid = bytes(descendant.CIDToGIDMap.read_bytes())
+            assert int.from_bytes(cidtogid[14:16], "big") == tt_font.getGlyphID("A")
+            assert int.from_bytes(cidtogid[16:18], "big") == tt_font.getGlyphID(
+                "question"
+            )
+            assert parse_tounicode_cmap_sequences(
+                bytes(font.ToUnicode.read_bytes())
+            ) == {
+                b"A": (ord("A"),),
+                b"B": (ord("B"),),
+                b"\x01#": (ord("f"), ord("i")),
+            }
+        finally:
+            tt_font.close()
+
+    @pytest.mark.parametrize("ordering", ["Japan1", "GB1", "CNS1", "Korea1"])
+    def test_arbitrary_cmap_uses_adobe_collection_and_unknown_fallback(
+        self,
+        tmp_path,
+        ordering,
+    ):
+        """Known collection CIDs are remapped and unknown CIDs are explicit."""
+        font_path = tmp_path / f"{ordering}.ttf"
+        _build_test_font_file(
+            font_path,
+            family_name="Replacement",
+            style_name="Regular",
+            postscript_name="Replacement-Regular",
+            additional_characters={ord("?"): "question"},
+        )
+        font_data = font_path.read_bytes()
+        tt_font = TTFont(BytesIO(font_data))
+        pdf = new_pdf()
+        font, original_encoding = _build_unembedded_cidfont_pdf(
+            pdf,
+            cmap_data=(
+                b"begincmap\n"
+                b"1 begincodespacerange\n<A1> <A2>\nendcodespacerange\n"
+                b"2 begincidchar\n<A1> 34\n<A2> 65535\nendcidchar\n"
+                b"endcmap\n"
+            ),
+            content_codes=b"\xa1\xa2",
+            ordering=ordering,
+        )
+
+        embedder = FontEmbedder(pdf)
+        try:
+            with patch.object(
+                embedder._loader,
+                "load_cidfont_replacement_by_ordering",
+                return_value=(font_data, tt_font),
+            ):
+                result = embedder.embed_missing_fonts()
+
+            assert result.fonts_failed == []
+            assert font["/Encoding"].objgen == original_encoding.objgen
+            descendant = _resolve_indirect(font["/DescendantFonts"][0])
+            cidtogid = bytes(descendant.CIDToGIDMap.read_bytes())
+            assert int.from_bytes(cidtogid[68:70], "big") == tt_font.getGlyphID("A")
+            assert int.from_bytes(cidtogid[-2:], "big") == tt_font.getGlyphID(
+                "question"
+            )
+            assert parse_tounicode_cmap_sequences(
+                bytes(font.ToUnicode.read_bytes())
+            ) == {b"\xa1": (ord("A"),), b"\xa2": (0xFFFD,)}
+        finally:
+            tt_font.close()
+
     @pytest.mark.skipif(
         not _noto_cjk_font_available(),
         reason="Noto Sans CJK Font not installed",
@@ -1086,6 +1620,65 @@ class TestCIDFontEmbedding:
         encoding = embedder._get_cidfont_encoding(font_dict)
 
         assert encoding == "Identity-V"
+
+    def test_get_cidfont_encoding_unicode_cmap_stream_v(self):
+        """Vertical writing mode is detected from a Unicode CMap stream."""
+        pdf = new_pdf()
+        encoding_stream = pdf.make_stream(b"begincmap endcmap")
+        encoding_stream[Name.CMapName] = Name("/UniJIS-UCS2-V")
+        font_dict = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCJK"),
+            Encoding=encoding_stream,
+        )
+
+        assert FontEmbedder(pdf)._get_cidfont_encoding(font_dict) == "Identity-V"
+
+    def test_get_cidfont_encoding_follows_usecmap_stream_entry(self):
+        """Vertical writing mode is inherited through a stream /UseCMap entry."""
+        pdf = new_pdf()
+        base = pdf.make_stream(b"begincmap endcmap")
+        base[Name.CMapName] = Name("/UniJIS-UTF16-V")
+        encoding = pdf.make_stream(b"begincmap endcmap")
+        encoding[Name.CMapName] = Name("/Custom-V")
+        encoding[Name.UseCMap] = base
+        font_dict = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCJK"),
+            Encoding=encoding,
+        )
+
+        assert FontEmbedder(pdf)._get_cidfont_encoding(font_dict) == "Identity-V"
+
+    def test_get_cidfont_encoding_reads_stream_wmode_operator(self):
+        """An embedded CMap's WMode operator selects vertical writing."""
+        pdf = new_pdf()
+        encoding = pdf.make_stream(b"begincmap\n/WMode 1 def\nendcmap")
+        encoding[Name.CMapName] = Name("/Custom")
+        font_dict = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCJK"),
+            Encoding=encoding,
+        )
+
+        assert FontEmbedder(pdf)._get_cidfont_encoding(font_dict) == "Identity-V"
+
+    def test_get_cidfont_encoding_ignores_commented_usecmap(self):
+        """Comment text cannot impersonate a predefined vertical usecmap."""
+        pdf = new_pdf()
+        encoding = pdf.make_stream(b"begincmap\n% /UniJIS-UCS2-V usecmap\nendcmap")
+        encoding[Name.CMapName] = Name("/Custom")
+        font_dict = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCJK"),
+            Encoding=encoding,
+        )
+
+        assert FontEmbedder(pdf)._get_cidfont_encoding(font_dict) == "Identity-H"
 
     def test_get_cidfont_encoding_default(self):
         """_get_cidfont_encoding returns Identity-H as default."""
