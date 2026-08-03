@@ -4,10 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdftopdfa"
-version = "0.8.5"
+version = "0.9.0"
 description = "Convert PDF files to the archival PDF/A format"
 readme = "README.md"
-license = {file = "LICENSE"}
+license = "MPL-2.0+"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 authors = [
     {name = "iredpaul"}
@@ -16,7 +17,6 @@ keywords = ["pdf", "pdfa", "pdf-a", "archival", "conversion", "iso-19005"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
@@ -33,6 +33,7 @@ dependencies = [
     "colorama>=0.4.6",
     "tqdm>=4.68.3",
     "fonttools>=4.63.0",
+    "pdfminer.six>=20260107",
     "numpy>=1.24,<2.4",
     "paddleocr>=3.7.0,<3.8",
 ]

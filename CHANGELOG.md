@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.9.0] - 2026-08-03
+
+### Features
+
+- Add PDF/A-2a and PDF/A-3a conversion with logical structure for tagged and scanned documents
+- Add canonical Factur-X metadata for XRechnung invoices
+
+### Changes
+
+- Preserve and repair existing Tagged PDF structures while generating compliant structure trees for untagged and OCR-processed inputs
+- Harden recursive PDF resource, font, color, annotation, attachment, and metadata processing for malformed and deeply nested documents
+- Add resumable veraPDF corpus validation and release integrity checks
+
+### Bug Fixes
+
+- Preserve authoritative contextual color defaults without rewriting shared images and shadings
+- Fail closed for unverifiable embedded PDF/A attachments
+- Fix Unicode mappings, font substitution, annotation appearances, and ParentTree integrity across PDF/A-2a and PDF/A-3a
+
+### Documentation
+
+- Document Level A CLI and API usage, scan support, OCR behavior, and PDF/UA limitations
+
+### CI / Build
+
+- Package the corpus runner, release scripts, documentation, and changelog in source distributions
+
 ## [0.8.5] - 2026-07-29
 
 ### Changes
