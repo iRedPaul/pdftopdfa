@@ -279,7 +279,7 @@ pip install -e ".[dev,ocr]"
 ### Running Tests
 
 ```bash
-pytest
+python -m pytest
 ```
 
 The test suite contains 2600+ tests covering fonts, color profiles, metadata, sanitization, and end-to-end conversion.

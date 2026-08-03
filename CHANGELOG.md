@@ -26,6 +26,7 @@
 ### CI / Build
 
 - Package the corpus runner, release scripts, documentation, and changelog in source distributions
+- Run pytest through Python so repository-level test modules remain importable in CI
 
 ## [0.8.5] - 2026-07-29
 

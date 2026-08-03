@@ -57,4 +57,4 @@ jobs:
           pip install -e ".[dev,ocr]"
 
       - name: Tests with coverage
-        run: pytest --cov=pdftopdfa --cov-report=term-missing
+        run: python -m pytest --cov=pdftopdfa --cov-report=term-missing
