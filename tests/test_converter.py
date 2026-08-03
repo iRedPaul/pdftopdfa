@@ -894,10 +894,12 @@ class TestConvertToPdfa:
         assert validation.flavour == level
         assert validation.failed_rules == 0
 
+    @patch("pdftopdfa.converter.validate_with_verapdf")
     def test_convert_with_validation_flag(
-        self, sample_pdf: Path, tmp_dir: Path
+        self, mock_verapdf: MagicMock, sample_pdf: Path, tmp_dir: Path
     ) -> None:
         """validate=True runs validation without errors for compliant PDF."""
+        mock_verapdf.return_value = VeraPDFResult(compliant=True, flavour="3b")
         output_path = tmp_dir / "output.pdf"
         result = convert_to_pdfa(sample_pdf, output_path, validate=True)
 
@@ -906,6 +908,7 @@ class TestConvertToPdfa:
         has_validation_error = any("Validation:" in w for w in result.warnings)
         assert not has_validation_error
         assert result.validation_failed is False
+        mock_verapdf.assert_called_once()
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
     def test_convert_with_failing_validation_sets_flag(

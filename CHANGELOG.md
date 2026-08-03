@@ -27,6 +27,7 @@
 
 - Package the corpus runner, release scripts, documentation, and changelog in source distributions
 - Run pytest through Python so repository-level test modules remain importable in CI
+- Mock veraPDF at unit-test boundaries so CI remains independent of local validator installations
 
 ## [0.8.5] - 2026-07-29
 

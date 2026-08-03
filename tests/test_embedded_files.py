@@ -234,6 +234,21 @@ _VERAPDF_AVAILABLE = "pdftopdfa.sanitizers.files.is_verapdf_available"
 _VERAPDF_VALIDATE = "pdftopdfa.sanitizers.files.validate_with_verapdf"
 
 
+@pytest.fixture(autouse=True)
+def mock_embedded_verapdf():
+    """Keep embedded-file tests independent of a local veraPDF installation."""
+    with (
+        patch(_VERAPDF_AVAILABLE, return_value=True),
+        patch(
+            _VERAPDF_VALIDATE,
+            side_effect=lambda _path, flavour: VeraPDFResult(
+                compliant=True, flavour=flavour
+            ),
+        ),
+    ):
+        yield
+
+
 class TestIsPdfaCompliantEmbeddedVeraPDF:
     """Tests for _is_pdfa_compliant_embedded with veraPDF integration."""
 

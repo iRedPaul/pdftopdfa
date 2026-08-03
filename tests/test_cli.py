@@ -1432,9 +1432,14 @@ class TestDirectoryValidationFailures:
 
         assert result.exit_code == EXIT_VALIDATION_FAILED
 
+    @patch("pdftopdfa.verapdf.is_verapdf_available", return_value=True)
     @patch("pdftopdfa.cli.convert_directory")
     def test_skipped_validation_failure_returns_exit_code(
-        self, mock_convert_dir, runner: CliRunner, tmp_dir: Path
+        self,
+        mock_convert_dir,
+        _mock_available: MagicMock,
+        runner: CliRunner,
+        tmp_dir: Path,
     ) -> None:
         """A skipped, unvalidated copy is still a validation failure."""
         input_dir = tmp_dir / "input"
