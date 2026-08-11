@@ -13,12 +13,13 @@ import gc
 import logging
 import math
 import shutil
+import threading
 import time
 from dataclasses import dataclass, field
 from numbers import Number
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 # Optional import of ocrmypdf
 try:
@@ -141,6 +142,100 @@ def validate_ocr_languages(languages: list[str]) -> list[str]:
     return languages
 
 
+def _require_ocr_runtime(ocr_execution_provider: str) -> None:
+    onnxruntime_engine_config(ocr_execution_provider)
+    if HAS_OCR:
+        return
+    extra = (
+        "directml"
+        if execution_provider_base(ocr_execution_provider) == "directml"
+        else "ocr"
+    )
+    raise OCRError(
+        f"OCR not available. Install the OCR dependency: pip install pdftopdfa[{extra}]"
+    )
+
+
+class OCRSession:
+    """Reuse one PP-OCRv6 model session across images from one document."""
+
+    def __init__(
+        self,
+        *,
+        detection_model_dir: Path,
+        recognition_model_dir: Path,
+        ocr_execution_provider: str = "cpu",
+    ) -> None:
+        """Configure a document-bound OCR session."""
+        _require_ocr_runtime(ocr_execution_provider)
+
+        self._detection_model_dir = detection_model_dir
+        self._recognition_model_dir = recognition_model_dir
+        self._ocr_execution_provider = ocr_execution_provider
+        self._backend: Any | None = None
+        self._closed = False
+        self._lock = threading.RLock()
+
+    def __enter__(self) -> "OCRSession":
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("OCRSession is closed")
+            return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        try:
+            self.close()
+        except Exception as close_error:
+            if exc is None:
+                raise
+            exc.add_note(f"OCR model cleanup also failed: {close_error}")
+
+    def close(self) -> None:
+        """Release the session's OCR models exactly once."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            backend = self._backend
+            self._backend = None
+            if backend is None:
+                return
+            try:
+                backend.close()
+            finally:
+                gc.collect()
+
+    def recognize_image(
+        self,
+        input_path: str | Path,
+        *,
+        layout: str = "auto",
+        allowed_characters: str | None = None,
+    ) -> list[tuple[str, float]]:
+        """Recognize one image while retaining the session's loaded models."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("OCRSession is closed")
+            if self._backend is None:
+                from .ocr_paddle import _ImageOCRSession
+
+                self._backend = _ImageOCRSession(
+                    detection_model_dir=self._detection_model_dir,
+                    recognition_model_dir=self._recognition_model_dir,
+                    ocr_execution_provider=self._ocr_execution_provider,
+                )
+            return self._backend.recognize_image(
+                input_path,
+                layout=layout,
+                allowed_characters=allowed_characters,
+            )
+
+
 def recognize_image(
     input_path: str | Path,
     *,
@@ -157,31 +252,16 @@ def recognize_image(
     image directly to the recognition model. When ``allowed_characters`` is
     provided, disallowed CTC classes are masked before decoding.
     """
-    onnxruntime_engine_config(ocr_execution_provider)
-    if not HAS_OCR:
-        extra = (
-            "directml"
-            if execution_provider_base(ocr_execution_provider) == "directml"
-            else "ocr"
-        )
-        raise OCRError(
-            "OCR not available. Install the OCR dependency: "
-            f"pip install pdftopdfa[{extra}]"
-        )
-
-    from .ocr_paddle import recognize_image as recognize_with_paddle
-
-    try:
-        return recognize_with_paddle(
+    with OCRSession(
+        detection_model_dir=detection_model_dir,
+        recognition_model_dir=recognition_model_dir,
+        ocr_execution_provider=ocr_execution_provider,
+    ) as session:
+        return session.recognize_image(
             input_path,
-            detection_model_dir=detection_model_dir,
-            recognition_model_dir=recognition_model_dir,
-            ocr_execution_provider=ocr_execution_provider,
             layout=layout,
             allowed_characters=allowed_characters,
         )
-    finally:
-        _release_ocr_models()
 
 
 def _release_ocr_models() -> None:
@@ -1626,17 +1706,7 @@ def apply_ocr(
         languages = ["en"]
     if force and deskew:
         raise OCRError("Deskew cannot be combined with forced OCR")
-    onnxruntime_engine_config(ocr_execution_provider)
-    if not HAS_OCR:
-        extra = (
-            "directml"
-            if execution_provider_base(ocr_execution_provider) == "directml"
-            else "ocr"
-        )
-        raise OCRError(
-            "OCR not available. Install the OCR dependency: "
-            f"pip install pdftopdfa[{extra}]"
-        )
+    _require_ocr_runtime(ocr_execution_provider)
 
     from .ocr_paddle import validate_model_directories
 

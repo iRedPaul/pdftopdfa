@@ -105,11 +105,9 @@ _coordinate_dpi_lock = threading.Lock()
 _coordinate_dpi_by_image: dict[Path, float] = {}
 
 
-def _resolve_and_validate_model_directories(
+def _resolve_model_directories(
     detection_model_dir: Path | None,
     recognition_model_dir: Path | None,
-    *,
-    recheck: bool,
 ) -> tuple[Path, Path]:
     if detection_model_dir is None or recognition_model_dir is None:
         raise OCRError(
@@ -130,6 +128,19 @@ def _resolve_and_validate_model_directories(
         pair = tuple(model_dir.resolve() for model_dir in unresolved_pair)
     except (OSError, RuntimeError) as exc:
         raise OCRError(f"Invalid PaddleOCR model directory: {exc}") from exc
+    return pair
+
+
+def _resolve_and_validate_model_directories(
+    detection_model_dir: Path | None,
+    recognition_model_dir: Path | None,
+    *,
+    recheck: bool,
+) -> tuple[Path, Path]:
+    pair = _resolve_model_directories(
+        detection_model_dir,
+        recognition_model_dir,
+    )
 
     with _model_lock:
         if not recheck and pair == _cached_pair and _cached_fingerprint is not None:
@@ -389,22 +400,24 @@ def _predict(
     *,
     allowed_characters: str | None = None,
     latin_only: bool = False,
+    model: Any | None = None,
 ) -> Any:
     try:
         with _prediction_lock:
-            _discard_stale_prediction_results()
-            cached_prediction = _prediction_result_by_image.pop(
-                input_file.resolve(),
-                None,
-            )
-            if (
-                allowed_characters is None
-                and cached_prediction is not None
-                and cached_prediction.model_pair == _model_pair_for_cache(options)
-                and cached_prediction.latin_only == latin_only
-            ):
-                return cached_prediction.result
-            model = _get_model(options)
+            if model is None:
+                _discard_stale_prediction_results()
+                cached_prediction = _prediction_result_by_image.pop(
+                    input_file.resolve(),
+                    None,
+                )
+                if (
+                    allowed_characters is None
+                    and cached_prediction is not None
+                    and cached_prediction.model_pair == _model_pair_for_cache(options)
+                    and cached_prediction.latin_only == latin_only
+                ):
+                    return cached_prediction.result
+                model = _get_model(options)
             if allowed_characters is None and not latin_only:
                 results = list(
                     model.predict(
@@ -471,6 +484,79 @@ def _text_confidence_results(
     return results
 
 
+def _validate_image_options(
+    layout: str,
+    allowed_characters: str | None,
+) -> None:
+    if layout not in {"auto", "single_line"}:
+        raise ValueError("layout must be 'auto' or 'single_line'")
+    if allowed_characters is not None and not isinstance(allowed_characters, str):
+        raise TypeError("allowed_characters must be a string or None")
+
+
+class _ImageOCRSession:
+    """Own one lazy PaddleOCR model for sequential image recognition."""
+
+    def __init__(
+        self,
+        *,
+        detection_model_dir: Path,
+        recognition_model_dir: Path,
+        ocr_execution_provider: str = "cpu",
+    ) -> None:
+        self._model_directories = _resolve_model_directories(
+            detection_model_dir,
+            recognition_model_dir,
+        )
+        _validate_model_directory(self._model_directories[0], _DETECTION_MODEL)
+        _validate_model_directory(self._model_directories[1], _RECOGNITION_MODEL)
+        self._execution_provider = validate_ocr_execution_provider(
+            ocr_execution_provider
+        )
+        self._model: Any | None = None
+        self._closed = False
+        self._lock = threading.RLock()
+
+    def recognize_image(
+        self,
+        input_path: str | Path,
+        *,
+        layout: str = "auto",
+        allowed_characters: str | None = None,
+    ) -> list[tuple[str, float]]:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("OCRSession is closed")
+            _validate_image_options(layout, allowed_characters)
+            if self._model is None:
+                self._model = _create_model(
+                    *self._model_directories,
+                    self._execution_provider,
+                )
+            return recognize_image(
+                input_path,
+                detection_model_dir=self._model_directories[0],
+                recognition_model_dir=self._model_directories[1],
+                ocr_execution_provider=self._execution_provider,
+                layout=layout,
+                allowed_characters=allowed_characters,
+                _model=self._model,
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            model = self._model
+            self._model = None
+
+        if model is not None:
+            close = getattr(model, "close", None)
+            if callable(close):
+                close()
+
+
 def recognize_image(
     input_path: str | Path,
     *,
@@ -479,12 +565,10 @@ def recognize_image(
     ocr_execution_provider: str = "cpu",
     layout: str = "auto",
     allowed_characters: str | None = None,
+    _model: Any | None = None,
 ) -> list[tuple[str, float]]:
     """Recognize text and confidence values in one image with PP-OCRv6."""
-    if layout not in {"auto", "single_line"}:
-        raise ValueError("layout must be 'auto' or 'single_line'")
-    if allowed_characters is not None and not isinstance(allowed_characters, str):
-        raise TypeError("allowed_characters must be a string or None")
+    _validate_image_options(layout, allowed_characters)
 
     input_file = Path(input_path)
     options = SimpleNamespace(
@@ -500,6 +584,7 @@ def recognize_image(
             input_file,
             options,
             allowed_characters=allowed_characters,
+            model=_model,
         )
         return _text_confidence_results(
             _field(result, "rec_texts"),
@@ -508,7 +593,7 @@ def recognize_image(
 
     try:
         with _prediction_lock:
-            model = _get_model(options)
+            model = _model if _model is not None else _get_model(options)
             text_rec_model = model.paddlex_pipeline.text_rec_model
             with _allowed_character_decoder(text_rec_model, allowed_characters):
                 results = list(

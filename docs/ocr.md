@@ -317,6 +317,30 @@ bypasses detection. `allowed_characters` restricts CTC decoding itself, so a
 disallowed character cannot win a decoding step. Omitting both options uses
 the standard OCR pipeline unchanged.
 
+For multiple images from one document, use `OCRSession`. It loads the models
+lazily for the first image, reuses them for later images, and releases them
+once when the context exits, including after an error:
+
+```python
+from pathlib import Path
+
+from pdftopdfa import OCRSession
+
+with OCRSession(
+    detection_model_dir=Path(
+        "/opt/pdftopdfa/models/PP-OCRv6_medium_det"
+    ),
+    recognition_model_dir=Path(
+        "/opt/pdftopdfa/models/PP-OCRv6_medium_rec"
+    ),
+) as session:
+    first = session.recognize_image(Path("page-1.png"))
+    second = session.recognize_image(Path("page-2.png"))
+```
+
+Calls on one session are processed sequentially. The standalone
+`recognize_image()` function remains the one-image convenience API.
+
 An already-cropped table can be recognized from a local image path or a
 `PIL.Image.Image`:
 

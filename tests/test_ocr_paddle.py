@@ -26,6 +26,7 @@ from pikepdf import Dictionary, Name, Pdf, parse_content_stream
 from PIL import Image, ImageDraw, ImageFont
 
 import pdftopdfa.ocr_paddle as ocr_paddle
+from pdftopdfa import OCRSession
 from pdftopdfa.exceptions import OCRError
 from pdftopdfa.ocr import apply_ocr, validate_ocr_languages
 
@@ -583,6 +584,60 @@ def test_recognize_image_auto_reuses_existing_prediction_results(
     assert first == second == [("First", 0.9), ("Second", 0.8)]
     assert create_model.call_count == 1
     assert model.predict.call_count == 2
+
+
+def test_ocr_session_owns_one_model_for_multiple_images(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    model = MagicMock()
+    model.predict.side_effect = [
+        [_result(texts=["First"])],
+        [_result(texts=["Second"])],
+    ]
+
+    with patch.object(ocr_paddle, "_create_model", return_value=model) as create_model:
+        with OCRSession(
+            detection_model_dir=model_dirs[0],
+            recognition_model_dir=model_dirs[1],
+        ) as session:
+            create_model.assert_not_called()
+            first = session.recognize_image(page_image)
+            second = session.recognize_image(page_image)
+            model.close.assert_not_called()
+        session.close()
+
+    assert first == [("First", 0.95)]
+    assert second == [("Second", 0.95)]
+    create_model.assert_called_once_with(*model_dirs, "cpu")
+    model.close.assert_called_once_with()
+    assert ocr_paddle._cached_model is None
+
+
+def test_ocr_session_closes_its_model_once_after_inference_error(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    model = MagicMock()
+    model.predict.side_effect = [
+        [_result(texts=["First"])],
+        RuntimeError("inference failed"),
+    ]
+
+    with (
+        patch.object(ocr_paddle, "_create_model", return_value=model) as create_model,
+        pytest.raises(OCRError, match="inference failed"),
+    ):
+        with OCRSession(
+            detection_model_dir=model_dirs[0],
+            recognition_model_dir=model_dirs[1],
+        ) as session:
+            assert session.recognize_image(page_image) == [("First", 0.95)]
+            session.recognize_image(page_image)
+
+    create_model.assert_called_once_with(*model_dirs, "cpu")
+    model.close.assert_called_once_with()
+    assert ocr_paddle._cached_model is None
 
 
 def test_recognize_image_single_line_bypasses_detection_and_reuses_model(

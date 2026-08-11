@@ -141,13 +141,15 @@ def test_recognize_image_is_exposed_by_public_api(
     tmp_path: Path,
 ) -> None:
     image_path = tmp_path / "line.png"
+    backend = MagicMock()
+    backend.recognize_image.return_value = [("123", 0.9)]
     with (
         patch("pdftopdfa.ocr.onnxruntime_engine_config"),
         patch(
-            "pdftopdfa.ocr_paddle.recognize_image",
-            return_value=[("123", 0.9)],
-        ) as recognize_with_paddle,
-        patch("pdftopdfa.ocr._release_ocr_models") as release_models,
+            "pdftopdfa.ocr_paddle._ImageOCRSession",
+            return_value=backend,
+        ) as backend_class,
+        patch("pdftopdfa.ocr.gc.collect") as collect,
     ):
         result = recognize_image(
             image_path,
@@ -158,15 +160,43 @@ def test_recognize_image_is_exposed_by_public_api(
         )
 
     assert result == [("123", 0.9)]
-    recognize_with_paddle.assert_called_once_with(
-        image_path,
+    backend_class.assert_called_once_with(
         detection_model_dir=model_dirs[0],
         recognition_model_dir=model_dirs[1],
         ocr_execution_provider="cpu",
+    )
+    backend.recognize_image.assert_called_once_with(
+        image_path,
         layout="single_line",
         allowed_characters="0123456789",
     )
-    release_models.assert_called_once_with()
+    backend.close.assert_called_once_with()
+    collect.assert_called_once_with()
+
+
+def test_recognize_image_preserves_error_and_release_behavior(
+    model_dirs: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    backend = MagicMock()
+    backend.recognize_image.side_effect = OCRError("inference failed")
+    with (
+        patch("pdftopdfa.ocr.onnxruntime_engine_config"),
+        patch(
+            "pdftopdfa.ocr_paddle._ImageOCRSession",
+            return_value=backend,
+        ),
+        patch("pdftopdfa.ocr.gc.collect") as collect,
+        pytest.raises(OCRError, match="inference failed"),
+    ):
+        recognize_image(
+            tmp_path / "page.png",
+            detection_model_dir=model_dirs[0],
+            recognition_model_dir=model_dirs[1],
+        )
+
+    backend.close.assert_called_once_with()
+    collect.assert_called_once_with()
 
 
 class TestOcrExecutionProvider:

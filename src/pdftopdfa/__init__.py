@@ -21,7 +21,7 @@ from .exceptions import (
     ValidationError,
     VeraPDFError,
 )
-from .ocr import recognize_image
+from .ocr import OCRSession, recognize_image
 from .table import (
     TableBoundingBox,
     TableCell,
@@ -40,6 +40,7 @@ __all__ = [
     "convert_to_pdfa",
     "convert_files",
     "convert_directory",
+    "OCRSession",
     "recognize_image",
     "recognize_table",
     "ConversionResult",
