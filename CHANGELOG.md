@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.9.1] - 2026-08-11
+
+### Features
+
+- Add a reusable `OCRSession` API that lazily loads and reuses one PP-OCRv6 model across multiple images
+
+### Documentation
+
+- Document context-managed OCR sessions for sequential multi-image recognition
+
 ## [0.9.0] - 2026-08-03
 
 ### Features
