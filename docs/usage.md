@@ -5,8 +5,9 @@ This guide covers everyday usage of `pdftopdfa` from the command line and Python
 For OCR model setup and processing behavior, see [OCR Guide](ocr.md).
 
 OCR users must install exactly one runtime extra: `pdftopdfa[ocr]` for CPU or
-`pdftopdfa[directml]` for DirectML on Windows 11. CPU is the default execution
-provider; DirectML must be selected explicitly.
+`pdftopdfa[directml]` for the project's supported DirectML configuration on
+Windows 11. CPU is the default execution provider; DirectML must be selected
+explicitly.
 
 For the full list of PDF/A-2/3 compliance rules, see the [veraPDF PDF/A-2 and PDF/A-3 rules reference](https://github.com/veraPDF/veraPDF-validation-profiles/wiki/PDFA-Parts-2-and-3-rules).
 
@@ -37,6 +38,9 @@ pdftopdfa --no-pdfa --deskew --rotate-pages \
   input.pdf
 ```
 
+If the console script is not on `PATH`, the module entry point
+`python -m pdftopdfa` accepts the same arguments.
+
 ### Batch Processing
 
 ```bash
@@ -57,11 +61,16 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 - Single-file conversion without explicit output writes next to the input file.
 - Directory conversion without explicit output writes into the same directory.
 - Recursive directory conversion with an explicit output directory preserves subdirectory structure.
-- When converting in-place (`output_dir=None`), generated `_pdfa.pdf` or
-  `_processed.pdf` outputs are skipped when the corresponding source file is
+- With same-directory output (`output_dir=None`), generated `_pdfa.pdf` or
+  `_processed.pdf` files are skipped when the corresponding source file is
   present, avoiding reconversion loops without excluding standalone inputs
   whose names happen to use those suffixes.
-- Existing output files are not overwritten unless `-f/--force` (CLI) or `force_overwrite=True` (API) is used.
+- The CLI and batch APIs do not overwrite existing outputs unless
+  `-f/--force` or `force_overwrite=True`, respectively, is used.
+- Direct `convert_to_pdfa()` calls replace an existing, distinct output file;
+  that API has no overwrite-protection option.
+- Do not pass the source path or a hard link to it as the output path; actual
+  processing requires distinct input and output file identities.
 
 ## Font Policy
 
@@ -93,12 +102,12 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `-q, --quiet` | Show only errors |
 | `--verbose` | Enable detailed logs |
 | `--ocr` | Enable OCR for scanned/image-based PDFs; requires both model-directory options |
-| `--ocr-force` | Replace an existing OCR layer; requires both model-directory options and implies `--ocr` |
+| `--ocr-force` | Replace an existing OCR layer; requires both model-directory options, implies `--ocr`, and cannot be combined with `--deskew` |
 | `--ocr-lang LANG` | PaddleOCR language code (default: `en`), for example `de` or `de+en`; does not enable OCR by itself |
 | `--ocr-detection-model-dir DIR` | Directory containing compatible PP-OCRv6 Medium detection `inference.onnx` and `inference.yml` |
 | `--ocr-recognition-model-dir DIR` | Directory containing compatible PP-OCRv6 Medium recognition `inference.onnx` and `inference.yml` |
-| `--ocr-execution-provider [cpu\|directml\|directml:INDEX]` | ONNX Runtime execution provider (default: `cpu`); DirectML requires the `directml` extra on Windows 11, and `directml:INDEX` selects a specific GPU |
-| `--ocr-layout` | Order OCR lines by detected page columns without another OCR pass; see [OCR Page Layout](ocr.md#page-layout) |
+| `--ocr-execution-provider [cpu\|directml\|directml:INDEX]` | ONNX Runtime execution provider (default: `cpu`); any non-CPU provider requires both model-directory options; DirectML uses the `directml` extra and is project-supported on Windows 11, while `directml:INDEX` selects a specific raw DXGI adapter index |
+| `--ocr-layout` | Order OCR lines by detected page columns without another OCR pass; requires both model-directory options and implies `--ocr`; see [OCR Page Layout](ocr.md#page-layout) |
 | `--deskew` | Straighten scan-like, raster-dominant pages; requires both model-directory options and implies `--ocr` |
 | `--rotate-pages` | Automatically orient pages with the bundled Paddle model; requires both model-directory options and implies `--ocr` |
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
@@ -108,13 +117,16 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `--version` | Show version and exit |
 | `--help` | Show help and exit |
 
+Providing both model-directory options enables OCR even when `--ocr` is
+omitted. Providing only one model directory is an error.
+
 ### Exit Codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Success |
 | `1` | General error |
-| `2` | Input path not found |
+| `2` | CLI usage or argument error, including a nonexistent input path |
 | `3` | Conversion failed |
 | `4` | Validation failed |
 | `5` | Permission error |
@@ -125,22 +137,28 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 
 ```python
 from pathlib import Path
-from pdftopdfa import convert_to_pdfa
+from pdftopdfa import PDFToPDFAError, convert_to_pdfa
 
-result = convert_to_pdfa(
-    input_path=Path("input.pdf"),
-    output_path=Path("output.pdf"),
-    level="2a",
-    validate=True,
-)
-
-if result.success and not result.validation_failed:
-    print("Done")
-elif result.validation_failed:
-    print("Conversion completed, but validation failed")
+try:
+    result = convert_to_pdfa(
+        input_path=Path("input.pdf"),
+        output_path=Path("output.pdf"),
+        level="2a",
+        validate=True,
+    )
+except PDFToPDFAError as exc:
+    print(f"Conversion failed: {exc}")
 else:
-    print(result.error)
+    if result.validation_failed:
+        print("Conversion completed, but validation failed")
+    else:
+        print("Done")
 ```
+
+`convert_to_pdfa()` raises on conversion failure and otherwise returns a result
+with `success=True`. The batch APIs represent handled per-file failures with
+`success=False` and an `error` message so that later files can still be
+processed.
 
 Signature:
 
@@ -189,11 +207,12 @@ result = convert_to_pdfa(
 )
 ```
 
-Set `ocr_execution_provider="directml"` to use DirectML on Windows 11 after
-installing `pdftopdfa[directml]`. The same FP32 ONNX model directories are used
-for both providers. If DirectML is requested but unavailable, the call raises
+Set `ocr_execution_provider="directml"` to use the project's supported
+DirectML configuration on Windows 11 after installing
+`pdftopdfa[directml]`. The same FP32 ONNX model directories are used for both
+providers. If DirectML is requested but unavailable, the call raises
 `OCRError` instead of falling back to CPU. Use `"directml:<index>"`, for
-example `"directml:1"`, to pin a specific GPU; see
+example `"directml:1"`, to pass a specific raw DXGI adapter index; see
 [docs/ocr.md](ocr.md#selecting-a-gpu).
 
 Pass `pdfa=False` to keep the existing OCR behavior while skipping all
@@ -206,7 +225,9 @@ validated or guaranteed to conform to PDF/A.
 
 Requesting OCR processing disables the document-level optimization that copies
 an already-compliant PDF/A unchanged. Page selection still happens normally:
-without `ocr_force=True`, pages that already contain text are skipped.
+without `ocr_force=True`, pages with meaningful non-whitespace text are
+skipped; image pages whose extracted text is only whitespace still receive
+OCR.
 
 By default, non-standard visible annotations are flattened into page content for
 maximum archival robustness. Set `preserve_stamps=True` or pass
@@ -307,6 +328,15 @@ def convert_files(
 ) -> list[ConversionResult]
 ```
 
+Before processing, `convert_files()` requires unique output paths and rejects
+any output path that overlaps any batch input, including through a hard link.
+These conflicts raise `ConversionError` even with `force_overwrite=True`. An
+existing output without overwrite permission instead produces a per-file
+result with `success=False`, and processing continues. `on_progress` is called
+before each file with `(zero_based_index, total, filename)`. If `cancel_event`
+is set, processing stops before the next file and the results accumulated so
+far are returned.
+
 ### `needs_ocr()`
 
 Library helper to analyze whether a PDF would benefit from OCR. It is not
@@ -330,9 +360,9 @@ Signature:
 def needs_ocr(pdf: pikepdf.Pdf, *, threshold: float = 0.5) -> bool
 ```
 
-A page counts as needing OCR when it contains images but no text operators.
-`needs_ocr()` returns `True` when at least `threshold` (0.0-1.0) of the pages
-need OCR.
+A page counts as needing OCR when it contains images but no non-whitespace text
+operands. `needs_ocr()` returns `True` when at least `threshold` (0.0-1.0) of
+the pages need OCR.
 
 ### `ConversionResult`
 
@@ -340,14 +370,14 @@ need OCR.
 
 | Field | Type | Description |
 |---|---|---|
-| `success` | `bool` | `True` if conversion succeeded |
+| `success` | `bool` | `True` if processing and output creation succeeded; does not imply successful PDF/A validation |
 | `input_path` | `Path` | Input file path |
 | `output_path` | `Path` | Output file path |
-| `level` | `str \| None` | Requested level for converted output, detected level for a compliant skip, or `None` for unchanged unsupported/no-PDF/A output |
+| `level` | `str \| None` | Requested level for converted output, detected level for a compliant skip, or `None` when no PDF/A level was produced or detected, such as a protected input copied unchanged or `pdfa=False` output |
 | `warnings` | `list[str]` | Non-fatal conversion warnings |
 | `processing_time` | `float` | Runtime in seconds |
-| `error` | `str \\| None` | Error message if failed |
-| `validation_failed` | `bool` | `True` if validation reported non-compliance or could not complete |
+| `error` | `str \| None` | Error message for a handled per-file batch failure |
+| `validation_failed` | `bool` | `True` if validation reported non-compliance or could not complete, or if a preserved embedded PDF could not be converted |
 | `skipped` | `bool` | `True` if the original PDF was copied unchanged |
 
 ## Exceptions
@@ -361,20 +391,29 @@ All custom exceptions inherit from `PDFToPDFAError`:
 - `OCRError`
 - `VeraPDFError`
 
+`ValidationError` remains a public exception type, but when validation is
+requested the high-level conversion APIs currently report veraPDF
+non-compliance or an unavailable validator through
+`ConversionResult.validation_failed` instead of raising it.
+
 OCR configuration is validated before input processing:
 
-- CLI use of `--ocr`, `--ocr-force`, `--deskew`, `--rotate-pages`, or
-  `--ocr-execution-provider directml` without both model-directory options
-  raises a Click `UsageError`.
+- CLI use of `--ocr`, `--ocr-force`, `--deskew`, `--rotate-pages`,
+  `--ocr-layout`, or a non-CPU execution provider such as `directml` or
+  `directml:1` without both model-directory options raises a Click
+  `UsageError`.
 - Providing only one model-directory option also raises `UsageError`.
 - The high-level Python APIs raise `ValueError` when only one model directory
   is supplied, or when languages, OCR processing options, or
-  `ocr_execution_provider="directml"` are supplied without the complete pair.
+  a non-CPU `ocr_execution_provider` are supplied without the complete pair.
+- Forced OCR (`--ocr-force` or `ocr_force=True`) cannot be combined with
+  deskew (`--deskew` or `ocr_deskew=True`).
 - Invalid language codes such as `eng` and `deu` are rejected. Use `en`, `de`,
   or `["de", "en"]` for mixed German/English metadata.
 - Requesting DirectML when `DmlExecutionProvider` is unavailable raises
   `OCRError`; CPU fallback is intentionally disabled.
-- Missing, altered, or structurally invalid model artifacts raise `OCRError`.
+- Missing, structurally invalid, or incompatible model artifacts raise
+  `OCRError`.
 
 Example:
 
@@ -392,13 +431,17 @@ except ConversionError as exc:
 ```
 
 Encrypted PDFs are copied to the output path unchanged and returned with
-`success=True`, `skipped=True`, and a warning that conversion was skipped.
+`success=True`, `skipped=True`, and a warning that conversion was skipped. The
+copy has not been converted and is not guaranteed to conform to PDF/A, even if
+its default output name ends in `_pdfa.pdf`.
 
 Digitally signed PDFs are also copied unchanged by default, because OCR,
 metadata repair, font embedding, and PDF/A rewriting would invalidate the
-cryptographic signature. Use `--allow-signature-invalidation` or
+cryptographic signature. The result has `success=True`, `skipped=True`, and a
+warning, but the unchanged copy is not guaranteed to conform to the requested
+PDF/A level. Use `--allow-signature-invalidation` or
 `allow_signature_invalidation=True` only when you intentionally want an
-unsigned PDF/A copy. For signed archives, the recommended workflow is to
+unsigned converted copy. For signed archives, the recommended workflow is to
 convert to PDF/A first and sign the PDF/A output afterwards.
 
 ## PDF/A Levels
@@ -447,13 +490,16 @@ Notes:
 ## Validation
 
 `pdftopdfa` integrates with [veraPDF](https://verapdf.org/) for PDF/A validation.
+Install veraPDF separately and make its executable available on `PATH`, or set
+`VERAPDF_PATH` to the executable or its parent directory.
 
 - CLI: `pdftopdfa -v input.pdf`
 - API: pass `validate=True`
 
 Explicit validation is fail-closed: if veraPDF is missing or cannot complete,
-conversion APIs return a result with `validation_failed=True`, and the CLI
-exits with the validation-failure code.
+the Python APIs return a result with `validation_failed=True`. The CLI checks
+for veraPDF before conversion and exits with the validation-failure code if it
+is unavailable.
 
 ## Environment Variables
 
