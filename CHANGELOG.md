@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.9.2] - 2026-08-12
+
+### Changes
+
+- Simplify conversion, font, metadata, orientation, and sanitizer internals by reusing existing logic and removing redundant code
+
+### CI / Build
+
+- Enable targeted Ruff simplification and performance checks
+
 ## [0.9.1] - 2026-08-11
 
 ### Features
