@@ -93,7 +93,7 @@ def _is_pdfa_compliant_embedded(filespec: object) -> bool:
             return False
 
         # Quick check: must start with PDF magic bytes
-        if not data[:5] == b"%PDF-":
+        if data[:5] != b"%PDF-":
             return False
 
         # Open as PDF and check PDF/A level via XMP
@@ -162,7 +162,7 @@ def _try_convert_embedded_pdf_to_pdfa2(data: bytes) -> bytes | None:
         Converted PDF/A-2b bytes on success, or None if conversion failed.
     """
     # Deferred import breaks the circular dependency at module load time.
-    from ..converter import convert_to_pdfa  # noqa: PLC0415
+    from ..converter import convert_to_pdfa
 
     depth = _embedded_pdf_conversion_depth.get()
     if depth >= _MAX_EMBEDDED_PDF_CONVERSION_DEPTH:
@@ -909,8 +909,7 @@ def ensure_embedded_file_subtypes(pdf: Pdf) -> int:
         try:
             val = str(subtype_name)
             # Strip leading "/" from PDF Name
-            if val.startswith("/"):
-                val = val[1:]
+            val = val.removeprefix("/")
             # Valid MIME: exactly one "/" separating non-empty type and subtype
             parts = val.split("/")
             return len(parts) == 2 and len(parts[0]) > 0 and len(parts[1]) > 0

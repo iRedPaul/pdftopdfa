@@ -1289,7 +1289,7 @@ class TestCIDFontToUnicodePUAFallback:
         mapping = parse_tounicode_cmap(cmap_data)
         # 10 glyphs minus .notdef = 9 PUA mappings
         assert len(mapping) == 9
-        for gid, uni in mapping.items():
+        for uni in mapping.values():
             assert 0xE000 <= uni <= 0xF8FF
 
     def test_no_cmap_pua_values_are_unique(self):

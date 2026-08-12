@@ -681,8 +681,7 @@ def _normalized_object_signature(
         if isinstance(value, Array):
             signature.append(("array", None))
             pending.append(("end-array", None))
-            for item in reversed(list(value)):
-                pending.append(("value", item))
+            pending.extend(("value", item) for item in reversed(list(value)))
             continue
 
         if isinstance(value, bytes):

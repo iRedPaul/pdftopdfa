@@ -13,50 +13,6 @@ logger = logging.getLogger(__name__)
 SYMBOL_CMAP_OFFSETS = (0x0000, 0xF000, 0xF100, 0xF200)
 
 
-def obj_key(obj: pikepdf.Object) -> tuple[int, int] | None:
-    """Returns a stable identity key for cycle detection.
-
-    Uses pikepdf's objgen (object number, generation) which is stable
-    across repeated accesses, unlike Python id() which can be reused
-    for transient wrapper objects.
-
-    Args:
-        obj: A pikepdf object.
-
-    Returns:
-        The (obj_num, gen) tuple for indirect objects, or None for
-        direct objects (which cannot form reference cycles).
-    """
-    try:
-        og = obj.objgen
-        if og != (0, 0):
-            return og
-    except Exception:
-        pass
-    return None
-
-
-def check_visited(obj: pikepdf.Object, visited: set[tuple[int, int]]) -> bool:
-    """Checks if an object has been visited and marks it if not.
-
-    Args:
-        obj: A pikepdf object to check.
-        visited: Set of objgen tuples already visited.
-
-    Returns:
-        True if the object was already visited (should be skipped),
-        False if it's new (and has now been added to visited).
-    """
-    key = obj_key(obj)
-    if key is None:
-        # Direct object — cannot form cycles, always process
-        return False
-    if key in visited:
-        return True
-    visited.add(key)
-    return False
-
-
 def safe_str(obj: pikepdf.Object, fallback: str = "Unknown") -> str:
     """Converts a pikepdf object to string, handling non-UTF-8 bytes.
 

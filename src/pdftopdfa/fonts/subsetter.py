@@ -734,7 +734,7 @@ def _resolve_simple_font_encoding(
             if not pdfa_normalized or all_agl:
                 code_to_glyphname.update(overrides)
 
-        return code_to_glyphname if code_to_glyphname else None
+        return code_to_glyphname or None
     except Exception:
         return None
 

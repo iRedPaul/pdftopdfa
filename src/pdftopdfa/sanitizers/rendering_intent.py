@@ -289,11 +289,11 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
                 processed_type3.add(font_context)
                 charprocs = _resolve_indirect(font.get("/CharProcs"))
                 if isinstance(charprocs, Dictionary):
-                    for char_name in list(charprocs.keys()):
-                        if isinstance(_resolve_indirect(charprocs[char_name]), Stream):
-                            discovered.append(
-                                ("stream", charprocs, char_name, font_resources)
-                            )
+                    discovered.extend(
+                        ("stream", charprocs, char_name, font_resources)
+                        for char_name in list(charprocs.keys())
+                        if isinstance(_resolve_indirect(charprocs[char_name]), Stream)
+                    )
                 if font_resources is not resources:
                     discovered.append(("resources", font_resources, None, None))
         return discovered
@@ -323,9 +323,11 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
         if isinstance(contents, Stream):
             tasks.append(("stream", page_dict, Name.Contents, page_resources))
         elif isinstance(contents, Array):
-            for index in range(len(contents)):
-                if isinstance(_resolve_indirect(contents[index]), Stream):
-                    tasks.append(("stream", contents, index, page_resources))
+            tasks.extend(
+                ("stream", contents, index, page_resources)
+                for index in range(len(contents))
+                if isinstance(_resolve_indirect(contents[index]), Stream)
+            )
 
         tasks.append(("resources", page_resources, None, None))
 
@@ -1044,8 +1046,10 @@ def _sanitize_image_intents_in_resource_graph(
                 ):
                     pending.append(_resolve_indirect(pattern.get("/Resources")))
 
-        for group in _iter_soft_mask_groups(parent, visited):
-            pending.append(_resolve_indirect(group.get("/Resources")))
+        pending.extend(
+            _resolve_indirect(group.get("/Resources"))
+            for group in _iter_soft_mask_groups(parent, visited)
+        )
 
     return fixed
 

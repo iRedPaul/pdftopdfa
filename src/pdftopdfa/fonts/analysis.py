@@ -13,7 +13,7 @@ from ..exceptions import FontEmbeddingError
 from ..utils import resolve_indirect as _resolve_indirect
 from .constants import STANDARD_14_FONTS, UTF16_ENCODING_NAMES
 from .tounicode import resolve_glyph_to_unicode
-from .traversal import iter_all_page_fonts
+from .traversal import iter_acroform_dr_fonts, iter_all_page_fonts
 from .utils import get_encoding_name as _get_encoding_name
 from .utils import safe_str as _safe_str
 
@@ -361,9 +361,7 @@ def _has_valid_font_signature(data: bytes, key: str) -> bool:
         if magic in (b"OTTO", b"ttcf", b"\x00\x01\x00\x00"):
             return True
         # Raw CFF: major version 1, header size >= 4
-        if data[0] == 1 and data[2] >= 4:
-            return True
-        return False
+        return data[0] == 1 and data[2] >= 4
     return False
 
 
@@ -404,6 +402,19 @@ def _check_font_descriptor_embedded(font: pikepdf.Object) -> bool:
     return False
 
 
+def _analyze_font(font: pikepdf.Object) -> FontInfo:
+    """Collect the compliance-relevant information for one font."""
+    font_name = get_font_name(font)
+    return FontInfo(
+        name=font_name,
+        type=get_font_type(font),
+        embedded=is_font_embedded(font),
+        subset=_is_subset_font(font_name),
+        has_tounicode=has_tounicode_cmap(font),
+        unicode_derivable=can_derive_unicode(font),
+    )
+
+
 def analyze_fonts(pdf: pikepdf.Pdf) -> list[FontInfo]:
     """Analyzes all fonts in the PDF document.
 
@@ -429,36 +440,22 @@ def analyze_fonts(pdf: pikepdf.Pdf) -> list[FontInfo]:
                         continue
                     seen_font_ids.add(obj_key)
 
-                font_name = get_font_name(font)
-                font_type = get_font_type(font)
-                embedded = is_font_embedded(font)
-                subset = _is_subset_font(font_name)
-                tounicode = has_tounicode_cmap(font)
-                derivable = can_derive_unicode(font)
+                font_info = _analyze_font(font)
 
                 # Distinct objects sharing name and type may differ in
                 # embedding status (e.g. merged PDFs), so each object
                 # gets its own entry
-                fonts.append(
-                    FontInfo(
-                        name=font_name,
-                        type=font_type,
-                        embedded=embedded,
-                        subset=subset,
-                        has_tounicode=tounicode,
-                        unicode_derivable=derivable,
-                    )
-                )
+                fonts.append(font_info)
                 logger.debug(
                     "Font found on page %d: %s (%s, embedded=%s,"
                     " subset=%s, tounicode=%s, derivable=%s)",
                     page_num,
-                    font_name,
-                    font_type,
-                    embedded,
-                    subset,
-                    tounicode,
-                    derivable,
+                    font_info.name,
+                    font_info.type,
+                    font_info.embedded,
+                    font_info.subset,
+                    font_info.has_tounicode,
+                    font_info.unicode_derivable,
                 )
             except UnicodeDecodeError:
                 logger.debug(
@@ -476,53 +473,24 @@ def analyze_fonts(pdf: pikepdf.Pdf) -> list[FontInfo]:
                 )
                 continue
 
-    # Scan AcroForm DR (Default Resources) fonts
-    try:
-        root = pdf.Root
-        if root is not None and "/AcroForm" in root:
-            acroform = _resolve_indirect(root.AcroForm)
-            dr = acroform.get("/DR")
-            if dr is not None:
-                dr = _resolve_indirect(dr)
-                font_dict = dr.get("/Font")
-                if font_dict is not None:
-                    font_dict = _resolve_indirect(font_dict)
-                    for font_key in list(font_dict.keys()):
-                        try:
-                            font = _resolve_indirect(font_dict[font_key])
-                            obj_key = font.objgen
-                            if obj_key != (0, 0):
-                                if obj_key in seen_font_ids:
-                                    continue
-                                seen_font_ids.add(obj_key)
+    for _, font in iter_acroform_dr_fonts(pdf):
+        try:
+            obj_key = font.objgen
+            if obj_key != (0, 0):
+                if obj_key in seen_font_ids:
+                    continue
+                seen_font_ids.add(obj_key)
 
-                            font_name = get_font_name(font)
-                            font_type = get_font_type(font)
-                            embedded = is_font_embedded(font)
-                            subset = _is_subset_font(font_name)
-                            tounicode = has_tounicode_cmap(font)
-                            derivable = can_derive_unicode(font)
-
-                            fonts.append(
-                                FontInfo(
-                                    name=font_name,
-                                    type=font_type,
-                                    embedded=embedded,
-                                    subset=subset,
-                                    has_tounicode=tounicode,
-                                    unicode_derivable=derivable,
-                                )
-                            )
-                            logger.debug(
-                                "Font found in AcroForm DR: %s (%s, embedded=%s)",
-                                font_name,
-                                font_type,
-                                embedded,
-                            )
-                        except Exception:
-                            continue
-    except Exception:
-        pass
+            font_info = _analyze_font(font)
+            fonts.append(font_info)
+            logger.debug(
+                "Font found in AcroForm DR: %s (%s, embedded=%s)",
+                font_info.name,
+                font_info.type,
+                font_info.embedded,
+            )
+        except Exception:
+            continue
 
     return fonts
 

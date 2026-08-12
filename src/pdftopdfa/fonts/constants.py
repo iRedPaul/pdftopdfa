@@ -164,21 +164,4 @@ UTF16_ENCODING_NAMES = frozenset(
 )
 
 # Standard 14 PDF fonts (not embedded in standard PDFs)
-STANDARD_14_FONTS = frozenset(
-    {
-        "Courier",
-        "Courier-Bold",
-        "Courier-BoldOblique",
-        "Courier-Oblique",
-        "Helvetica",
-        "Helvetica-Bold",
-        "Helvetica-BoldOblique",
-        "Helvetica-Oblique",
-        "Times-Roman",
-        "Times-Bold",
-        "Times-BoldItalic",
-        "Times-Italic",
-        "Symbol",
-        "ZapfDingbats",
-    }
-)
+STANDARD_14_FONTS = frozenset(FONT_REPLACEMENTS)

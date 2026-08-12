@@ -769,8 +769,7 @@ def _unpack_samples(
                 val = (row_data[offset] << 8) | row_data[offset + 1]
                 samples.append(val)
         elif bpc == 8:
-            for i in range(samples_per_row):
-                samples.append(row_data[i])
+            samples.extend(row_data[:samples_per_row])
         elif bpc <= 8:
             bit_offset = 0
             for _ in range(samples_per_row):

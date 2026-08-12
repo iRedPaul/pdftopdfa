@@ -45,10 +45,11 @@ def _make_tt_font_bytes(
     # Use first subtable mapping for setupCharacterMap (FontBuilder requirement)
     if cmap_subtables:
         first_mapping = cmap_subtables[0][2]
-        setup_cmap: dict[int, str] = {}
-        for code, gname in first_mapping.items():
-            if 0 <= code <= 0xFFFF and gname in glyphs:
-                setup_cmap[code] = gname
+        setup_cmap = {
+            code: gname
+            for code, gname in first_mapping.items()
+            if 0 <= code <= 0xFFFF and gname in glyphs
+        }
         fb.setupCharacterMap(setup_cmap)
     elif include_a:
         fb.setupCharacterMap({0x41: "A"})

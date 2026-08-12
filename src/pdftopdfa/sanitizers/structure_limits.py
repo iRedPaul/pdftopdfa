@@ -313,33 +313,6 @@ def _sanitize_operand(value: Any, stats: dict[str, int]) -> tuple[Any, bool]:
     return result, changed
 
 
-def _validate_text_operands(operator_name: str, operands: Any) -> bool:
-    """Validate parsed text-showing operator operand structure."""
-    if operator_name == "Tj" or operator_name == "'":
-        return len(operands) == 1 and isinstance(operands[0], pikepdf.String)
-
-    if operator_name == '"':
-        if len(operands) != 3:
-            return False
-        return isinstance(operands[2], pikepdf.String)
-
-    if operator_name == "TJ":
-        if len(operands) != 1 or not isinstance(operands[0], Array):
-            return False
-        for item in operands[0]:
-            if (
-                isinstance(item, pikepdf.String)
-                or isinstance(item, int)
-                or isinstance(item, float)
-                or isinstance(item, Decimal)
-            ):
-                continue
-            return False
-        return True
-
-    return True
-
-
 def _count_odd_hex_string_tokens(stream_data: bytes) -> int:
     """Count odd-length hexadecimal string literals in content stream bytes."""
     odd = 0

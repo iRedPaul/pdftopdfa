@@ -141,7 +141,7 @@ def _validate_font_program(tt_font, font_name: str = "") -> bool:
         return False
 
     # Check for negative advance widths
-    for _name, (advance, _lsb) in tt_font["hmtx"].metrics.items():
+    for advance, _lsb in tt_font["hmtx"].metrics.values():
         if advance < 0:
             logger.debug(
                 "Font %s: font program has negative advance width",
@@ -150,9 +150,7 @@ def _validate_font_program(tt_font, font_name: str = "") -> bool:
             return False
 
     # If all glyphs have zero width, the font program is likely damaged
-    all_zero = all(
-        advance == 0 for _name, (advance, _lsb) in tt_font["hmtx"].metrics.items()
-    )
+    all_zero = all(advance == 0 for advance, _lsb in tt_font["hmtx"].metrics.values())
     if all_zero and num_hmtx > 1:
         logger.debug("Font %s: font program has all zero-width glyphs", font_name)
         return False
@@ -737,9 +735,10 @@ def _extract_cff_glyph_widths(tt_font) -> dict[str, int]:
 
     glyph_order = char_strings.keys()
     # Build glyph name → GID mapping for FDSelect lookup
-    glyph_name_to_gid: dict[str, int] = {}
-    for gid, gname in enumerate(tt_font.getGlyphOrder() if has_fd_array else []):
-        glyph_name_to_gid[gname] = gid
+    glyph_name_to_gid = {
+        gname: gid
+        for gid, gname in enumerate(tt_font.getGlyphOrder() if has_fd_array else [])
+    }
 
     result: dict[str, int] = {}
     for gname in glyph_order:

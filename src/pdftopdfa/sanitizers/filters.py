@@ -433,9 +433,7 @@ def _may_contain_inline_images(stream: Stream) -> bool:
     if stream.get("/Type") is not None:
         return False
     # Skip font streams (have /Length1, /Length2, or /Length3).
-    if stream.get("/Length1") is not None:
-        return False
-    return True
+    return stream.get("/Length1") is None
 
 
 def _has_lzw_filter(stream: Stream) -> bool:

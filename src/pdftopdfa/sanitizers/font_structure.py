@@ -47,15 +47,6 @@ _VALID_FONTFILE3_SUBTYPES = frozenset(
     }
 )
 
-# Subtypes that require /FirstChar, /LastChar, /Widths
-_SIMPLE_FONT_SUBTYPES = frozenset(
-    {
-        "/Type1",
-        "/MMType1",
-        "/TrueType",
-    }
-)
-
 # Subtypes that do NOT require /FirstChar, /LastChar, /Widths
 _SKIP_CHAR_RANGE_SUBTYPES = frozenset(
     {
@@ -312,8 +303,7 @@ def _fix_char_range_and_widths(font: pikepdf.Object, result: dict[str, int]) -> 
         if base_font is not None:
             base_name = _safe_str(base_font)
             # Strip leading "/" and optional "ABCDEF+" subset prefix
-            if base_name.startswith("/"):
-                base_name = base_name[1:]
+            base_name = base_name.removeprefix("/")
             if "+" in base_name:
                 base_name = base_name.split("+", 1)[1]
             if base_name in STANDARD_14_FONTS:

@@ -147,10 +147,10 @@ class FontMetricsExtractor:
         byte_mapping = byte_encoding[2] if byte_encoding is not None else {}
         units_per_em = head.unitsPerEm
         scale = 1000.0 / units_per_em
+        notdef_width = round(hmtx.metrics.get(".notdef", (500, 0))[0] * scale)
 
         if not cmap:
-            notdef_width = hmtx.metrics.get(".notdef", (500, 0))[0]
-            return [round(notdef_width * scale)] * 256
+            return [notdef_width] * 256
 
         widths = []
         for char_code in range(256):
@@ -159,8 +159,7 @@ class FontMetricsExtractor:
                 width = round(hmtx.metrics[glyph_name][0] * scale)
             else:
                 # Fallback: width of .notdef or space
-                notdef_width = hmtx.metrics.get(".notdef", (500, 0))[0]
-                width = round(notdef_width * scale)
+                width = notdef_width
             widths.append(width)
 
         return widths
@@ -189,11 +188,12 @@ class FontMetricsExtractor:
         cmap = get_any_cmap(tt_font)
         units_per_em = head.unitsPerEm
         scale = 1000.0 / units_per_em
-        notdef_width = hmtx.metrics.get(".notdef", (500, 0))[0]
+        notdef_width = round(hmtx.metrics.get(".notdef", (500, 0))[0] * scale)
 
         widths = []
         for code in range(256):
             adobe_name = encoding.get(code)
+            width = notdef_width
             if adobe_name:
                 # Resolve Adobe glyph name to actual font glyph name
                 glyph = resolve_glyph_name(
@@ -201,12 +201,6 @@ class FontMetricsExtractor:
                 )
                 if glyph:
                     width = round(hmtx.metrics[glyph][0] * scale)
-                else:
-                    # Glyph not found - use .notdef width
-                    width = round(notdef_width * scale)
-            else:
-                # No glyph defined for this code
-                width = round(notdef_width * scale)
             widths.append(width)
 
         return widths
@@ -304,6 +298,7 @@ class FontMetricsExtractor:
         scale = 1000.0 / units_per_em
 
         glyph_order = tt_font.getGlyphOrder()
+        notdef_width = round(hmtx.metrics.get(".notdef", (500, 0))[0] * scale)
 
         # Collect all widths
         widths: list[tuple[int, int]] = []
@@ -320,7 +315,7 @@ class FontMetricsExtractor:
             if glyph_name in hmtx.metrics:
                 width = round(hmtx.metrics[glyph_name][0] * scale)
             else:
-                width = round(hmtx.metrics.get(".notdef", (500, 0))[0] * scale)
+                width = notdef_width
             widths.append((cid, width))
 
         # Create W array using both PDF formats:

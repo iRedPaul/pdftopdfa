@@ -109,14 +109,13 @@ def _iter_content_streams_with_resources(
         Tuples of (stream_owner, resources_dict).
     """
     processed: set[_ContextKey] = set()
-    active: set[_ObjectKey] = set()
 
     # Page-level
     resources = get_page_resources(page)
 
     if resources is not None:
         yield (page.obj, resources)
-        yield from _iter_nested_streams(resources, processed, active)
+        yield from _iter_nested_streams(resources, processed)
 
     # Annotation Appearance Streams
     annots = page.get("/Annots")
@@ -157,7 +156,6 @@ def _iter_content_streams_with_resources(
                             ap_entry,
                             res,
                             processed,
-                            active,
                         )
                 elif isinstance(ap_entry, pikepdf.Dictionary):
                     for sub_key in list(ap_entry.keys()):
@@ -174,7 +172,6 @@ def _iter_content_streams_with_resources(
                                         sub,
                                         res,
                                         processed,
-                                        active,
                                     )
                         except Exception:
                             continue
@@ -224,36 +221,30 @@ def _iter_stream_context(
     stream: pikepdf.Stream,
     resources: pikepdf.Dictionary,
     processed: set[_ContextKey],
-    active: set[_ObjectKey],
 ) -> Iterator[tuple[pikepdf.Object, pikepdf.Object]]:
     """Yield one stream/resource context and its graph without recursion."""
     yield from _iter_resource_graph(
         [("stream", stream, resources)],
         processed,
-        active,
     )
 
 
 def _iter_nested_streams(
     resources: pikepdf.Object,
     processed: set[_ContextKey],
-    active: set[_ObjectKey],
 ) -> Iterator[tuple[pikepdf.Object, pikepdf.Object]]:
     """Yield nested stream/resource contexts without using Python recursion."""
     yield from _iter_resource_graph(
         [("resources", resources, None)],
         processed,
-        active,
     )
 
 
 def _iter_resource_graph(
     initial_tasks: list[tuple[str, pikepdf.Object, pikepdf.Object | None]],
     processed: set[_ContextKey],
-    active: set[_ObjectKey],
 ) -> Iterator[tuple[pikepdf.Object, pikepdf.Object]]:
     """Walk content-bearing resource graphs with an explicit work stack."""
-    del active  # Context-pair deduplication is sufficient for finite PDF graphs.
     tasks = list(reversed(initial_tasks))
 
     while tasks:

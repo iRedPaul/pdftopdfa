@@ -48,12 +48,6 @@ _DEFAULT_CS_NAMES: dict[ColorSpaceType, Name] = {
     ColorSpaceType.DEVICE_CMYK: Name.DefaultCMYK,
 }
 
-_DEVICE_CS_NAMES: dict[ColorSpaceType, Name] = {
-    ColorSpaceType.DEVICE_GRAY: Name.DeviceGray,
-    ColorSpaceType.DEVICE_RGB: Name.DeviceRGB,
-    ColorSpaceType.DEVICE_CMYK: Name.DeviceCMYK,
-}
-
 _DEVICE_NAME_TO_TYPE: dict[Name, ColorSpaceType] = {
     Name.DeviceGray: ColorSpaceType.DEVICE_GRAY,
     Name.DeviceRGB: ColorSpaceType.DEVICE_RGB,

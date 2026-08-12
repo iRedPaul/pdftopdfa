@@ -1314,33 +1314,6 @@ def _sanitize_extension_schema_blocks(
     return result
 
 
-def _collect_declared_extension_properties(
-    blocks: dict[str, etree._Element],
-) -> dict[str, set[str]]:
-    """Collect locally declared extension properties from sanitized blocks."""
-    ns_rdf = NAMESPACES["rdf"]
-    property_tag = f"{{{_NS_PDFA_SCHEMA}}}property"
-    seq_tag = f"{{{ns_rdf}}}Seq"
-    li_tag = f"{{{ns_rdf}}}li"
-    name_tag = f"{{{_NS_PDFA_PROPERTY}}}name"
-    declared: dict[str, set[str]] = {}
-
-    for uri, block in blocks.items():
-        prop_elem = block.find(property_tag)
-        if prop_elem is None:
-            continue
-        seq = prop_elem.find(seq_tag)
-        if seq is None:
-            continue
-        for prop_li in seq.findall(li_tag):
-            name_elem = prop_li.find(name_tag)
-            prop_name = (name_elem.text or "").strip() if name_elem is not None else ""
-            if prop_name:
-                declared.setdefault(uri, set()).add(prop_name)
-
-    return declared
-
-
 def _collect_declared_extension_schema_details(
     blocks: dict[str, etree._Element],
 ) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, dict[str, str]]]]:
@@ -2390,8 +2363,7 @@ def _parse_pdf_date(date_str: str) -> datetime | None:
         return None
 
     # Remove 'D:' prefix if present
-    if date_str.startswith("D:"):
-        date_str = date_str[2:]
+    date_str = date_str.removeprefix("D:")
 
     # Pattern for PDF date: YYYYMMDDHHMMSS with optional timezone
     pattern = r"(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?([-+Z])?([\d']+)?"
@@ -2887,12 +2859,13 @@ def create_xmp_metadata(
         original_schema_blocks=original_blocks,
     )
     if extension_elem is not None:
-        for prefix, uri in [
-            ("pdfaExtension", _NS_PDFA_EXTENSION),
-            ("pdfaSchema", _NS_PDFA_SCHEMA),
-            ("pdfaProperty", _NS_PDFA_PROPERTY),
-        ]:
-            nsmap[prefix] = uri
+        nsmap.update(
+            {
+                "pdfaExtension": _NS_PDFA_EXTENSION,
+                "pdfaSchema": _NS_PDFA_SCHEMA,
+                "pdfaProperty": _NS_PDFA_PROPERTY,
+            }
+        )
 
         description.append(extension_elem)
 

@@ -1627,7 +1627,6 @@ class FontEmbedder:
         else:
             # Try dict-like access for indirect/wrapped pikepdf objects
             try:
-                encoding.get  # noqa: B018
                 code_to_unicode = generate_tounicode_from_encoding_dict(encoding)
             except Exception:
                 # Can't determine encoding

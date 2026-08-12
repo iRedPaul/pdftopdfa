@@ -49,10 +49,7 @@ def _validate_icc_profile(profile_data: bytes) -> bool:
     # Only mntr, prtr, scnr, spac allowed; nmcl (Named Color) not allowed
     device_class = profile_data[12:16]
     allowed_classes = {b"mntr", b"prtr", b"scnr", b"spac"}
-    if device_class not in allowed_classes:
-        return False
-
-    return True
+    return device_class in allowed_classes
 
 
 @functools.cache

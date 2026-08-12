@@ -280,6 +280,26 @@ def _predict_batch(
     ]
 
 
+def _consensus_prediction(
+    page_number: int, candidates: list[_Prediction]
+) -> _Prediction | None:
+    """Return a prediction when at least three candidates agree on an angle."""
+    counts = {
+        angle: sum(candidate.correction_angle == angle for candidate in candidates)
+        for angle in _ALLOWED_ANGLES
+    }
+    winning_angle = max(counts, key=lambda angle: counts[angle])
+    if counts[winning_angle] < 3:
+        return None
+
+    winning_score = max(
+        candidate.score
+        for candidate in candidates
+        if candidate.correction_angle == winning_angle
+    )
+    return _Prediction(page_number, winning_angle, winning_score)
+
+
 def _refine_low_confidence_predictions(
     images: list[Any],
     predictions: list[_Prediction],
@@ -332,25 +352,11 @@ def _refine_low_confidence_predictions(
 
     refined = predictions.copy()
     for index, page_candidates in candidates.items():
-        counts = {
-            angle: sum(
-                candidate.correction_angle == angle for candidate in page_candidates
-            )
-            for angle in _ALLOWED_ANGLES
-        }
-        winning_angle = max(counts, key=lambda angle: counts[angle])
-        if counts[winning_angle] < 3:
-            continue
-        winning_score = max(
-            candidate.score
-            for candidate in page_candidates
-            if candidate.correction_angle == winning_angle
+        consensus = _consensus_prediction(
+            predictions[index].page_number, page_candidates
         )
-        refined[index] = _Prediction(
-            page_number=predictions[index].page_number,
-            correction_angle=winning_angle,
-            score=winning_score,
-        )
+        if consensus is not None:
+            refined[index] = consensus
 
     spatial_indices = [
         index
@@ -398,25 +404,11 @@ def _refine_low_confidence_predictions(
                 spatial_candidates[index].append(prediction)
 
     for index, page_candidates in spatial_candidates.items():
-        counts = {
-            angle: sum(
-                candidate.correction_angle == angle for candidate in page_candidates
-            )
-            for angle in _ALLOWED_ANGLES
-        }
-        winning_angle = max(counts, key=lambda angle: counts[angle])
-        if counts[winning_angle] < 3:
-            continue
-        winning_score = max(
-            candidate.score
-            for candidate in page_candidates
-            if candidate.correction_angle == winning_angle
+        consensus = _consensus_prediction(
+            predictions[index].page_number, page_candidates
         )
-        refined[index] = _Prediction(
-            page_number=predictions[index].page_number,
-            correction_angle=winning_angle,
-            score=winning_score,
-        )
+        if consensus is not None:
+            refined[index] = consensus
 
     return refined
 

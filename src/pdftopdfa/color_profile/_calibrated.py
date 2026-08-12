@@ -15,11 +15,6 @@ from ._types import ColorSpaceType
 
 logger = logging.getLogger(__name__)
 
-_CAL_TYPE_MAP: dict[str, ColorSpaceType] = {
-    "/CalGray": ColorSpaceType.CAL_GRAY,
-    "/CalRGB": ColorSpaceType.CAL_RGB,
-}
-
 
 def _log_calibration_params(cs) -> None:
     """Log the original calibration parameters before replacement."""

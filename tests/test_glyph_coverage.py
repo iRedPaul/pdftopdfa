@@ -29,8 +29,7 @@ def _make_ttfont_data(glyph_count: int = 3) -> bytes:
         Serialized font bytes.
     """
     glyph_names = [".notdef"]
-    for i in range(1, glyph_count):
-        glyph_names.append(f"glyph{i:05d}")
+    glyph_names.extend(f"glyph{i:05d}" for i in range(1, glyph_count))
 
     fb = FontBuilder(1000, isTTF=True)
     fb.setupGlyphOrder(glyph_names)

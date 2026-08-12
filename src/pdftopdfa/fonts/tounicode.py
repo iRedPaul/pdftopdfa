@@ -14,6 +14,7 @@ from fontTools import agl
 from pdfminer.cmapdb import CMapDB
 
 from ..utils import resolve_indirect as _resolve_indirect
+from .constants import UTF16_ENCODING_NAMES
 from .encodings import STANDARD_ENCODING, SYMBOL_ENCODING, ZAPFDINGBATS_ENCODING
 from .glyph_mapping import SYMBOL_GLYPH_TO_UNICODE, ZAPFDINGBATS_GLYPH_TO_UNICODE
 from .utils import safe_str as _safe_str
@@ -638,6 +639,52 @@ def _unicode_value_to_utf16_hex(unicode_value: UnicodeValue) -> str:
     return text.encode("utf-16-be").hex().upper()
 
 
+def _format_tounicode_cmap(
+    code_to_unicode: dict[int, UnicodeValue],
+    *,
+    source_hex_width: int,
+) -> bytes:
+    """Format a code-to-Unicode mapping as an Adobe ToUnicode CMap."""
+    max_source = "F" * source_hex_width
+    lines = [
+        "/CIDInit /ProcSet findresource begin",
+        "12 dict begin",
+        "begincmap",
+        "/CIDSystemInfo <<",
+        "  /Registry (Adobe)",
+        "  /Ordering (UCS)",
+        "  /Supplement 0",
+        ">> def",
+        "/CMapName /Adobe-Identity-UCS def",
+        "/CMapType 2 def",
+        "1 begincodespacerange",
+        f"<{'0' * source_hex_width}> <{max_source}>",
+        "endcodespacerange",
+    ]
+
+    sorted_codes = sorted(code_to_unicode)
+    for i in range(0, len(sorted_codes), 100):
+        chunk = sorted_codes[i : i + 100]
+        lines.append(f"{len(chunk)} beginbfchar")
+        for code in chunk:
+            destination = _unicode_value_to_utf16_hex(code_to_unicode[code])
+            lines.append(f"<{code:0{source_hex_width}X}> <{destination}>")
+        lines.append("endbfchar")
+
+    lines.extend(
+        [
+            "endcmap",
+            "CMapName currentdict /CMap defineresource pop",
+            "end",
+            "end",
+        ]
+    )
+
+    result = "\n".join(lines).encode("ascii")
+    validate_tounicode_cmap(result)
+    return result
+
+
 def generate_tounicode_cmap_data(
     code_to_unicode: dict[int, UnicodeValue],
 ) -> bytes:
@@ -653,47 +700,7 @@ def generate_tounicode_cmap_data(
     # The declared codespace is <00> <FF>; codes outside the 8-bit range
     # cannot be represented and are dropped.
     code_to_unicode = {c: u for c, u in code_to_unicode.items() if 0 <= c <= 255}
-    lines = [
-        "/CIDInit /ProcSet findresource begin",
-        "12 dict begin",
-        "begincmap",
-        "/CIDSystemInfo <<",
-        "  /Registry (Adobe)",
-        "  /Ordering (UCS)",
-        "  /Supplement 0",
-        ">> def",
-        "/CMapName /Adobe-Identity-UCS def",
-        "/CMapType 2 def",
-        "1 begincodespacerange",
-        "<00> <FF>",
-        "endcodespacerange",
-    ]
-
-    # Group entries into chunks (max 100 per block)
-    sorted_codes = sorted(code_to_unicode.keys())
-    chunk_size = 100
-
-    for i in range(0, len(sorted_codes), chunk_size):
-        chunk = sorted_codes[i : i + chunk_size]
-        lines.append(f"{len(chunk)} beginbfchar")
-        for code in chunk:
-            unicode_val = code_to_unicode[code]
-            destination = _unicode_value_to_utf16_hex(unicode_val)
-            lines.append(f"<{code:02X}> <{destination}>")
-        lines.append("endbfchar")
-
-    lines.extend(
-        [
-            "endcmap",
-            "CMapName currentdict /CMap defineresource pop",
-            "end",
-            "end",
-        ]
-    )
-
-    result = "\n".join(lines).encode("ascii")
-    validate_tounicode_cmap(result)
-    return result
+    return _format_tounicode_cmap(code_to_unicode, source_hex_width=2)
 
 
 def generate_cidfont_tounicode_cmap(
@@ -708,52 +715,7 @@ def generate_cidfont_tounicode_cmap(
         CMap data as bytes.
     """
     code_to_unicode = filter_invalid_unicode_values(code_to_unicode)
-    lines = [
-        "/CIDInit /ProcSet findresource begin",
-        "12 dict begin",
-        "begincmap",
-        "/CIDSystemInfo <<",
-        "  /Registry (Adobe)",
-        "  /Ordering (UCS)",
-        "  /Supplement 0",
-        ">> def",
-        "/CMapName /Adobe-Identity-UCS def",
-        "/CMapType 2 def",
-        "1 begincodespacerange",
-        "<0000> <FFFF>",
-        "endcodespacerange",
-    ]
-
-    # Group entries into chunks (max 100 per block)
-    sorted_codes = sorted(code_to_unicode.keys())
-    chunk_size = 100
-
-    for i in range(0, len(sorted_codes), chunk_size):
-        chunk = sorted_codes[i : i + chunk_size]
-        lines.append(f"{len(chunk)} beginbfchar")
-        for code in chunk:
-            unicode_val = code_to_unicode[code]
-            if unicode_val <= 0xFFFF:
-                lines.append(f"<{code:04X}> <{unicode_val:04X}>")
-            else:
-                # Surrogate pair for Unicode > 0xFFFF
-                high = 0xD800 + ((unicode_val - 0x10000) >> 10)
-                low = 0xDC00 + ((unicode_val - 0x10000) & 0x3FF)
-                lines.append(f"<{code:04X}> <{high:04X}{low:04X}>")
-        lines.append("endbfchar")
-
-    lines.extend(
-        [
-            "endcmap",
-            "CMapName currentdict /CMap defineresource pop",
-            "end",
-            "end",
-        ]
-    )
-
-    result = "\n".join(lines).encode("ascii")
-    validate_tounicode_cmap(result)
-    return result
+    return _format_tounicode_cmap(code_to_unicode, source_hex_width=4)
 
 
 def validate_tounicode_cmap(data: bytes) -> None:
@@ -1240,13 +1202,6 @@ def flatten_cid_encoding_cmap(
     )
 
 
-_SUPPORTED_NAMED_UNICODE_CMAPS = frozenset(
-    f"Uni{collection}-{encoding}-{direction}"
-    for collection in ("JIS", "GB", "CNS", "KS")
-    for encoding in ("UCS2", "UTF16")
-    for direction in ("H", "V")
-)
-
 _UCS2_CODE_SPACES = ((b"\x00\x00", b"\xff\xff"),)
 _UTF16_CODE_SPACES = (
     (b"\x00\x00", b"\xd7\xff"),
@@ -1281,7 +1236,7 @@ def _named_cid_encoding_map(name: str) -> CIDEncodingMap | None:
             unmapped_to_zero=False,
         )
 
-    if normalized not in _SUPPORTED_NAMED_UNICODE_CMAPS:
+    if normalized not in UTF16_ENCODING_NAMES:
         return None
     decoder = _pdfminer_cmap_decoder(normalized)
     if decoder is None:

@@ -94,7 +94,23 @@ line-length = 88
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "W", "UP"]
+select = [
+    "E",
+    "F",
+    "FURB110",
+    "FURB188",
+    "I",
+    "N",
+    "PERF102",
+    "PERF401",
+    "PERF403",
+    "RUF100",
+    "SIM101",
+    "SIM103",
+    "SIM201",
+    "UP",
+    "W",
+]
 ignore = []
 
 [tool.ruff.lint.isort]

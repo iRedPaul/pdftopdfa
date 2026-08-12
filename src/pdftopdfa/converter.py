@@ -305,8 +305,7 @@ def _validate_pdfa_output(
         return True
     if result.compliant:
         return False
-    for error in result.errors:
-        warnings.append(f"Validation: {error}")
+    warnings.extend(f"Validation: {error}" for error in result.errors)
     return True
 
 
@@ -641,6 +640,28 @@ def _has_annotations(pdf_path: Path) -> bool:
     return bool(_annotated_page_numbers(pdf_path))
 
 
+def _save_with_metadata_fallback(
+    pdf: pikepdf.Pdf, output_path: Path, warning_message: str
+) -> None:
+    """Retry a failed save after removing invalid document metadata."""
+    try:
+        pdf.save(output_path)
+    except Exception as exc:
+        metadata_removed = False
+        if "/Metadata" in pdf.Root:
+            try:
+                del pdf.Root["/Metadata"]
+                metadata_removed = True
+            except Exception:
+                metadata_removed = False
+
+        if not metadata_removed:
+            raise
+
+        logger.warning(warning_message, exc)
+        pdf.save(output_path)
+
+
 def _strip_annotations_for_ocr(input_path: Path, clean_path: Path) -> bool:
     """Remove all annotations from a PDF for clean OCR processing.
 
@@ -671,26 +692,12 @@ def _strip_annotations_for_ocr(input_path: Path, clean_path: Path) -> bool:
                 del pdf.Root["/AcroForm"]
                 removed = True
 
-            try:
-                pdf.save(clean_path)
-            except Exception as exc:
-                metadata_removed = False
-                if "/Metadata" in pdf.Root:
-                    try:
-                        del pdf.Root["/Metadata"]
-                        metadata_removed = True
-                    except Exception:
-                        metadata_removed = False
-
-                if not metadata_removed:
-                    raise
-
-                logger.warning(
-                    "Saving annotation-stripped PDF failed; retrying without "
-                    "document metadata: %s",
-                    exc,
-                )
-                pdf.save(clean_path)
+            _save_with_metadata_fallback(
+                pdf,
+                clean_path,
+                "Saving annotation-stripped PDF failed; retrying without "
+                "document metadata: %s",
+            )
         return removed
     except Exception as exc:
         logger.warning("Could not strip annotations for OCR: %s", exc)
@@ -717,26 +724,12 @@ def _prepare_signed_pdf_for_ocr(input_path: Path, prepared_path: Path) -> dict:
         if sig_result["signatures_found"] == 0:
             return sig_result
 
-        try:
-            pdf.save(prepared_path)
-        except Exception as exc:
-            metadata_removed = False
-            if "/Metadata" in pdf.Root:
-                try:
-                    del pdf.Root["/Metadata"]
-                    metadata_removed = True
-                except Exception:
-                    metadata_removed = False
-
-            if not metadata_removed:
-                raise
-
-            logger.warning(
-                "Saving signature-sanitized OCR source failed; retrying without "
-                "document metadata: %s",
-                exc,
-            )
-            pdf.save(prepared_path)
+        _save_with_metadata_fallback(
+            pdf,
+            prepared_path,
+            "Saving signature-sanitized OCR source failed; retrying without "
+            "document metadata: %s",
+        )
 
     return sig_result
 
@@ -1100,116 +1093,115 @@ def convert_to_pdfa(
                     else "ocr"
                 )
                 raise OCRError(f"OCR not available - pip install pdftopdfa[{extra}]")
-            else:
-                fd, tmp_path = tempfile.mkstemp(
-                    suffix=".pdf", prefix=f".{input_path.stem}_ocr_"
-                )
-                os.close(fd)
-                ocr_temp_file = Path(tmp_path)
-                ocr_source_base = input_path
+            fd, tmp_path = tempfile.mkstemp(
+                suffix=".pdf", prefix=f".{input_path.stem}_ocr_"
+            )
+            os.close(fd)
+            ocr_temp_file = Path(tmp_path)
+            ocr_source_base = input_path
 
-                fd_sig, sig_tmp = tempfile.mkstemp(
-                    suffix=".pdf",
-                    prefix=f".{input_path.stem}_sig_",
-                )
-                os.close(fd_sig)
-                ocr_signature_temp_file = Path(sig_tmp)
-                sig_result = _prepare_signed_pdf_for_ocr(
-                    input_path, ocr_signature_temp_file
-                )
-                if sig_result["signatures_found"] > 0:
-                    ocr_source_base = ocr_signature_temp_file
-                    if not any("digital signature" in w for w in warnings):
-                        warnings.append(
-                            _signature_invalidation_warning(
-                                sig_result["signatures_found"], pdfa=pdfa
-                            )
-                        )
-                else:
-                    try:
-                        ocr_signature_temp_file.unlink()
-                    except Exception:
-                        pass
-                    else:
-                        ocr_signature_temp_file = None
-
-                # Strip annotations before OCR so they are not
-                # rasterized into page images.
-                annotated_pages = _annotated_page_numbers(ocr_source_base)
-                preserve_annots = bool(annotated_pages)
-                ocr_source = ocr_source_base
-                if preserve_annots:
-                    fd2, clean_tmp = tempfile.mkstemp(
-                        suffix=".pdf",
-                        prefix=f".{input_path.stem}_clean_",
-                    )
-                    os.close(fd2)
-                    ocr_clean_temp_file = Path(clean_tmp)
-                    if _strip_annotations_for_ocr(ocr_source_base, ocr_clean_temp_file):
-                        ocr_source = ocr_clean_temp_file
-                    else:
-                        preserve_annots = False
-
-                apply_ocr(
-                    ocr_source,
-                    ocr_temp_file,
-                    effective_ocr_languages,
-                    detection_model_dir=ocr_detection_model_dir,
-                    recognition_model_dir=ocr_recognition_model_dir,
-                    force=ocr_force,
-                    deskew=ocr_deskew,
-                    rotate_pages=ocr_rotate_pages,
-                    ocr_execution_provider=ocr_execution_provider,
-                    layout=ocr_layout,
-                    _annotated_pages=annotated_pages,
-                )
-
-                # Re-inject original annotations into OCR output.
-                if preserve_annots:
-                    fd3, merged_tmp = tempfile.mkstemp(
-                        suffix=".pdf",
-                        prefix=f".{input_path.stem}_merged_",
-                    )
-                    os.close(fd3)
-                    ocr_merged_temp_file = Path(merged_tmp)
-                    restore_result = _restore_annotations_after_ocr(
-                        ocr_source_base, ocr_temp_file, ocr_merged_temp_file
-                    )
-                    if restore_result.status is not _AnnotationRestoreStatus.SUCCESS:
-                        reason = restore_result.error or (
-                            "No annotations were available for restoration"
-                        )
-                        raise OCRError(
-                            "OCR annotation restoration failed; conversion aborted "
-                            f"to prevent annotation loss: {reason}"
-                        )
-                    try:
-                        os.replace(str(ocr_merged_temp_file), str(ocr_temp_file))
-                    except OSError as exc:
-                        raise OCRError(
-                            "OCR annotation restoration could not be finalized; "
-                            f"conversion aborted to prevent annotation loss: {exc}"
-                        ) from exc
-                    logger.debug(
-                        "%d annotation(s) preserved through OCR", restore_result.count
-                    )
+            fd_sig, sig_tmp = tempfile.mkstemp(
+                suffix=".pdf",
+                prefix=f".{input_path.stem}_sig_",
+            )
+            os.close(fd_sig)
+            ocr_signature_temp_file = Path(sig_tmp)
+            sig_result = _prepare_signed_pdf_for_ocr(
+                input_path, ocr_signature_temp_file
+            )
+            if sig_result["signatures_found"] > 0:
+                ocr_source_base = ocr_signature_temp_file
+                if not any("digital signature" in w for w in warnings):
                     warnings.append(
-                        f"{restore_result.count} annotation(s) preserved through OCR"
+                        _signature_invalidation_warning(
+                            sig_result["signatures_found"], pdfa=pdfa
+                        )
                     )
-                    ocr_merged_temp_file = None
+            else:
+                try:
+                    ocr_signature_temp_file.unlink()
+                except Exception:
+                    pass
+                else:
+                    ocr_signature_temp_file = None
 
-                # Clean up the stripped copy.
-                if ocr_clean_temp_file is not None:
-                    try:
-                        ocr_clean_temp_file.unlink()
-                    except Exception:
-                        pass
-                    else:
-                        ocr_clean_temp_file = None
+            # Strip annotations before OCR so they are not
+            # rasterized into page images.
+            annotated_pages = _annotated_page_numbers(ocr_source_base)
+            preserve_annots = bool(annotated_pages)
+            ocr_source = ocr_source_base
+            if preserve_annots:
+                fd2, clean_tmp = tempfile.mkstemp(
+                    suffix=".pdf",
+                    prefix=f".{input_path.stem}_clean_",
+                )
+                os.close(fd2)
+                ocr_clean_temp_file = Path(clean_tmp)
+                if _strip_annotations_for_ocr(ocr_source_base, ocr_clean_temp_file):
+                    ocr_source = ocr_clean_temp_file
+                else:
+                    preserve_annots = False
 
-                actual_input = ocr_temp_file
-                lang_str = "+".join(effective_ocr_languages)
-                warnings.append(f"OCR performed (languages: {lang_str})")
+            apply_ocr(
+                ocr_source,
+                ocr_temp_file,
+                effective_ocr_languages,
+                detection_model_dir=ocr_detection_model_dir,
+                recognition_model_dir=ocr_recognition_model_dir,
+                force=ocr_force,
+                deskew=ocr_deskew,
+                rotate_pages=ocr_rotate_pages,
+                ocr_execution_provider=ocr_execution_provider,
+                layout=ocr_layout,
+                _annotated_pages=annotated_pages,
+            )
+
+            # Re-inject original annotations into OCR output.
+            if preserve_annots:
+                fd3, merged_tmp = tempfile.mkstemp(
+                    suffix=".pdf",
+                    prefix=f".{input_path.stem}_merged_",
+                )
+                os.close(fd3)
+                ocr_merged_temp_file = Path(merged_tmp)
+                restore_result = _restore_annotations_after_ocr(
+                    ocr_source_base, ocr_temp_file, ocr_merged_temp_file
+                )
+                if restore_result.status is not _AnnotationRestoreStatus.SUCCESS:
+                    reason = restore_result.error or (
+                        "No annotations were available for restoration"
+                    )
+                    raise OCRError(
+                        "OCR annotation restoration failed; conversion aborted "
+                        f"to prevent annotation loss: {reason}"
+                    )
+                try:
+                    os.replace(str(ocr_merged_temp_file), str(ocr_temp_file))
+                except OSError as exc:
+                    raise OCRError(
+                        "OCR annotation restoration could not be finalized; "
+                        f"conversion aborted to prevent annotation loss: {exc}"
+                    ) from exc
+                logger.debug(
+                    "%d annotation(s) preserved through OCR", restore_result.count
+                )
+                warnings.append(
+                    f"{restore_result.count} annotation(s) preserved through OCR"
+                )
+                ocr_merged_temp_file = None
+
+            # Clean up the stripped copy.
+            if ocr_clean_temp_file is not None:
+                try:
+                    ocr_clean_temp_file.unlink()
+                except Exception:
+                    pass
+                else:
+                    ocr_clean_temp_file = None
+
+            actual_input = ocr_temp_file
+            lang_str = "+".join(effective_ocr_languages)
+            warnings.append(f"OCR performed (languages: {lang_str})")
 
         if not pdfa:
             _copy_input_to_output(actual_input, output_path)

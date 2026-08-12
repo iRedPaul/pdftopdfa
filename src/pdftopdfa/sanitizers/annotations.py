@@ -115,7 +115,7 @@ def _get_annotation_arrays(
     pdf: Pdf,
 ) -> list[tuple[Dictionary | Stream, Array]]:
     """Return cached annotation arrays for *pdf*, scanning only once."""
-    global _annotation_arrays_cache  # noqa: PLW0603
+    global _annotation_arrays_cache
     with _annotation_arrays_lock:
         if _annotation_arrays_cache is not None and _annotation_arrays_cache[0] is pdf:
             return _annotation_arrays_cache[1]
@@ -127,7 +127,7 @@ def _get_annotation_arrays(
 
 def _invalidate_annotation_arrays_cache(pdf: Pdf) -> None:
     """Invalidate the cache after structural annotation changes."""
-    global _annotation_arrays_cache  # noqa: PLW0603
+    global _annotation_arrays_cache
     with _annotation_arrays_lock:
         if _annotation_arrays_cache is not None and _annotation_arrays_cache[0] is pdf:
             _annotation_arrays_cache = None
