@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.9.3] - 2026-08-17
+
+### Bug Fixes
+
+- Fix layout-aware OCR ordering around full-width headers, footers, and text blocks
+
+### Documentation
+
+- Clarify OCR setup and behavior, licensing, validation, conversion results, and PDF/A guarantees
+
 ## [0.9.2] - 2026-08-12
 
 ### Changes
