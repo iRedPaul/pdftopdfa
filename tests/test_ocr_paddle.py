@@ -932,6 +932,61 @@ def test_layout_orders_detected_columns_without_rerunning_ocr(
     predict.assert_called_once()
 
 
+def test_layout_orders_columns_between_full_width_blocks(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    texts = [
+        "Footer",
+        "Right top",
+        "Header",
+        "Left top",
+        "Right bottom",
+        "Left bottom",
+    ]
+    polygons = [
+        [[55, 150], [345, 150], [345, 175], [55, 175]],
+        [[270, 40], [370, 40], [370, 60], [270, 60]],
+        [[55, 5], [345, 5], [345, 25], [55, 25]],
+        [[20, 40], [100, 40], [100, 60], [20, 60]],
+        [[270, 90], [370, 90], [370, 110], [270, 110]],
+        [[20, 90], [100, 90], [100, 110], [20, 110]],
+    ]
+    result = _result(
+        texts=texts,
+        scores=[0.9] * len(texts),
+        polygons=polygons,
+        boxes=[
+            [
+                min(point[0] for point in polygon),
+                min(point[1] for point in polygon),
+                max(point[0] for point in polygon),
+                max(point[1] for point in polygon),
+            ]
+            for polygon in polygons
+        ],
+        text_word=[[text] for text in texts],
+        text_word_region=[[polygon] for polygon in polygons],
+    )
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(model_dirs, layout=True),
+        )
+
+    expected = [
+        "Header",
+        "Left top",
+        "Left bottom",
+        "Right top",
+        "Right bottom",
+        "Footer",
+    ]
+    assert [line.text for line in page.children] == expected
+    assert plain_text == "\n".join(expected)
+
+
 @pytest.mark.parametrize(
     (
         "line_polygon",

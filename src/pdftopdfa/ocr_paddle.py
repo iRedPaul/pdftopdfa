@@ -53,6 +53,7 @@ _TESSERACT_PLUGIN = "ocrmypdf.builtin_plugins.tesseract_ocr"
 _MIN_DESKEW_ANGLE = 0.05
 _MAX_DESKEW_ANGLE = 10.0
 _TEXT_DETECTION_LIMIT_SIDE_LEN = 1600
+_SPANNING_LINE_WIDTH_RATIO = 0.7
 _NON_LATIN_OCR_LANGUAGES = frozenset({"ch", "chinese_cht", "japan"})
 
 
@@ -1277,33 +1278,57 @@ def _region_from_geometry(
     return _LayoutRegion(left, top, right, bottom)
 
 
-def _result_text_regions(
+def _result_text_region_sections(
     result: Any,
     width: int,
     height: int,
-) -> list[_LayoutRegion]:
+) -> list[list[_LayoutRegion]]:
     texts, _scores, polygons, _boxes = _parallel_line_data(result)
     word_data = _optional_word_data(result, len(texts))
-    regions = []
     if word_data is not None:
         _word_texts, word_regions = word_data
-        for line_regions in word_regions:
+        lines = []
+        for polygon, line_regions in zip(polygons, word_regions, strict=True):
+            line_region = _region_from_geometry(polygon, width, height)
             try:
                 values = list(line_regions)
             except TypeError:
                 continue
+            regions = []
             for value in values:
                 region = _region_from_geometry(value, width, height)
                 if region is not None:
                     regions.append(region)
-    if regions:
-        return regions
+            if line_region is not None and regions:
+                lines.append((line_region, regions))
+        if lines:
+            sections: list[list[_LayoutRegion]] = [[]]
+            for line_region, regions in sorted(
+                lines,
+                key=lambda item: (
+                    item[0].top,
+                    item[0].left,
+                    item[0].bottom,
+                    item[0].right,
+                ),
+            ):
+                if (
+                    line_region.right - line_region.left
+                    >= width * _SPANNING_LINE_WIDTH_RATIO
+                ):
+                    if sections[-1]:
+                        sections.append([])
+                    continue
+                sections[-1].extend(regions)
+            if any(sections):
+                return [section for section in sections if section]
 
+    regions = []
     for value in polygons:
         region = _region_from_geometry(value, width, height)
         if region is not None:
             regions.append(region)
-    return regions
+    return [regions]
 
 
 def _column_regions(
@@ -1397,14 +1422,54 @@ def _sort_lines(
     lines: list[OcrElement],
     columns: list[_LayoutRegion],
 ) -> list[OcrElement]:
-    return sorted(
-        lines,
-        key=lambda line: (
-            _line_column_index(line, columns),
+    def position_key(line: OcrElement) -> tuple[float, float]:
+        return (
             line.bbox.top if line.bbox is not None else math.inf,
             line.bbox.left if line.bbox is not None else math.inf,
-        ),
-    )
+        )
+
+    def sort_key(line: OcrElement) -> tuple[float, float, float]:
+        return (_line_column_index(line, columns), *position_key(line))
+
+    spanning_lines = []
+    for line in lines:
+        if line.bbox is None:
+            continue
+        for left_column, right_column in zip(columns, columns[1:]):
+            boundary = left_column.right
+            minimum_overlap = (
+                min(
+                    left_column.right - left_column.left,
+                    right_column.right - right_column.left,
+                )
+                * 0.1
+            )
+            if (
+                line.bbox.left <= boundary - minimum_overlap
+                and line.bbox.right >= boundary + minimum_overlap
+            ):
+                spanning_lines.append(line)
+                break
+
+    spanning_lines.sort(key=position_key)
+    if not spanning_lines:
+        return sorted(lines, key=sort_key)
+
+    spanning_ids = {id(line) for line in spanning_lines}
+    remaining = [line for line in lines if id(line) not in spanning_ids]
+    ordered = []
+    for spanning_line in spanning_lines:
+        before = [
+            line
+            for line in remaining
+            if position_key(line)[0] < position_key(spanning_line)[0]
+        ]
+        ordered.extend(sorted(before, key=sort_key))
+        before_ids = {id(line) for line in before}
+        remaining = [line for line in remaining if id(line) not in before_ids]
+        ordered.append(spanning_line)
+    ordered.extend(sorted(remaining, key=sort_key))
+    return ordered
 
 
 def _image_properties(input_file: Path) -> tuple[int, int, float]:
@@ -1613,8 +1678,17 @@ class PaddleOcrEngine(OcrEngine):
             language,
         )
         if layout:
-            content_regions = _result_text_regions(result, width, height)
-            columns = _column_regions(content_regions, width, height)
+            columns = [_LayoutRegion(0, 0, width, height)]
+            largest_section = 0
+            for content_regions in _result_text_region_sections(
+                result,
+                width,
+                height,
+            ):
+                candidate = _column_regions(content_regions, width, height)
+                if len(candidate) > 1 and len(content_regions) > largest_section:
+                    columns = candidate
+                    largest_section = len(content_regions)
             scaled_columns = [
                 _LayoutRegion(
                     round(column.left * scale),
