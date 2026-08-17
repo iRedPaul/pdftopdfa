@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.4] - 2026-08-17
+
+### Bug Fixes
+
+- Preserve AcroForms during OCR conversion when no page annotations are present
+
 ## [0.9.3] - 2026-08-17
 
 ### Bug Fixes
