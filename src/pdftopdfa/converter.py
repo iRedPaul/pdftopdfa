@@ -640,6 +640,15 @@ def _has_annotations(pdf_path: Path) -> bool:
     return bool(_annotated_page_numbers(pdf_path))
 
 
+def _has_acroform(pdf_path: Path) -> bool:
+    """Return whether the PDF declares an interactive form."""
+    try:
+        with pikepdf.open(pdf_path) as pdf:
+            return "/AcroForm" in pdf.Root
+    except Exception:
+        return False
+
+
 def _save_with_metadata_fallback(
     pdf: pikepdf.Pdf, output_path: Path, warning_message: str
 ) -> None:
@@ -777,7 +786,8 @@ def _restore_annotations_after_ocr(
             except Exception:
                 continue
 
-        if annotation_count == 0:
+        has_acroform = "/AcroForm" in original_pdf.Root
+        if annotation_count == 0 and not has_acroform:
             return _AnnotationRestoreResult(
                 status=_AnnotationRestoreStatus.NO_ANNOTATIONS
             )
@@ -821,7 +831,7 @@ def _restore_annotations_after_ocr(
 
         # Restore /AcroForm if present in original. copy_foreign preserves
         # shared indirect objects, including relationships to copied widgets.
-        if "/AcroForm" in original_pdf.Root:
+        if has_acroform:
             acroform = original_pdf.Root["/AcroForm"]
             acroform_ref = original_pdf.make_indirect(acroform)
             ocr_pdf.Root["/AcroForm"] = ocr_pdf.copy_foreign(acroform_ref)
@@ -1128,7 +1138,7 @@ def convert_to_pdfa(
             # Strip annotations before OCR so they are not
             # rasterized into page images.
             annotated_pages = _annotated_page_numbers(ocr_source_base)
-            preserve_annots = bool(annotated_pages)
+            preserve_annots = bool(annotated_pages) or _has_acroform(ocr_source_base)
             ocr_source = ocr_source_base
             if preserve_annots:
                 fd2, clean_tmp = tempfile.mkstemp(

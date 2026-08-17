@@ -409,6 +409,26 @@ class TestRestoreAnnotationsAfterOcr:
             form_widget = resolve(af["/Fields"][0])
             assert page_widget.objgen == form_widget.objgen
 
+    def test_acroform_without_page_annotations_is_copied(self, tmp_dir: Path) -> None:
+        """An AcroForm alone is restored after OCR."""
+        pdf = make_pdf_with_page()
+        field = pdf.make_indirect(Dictionary(FT=Name.Tx, T="field1"))
+        pdf.Root["/AcroForm"] = Dictionary(Fields=Array([field]))
+        original = tmp_dir / "acro_only_orig.pdf"
+        pdf.save(str(original))
+
+        ocr_pdf = make_pdf_with_page()
+        ocr_path = tmp_dir / "acro_only_ocr.pdf"
+        ocr_pdf.save(str(ocr_path))
+
+        output = tmp_dir / "acro_only_merged.pdf"
+        result = _restore_annotations_after_ocr(original, ocr_path, output)
+
+        assert result.status is _AnnotationRestoreStatus.SUCCESS
+        assert result.count == 0
+        with pikepdf.open(output) as merged:
+            assert str(merged.Root.AcroForm.Fields[0].T) == "field1"
+
     def test_page_count_mismatch_returns_failure(self, tmp_dir: Path) -> None:
         """Page count mismatch is distinguishable from no annotations."""
         original = _make_pdf_with_stamp(tmp_dir, "mismatch_orig.pdf")
@@ -581,6 +601,47 @@ class TestOcrAnnotationIntegration:
             annots = merged.pages[0].get("/Annots")
             assert annots is not None
             assert len(annots) >= 1
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
+    def test_forced_ocr_handles_acroform_without_page_annotations(
+        self,
+        mock_is_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        tmp_dir: Path,
+    ) -> None:
+        """Forced OCR strips and restores a standalone AcroForm."""
+        import shutil
+
+        from pdftopdfa.converter import convert_to_pdfa
+
+        pdf = make_pdf_with_page()
+        field = pdf.make_indirect(Dictionary(FT=Name.Tx, T="field1"))
+        pdf.Root["/AcroForm"] = Dictionary(Fields=Array([field]))
+        original = tmp_dir / "acro_only.pdf"
+        pdf.save(str(original))
+
+        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> None:
+            with pikepdf.open(src) as prepared:
+                assert "/AcroForm" not in prepared.Root
+            shutil.copy2(src, dst)
+
+        mock_apply_ocr.side_effect = fake_apply_ocr
+
+        output = tmp_dir / "acro_only_processed.pdf"
+        result = convert_to_pdfa(
+            original,
+            output,
+            pdfa=False,
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            ocr_force=True,
+        )
+
+        assert result.success
+        assert mock_apply_ocr.call_args.kwargs["force"] is True
+        with pikepdf.open(output) as processed:
+            assert str(processed.Root.AcroForm.Fields[0].T) == "field1"
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
