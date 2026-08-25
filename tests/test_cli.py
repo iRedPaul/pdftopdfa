@@ -367,14 +367,14 @@ class TestCliConvert:
 
     @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
-    def test_cli_pdfua_validation_checks_both_profiles(
+    def test_cli_pdfua_validate_does_not_repeat_automatic_validation(
         self,
         mock_convert_to_pdfa: MagicMock,
         mock_validate: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """PDF/UA CLI validation checks the PDF/A and UA-1 profiles."""
+        """The converter owns the mandatory PDF/A and UA-1 validation."""
         output_path = tmp_dir / "output.pdf"
         mock_convert_to_pdfa.return_value = ConversionResult(
             success=True,
@@ -399,60 +399,7 @@ class TestCliConvert:
         )
 
         assert result == EXIT_SUCCESS
-        assert [call.kwargs["flavour"] for call in mock_validate.call_args_list] == [
-            "2a",
-            "ua1",
-        ]
-
-    @patch("pdftopdfa.cli.validate_with_verapdf")
-    @patch("pdftopdfa.cli.convert_to_pdfa")
-    def test_cli_pdfua_validation_checks_ua_after_pdfa_failure(
-        self,
-        mock_convert_to_pdfa: MagicMock,
-        mock_validate: MagicMock,
-        sample_pdf: Path,
-        tmp_dir: Path,
-    ) -> None:
-        """PDF/UA validation still runs when PDF/A validation fails."""
-        output_path = tmp_dir / "output.pdf"
-        mock_convert_to_pdfa.return_value = ConversionResult(
-            success=True,
-            input_path=sample_pdf,
-            output_path=output_path,
-            level="2a",
-        )
-        mock_validate.side_effect = [
-            MagicMock(
-                compliant=False,
-                passed_rules=0,
-                failed_rules=1,
-                errors=[],
-                warnings=[],
-            ),
-            MagicMock(
-                compliant=True,
-                passed_rules=1,
-                failed_rules=0,
-                errors=[],
-                warnings=[],
-            ),
-        ]
-
-        result = cli_module._convert_single_file(
-            sample_pdf,
-            str(output_path),
-            "2a",
-            do_validate=True,
-            force=False,
-            quiet=True,
-            pdfua=True,
-        )
-
-        assert result == EXIT_VALIDATION_FAILED
-        assert [call.kwargs["flavour"] for call in mock_validate.call_args_list] == [
-            "2a",
-            "ua1",
-        ]
+        mock_validate.assert_not_called()
 
     def test_pdfua_validation_success_uses_pdfua_label(
         self,
@@ -842,15 +789,18 @@ class TestCliDirectory:
 class TestCliValidation:
     """Tests for --validate option."""
 
-    @patch("pdftopdfa.verapdf.is_verapdf_available", return_value=False)
-    def test_cli_missing_validator_returns_validation_failure(
+    @patch(
+        "pdftopdfa.cli.validate_with_verapdf",
+        side_effect=VeraPDFError("veraPDF not installed"),
+    )
+    def test_cli_missing_validator_publishes_then_returns_validation_failure(
         self,
-        _mock_available: MagicMock,
+        _mock_validate: MagicMock,
         runner: CliRunner,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """A missing validator uses the documented validation exit code."""
+        """A missing validator does not suppress the converted output."""
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
@@ -859,12 +809,13 @@ class TestCliValidation:
         )
 
         assert result.exit_code == EXIT_VALIDATION_FAILED
-        assert "Validation requires veraPDF" in result.output
-        assert not output_path.exists()
+        assert "Validation failed: veraPDF could not run" in result.output
+        assert output_path.is_file()
+        assert output_path.read_bytes().startswith(b"%PDF-")
 
     @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
-    def test_cli_validation_runtime_error_fails_closed(
+    def test_cli_validation_runtime_error_returns_failure_status(
         self,
         mock_convert_to_pdfa: MagicMock,
         mock_validate: MagicMock,

@@ -65,7 +65,7 @@ from .tagging import ensure_logical_structure
 from .utils import get_required_pdf_version, is_pdf_encrypted, validate_pdfa_level
 from .validator import detect_iso_standards, detect_pdfa_level
 from .verapdf import validate_with_verapdf
-from .wcag import apply_wcag_21
+from .wcag import apply_wcag_21, prepare_pdfua_document
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +256,7 @@ _SIGNATURE_SKIP_WARNING = (
     "invalidate them"
 )
 _VALIDATION_PUBLICATION_WARNING = (
-    "Output was not published because validation did not complete successfully"
+    "Output was published despite failed or incomplete validation"
 )
 
 
@@ -350,8 +350,7 @@ class ConversionResult:
     Attributes:
         success: True if the conversion was successful.
         input_path: Path to the input PDF.
-        output_path: Requested path for the output PDF. A failed requested
-            validation leaves any existing file at this path unchanged.
+        output_path: Requested path for the output PDF.
         level: Requested level for a converted output, detected level for a
             validated compliant skip, or None when PDF/A conversion was
             disabled or an unsupported input was copied unchanged.
@@ -360,7 +359,7 @@ class ConversionResult:
         error: Error message if success=False.
         validation_failed: True if veraPDF reported non-conformance or could
             not complete, or if a preserved embedded PDF could not be
-            converted. The candidate output is not published in this case.
+            converted. The candidate output is still published in this case.
         skipped: True if the original PDF was copied through unchanged.
     """
 
@@ -484,14 +483,13 @@ def _validate_input_snapshot_and_publish(
             validation_failed = (
                 _validate_pdfua_output(staged_input, warnings) or validation_failed
             )
-        if not validation_failed:
-            publish_staged_file(
-                staged_input,
-                output_path,
-                snapshot,
-                backup=staged_input.with_name(f"backup{output_path.suffix}"),
-                require_absent=not allow_overwrite,
-            )
+        publish_staged_file(
+            staged_input,
+            output_path,
+            snapshot,
+            backup=staged_input.with_name(f"backup{output_path.suffix}"),
+            require_absent=not allow_overwrite,
+        )
     return validation_failed
 
 
@@ -515,7 +513,8 @@ def _copy_encrypted_input(
     logger.warning("%s: %s", warning, input_path)
     warnings = [warning]
     validation_failed = False
-    if validate:
+    validate_candidate = validate or pdfua
+    if validate_candidate:
         validation_failed = _validate_input_snapshot_and_publish(
             input_path,
             output_path,
@@ -537,7 +536,7 @@ def _copy_encrypted_input(
         success=True,
         input_path=input_path,
         output_path=output_path,
-        level=level if validate and not validation_failed else None,
+        level=level if validate_candidate and not validation_failed else None,
         warnings=warnings,
         processing_time=processing_time,
         skipped=True,
@@ -1025,7 +1024,9 @@ def convert_to_pdfa(
             ignored in this mode.
         pdfua: If True, also produce PDF/UA-1 output. This requires PDF/A-2a
             or PDF/A-3a.
-        validate: If True, the result is validated.
+        validate: If True, the result is validated. PDF/UA-1 output is always
+            submitted to both requested validation profiles; the candidate is
+            published regardless of the validation result.
         skip_any_pdfa: If True, skip conversion for any input that veraPDF
             validates as compliant PDF/A, regardless of target level.
         ocr_languages: Optional list of PaddleOCR language codes
@@ -1158,7 +1159,7 @@ def convert_to_pdfa(
                 branch_warnings = [signature_skip_warning]
                 validation_failed = False
                 check_pdf.close()
-                if validate:
+                if validate or pdfua:
                     validation_failed = _validate_input_snapshot_and_publish(
                         input_path,
                         output_path,
@@ -1179,7 +1180,9 @@ def convert_to_pdfa(
                     success=True,
                     input_path=input_path,
                     output_path=output_path,
-                    level=level if validate and not validation_failed else None,
+                    level=(
+                        level if (validate or pdfua) and not validation_failed else None
+                    ),
                     warnings=branch_warnings,
                     processing_time=processing_time,
                     skipped=True,
@@ -1631,6 +1634,17 @@ def convert_to_pdfa(
         if count > 0:
             warnings.append(f"{count} .notdef usage operator(s) fixed")
 
+        if pdfua:
+            pdfua_prepare_result = prepare_pdfua_document(pdf)
+            printer_marks_preserved = pdfua_prepare_result.get(
+                "printer_mark_annotations_preserved", 0
+            )
+            if printer_marks_preserved:
+                warnings.append(
+                    f"{printer_marks_preserved} PrinterMark annotation(s) "
+                    "preserved as untagged incidental artifacts for PDF/UA-1"
+                )
+
         if level.endswith("a"):
             ocr_manifest = None
             if ocr_manifest_temp_file is not None and ocr_manifest_temp_file.exists():
@@ -1648,6 +1662,7 @@ def convert_to_pdfa(
             tagging_result = ensure_logical_structure(
                 pdf,
                 semantic=True,
+                pdfua=pdfua,
                 ocr_manifest=ocr_manifest,
                 preflight=False,
             )
@@ -1681,6 +1696,19 @@ def convert_to_pdfa(
                     f"{vector_review_count} {page_label} require manual review: "
                     "unclassified direct vector painting was retained as a "
                     "Layout artifact"
+                )
+            table_review_count = tagging_result.get(
+                "semantic_table_review_required",
+                0,
+            )
+            if table_review_count:
+                table_label = "table" if table_review_count == 1 else "tables"
+                review_verb = "requires" if table_review_count == 1 else "require"
+                retain_verb = "was" if table_review_count == 1 else "were"
+                warnings.append(
+                    f"{table_review_count} inferred non-rectangular {table_label} "
+                    f"{review_verb} manual review and {retain_verb} retained as "
+                    "conservative reading structure"
                 )
             scanned_visual_review_count = tagging_result.get(
                 "semantic_scanned_visual_review_required",
@@ -1743,6 +1771,7 @@ def convert_to_pdfa(
                             (
                                 alternative_review_count,
                                 vector_review_count,
+                                table_review_count,
                                 scanned_visual_review_count,
                                 link_review_count,
                                 form_review_count,
@@ -1773,6 +1802,19 @@ def convert_to_pdfa(
                         "WCAG 2.1 3.1.1 requires manual review: the document "
                         "language is undetermined"
                     )
+                annotation_review_count = wcag_result.get(
+                    "annotation_descriptions_review_required", 0
+                )
+                if annotation_review_count:
+                    warnings.append(
+                        f"{annotation_review_count} generated annotation "
+                        "description(s) require human review"
+                    )
+                warnings.append(
+                    "PDF/UA-1 and WCAG 2.1 conformance requires human review "
+                    "of semantic accuracy, reading order, alternatives, "
+                    "language, color and contrast, forms, and media"
+                )
 
         # 7. Create output directory if needed
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1814,33 +1856,33 @@ def convert_to_pdfa(
 
         processing_time = time.perf_counter() - start_time
 
-        # 9. Optional: Validate
+        # 9. Validate requested profiles before atomically publishing the same
+        # candidate. Non-conformance is reported but does not suppress output.
         validation_failed = (
             sanitize_result.get("embedded_pdf_conversions_failed", 0) > 0
         )
-        if validate:
+        if validate or pdfua:
             logger.debug("Validating output with veraPDF")
             validation_failed = (
                 _validate_pdfa_output(final_output_temp_file, level, warnings)
                 or validation_failed
             )
-            if pdfua:
-                validation_failed = (
-                    _validate_pdfua_output(final_output_temp_file, warnings)
-                    or validation_failed
-                )
+        if pdfua:
+            validation_failed = (
+                _validate_pdfua_output(final_output_temp_file, warnings)
+                or validation_failed
+            )
 
         if validation_failed:
             warnings.append(_VALIDATION_PUBLICATION_WARNING)
-        else:
-            publish_staged_file(
-                final_output_temp_file,
-                output_path,
-                final_output_snapshot,
-                backup=final_output_temp_file.with_name(f"backup{output_path.suffix}"),
-                require_absent=not _allow_output_overwrite,
-            )
-            final_output_temp_file = None
+        publish_staged_file(
+            final_output_temp_file,
+            output_path,
+            final_output_snapshot,
+            backup=final_output_temp_file.with_name(f"backup{output_path.suffix}"),
+            require_absent=not _allow_output_overwrite,
+        )
+        final_output_temp_file = None
 
         logger.info(
             "Conversion successful: %s (%.2f seconds)",

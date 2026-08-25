@@ -623,7 +623,7 @@ class TestConvertNonCompliantEmbeddedFiles:
     def test_failed_attachment_conversion_marks_outer_result_invalid(
         self, tmp_path: Path
     ) -> None:
-        """An invalid outer candidate is withheld while the source stays intact."""
+        """An invalid outer candidate is published while the source stays intact."""
         input_path = tmp_path / "input.pdf"
         output_path = tmp_path / "output.pdf"
         pdf = _make_pdf_with_embedded(b"%PDF-1.4 unconvertible", "bad.pdf")
@@ -635,8 +635,10 @@ class TestConvertNonCompliantEmbeddedFiles:
         assert result.success is True
         assert result.validation_failed is True
         assert any("attachment" in warning for warning in result.warnings)
-        assert any("not published" in warning for warning in result.warnings)
-        assert not output_path.exists()
+        assert any("published despite" in warning for warning in result.warnings)
+        assert output_path.is_file()
+        with pikepdf.open(output_path) as output_pdf:
+            assert "/EmbeddedFiles" in output_pdf.Root.Names
         with pikepdf.open(input_path) as source_pdf:
             names_array = source_pdf.Root.Names.EmbeddedFiles.Names
             filespec = _resolve_indirect(names_array[1])
@@ -1150,6 +1152,24 @@ class TestEnsureFilespecUfEntries:
         assert count == 1
         assert str(file_spec.get("/F")) == "embedded_file"
         assert str(file_spec.get("/UF")) == "embedded_file"
+
+    def test_blank_f_and_uf_are_replaced_with_nonempty_fallbacks(self) -> None:
+        pdf = new_pdf()
+        pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
+        file_spec = Dictionary(Type=Name.Filespec, F="", UF="   ")
+        annotation = Dictionary(
+            Type=Name.Annot,
+            Subtype=Name.FileAttachment,
+            Rect=Array([0, 0, 100, 100]),
+            FS=file_spec,
+        )
+        pdf.pages[0]["/Annots"] = Array([annotation])
+
+        count = ensure_filespec_uf_entries(pdf)
+
+        assert count == 1
+        assert str(file_spec["/F"]) == "embedded_file"
+        assert str(file_spec["/UF"]) == "embedded_file"
 
     def test_file_attachment_annotation(self) -> None:
         """FileAttachment annotation FileSpec gets /UF added."""

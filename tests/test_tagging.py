@@ -15,6 +15,7 @@ from pikepdf import Array, Dictionary, Name, NameTree, NumberTree, String
 
 import pdftopdfa.tagging as tagging
 from pdftopdfa.exceptions import ConversionError
+from pdftopdfa.semantics import ContentReference, StructureNode
 from pdftopdfa.tagging import ensure_logical_structure
 from pdftopdfa.utils import resolve_indirect
 
@@ -41,6 +42,42 @@ def _add_page(
     page = pikepdf.Page(page_dict)
     pdf.pages.append(page)
     return page
+
+
+def test_pdfua_demotes_inferred_nonrectangular_table() -> None:
+    table = StructureNode(
+        "Table",
+        children=(
+            StructureNode(
+                "TR",
+                children=(
+                    StructureNode("TH", content=(ContentReference("h1"),)),
+                    StructureNode("TH", content=(ContentReference("h2"),)),
+                ),
+            ),
+            StructureNode(
+                "TR",
+                children=(StructureNode("TD", content=(ContentReference("v1"),)),),
+            ),
+        ),
+    )
+    document = StructureNode("Document", children=(table,))
+
+    normalized, review_required = tagging._normalize_pdfua_plan_tables(document)
+
+    assert review_required == 1
+    assert [node.role for node in normalized.walk()] == [
+        "Document",
+        "Div",
+        "Div",
+        "P",
+        "P",
+        "Div",
+        "P",
+    ]
+    assert [
+        reference.span_id for node in normalized.walk() for reference in node.content
+    ] == ["h1", "h2", "v1"]
 
 
 def _nested_form_chain(pdf: pikepdf.Pdf, depth: int) -> pikepdf.Stream:
@@ -338,6 +375,21 @@ def test_preserves_structure_with_redundant_standard_role_mappings() -> None:
     assert str(document["/ActualText"]) == "replacement text"
 
 
+def test_pdfua_removes_circular_standard_identity_role_mappings() -> None:
+    pdf = new_pdf()
+    _add_page(pdf, b"BT ET")
+    old_root, _document = _install_existing_structure(
+        pdf,
+        role_map=Dictionary(Document=Name.Document, Span=Name.Span),
+    )
+
+    result = ensure_logical_structure(pdf, pdfua=True)
+
+    assert result["structure_preserved"] is True
+    assert pdf.Root["/StructTreeRoot"].objgen == old_root.objgen
+    assert len(resolve_indirect(old_root["/RoleMap"])) == 0
+
+
 def test_suspect_valid_structure_actualtext_still_covers_pua_content() -> None:
     from pdftopdfa.sanitizers.pua_actualtext import sanitize_pua_actualtext
 
@@ -408,7 +460,7 @@ def test_preserves_valid_structure_language() -> None:
     assert str(document["/Lang"]) == "de-DE"
 
 
-def test_preserves_structure_with_unstructured_popup_annotation() -> None:
+def test_rebuilds_structure_with_unstructured_popup_annotation() -> None:
     pdf = new_pdf()
     page = _add_page(pdf, b"BT ET")
     root, document = _install_existing_structure(pdf)
@@ -423,10 +475,55 @@ def test_preserves_structure_with_unstructured_popup_annotation() -> None:
 
     result = ensure_logical_structure(pdf)
 
-    assert result["structure_preserved"] is True
-    assert pdf.Root["/StructTreeRoot"].objgen == root.objgen
+    assert result["structure_rebuilt"] is True
+    assert result["annotations_tagged"] == 1
+    assert pdf.Root["/StructTreeRoot"].objgen != root.objgen
     assert resolve_indirect(root["/K"]).objgen == document.objgen
-    assert "/StructParent" not in popup
+    assert int(popup["/StructParent"]) == 1
+    generated_root, _, divs = _generated_parts(pdf)
+    annotation_element = resolve_indirect(divs[0]["/K"][1])
+    assert annotation_element["/S"] == Name.Annot
+    assert resolve_indirect(annotation_element["/K"])["/Obj"].objgen == popup.objgen
+    assert NumberTree(generated_root["/ParentTree"])[1].objgen == (
+        annotation_element.objgen
+    )
+
+
+def test_pdfua_preserves_printer_mark_as_untagged_incidental_artifact() -> None:
+    pdf = new_pdf()
+    page = _add_page(pdf, b"q Q")
+    printer_mark = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Annot,
+            Subtype=Name.PrinterMark,
+            Rect=Array([0, 0, 10, 10]),
+            StructParent=9,
+        )
+    )
+    page.obj["/Annots"] = Array([printer_mark])
+
+    first_result = ensure_logical_structure(
+        pdf,
+        semantic=True,
+        pdfua=True,
+        preflight=False,
+    )
+    first_root = pdf.Root["/StructTreeRoot"]
+    second_result = ensure_logical_structure(
+        pdf,
+        semantic=True,
+        pdfua=True,
+        preflight=False,
+    )
+
+    assert first_result["structure_rebuilt"] is True
+    assert first_result["annotations_tagged"] == 0
+    assert second_result["structure_preserved"] is True
+    assert pdf.Root["/StructTreeRoot"].objgen == first_root.objgen
+    assert len(page.obj["/Annots"]) == 1
+    assert resolve_indirect(page.obj["/Annots"][0]).objgen == printer_mark.objgen
+    assert "/StructParent" not in printer_mark
+    assert "/StructParents" not in printer_mark
 
 
 def test_normalizes_empty_structure_language() -> None:
@@ -452,6 +549,98 @@ def test_preserves_standard_role_mapped_to_standard_role() -> None:
 
     assert result["structure_preserved"] is True
     assert pdf.Root["/StructTreeRoot"].objgen == old_root.objgen
+
+
+def test_pdfua_rebuilds_standard_role_mapped_to_another_standard_role() -> None:
+    pdf = new_pdf()
+    _add_page(pdf, b"BT ET")
+    old_root, _document = _install_existing_structure(
+        pdf,
+        role_map=Dictionary(Document=Name.Div),
+    )
+
+    result = ensure_logical_structure(pdf, pdfua=True)
+
+    assert result["structure_rebuilt"] is True
+    assert pdf.Root["/StructTreeRoot"].objgen != old_root.objgen
+
+
+def test_pdfua_assigns_and_registers_missing_note_identifier() -> None:
+    pdf = new_pdf()
+    _add_page(pdf, b"BT ET")
+    root, note = _install_existing_structure(pdf, role=Name.Note)
+
+    result = ensure_logical_structure(pdf, pdfua=True)
+
+    identifier = resolve_indirect(note["/ID"])
+    assert result["structure_preserved"] is True
+    assert result["semantic_repairs"] == 1
+    assert isinstance(identifier, String)
+    assert resolve_indirect(NameTree(root["/IDTree"])[str(identifier)]).objgen == (
+        note.objgen
+    )
+
+
+def test_pdfua_replaces_empty_note_identifier_in_id_tree() -> None:
+    pdf = new_pdf()
+    _add_page(pdf, b"BT ET")
+    root, note = _install_existing_structure(pdf, role=Name.Note)
+    note["/ID"] = String("")
+    id_tree = NameTree.new(pdf)
+    id_tree[""] = note
+    root["/IDTree"] = id_tree.obj
+
+    result = ensure_logical_structure(pdf, pdfua=True)
+
+    identifier = resolve_indirect(note["/ID"])
+    repaired_tree = NameTree(root["/IDTree"])
+    assert result["structure_preserved"] is True
+    assert result["semantic_repairs"] == 1
+    assert isinstance(identifier, String)
+    assert len(repaired_tree) == 1
+    assert resolve_indirect(repaired_tree[str(identifier)]).objgen == note.objgen
+
+
+def test_widget_tooltips_are_scoped_to_terminal_fields() -> None:
+    pdf = new_pdf()
+    shared_parent = pdf.make_indirect(Dictionary(FT=Name.Tx))
+    fields = []
+    widgets = []
+    for label in ("First name", "Last name"):
+        field = pdf.make_indirect(Dictionary(T=String(label), Parent=shared_parent))
+        widget = pdf.make_indirect(
+            Dictionary(Type=Name.Annot, Subtype=Name.Widget, Parent=field)
+        )
+        field["/Kids"] = Array([widget])
+        fields.append(field)
+        widgets.append(widget)
+    shared_parent["/Kids"] = Array(fields)
+
+    assert tagging._ensure_widget_tooltip(widgets[0]) is True
+    assert tagging._ensure_widget_tooltip(widgets[1]) is True
+
+    assert "/TU" not in shared_parent
+    assert [str(field["/TU"]) for field in fields] == ["First name", "Last name"]
+    assert [str(widget["/TU"]) for widget in widgets] == ["First name", "Last name"]
+
+
+def test_widget_tooltip_uses_parent_field_when_widget_repeats_field_type() -> None:
+    pdf = new_pdf()
+    field = pdf.make_indirect(Dictionary(FT=Name.Tx, T=String("Customer email")))
+    widget = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Annot,
+            Subtype=Name.Widget,
+            FT=Name.Tx,
+            Parent=field,
+        )
+    )
+    field["/Kids"] = Array([widget])
+
+    assert tagging._ensure_widget_tooltip(widget) is True
+
+    assert str(field["/TU"]) == "Customer email"
+    assert str(widget["/TU"]) == "Customer email"
 
 
 def test_preserves_long_role_map_alias_chain() -> None:
@@ -3572,6 +3761,68 @@ class TestStructureHierarchyValidation:
         root, *elements = self._tree(pdf, roles)
 
         assert tagging._valid_structure_hierarchy(root, None, elements) is False
+
+    def test_pdfua_rejects_multiple_table_captions(self) -> None:
+        pdf = new_pdf()
+        root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+        table = pdf.make_indirect(
+            Dictionary(Type=Name.StructElem, S=Name.Table, P=root)
+        )
+        captions = [
+            pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Caption, P=table))
+            for _ in range(2)
+        ]
+        row = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.TR, P=table))
+        cell = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.TD, P=row))
+        table["/K"] = Array([*captions, row])
+        row["/K"] = cell
+        elements = [table, *captions, row, cell]
+
+        assert tagging._valid_structure_hierarchy(root, None, elements) is True
+        assert (
+            tagging._valid_structure_hierarchy(
+                root,
+                None,
+                elements,
+                pdfua=True,
+            )
+            is False
+        )
+
+    def test_pdfua_accepts_rectangular_table_with_column_span(self) -> None:
+        pdf = new_pdf()
+        root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+        table = pdf.make_indirect(
+            Dictionary(Type=Name.StructElem, S=Name.Table, P=root)
+        )
+        first_row = pdf.make_indirect(
+            Dictionary(Type=Name.StructElem, S=Name.TR, P=table)
+        )
+        second_row = pdf.make_indirect(
+            Dictionary(Type=Name.StructElem, S=Name.TR, P=table)
+        )
+        first_cell = pdf.make_indirect(
+            Dictionary(
+                Type=Name.StructElem,
+                S=Name.TD,
+                P=first_row,
+                A=Dictionary(O=Name.Table, ColSpan=2),
+            )
+        )
+        other_cells = [
+            pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.TD, P=second_row))
+            for _ in range(2)
+        ]
+        table["/K"] = Array([first_row, second_row])
+        first_row["/K"] = first_cell
+        second_row["/K"] = Array(other_cells)
+
+        assert tagging._valid_structure_hierarchy(
+            root,
+            None,
+            [table, first_row, first_cell, second_row, *other_cells],
+            pdfua=True,
+        )
 
 
 class TestPreflightOptOut:

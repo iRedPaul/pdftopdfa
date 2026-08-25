@@ -772,6 +772,26 @@ def test_separate_invisible_digital_text_remains_logical_content() -> None:
     assert [marker[0] for marker in _marked_content(page)] == ["/Span", "/Span"]
 
 
+def test_iccbased_text_color_has_deterministic_paint_visibility() -> None:
+    pdf = pikepdf.Pdf.new()
+    profile = pdf.make_stream(b"")
+    profile["/N"] = 1
+    page = _page(
+        pdf,
+        b"/CS0 cs 0 scn BT /F1 12 Tf 20 200 Td (Visible text) Tj ET",
+        Dictionary(
+            ColorSpace=Dictionary(CS0=Array([Name.ICCBased, profile])),
+            Font=Dictionary(F1=_font(pdf)),
+        ),
+        size=(300, 300),
+    )
+
+    result = ensure_logical_structure(pdf, semantic=True)
+
+    assert result["semantic_content_items"] == 1
+    assert _marked_content(page)[0][0] == "/Span"
+
+
 def test_semantic_link_owns_overlapping_text_and_objr_after_reopen() -> None:
     pdf = pikepdf.Pdf.new()
     font = _font(pdf)
@@ -796,6 +816,7 @@ def test_semantic_link_owns_overlapping_text_and_objr_after_reopen() -> None:
     assert result["semantic_structure_generated"] is True
     assert result["annotations_tagged"] == 1
     assert result["semantic_link_review_required"] == 0
+    assert str(annotation["/Contents"]) == "Open documentation"
     assert page.obj["/Tabs"] == Name.S
     link = next(item for item in _structure_objects(pdf) if item.get("/S") == Name.Link)
     link_kids = _k_objects(link)
@@ -825,6 +846,7 @@ def test_semantic_link_owns_overlapping_text_and_objr_after_reopen() -> None:
         root_objgen = reopened_root.objgen
         reopened_page = reopened.pages[0]
         reopened_annotation = resolve_indirect(reopened_page.obj["/Annots"][0])
+        assert str(reopened_annotation["/Contents"]) == "Open documentation"
         reopened_link = next(
             item for item in _structure_objects(reopened) if item.get("/S") == Name.Link
         )
@@ -1370,6 +1392,7 @@ def test_semantic_widget_uses_form_role_and_inherited_tooltip() -> None:
     assert result["annotations_tagged"] == 1
     assert result["semantic_form_review_required"] == 0
     assert str(widget["/TU"]) == "Customer email"
+    assert str(field["/TU"]) == "Customer email"
     form = next(item for item in _structure_objects(pdf) if item.get("/S") == Name.Form)
     object_reference = resolve_indirect(form["/K"])
     assert object_reference["/Type"] == Name.OBJR

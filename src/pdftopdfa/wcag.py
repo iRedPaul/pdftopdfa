@@ -20,6 +20,25 @@ _REQUIRED_LABEL = re.compile(r"\brequired\b", re.IGNORECASE)
 _REQUIRED_SUFFIX = " (required)"
 
 
+def prepare_pdfua_document(pdf: Pdf) -> dict[str, int]:
+    """Keep printer-mark annotations as untagged incidental artifacts."""
+    printer_marks_preserved = 0
+    for page in pdf.pages:
+        annotations = resolve_indirect(page.obj.get("/Annots"))
+        if not isinstance(annotations, Array):
+            continue
+        for value in annotations:
+            annotation = resolve_indirect(value)
+            if isinstance(annotation, Dictionary) and (
+                resolve_indirect(annotation.get("/Subtype")) == Name.PrinterMark
+            ):
+                printer_marks_preserved += 1
+                for key in ("/StructParent", "/StructParents"):
+                    if key in annotation:
+                        del annotation[key]
+    return {"printer_mark_annotations_preserved": printer_marks_preserved}
+
+
 def _field_entry(widget: Dictionary, key: str) -> tuple[Dictionary, object] | None:
     """Return an inheritable field entry without following a cyclic field tree."""
     current: object = widget
@@ -52,6 +71,22 @@ def _required_tooltip(label: str) -> String:
         else:
             high = middle - 1
     return String(f"{label[:low]}{_REQUIRED_SUFFIX}")
+
+
+def _bounded_string(value: str) -> String:
+    """Return a non-empty PDF string within the encoded string limit."""
+    result = String(value)
+    if len(bytes(result)) <= _MAX_STRING_BYTES:
+        return result
+    low = 0
+    high = len(value)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(bytes(String(value[:middle]))) <= _MAX_STRING_BYTES:
+            low = middle
+        else:
+            high = middle - 1
+    return String(value[:low])
 
 
 def _indicate_required_control(widget: Dictionary) -> bool:
@@ -106,7 +141,16 @@ def apply_wcag_21(pdf: Pdf) -> dict[str, int | bool]:
     """
     tab_orders_set = 0
     required_controls_labeled = 0
+    annotation_descriptions_added = 0
+    annotation_descriptions_review_required = 0
     seen_widgets: set[tuple[int, int] | int] = set()
+
+    page_labels_added = 0
+    if not isinstance(resolve_indirect(pdf.Root.get("/PageLabels")), Dictionary):
+        pdf.Root["/PageLabels"] = pdf.make_indirect(
+            Dictionary(Nums=Array([0, Dictionary(S=Name.D, St=1)]))
+        )
+        page_labels_added = 1
 
     for page in pdf.pages:
         if resolve_indirect(page.obj.get("/Tabs")) != Name.S:
@@ -117,11 +161,51 @@ def apply_wcag_21(pdf: Pdf) -> dict[str, int | bool]:
         if not isinstance(annotations, Array):
             continue
         for value in annotations:
-            widget = resolve_indirect(value)
-            if not isinstance(widget, Dictionary) or (
-                resolve_indirect(widget.get("/Subtype")) != Name.Widget
-            ):
+            annotation = resolve_indirect(value)
+            if not isinstance(annotation, Dictionary):
                 continue
+            subtype = resolve_indirect(annotation.get("/Subtype"))
+            if subtype != Name.Widget:
+                contents = resolve_indirect(annotation.get("/Contents"))
+                if not isinstance(contents, String) or not str(contents).strip():
+                    description = None
+                    if subtype == Name.Popup:
+                        parent = resolve_indirect(annotation.get("/Parent"))
+                        candidate = (
+                            resolve_indirect(parent.get("/Contents"))
+                            if isinstance(parent, Dictionary)
+                            else None
+                        )
+                        if isinstance(candidate, String) and str(candidate).strip():
+                            description = str(candidate).strip()
+                    elif subtype == Name.FileAttachment:
+                        file_spec = resolve_indirect(annotation.get("/FS"))
+                        if isinstance(file_spec, Dictionary):
+                            for key in ("/Desc", "/UF", "/F"):
+                                candidate = resolve_indirect(file_spec.get(key))
+                                if (
+                                    isinstance(candidate, String)
+                                    and str(candidate).strip()
+                                ):
+                                    description = str(candidate).strip()
+                                    break
+                    if description is None:
+                        subtype_name = (
+                            str(subtype).removeprefix("/")
+                            if isinstance(subtype, Name)
+                            else "PDF"
+                        )
+                        description = (
+                            "Link"
+                            if subtype == Name.Link
+                            else f"{subtype_name} annotation"
+                        )
+                        annotation_descriptions_review_required += 1
+                    annotation["/Contents"] = _bounded_string(description)
+                    annotation_descriptions_added += 1
+            if subtype != Name.Widget:
+                continue
+            widget = annotation
             objgen = widget.objgen
             identity: tuple[int, int] | int = objgen if objgen != (0, 0) else id(widget)
             if identity in seen_widgets:
@@ -133,15 +217,22 @@ def apply_wcag_21(pdf: Pdf) -> dict[str, int | bool]:
     language_review_required = not language or language == "und"
     logger.info(
         "Applied WCAG 2.1 PDF requirements: %d tab order(s), %d required "
-        "control label(s)",
+        "control label(s), %d annotation description(s)",
         tab_orders_set,
         required_controls_labeled,
+        annotation_descriptions_added,
     )
     return {
         "page_tab_orders_set": tab_orders_set,
+        "page_labels_added": page_labels_added,
         "required_controls_labeled": required_controls_labeled,
+        "annotation_descriptions_added": annotation_descriptions_added,
+        "annotation_descriptions_review_required": (
+            annotation_descriptions_review_required
+        ),
         "language_review_required": language_review_required,
+        "human_review_required": True,
     }
 
 
-__all__ = ["apply_wcag_21"]
+__all__ = ["apply_wcag_21", "prepare_pdfua_document"]

@@ -1793,6 +1793,16 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
         except Exception:
             return True
         try:
+            if isinstance(color_space, (list, tuple)) and color_space:
+                family = literal_name(resolve1(color_space[0]))
+                return family not in {
+                    "CalGray",
+                    "CalRGB",
+                    "Lab",
+                    "ICCBased",
+                    "Indexed",
+                    "I",
+                }
             return literal_name(color_space) not in device_spaces
         except Exception:
             return True

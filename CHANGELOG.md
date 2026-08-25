@@ -11,12 +11,12 @@
 ### Changes
 
 - Convert encrypted PDFs that open with an empty user password to PDF/A while preserving password-protected PDFs unchanged
-- Publish PDF output only after structural checks and requested validation succeed
+- Publish PDF output after structural checks even when requested validation fails
 - Simplify semantic tagging type annotations and imports
 
 ### Documentation
 
-- Document inferred semantics, review limitations, and fail-closed publication behavior
+- Document inferred semantics, review limitations, and non-blocking validation behavior
 
 ## [0.9.4] - 2026-08-17
 
