@@ -3256,6 +3256,12 @@ def test_preserved_rich_tree_reports_newly_artifactized_vector_path() -> None:
     assert result["path_artifacts_tagged"] == 1
     assert result["semantic_vector_review_required"] == 1
     instructions = list(pikepdf.parse_content_stream(page))
+    operators = [
+        str(instruction.operator)
+        for instruction in instructions
+        if isinstance(instruction, pikepdf.ContentStreamInstruction)
+    ]
+    assert operators[-5:] == ["BMC", "m", "l", "S", "EMC"]
     assert (
         sum(
             isinstance(instruction, pikepdf.ContentStreamInstruction)

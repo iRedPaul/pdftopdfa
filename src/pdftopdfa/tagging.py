@@ -1633,6 +1633,7 @@ def _artifact_untagged_path_painting(
         ] = []
         protected: list[bool] = []
         changed = 0
+        path_start: int | None = None
         for instruction in instructions:
             if isinstance(instruction, pikepdf.ContentStreamInlineImage):
                 rewritten.append(instruction)
@@ -1661,22 +1662,27 @@ def _artifact_untagged_path_painting(
             elif operator == _EMC:
                 if protected:
                     protected.pop()
-            if str(operator) in _PATH_PAINTING_OPERATORS | {"sh"} and not any(
-                protected
-            ):
+            operator_name = str(operator)
+            if operator_name in {"m", "re"} and path_start is None:
+                path_start = len(rewritten)
+            path_painting = operator_name in _PATH_PAINTING_OPERATORS
+            if (path_painting or operator_name == "sh") and not any(protected):
+                marker = pikepdf.ContentStreamInstruction(
+                    [Name.Artifact],
+                    _BMC,
+                )
+                if path_painting and path_start is not None:
+                    rewritten.insert(path_start, marker)
+                else:
+                    rewritten.append(marker)
                 rewritten.extend(
-                    (
-                        pikepdf.ContentStreamInstruction(
-                            [Name.Artifact],
-                            _BMC,
-                        ),
-                        instruction,
-                        pikepdf.ContentStreamInstruction([], _EMC),
-                    )
+                    (instruction, pikepdf.ContentStreamInstruction([], _EMC))
                 )
                 changed += 1
             else:
                 rewritten.append(instruction)
+            if path_painting or operator_name == "n":
+                path_start = None
         if changed:
             content = pikepdf.unparse_content_stream(rewritten)
             if page is None:
@@ -8314,6 +8320,7 @@ def _rewrite_semantic_content(
     seen_form_replacements: set[int] = set()
     nesting: list[tuple[str, bool, bool, bool]] = []
     named_properties_to_clean: dict[_ObjectKey | int, Dictionary] = {}
+    path_start: int | None = None
 
     def in_source_artifact() -> bool:
         return any(
@@ -8331,6 +8338,7 @@ def _rewrite_semantic_content(
         instruction: pikepdf.ContentStreamInstruction
         | pikepdf.ContentStreamInlineImage,
         span_id: str | None,
+        object_start: int | None = None,
     ) -> None:
         nonlocal next_mcid, artifacts_tagged
         if in_source_artifact():
@@ -8372,12 +8380,18 @@ def _rewrite_semantic_content(
                 )
             binding.mcid = next_mcid
             seen_references.add(span_id)
-            rewritten.extend(_wrap_instruction(instruction, _content_marker(next_mcid)))
+            marker = _content_marker(next_mcid)
             next_mcid += 1
-            return
-        artifact = artifacts.get(span_id) if span_id is not None else None
-        rewritten.extend(_wrap_instruction(instruction, _artifact_marker(artifact)))
-        artifacts_tagged += 1
+        else:
+            artifact = artifacts.get(span_id) if span_id is not None else None
+            marker = _artifact_marker(artifact)
+            artifacts_tagged += 1
+        if object_start is None:
+            rewritten.extend(_wrap_instruction(instruction, marker))
+        else:
+            rewritten.insert(object_start, marker)
+            rewritten.append(instruction)
+            rewritten.append(pikepdf.ContentStreamInstruction([], _EMC))
 
     for instruction in instructions:
         if isinstance(instruction, pikepdf.ContentStreamInlineImage):
@@ -8638,6 +8652,14 @@ def _rewrite_semantic_content(
                 current_xobject_index,
             )
             append_paint(instruction, span_id)
+            continue
+        if operator_name in {"m", "re"} and path_start is None:
+            path_start = len(rewritten)
+        if operator_name == "n":
+            path_start = None
+        if operator_name in _PATH_PAINTING_OPERATORS:
+            append_paint(instruction, None, path_start)
+            path_start = None
             continue
         if operator_name in _PAINTING_OPERATORS:
             append_paint(instruction, None)

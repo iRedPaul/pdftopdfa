@@ -2585,6 +2585,20 @@ def test_repeated_page_content_and_paths_become_typed_artifacts() -> None:
     assert all(page.obj["/Tabs"] == Name.S for page in pdf.pages)
 
 
+def test_generated_path_artifact_marker_starts_before_path_object() -> None:
+    pdf = pikepdf.Pdf.new()
+    page = _page(pdf, b"q 0 0 m 10 10 l S Q", size=(100, 100))
+
+    ensure_logical_structure(pdf, semantic=True)
+
+    operators = [
+        str(instruction.operator)
+        for instruction in pikepdf.parse_content_stream(page)
+        if isinstance(instruction, pikepdf.ContentStreamInstruction)
+    ]
+    assert operators == ["q", "BDC", "m", "l", "S", "EMC", "Q"]
+
+
 def test_ocr_form_mcid_is_referenced_by_mcr_and_preserves_unicode() -> None:
     pdf, _form, manifest = _ocr_document()
 
