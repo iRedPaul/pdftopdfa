@@ -6,6 +6,7 @@
 
 import re
 from io import BytesIO
+from unittest.mock import patch
 
 import pikepdf
 import pytest
@@ -709,6 +710,84 @@ def test_rebuilds_structurally_inconsistent_existing_tree(
 
     assert result["structure_rebuilt"] is True
     assert pdf.Root["/StructTreeRoot"].objgen != old_root.objgen
+
+
+@pytest.mark.parametrize(
+    "child_roles",
+    [
+        (Name.LBody,),
+        (Name.Lbl,),
+        (Name.Lbl, Name.Lbl, Name.LBody, Name.LBody),
+        (Name.LBody, Name.Lbl, Name.LBody),
+    ],
+    ids=["body-only", "label-only", "repeated", "mixed-order"],
+)
+def test_preserves_valid_list_item_child_sequences(
+    child_roles: tuple[Name, ...],
+) -> None:
+    pdf = new_pdf()
+    page = _add_page(
+        pdf,
+        b" ".join(
+            f"/Span <</MCID {mcid}>> BDC q Q EMC".encode("ascii")
+            for mcid in range(len(child_roles))
+        ),
+    )
+    page.obj["/StructParents"] = 0
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    document = pdf.make_indirect(
+        Dictionary(Type=Name.StructElem, S=Name.Document, P=root, Pg=page.obj)
+    )
+    list_element = pdf.make_indirect(
+        Dictionary(Type=Name.StructElem, S=Name.L, P=document, Pg=page.obj)
+    )
+    item = pdf.make_indirect(
+        Dictionary(Type=Name.StructElem, S=Name.LI, P=list_element, Pg=page.obj)
+    )
+    children: list[Dictionary] = []
+    marked_content_references: list[Dictionary] = []
+    for mcid, role in enumerate(child_roles):
+        marked_content_reference = pdf.make_indirect(
+            Dictionary(
+                Type=Name.MCR,
+                Pg=page.obj,
+                MCID=mcid,
+            )
+        )
+        marked_content_references.append(marked_content_reference)
+        children.append(
+            pdf.make_indirect(
+                Dictionary(
+                    Type=Name.StructElem,
+                    S=role,
+                    P=item,
+                    Pg=page.obj,
+                    K=marked_content_reference,
+                )
+            )
+        )
+    item["/K"] = Array(children)
+    list_element["/K"] = item
+    document["/K"] = list_element
+    root["/K"] = document
+    parent_tree = NumberTree.new(pdf)
+    parent_tree[0] = Array(children)
+    root["/ParentTree"] = parent_tree.obj
+    root["/ParentTreeNextKey"] = 1
+    pdf.Root["/StructTreeRoot"] = root
+
+    result = ensure_logical_structure(pdf, semantic=True)
+
+    assert result["structure_preserved"] is True
+    assert result["structure_rebuilt"] is False
+    assert pdf.Root["/StructTreeRoot"].objgen == root.objgen
+    assert [resolve_indirect(child)["/S"] for child in item["/K"]] == list(child_roles)
+    assert [owner.objgen for owner in NumberTree(root["/ParentTree"])[0]] == [
+        child.objgen for child in children
+    ]
+    assert [resolve_indirect(child["/K"]).objgen for child in children] == [
+        reference.objgen for reference in marked_content_references
+    ]
 
 
 def test_repairs_wrong_parent_tree_mapping_without_rebuilding_structure() -> None:
@@ -2143,7 +2222,7 @@ def test_rebuilds_when_form_mcid_has_no_structure_reference() -> None:
     assert _wrapper_mcid(page) == 0
 
 
-def test_self_referencing_form_xobject_terminates() -> None:
+def test_self_referencing_form_xobject_fails_closed() -> None:
     pdf = new_pdf()
     form = pdf.make_stream(b"/Fm Do")
     form["/Type"] = Name.XObject
@@ -2158,10 +2237,11 @@ def test_self_referencing_form_xobject_terminates() -> None:
         resources=Dictionary(XObject=Dictionary(Fm=form)),
     )
 
-    result = ensure_logical_structure(pdf)
+    with pytest.raises(ConversionError, match="Form XObject is recursive"):
+        ensure_logical_structure(pdf)
 
-    assert result["structure_rebuilt"] is True
-    assert _wrapper_mcid(page) == 0
+    assert "/StructTreeRoot" not in pdf.Root
+    assert "/StructParents" not in page.obj
 
 
 def test_rebuild_removes_mcid_from_soft_mask_with_inherited_resources() -> None:
@@ -2339,7 +2419,7 @@ def test_explicit_rebuild_replaces_existing_structure_and_page_key() -> None:
     assert len(_content_streams(page)) == 3
 
 
-def test_tags_annotations_with_objr_and_parent_tree_entries() -> None:
+def test_tags_annotation_roles_with_objr_and_parent_tree_entries() -> None:
     pdf = new_pdf()
     page = _add_page(pdf, b"q Q")
     page.obj["/StructParent"] = 98
@@ -2357,13 +2437,21 @@ def test_tags_annotations_with_objr_and_parent_tree_entries() -> None:
             Rect=Array([10, 10, 20, 20]),
         )
     )
-    page.obj["/Annots"] = Array([first, second])
+    third = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Annot,
+            Subtype=Name.Widget,
+            Rect=Array([20, 20, 30, 30]),
+        )
+    )
+    page.obj["/Annots"] = Array([first, second, third])
 
     result = ensure_logical_structure(pdf)
 
-    assert result["annotations_tagged"] == 2
+    assert result["annotations_tagged"] == 3
+    assert page.obj["/Tabs"] == Name.S
     annotations = [resolve_indirect(item) for item in page.obj["/Annots"]]
-    assert [int(item["/StructParent"]) for item in annotations] == [1, 2]
+    assert [int(item["/StructParent"]) for item in annotations] == [1, 2, 3]
     assert "/StructParent" not in page.obj
     assert all("/StructParents" not in item for item in annotations)
     assert all(item.is_indirect for item in annotations)
@@ -2373,19 +2461,20 @@ def test_tags_annotations_with_objr_and_parent_tree_entries() -> None:
     annotation_elements = [resolve_indirect(item) for item in div_kids[1:]]
     assert [str(item["/S"]) for item in annotation_elements] == [
         "/Annot",
-        "/Annot",
+        "/Link",
+        "/Form",
     ]
     for annotation, element, key in zip(
         annotations,
         annotation_elements,
-        [1, 2],
+        [1, 2, 3],
         strict=True,
     ):
         objr = resolve_indirect(element["/K"])
         assert str(objr["/Type"]) == "/OBJR"
         assert objr["/Obj"].objgen == annotation.objgen
         assert NumberTree(root["/ParentTree"])[key].objgen == element.objgen
-    assert int(root["/ParentTreeNextKey"]) == 3
+    assert int(root["/ParentTreeNextKey"]) == 4
 
 
 def test_clones_annotation_reused_on_multiple_pages() -> None:
@@ -2973,7 +3062,7 @@ def test_rejects_malformed_contents_during_rebuild() -> None:
     page = _add_page(pdf)
     page.obj["/Contents"] = Name.Contents
 
-    with pytest.raises(ConversionError, match="malformed /Contents"):
+    with pytest.raises(ConversionError, match="page contents are malformed"):
         ensure_logical_structure(pdf)
 
 
@@ -3147,3 +3236,386 @@ def test_rebuilds_structure_with_oversized_id_string(
 
     assert result["structure_rebuilt"] is True
     assert pdf.Root["/StructTreeRoot"].objgen != root.objgen
+
+
+def test_preserved_rich_tree_reports_newly_artifactized_vector_path() -> None:
+    pdf = new_pdf()
+    page = _add_page(pdf, b"BT 10 10 Td (Body) Tj ET")
+    _install_existing_structure(pdf, role=Name.P)
+    content = resolve_indirect(page.obj["/Contents"])
+    assert isinstance(content, pikepdf.Stream)
+    content.write(
+        bytes(content.read_bytes())
+        + b"\n/Artifact BMC 0 0 m 5 5 l S EMC"
+        + b"\n10 10 m 20 20 l S"
+    )
+
+    result = ensure_logical_structure(pdf, semantic=True)
+
+    assert result["structure_preserved"] is True
+    assert result["path_artifacts_tagged"] == 1
+    assert result["semantic_vector_review_required"] == 1
+    instructions = list(pikepdf.parse_content_stream(page))
+    assert (
+        sum(
+            isinstance(instruction, pikepdf.ContentStreamInstruction)
+            and instruction.operator == pikepdf.Operator("BMC")
+            and instruction.operands[0] == Name.Artifact
+            for instruction in instructions
+        )
+        == 2
+    )
+
+
+def test_preserved_rich_tree_artifactizes_only_unprotected_shading() -> None:
+    pdf = new_pdf()
+    page = _add_page(
+        pdf,
+        b"BT 10 10 Td (Body) Tj ET",
+        resources=Dictionary(Shading=Dictionary(Sh0=Dictionary())),
+    )
+    root, _document = _install_existing_structure(pdf, role=Name.P)
+    original_root = root.objgen
+    content = resolve_indirect(page.obj["/Contents"])
+    assert isinstance(content, pikepdf.Stream)
+    tagged = bytes(content.read_bytes())
+    assert tagged.endswith(b"\nEMC\n")
+    content.write(
+        tagged[: -len(b"\nEMC\n")]
+        + b"\n/Sh0 sh\nEMC\n"
+        + b"/Artifact BMC /Sh0 sh EMC\n"
+        + b"/Sh0 sh"
+    )
+
+    result = ensure_logical_structure(pdf, semantic=True)
+
+    assert result["structure_preserved"] is True
+    assert pdf.Root["/StructTreeRoot"].objgen == original_root
+    assert result["path_artifacts_tagged"] == 1
+    assert result["semantic_vector_review_required"] == 1
+    instructions = list(pikepdf.parse_content_stream(page))
+    assert (
+        sum(
+            isinstance(instruction, pikepdf.ContentStreamInstruction)
+            and instruction.operator == pikepdf.Operator("BMC")
+            and instruction.operands[0] == Name.Artifact
+            for instruction in instructions
+        )
+        == 2
+    )
+
+
+def _form_with_named_mcid(
+    pdf: pikepdf.Pdf,
+    *,
+    form_resources: Dictionary,
+) -> pikepdf.Stream:
+    form = pdf.make_stream(b"/P /MC0 BDC 0 0 m 5 5 l S EMC")
+    form["/Type"] = Name.XObject
+    form["/Subtype"] = Name.Form
+    form["/BBox"] = Array([0, 0, 10, 10])
+    form["/Resources"] = form_resources
+    return form
+
+
+def test_untagged_painting_resolves_named_bdc_in_nested_form_resources() -> None:
+    """A nested form's own /Properties protect its marked content."""
+    pdf = new_pdf()
+    form = _form_with_named_mcid(
+        pdf,
+        form_resources=Dictionary(Properties=Dictionary(MC0=Dictionary(MCID=0))),
+    )
+    page_resources = Dictionary(XObject=Dictionary(Fm=form))
+    page = _add_page(pdf, b"/Fm Do", resources=page_resources)
+
+    assert tagging._has_untagged_painting(page, page_resources, set()) is False
+
+
+def test_untagged_painting_ignores_page_properties_inside_nested_form() -> None:
+    """Page-level /Properties cannot protect painting inside a nested form."""
+    pdf = new_pdf()
+    form = _form_with_named_mcid(
+        pdf,
+        form_resources=Dictionary(Properties=Dictionary(Other=Dictionary())),
+    )
+    page_resources = Dictionary(
+        XObject=Dictionary(Fm=form),
+        Properties=Dictionary(MC0=Dictionary(MCID=0)),
+    )
+    page = _add_page(pdf, b"/Fm Do", resources=page_resources)
+
+    assert tagging._has_untagged_painting(page, page_resources, set()) is True
+
+
+def test_untagged_painting_reports_unprotected_painting_in_nested_form() -> None:
+    """Painting inside a nested form without matching properties is untagged."""
+    pdf = new_pdf()
+    form = _form_with_named_mcid(
+        pdf,
+        form_resources=Dictionary(Properties=Dictionary(Other=Dictionary())),
+    )
+    page_resources = Dictionary(XObject=Dictionary(Fm=form))
+    page = _add_page(pdf, b"/Fm Do", resources=page_resources)
+
+    assert tagging._has_untagged_painting(page, page_resources, set()) is True
+
+
+def test_untagged_painting_resolves_named_bdc_in_page_resources() -> None:
+    pdf = new_pdf()
+    page_resources = Dictionary(Properties=Dictionary(MC0=Dictionary(MCID=0)))
+    page = _add_page(
+        pdf,
+        b"/MC0 <</MCID 0>> BDC 0 0 m 5 5 l S EMC",
+        resources=page_resources,
+    )
+
+    assert tagging._has_untagged_painting(page, page_resources, set()) is False
+
+
+def test_untagged_painting_reports_unprotected_named_bdc_in_page_resources() -> None:
+    pdf = new_pdf()
+    page_resources = Dictionary(Properties=Dictionary(MC0=Dictionary()))
+    page = _add_page(
+        pdf,
+        b"/P /MC0 BDC 0 0 m 5 5 l S EMC",
+        resources=page_resources,
+    )
+
+    assert tagging._has_untagged_painting(page, page_resources, set()) is True
+
+
+def test_marked_content_properties_resolves_named_reference() -> None:
+    properties = tagging._marked_content_properties(
+        [Name.P, Name("/MC0")],
+        Dictionary(Properties=Dictionary(MC0=Dictionary(MCID=3))),
+    )
+
+    assert isinstance(properties, Dictionary)
+    assert int(properties.MCID) == 3
+    assert (
+        tagging._marked_content_properties(
+            [Name.P, Name("/Missing")],
+            Dictionary(Properties=Dictionary()),
+        )
+        is None
+    )
+    assert (
+        tagging._marked_content_properties(
+            [Name.P, Dictionary(MCID=1)],
+            None,
+        )
+        is not None
+    )
+
+
+def test_scan_content_description_evidence_allows_bounded_form_nesting() -> None:
+    pdf = new_pdf()
+    form = _nested_form_chain(pdf, tagging._MAX_FORM_SCAN_DEPTH)
+
+    text_mcids, actual_text_mcids, has_text, has_actual_text = (
+        tagging._scan_content_description_evidence(
+            form,
+            resolve_indirect(form.get("/Resources")),
+            "bounded form chain",
+        )
+    )
+
+    assert text_mcids == frozenset()
+    assert actual_text_mcids == frozenset()
+    assert has_text is False
+    assert has_actual_text is False
+
+
+def test_scan_content_description_evidence_rejects_deep_form_nesting() -> None:
+    pdf = new_pdf()
+    form = _nested_form_chain(pdf, tagging._MAX_FORM_SCAN_DEPTH + 1)
+
+    with pytest.raises(ConversionError, match="nested deeper than"):
+        tagging._scan_content_description_evidence(
+            form,
+            resolve_indirect(form.get("/Resources")),
+            "deep form chain",
+        )
+
+
+def test_sanitize_content_stream_removes_named_mcid() -> None:
+    pdf = new_pdf()
+    stream = pdf.make_stream(b"/P /MC0 BDC q Q EMC")
+    mc0 = Dictionary(MCID=0)
+    resources = Dictionary(Properties=Dictionary(MC0=mc0))
+
+    languages_removed, mcids_removed = tagging._sanitize_content_stream(
+        stream,
+        resources,
+        remove_mcids=True,
+        description="test stream",
+    )
+
+    assert (languages_removed, mcids_removed) == (0, 1)
+    assert "/MCID" not in mc0
+
+
+def test_marked_instruction_without_mcid_resolves_named_reference() -> None:
+    instruction = pikepdf.ContentStreamInstruction(
+        [Name.P, Name("/MC0")],
+        pikepdf.Operator("BDC"),
+    )
+    resources = Dictionary(
+        Properties=Dictionary(MC0=Dictionary(MCID=7, Lang="en-US")),
+    )
+
+    resolved, removed, has_properties, named = tagging._marked_instruction_without_mcid(
+        instruction, resources, 1
+    )
+
+    assert removed is True
+    assert has_properties is True
+    assert isinstance(named, Dictionary)
+    assert str(named.Lang) == "en-US"
+    assert resolved is instruction
+    assert str(resolved.operands[1]) == "/MC0"
+
+
+def test_artifact_untagged_path_painting_honors_named_bdc_protection() -> None:
+    pdf = new_pdf()
+    page_resources = Dictionary(Properties=Dictionary(MC0=Dictionary(MCID=1)))
+    page = _add_page(pdf, b"BT 10 10 Td (Body) Tj ET", resources=page_resources)
+    root, document = _install_existing_structure(pdf, role=Name.P)
+    figure = pdf.make_indirect(
+        Dictionary(
+            Type=Name.StructElem,
+            S=Name.Figure,
+            P=document,
+            Pg=page.obj,
+            K=1,
+        )
+    )
+    document["/K"] = Array([0, figure])
+    NumberTree(root["/ParentTree"])[0] = Array([document, figure])
+    content = resolve_indirect(page.obj["/Contents"])
+    assert isinstance(content, pikepdf.Stream)
+    content.write(
+        bytes(content.read_bytes())
+        + b"\n/P /MC0 BDC 0 0 m 5 5 l S EMC"
+        + b"\n10 10 m 20 20 l S"
+    )
+
+    elements, changed = tagging._artifact_untagged_path_painting(pdf)
+
+    assert changed == 1
+    assert elements is not None
+    instructions = list(pikepdf.parse_content_stream(page))
+    assert (
+        sum(
+            isinstance(instruction, pikepdf.ContentStreamInstruction)
+            and instruction.operator == pikepdf.Operator("BMC")
+            and list(instruction.operands) == [Name.Artifact]
+            for instruction in instructions
+        )
+        == 1
+    )
+
+
+class TestStructureHierarchyValidation:
+    """PDF 1.7 nesting that is legal must not force a structure rebuild."""
+
+    @staticmethod
+    def _tree(pdf: pikepdf.Pdf, roles: tuple[str, ...]) -> list[Dictionary]:
+        """Build a linear chain of structure elements below the root."""
+        root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+        parent: Dictionary = root
+        elements: list[Dictionary] = []
+        for role in roles:
+            element = pdf.make_indirect(
+                Dictionary(Type=Name.StructElem, S=Name(role), P=parent)
+            )
+            elements.append(element)
+            parent = element
+        return [root, *elements]
+
+    @pytest.mark.parametrize(
+        "roles",
+        [
+            # PDF 32000-1, Table 336: /Lbl labels list and TOC items alike.
+            ("/TOC", "/TOCI", "/Lbl"),
+            ("/L", "/LI", "/Lbl"),
+            # Table 333: grouping elements nest, so /Document is not root-only.
+            ("/Part", "/Document"),
+            ("/Document", "/Document"),
+            ("/Sect", "/Document"),
+        ],
+    )
+    def test_accepts_legal_nesting(self, roles: tuple[str, ...]) -> None:
+        pdf = new_pdf()
+        root, *elements = self._tree(pdf, roles)
+
+        assert tagging._valid_structure_hierarchy(root, None, elements) is True
+
+    @pytest.mark.parametrize(
+        "roles",
+        [
+            ("/P", "/Lbl"),
+            ("/H1", "/Document"),
+            ("/Table", "/TD"),
+            ("/P", "/LI"),
+            ("/Div", "/TR"),
+        ],
+    )
+    def test_rejects_illegal_nesting(self, roles: tuple[str, ...]) -> None:
+        pdf = new_pdf()
+        root, *elements = self._tree(pdf, roles)
+
+        assert tagging._valid_structure_hierarchy(root, None, elements) is False
+
+
+class TestPreflightOptOut:
+    """`preflight=False` skips the rehearsal without changing the result."""
+
+    def test_default_rehearses_on_an_isolated_copy(self) -> None:
+        pdf = new_pdf()
+        _add_page(pdf, b"BT ET")
+        calls: list[bool] = []
+        original = tagging._ensure_logical_structure_in_place
+
+        def record(target, **kwargs):
+            calls.append(target is pdf)
+            return original(target, **kwargs)
+
+        with patch.object(
+            tagging,
+            "_ensure_logical_structure_in_place",
+            side_effect=record,
+        ):
+            ensure_logical_structure(pdf, semantic=True)
+
+        assert calls == [False, True]
+
+    def test_opt_out_runs_once_on_the_caller_pdf(self) -> None:
+        pdf = new_pdf()
+        _add_page(pdf, b"BT ET")
+        calls: list[bool] = []
+        original = tagging._ensure_logical_structure_in_place
+
+        def record(target, **kwargs):
+            calls.append(target is pdf)
+            return original(target, **kwargs)
+
+        with patch.object(
+            tagging,
+            "_ensure_logical_structure_in_place",
+            side_effect=record,
+        ):
+            ensure_logical_structure(pdf, semantic=True, preflight=False)
+
+        assert calls == [True]
+
+    def test_opt_out_produces_the_same_structure(self) -> None:
+        results = []
+        for preflight in (True, False):
+            pdf = new_pdf()
+            _add_page(pdf, b"BT ET")
+            results.append(
+                ensure_logical_structure(pdf, semantic=True, preflight=preflight)
+            )
+
+        assert results[0] == results[1]

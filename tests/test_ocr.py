@@ -5,9 +5,15 @@
 """Unit tests for the public OCR integration."""
 
 import ctypes
+import json
+import os
 import shutil
 import sys
+import zlib
+from collections.abc import Sequence
+from copy import deepcopy
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -20,6 +26,7 @@ from pikepdf import Dictionary, Name, Pdf
 from PIL import Image
 
 import pdftopdfa._ocr_runtime as ocr_runtime
+import pdftopdfa.digital_layout as digital_layout
 from pdftopdfa import recognize_image
 from pdftopdfa._ocr_runtime import (
     _DXGIAdapterDesc1,
@@ -33,6 +40,9 @@ from pdftopdfa._ocr_runtime import (
 )
 from pdftopdfa.exceptions import OCRError
 from pdftopdfa.ocr import (
+    _OCR_MAX_DOCUMENT_RASTER_PIXELS,
+    _OCR_MAX_PAGE_RASTER_PIXELS,
+    _cleanup_ocr_resources,
     _finalize_ocr_output,
     _find_deskew_pages,
     _image_color_space_marks,
@@ -40,8 +50,13 @@ from pdftopdfa.ocr import (
     _page_has_images,
     _page_has_text,
     _page_paint_analysis,
+    _preflight_ocr_input,
     _prepare_deskew_input,
+    _read_ocr_run_sidecars,
     _strip_invisible_text_from_form,
+    _validate_ocr_document_manifest,
+    _validate_ocr_page_manifest,
+    _write_ocr_document_manifest,
     apply_ocr,
     is_ocr_available,
     needs_ocr,
@@ -51,6 +66,12 @@ from pdftopdfa.ocr_rotation_fix import (
     _should_swap_visible_page_axis,
     filter_pdf_page,
 )
+from pdftopdfa.staging import StagedFileSnapshot
+from pdftopdfa.staging import publish_staged_file as publish_staged_file_impl
+from pdftopdfa.staging import (
+    rollback_staged_publication as rollback_staged_publication_impl,
+)
+from pdftopdfa.staging import verify_staged_file as verify_staged_file_snapshot
 
 
 @pytest.fixture(autouse=True)
@@ -89,6 +110,80 @@ def validate_models(model_dirs: tuple[Path, Path]):
 def _copy_ocr_input(input_path: Path, output_path: Path, **_kwargs: object) -> None:
     """Model OCRmyPDF's output contract in option-boundary tests."""
     shutil.copy2(input_path, output_path)
+
+
+def _add_ocr_form(
+    pdf: Pdf,
+    page_index: int,
+    name: str,
+    mcids: Sequence[int],
+) -> None:
+    """Attach an OCR Form whose content marks exactly *mcids*."""
+    content = b" ".join(
+        f"/Span <</MCID {mcid}>> BDC BT ET EMC".encode() for mcid in mcids
+    )
+    form = pdf.make_stream(content)
+    form[Name.Type] = Name.XObject
+    form[Name.Subtype] = Name.Form
+    form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+    form[Name.Resources] = Dictionary()
+    resources = pdf.pages[page_index].Resources
+    if Name.XObject not in resources:
+        resources[Name.XObject] = Dictionary()
+    resources.XObject[Name(name)] = form
+
+
+def _ocr_page_manifest(page_index: int, text: str) -> dict[str, object]:
+    bbox = {"left": 10.0, "top": 10.0, "right": 90.0, "bottom": 30.0}
+    polygon = [[10.0, 10.0], [90.0, 10.0], [90.0, 30.0], [10.0, 30.0]]
+    return {
+        "schema_version": 1,
+        "type": "pdftopdfa-ocr-page",
+        "page_index": page_index,
+        "raster": {"width": 100, "height": 100, "dpi": 300.0},
+        "coordinates": {
+            "width": 100.0,
+            "height": 100.0,
+            "dpi": 300.0,
+            "scale_from_raster": 1.0,
+        },
+        "languages": ["de", "en"],
+        "layout": {
+            "reading_order_applied": True,
+            "sections": [],
+            "selected_columns": [
+                {"left": 0.0, "top": 0.0, "right": 100.0, "bottom": 100.0}
+            ],
+        },
+        "lines": [
+            {
+                "mcid": 0,
+                "ocr_class": "ocr_line",
+                "text": text,
+                "confidence": 0.95,
+                "bbox": bbox,
+                "polygon": polygon,
+                "language": "de+en",
+                "direction": "ltr",
+                "baseline": {"slope": 0.0, "intercept": 0.0},
+                "text_angle": 0.0,
+                "words": [
+                    {
+                        "index": 0,
+                        "ocr_class": "ocrx_word",
+                        "text": text,
+                        "confidence": 0.95,
+                        "bbox": bbox,
+                        "polygon": polygon,
+                        "language": "de+en",
+                        "direction": "ltr",
+                        "baseline": None,
+                        "text_angle": None,
+                    }
+                ],
+            }
+        ],
+    }
 
 
 def _enumerate_mock_directml_devices(
@@ -555,6 +650,41 @@ def _nested_form_chain(
     return child
 
 
+def _write_pdf_with_declared_content_length(
+    path: Path,
+    content: bytes,
+    declared_length: int,
+) -> None:
+    """Write a minimal PDF whose stream length can intentionally be wrong."""
+    objects = (
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] "
+        b"/Resources <<>> /Contents 4 0 R >>",
+        f"<< /Length {declared_length} >>\nstream\n".encode("ascii")
+        + content
+        + b"\nendstream",
+    )
+    raw_pdf = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for object_number, value in enumerate(objects, start=1):
+        offsets.append(len(raw_pdf))
+        raw_pdf.extend(f"{object_number} 0 obj\n".encode("ascii"))
+        raw_pdf.extend(value)
+        raw_pdf.extend(b"\nendobj\n")
+    xref_offset = len(raw_pdf)
+    raw_pdf.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    raw_pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        raw_pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    raw_pdf.extend(
+        b"trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n"
+        + str(xref_offset).encode("ascii")
+        + b"\n%%EOF\n"
+    )
+    path.write_bytes(raw_pdf)
+
+
 class TestOcrDetection:
     """Tests for public OCR availability and page analysis helpers."""
 
@@ -590,6 +720,176 @@ class TestOcrDetection:
         assert needs_ocr(pdf, threshold=0.5) is True
         assert needs_ocr(pdf, threshold=0.6) is False
 
+    def test_needs_ocr_operator_budget_stops_before_public_walk(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            page.obj[Name.Contents] = pdf.make_stream(b"")
+            consumed = 0
+
+            def many_operators(_owner: object):
+                nonlocal consumed
+                for _ in range(200_000):
+                    consumed += 1
+                    yield SimpleNamespace(operator=pikepdf.Operator("q"), operands=())
+
+            monkeypatch.setattr(pikepdf, "parse_content_stream", many_operators)
+            with (
+                patch("pdftopdfa.ocr._page_has_images") as page_has_images,
+                patch("pdftopdfa.ocr._page_has_text") as page_has_text,
+                pytest.raises(OCRError, match="page operator budget exceeded"),
+            ):
+                needs_ocr(pdf)
+
+        assert consumed == digital_layout._MAX_DIGITAL_OPERATORS_PER_PAGE + 1
+        page_has_images.assert_not_called()
+        page_has_text.assert_not_called()
+
+    def test_needs_ocr_rejects_underdeclared_encoded_content_before_analysis(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_dir / "needs-ocr-underdeclared-content.pdf"
+        _write_pdf_with_declared_content_length(path, b"q Q q Q", 1)
+        original = path.read_bytes()
+        monkeypatch.setattr(
+            digital_layout,
+            "_MAX_ENCODED_CONTENT_BYTES_PER_CONTAINER",
+            5,
+        )
+
+        with (
+            Pdf.open(path) as pdf,
+            patch("pdftopdfa.ocr._page_has_images") as page_has_images,
+            patch("pdftopdfa.ocr._page_has_text") as page_has_text,
+            pytest.raises(OCRError, match="encoded content container byte budget"),
+        ):
+            needs_ocr(pdf)
+
+        assert path.read_bytes() == original
+        page_has_images.assert_not_called()
+        page_has_text.assert_not_called()
+
+    def test_needs_ocr_rejects_decoded_content_before_analysis(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            stream = pdf.make_stream(b"")
+            stream.write(
+                zlib.compress(b" " * 4_096 + b"q Q"),
+                filter=Name.FlateDecode,
+            )
+            page.obj[Name.Contents] = stream
+            monkeypatch.setattr(
+                digital_layout,
+                "_MAX_DECODED_CONTENT_BYTES_PER_CONTAINER",
+                128,
+            )
+
+            with (
+                patch("pdftopdfa.ocr._page_has_images") as page_has_images,
+                patch("pdftopdfa.ocr._page_has_text") as page_has_text,
+                pytest.raises(OCRError, match="content container byte budget exceeded"),
+            ):
+                needs_ocr(pdf)
+
+        page_has_images.assert_not_called()
+        page_has_text.assert_not_called()
+
+    def test_needs_ocr_rejects_form_nesting_before_analysis(self) -> None:
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            leaf = pdf.make_stream(b"q Q")
+            leaf[Name.Type] = Name.XObject
+            leaf[Name.Subtype] = Name.Form
+            leaf[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            leaf[Name.Resources] = Dictionary()
+            root = _nested_form_chain(pdf, leaf, count=66)
+            page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Root=root))
+            page.obj[Name.Contents] = pdf.make_stream(b"/Root Do")
+
+            with (
+                patch("pdftopdfa.ocr._page_has_images") as page_has_images,
+                patch("pdftopdfa.ocr._page_has_text") as page_has_text,
+                pytest.raises(OCRError, match="nesting depth budget exceeded"),
+            ):
+                needs_ocr(pdf)
+
+        page_has_images.assert_not_called()
+        page_has_text.assert_not_called()
+
+    def test_needs_ocr_rejects_recursive_form_before_analysis(self) -> None:
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            form = pdf.make_stream(b"/Self Do")
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            form[Name.Resources] = Dictionary(XObject=Dictionary(Self=form))
+            page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Root=form))
+            page.obj[Name.Contents] = pdf.make_stream(b"/Root Do")
+
+            with (
+                patch("pdftopdfa.ocr._page_has_images") as page_has_images,
+                patch("pdftopdfa.ocr._page_has_text") as page_has_text,
+                pytest.raises(OCRError, match="Form XObject is recursive"),
+            ):
+                needs_ocr(pdf)
+
+        page_has_images.assert_not_called()
+        page_has_text.assert_not_called()
+
+    def test_needs_ocr_rejects_repeated_form_invocations_before_analysis(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            form = pdf.make_stream(b"q Q")
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            form[Name.Resources] = Dictionary()
+            page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Fm=form))
+            page.obj[Name.Contents] = pdf.make_stream(b"/Fm Do /Fm Do /Fm Do")
+            monkeypatch.setattr(
+                digital_layout,
+                "_MAX_FORM_INVOCATIONS_PER_RESOURCE_PER_PAGE",
+                2,
+            )
+
+            with (
+                patch("pdftopdfa.ocr._page_has_images") as page_has_images,
+                patch("pdftopdfa.ocr._page_has_text") as page_has_text,
+                pytest.raises(OCRError, match="invocation budget exceeded"),
+            ):
+                needs_ocr(pdf)
+
+        page_has_images.assert_not_called()
+        page_has_text.assert_not_called()
+
+    def test_needs_ocr_accepts_bounded_invoked_form_text(self) -> None:
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, visible_form_text=True)
+
+            assert needs_ocr(pdf) is False
+
+    def test_needs_ocr_accepts_opened_encrypted_pdf_without_mutation(
+        self,
+        encrypted_pdf: Path,
+    ) -> None:
+        original = encrypted_pdf.read_bytes()
+
+        with Pdf.open(encrypted_pdf, password="testpassword") as pdf:
+            assert needs_ocr(pdf) is False
+
+        assert encrypted_pdf.read_bytes() == original
+
     def test_page_image_and_text_detection(
         self,
         pdf_with_image_obj: Pdf,
@@ -599,6 +899,84 @@ class TestOcrDetection:
         assert _page_has_text(pdf_with_image_obj.pages[0]) is False
         assert _page_has_images(pdf_with_text_obj.pages[0]) is False
         assert _page_has_text(pdf_with_text_obj.pages[0]) is True
+
+    def test_unreferenced_form_text_is_not_page_text(self) -> None:
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            form = pdf.make_stream(b"BT (Unused) Tj ET")
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            form[Name.Resources] = Dictionary()
+            page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Unused=form))
+            page.obj[Name.Contents] = pdf.make_stream(b"q Q")
+
+            assert _page_has_text(page) is False
+
+    @pytest.mark.parametrize("order", [b"/A Do /B Do", b"/B Do /A Do"])
+    @pytest.mark.parametrize("empty_shared_resources", [False, True])
+    def test_form_text_detection_tracks_effective_resource_context(
+        self,
+        order: bytes,
+        empty_shared_resources: bool,
+    ) -> None:
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+
+            def form(content: bytes, resources: Dictionary | None) -> pikepdf.Stream:
+                value = pdf.make_stream(content)
+                value[Name.Type] = Name.XObject
+                value[Name.Subtype] = Name.Form
+                value[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+                if resources is not None:
+                    value[Name.Resources] = resources
+                return value
+
+            shared = form(
+                b"/Nested Do",
+                Dictionary() if empty_shared_resources else None,
+            )
+            empty = form(b"q Q", Dictionary())
+            text = form(b"BT (Visible) Tj ET", Dictionary())
+            first = form(
+                b"/Shared Do",
+                Dictionary(XObject=Dictionary(Shared=shared, Nested=empty)),
+            )
+            second = form(
+                b"/Shared Do",
+                Dictionary(XObject=Dictionary(Shared=shared, Nested=text)),
+            )
+            page.obj[Name.Resources] = Dictionary(XObject=Dictionary(A=first, B=second))
+            page.obj[Name.Contents] = pdf.make_stream(order)
+
+            assert _page_has_text(page) is True
+
+    def test_resource_less_self_referential_form_text_detection_terminates(
+        self,
+    ) -> None:
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            form = pdf.make_stream(b"/Self Do")
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Self=form))
+            page.obj[Name.Contents] = pdf.make_stream(b"/Self Do")
+
+            assert _page_has_text(page) is False
+
+    def test_shared_form_with_own_resources_still_detects_text(self) -> None:
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            form = pdf.make_stream(b"BT (Shared) Tj ET")
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            form[Name.Resources] = Dictionary(ProcSet=pikepdf.Array([Name.PDF]))
+            page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Shared=form))
+            page.obj[Name.Contents] = pdf.make_stream(b"/Shared Do /Shared Do")
+
+            assert _page_has_text(page) is True
 
     def test_whitespace_only_text_does_not_suppress_ocr_detection(self) -> None:
         with Pdf.new() as pdf:
@@ -727,8 +1105,8 @@ class TestOcrLanguageMetadata:
 class TestRotatedOcrFormBoxes:
     """Tests for rotated OCR text-layer clipping repair."""
 
-    @pytest.mark.parametrize("rotation", [90, 270])
-    def test_swaps_ocr_form_box_axes(
+    @pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+    def test_zero_bases_ocr_form_box_for_every_rotation(
         self,
         tmp_dir: Path,
         rotation: int,
@@ -736,21 +1114,25 @@ class TestRotatedOcrFormBoxes:
         path = tmp_dir / f"rotated-{rotation}.pdf"
         with Pdf.new() as pdf:
             page = pdf.add_blank_page(page_size=(576, 432))
+            page.obj[Name.MediaBox] = pikepdf.Array([10, 20, 586, 452])
             page.obj[Name.Rotate] = rotation
+            page.obj[Name.UserUnit] = 2.5
             form = pdf.make_stream(b"")
             form[Name.Type] = Name.XObject
             form[Name.Subtype] = Name.Form
-            form[Name.BBox] = pikepdf.Array([0, 0, 576, 432])
+            form[Name.BBox] = pikepdf.Array([10, 20, 586, 452])
             xobjects = Dictionary()
             xobjects[Name("/OCR-pdf-0")] = form
             page.obj[Name.Resources] = Dictionary(XObject=xobjects)
             pdf.save(path)
 
-        _finalize_ocr_output(path, ["en"], [frozenset()])
+        new_forms = _finalize_ocr_output(path, ["en"], [frozenset()])
 
         with Pdf.open(path) as pdf:
             form = pdf.pages[0].Resources.XObject["/OCR-pdf-0"]
-            assert [float(value) for value in form.BBox] == [0, 0, 432, 576]
+            expected = [0, 0, 432, 576] if rotation in {90, 270} else [0, 0, 576, 432]
+            assert [float(value) for value in form.BBox] == expected
+        assert new_forms == {0: ("/OCR-pdf-0",)}
 
     @pytest.mark.parametrize("inherited", [False, True])
     def test_leaves_preexisting_ocr_form_unchanged(
@@ -775,11 +1157,580 @@ class TestRotatedOcrFormBoxes:
             pdf.save(path)
 
         existing_names = _ocr_form_names(path)
-        _finalize_ocr_output(path, ["en"], existing_names)
+        new_forms = _finalize_ocr_output(path, ["en"], existing_names)
 
         with Pdf.open(path) as pdf:
             form = pdf.pages[0].resources.XObject["/OCR-existing"]
             assert [float(value) for value in form.BBox] == [0, 0, 576, 432]
+        assert new_forms == {}
+
+
+class TestOcrResourcePreflight:
+    """Tests for fail-closed page geometry and raster limits."""
+
+    @pytest.mark.parametrize(
+        ("page_size", "exceeds_limit"),
+        [
+            (479.0, False),
+            (481.0, True),
+        ],
+    )
+    def test_enforces_600_dpi_page_pixel_limit_with_rotation_and_user_unit(
+        self,
+        tmp_dir: Path,
+        page_size: float,
+        exceeds_limit: bool,
+    ) -> None:
+        path = tmp_dir / f"raster-{page_size}.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(page_size, page_size))
+            page.obj[Name.Rotate] = 90
+            page.obj[Name.UserUnit] = 2.5
+            pdf.save(path)
+
+        if exceeds_limit:
+            with pytest.raises(
+                OCRError,
+                match=f"safety limit is {_OCR_MAX_PAGE_RASTER_PIXELS:,}",
+            ):
+                _preflight_ocr_input(path)
+        else:
+            _preflight_ocr_input(path)
+
+    @pytest.mark.parametrize(("page_count", "exceeds_limit"), [(28, False), (29, True)])
+    def test_enforces_document_raster_work_limit(
+        self,
+        tmp_dir: Path,
+        page_count: int,
+        exceeds_limit: bool,
+    ) -> None:
+        path = tmp_dir / f"raster-document-{page_count}.pdf"
+        with Pdf.new() as pdf:
+            for _ in range(page_count):
+                pdf.add_blank_page(page_size=(595, 842))
+            pdf.save(path)
+
+        if exceeds_limit:
+            with pytest.raises(
+                OCRError,
+                match=f"more than {_OCR_MAX_DOCUMENT_RASTER_PIXELS:,} pixels",
+            ):
+                _preflight_ocr_input(path)
+        else:
+            _preflight_ocr_input(path)
+
+    def test_enforces_document_page_count_before_pdfinfo_analysis(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        path = tmp_dir / "too-many-pages.pdf"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page(page_size=(10, 10))
+            pdf.add_blank_page(page_size=(10, 10))
+            pdf.save(path)
+
+        with (
+            patch("pdftopdfa.ocr._OCR_MAX_DOCUMENT_PAGES", 1),
+            patch("ocrmypdf.pdfinfo.PdfInfo") as pdfinfo,
+            pytest.raises(OCRError, match="more than 1 pages"),
+        ):
+            _preflight_ocr_input(path)
+
+        pdfinfo.assert_not_called()
+
+    def test_operator_budget_stops_before_consuming_unbounded_iterator(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_dir / "operator-budget.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            page.obj[Name.Contents] = pdf.make_stream(b"")
+            pdf.save(path)
+
+        consumed = 0
+
+        def many_operators(_owner: object):
+            nonlocal consumed
+            for _ in range(200_000):
+                consumed += 1
+                yield SimpleNamespace(operator=pikepdf.Operator("q"), operands=())
+
+        monkeypatch.setattr(pikepdf, "parse_content_stream", many_operators)
+        with (
+            patch("pdftopdfa.ocr._page_has_text") as page_has_text,
+            patch("pdftopdfa.ocr._page_paint_analysis") as paint_analysis,
+            patch("ocrmypdf.pdfinfo.PdfInfo") as pdfinfo,
+            pytest.raises(OCRError, match="page operator budget exceeded"),
+        ):
+            _preflight_ocr_input(path)
+
+        assert consumed == digital_layout._MAX_DIGITAL_OPERATORS_PER_PAGE + 1
+        assert consumed < 200_000
+        page_has_text.assert_not_called()
+        paint_analysis.assert_not_called()
+        pdfinfo.assert_not_called()
+
+    def test_document_operator_budget_runs_before_ocr_walkers(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_dir / "document-operator-budget.pdf"
+        with Pdf.new() as pdf:
+            for _ in range(2):
+                page = pdf.add_blank_page(page_size=(100, 100))
+                page.obj[Name.Contents] = pdf.make_stream(b"")
+            pdf.save(path)
+        consumed = 0
+
+        def two_operators(_owner: object):
+            nonlocal consumed
+            for _ in range(2):
+                consumed += 1
+                yield SimpleNamespace(operator=pikepdf.Operator("q"), operands=())
+
+        monkeypatch.setattr(pikepdf, "parse_content_stream", two_operators)
+        monkeypatch.setattr(
+            digital_layout,
+            "_MAX_DIGITAL_OPERATORS_PER_DOCUMENT",
+            3,
+        )
+
+        with (
+            patch("pdftopdfa.ocr._page_has_text") as page_has_text,
+            patch("pdftopdfa.ocr._page_paint_analysis") as paint_analysis,
+            patch("ocrmypdf.pdfinfo.PdfInfo") as pdfinfo,
+            pytest.raises(OCRError, match="document operator budget exceeded"),
+        ):
+            _preflight_ocr_input(path)
+
+        assert consumed == 4
+        page_has_text.assert_not_called()
+        paint_analysis.assert_not_called()
+        pdfinfo.assert_not_called()
+
+    def test_rejects_decoded_content_bomb_before_ocr_walkers(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_dir / "decoded-content-bomb.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            stream = pdf.make_stream(b"")
+            stream.write(
+                zlib.compress(b" " * 4_096 + b"q Q"),
+                filter=Name.FlateDecode,
+            )
+            page.obj[Name.Contents] = stream
+            pdf.save(path)
+        monkeypatch.setattr(
+            digital_layout,
+            "_MAX_DECODED_CONTENT_BYTES_PER_CONTAINER",
+            128,
+        )
+
+        with (
+            patch("pdftopdfa.ocr._page_has_text") as page_has_text,
+            patch("pdftopdfa.ocr._page_paint_analysis") as paint_analysis,
+            patch("ocrmypdf.pdfinfo.PdfInfo") as pdfinfo,
+            pytest.raises(OCRError, match="content container byte budget exceeded"),
+        ):
+            _preflight_ocr_input(path)
+
+        page_has_text.assert_not_called()
+        paint_analysis.assert_not_called()
+        pdfinfo.assert_not_called()
+
+    def test_rejects_cumulative_encoded_content_before_ocr_walkers(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_dir / "encoded-content-budget.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            page.obj[Name.Contents] = pikepdf.Array(
+                [pdf.make_stream(b"q Q"), pdf.make_stream(b"q Q")]
+            )
+            pdf.save(path, compress_streams=False)
+        monkeypatch.setattr(
+            digital_layout,
+            "_MAX_ENCODED_CONTENT_BYTES_PER_PAGE",
+            5,
+        )
+
+        with (
+            patch("pdftopdfa.ocr._page_has_text") as page_has_text,
+            patch("pdftopdfa.ocr._page_paint_analysis") as paint_analysis,
+            patch("ocrmypdf.pdfinfo.PdfInfo") as pdfinfo,
+            pytest.raises(OCRError, match="page encoded-content byte budget"),
+        ):
+            _preflight_ocr_input(path)
+
+        page_has_text.assert_not_called()
+        paint_analysis.assert_not_called()
+        pdfinfo.assert_not_called()
+
+    def test_canonical_copy_repairs_underdeclared_length_before_raw_read(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_dir / "underdeclared-content-length.pdf"
+        _write_pdf_with_declared_content_length(path, b"q Q q Q", 1)
+        observed_lengths: list[tuple[int, int]] = []
+        original_sizes = digital_layout._content_stream_sizes
+
+        def inspect_canonical_length(
+            stream: pikepdf.Stream,
+            decoded_limit: int,
+        ) -> tuple[int, int]:
+            declared_length = int(stream.get("/Length"))
+            raw_length = len(stream.get_raw_stream_buffer())
+            observed_lengths.append((declared_length, raw_length))
+            return original_sizes(stream, decoded_limit)
+
+        monkeypatch.setattr(
+            digital_layout,
+            "_content_stream_sizes",
+            inspect_canonical_length,
+        )
+        monkeypatch.setattr(
+            digital_layout,
+            "_MAX_ENCODED_CONTENT_BYTES_PER_CONTAINER",
+            5,
+        )
+
+        with (
+            patch("ocrmypdf.pdfinfo.PdfInfo") as pdfinfo,
+            pytest.raises(OCRError, match="encoded content container byte budget"),
+        ):
+            _preflight_ocr_input(path)
+
+        assert observed_lengths
+        assert observed_lengths[0][0] == observed_lengths[0][1]
+        assert observed_lengths[0][0] > 5
+        pdfinfo.assert_not_called()
+
+    def test_rejects_form_nesting_depth_before_pdfinfo(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        path = tmp_dir / "deep-forms.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            leaf = pdf.make_stream(b"q Q")
+            leaf[Name.Type] = Name.XObject
+            leaf[Name.Subtype] = Name.Form
+            leaf[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            leaf[Name.Resources] = Dictionary()
+            root = _nested_form_chain(pdf, leaf, count=66)
+            page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Root=root))
+            page.obj[Name.Contents] = pdf.make_stream(b"/Root Do")
+            pdf.save(path)
+
+        with (
+            patch("ocrmypdf.pdfinfo.PdfInfo") as pdfinfo,
+            pytest.raises(OCRError, match="nesting depth budget exceeded"),
+        ):
+            _preflight_ocr_input(path)
+
+        pdfinfo.assert_not_called()
+
+    def test_rejects_repeated_form_invocations_before_pdfinfo(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_dir / "repeated-form.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            form = pdf.make_stream(b"q Q")
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            form[Name.Resources] = Dictionary()
+            page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Fm=form))
+            page.obj[Name.Contents] = pdf.make_stream(b"/Fm Do /Fm Do /Fm Do")
+            pdf.save(path)
+        monkeypatch.setattr(
+            digital_layout,
+            "_MAX_FORM_INVOCATIONS_PER_RESOURCE_PER_PAGE",
+            2,
+        )
+
+        with (
+            patch("ocrmypdf.pdfinfo.PdfInfo") as pdfinfo,
+            pytest.raises(OCRError, match="invocation budget exceeded"),
+        ):
+            _preflight_ocr_input(path)
+
+        pdfinfo.assert_not_called()
+
+    def test_rejects_recursive_form_before_pdfinfo(self, tmp_dir: Path) -> None:
+        path = tmp_dir / "recursive-form.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            form = pdf.make_stream(b"/Self Do")
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            form[Name.Resources] = Dictionary(XObject=Dictionary(Self=form))
+            page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Root=form))
+            page.obj[Name.Contents] = pdf.make_stream(b"/Root Do")
+            pdf.save(path)
+
+        with (
+            patch("ocrmypdf.pdfinfo.PdfInfo") as pdfinfo,
+            pytest.raises(OCRError, match="Form XObject is recursive"),
+        ):
+            _preflight_ocr_input(path)
+
+        pdfinfo.assert_not_called()
+
+    def test_forced_ocr_budgets_unreferenced_existing_ocr_forms(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_dir / "unreferenced-existing-ocr-form.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            form = pdf.make_stream(b"q Q q Q")
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            form[Name.Resources] = Dictionary()
+            xobjects = Dictionary()
+            xobjects[Name("/OCR-existing")] = form
+            page.obj[Name.Resources] = Dictionary(XObject=xobjects)
+            page.obj[Name.Contents] = pdf.make_stream(b"")
+            pdf.save(path)
+        monkeypatch.setattr(
+            digital_layout,
+            "_MAX_DIGITAL_OPERATORS_PER_PAGE",
+            3,
+        )
+
+        with (
+            patch("ocrmypdf.pdfinfo.PdfInfo") as pdfinfo,
+            pytest.raises(OCRError, match="page operator budget exceeded"),
+        ):
+            _preflight_ocr_input(path, force=True)
+
+        pdfinfo.assert_not_called()
+
+    def test_accepts_bounded_nested_and_reused_forms(self, tmp_dir: Path) -> None:
+        path = tmp_dir / "bounded-complex-forms.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            font = Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type1,
+                BaseFont=Name.Helvetica,
+            )
+            leaf = pdf.make_stream(b"BT /F1 10 Tf 10 10 Td (Text) Tj ET")
+            leaf[Name.Type] = Name.XObject
+            leaf[Name.Subtype] = Name.Form
+            leaf[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+            leaf[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+            root = _nested_form_chain(pdf, leaf, count=5)
+            page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Root=root))
+            page.obj[Name.Contents] = pdf.make_stream(b"/Root Do /Root Do")
+            pdf.save(path)
+        pdfinfo_value = SimpleNamespace(
+            pages=[SimpleNamespace(has_text=True, images=[])]
+        )
+
+        with patch("ocrmypdf.pdfinfo.PdfInfo", return_value=pdfinfo_value) as pdfinfo:
+            _preflight_ocr_input(path)
+
+        pdfinfo.assert_called_once_with(path, max_workers=1)
+
+    def test_content_preflight_preserves_existing_output_and_manifest(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        input_path = tmp_dir / "oversized-content.pdf"
+        output_path = tmp_dir / "output.pdf"
+        manifest_path = tmp_dir / "manifest.json"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            page.obj[Name.Contents] = pikepdf.Array(
+                [pdf.make_stream(b"q Q"), pdf.make_stream(b"q Q")]
+            )
+            pdf.save(input_path, compress_streams=False)
+        output_sentinel = b"existing output"
+        manifest_sentinel = b"existing manifest"
+        output_path.write_bytes(output_sentinel)
+        manifest_path.write_bytes(manifest_sentinel)
+        monkeypatch.setattr(
+            digital_layout,
+            "_MAX_ENCODED_CONTENT_BYTES_PER_PAGE",
+            5,
+        )
+
+        with (
+            patch("pdftopdfa.ocr._require_ocr_runtime") as require_runtime,
+            patch("pdftopdfa.ocr_paddle.validate_model_directories") as validate_models,
+            patch("pdftopdfa.ocr.private_staging_directory") as stage_output,
+            patch("ocrmypdf.pdfinfo.PdfInfo") as pdfinfo,
+            patch("pdftopdfa.ocr.ocrmypdf.ocr") as run_ocr,
+            pytest.raises(OCRError, match="page encoded-content byte budget"),
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                _manifest_output_path=manifest_path,
+            )
+
+        require_runtime.assert_called_once_with("cpu")
+        validate_models.assert_not_called()
+        stage_output.assert_not_called()
+        pdfinfo.assert_not_called()
+        run_ocr.assert_not_called()
+        assert output_path.read_bytes() == output_sentinel
+        assert manifest_path.read_bytes() == manifest_sentinel
+
+    @pytest.mark.parametrize(
+        ("box_name", "coordinates", "message"),
+        [
+            (Name.MediaBox, [0, 0, 2, 100], "page-boundary limits"),
+            (Name.MediaBox, [0, 0, 14_401, 100], "page-boundary limits"),
+            (Name.MediaBox, [100, 0, 0, 100], "non-normalized MediaBox"),
+            (Name.CropBox, [-1, 0, 90, 90], "outside its MediaBox"),
+        ],
+    )
+    def test_rejects_page_boxes_that_pdfa_sanitization_would_change(
+        self,
+        tmp_dir: Path,
+        box_name: Name,
+        coordinates: list[int],
+        message: str,
+    ) -> None:
+        path = tmp_dir / f"invalid-{str(box_name)[1:]}.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            page.obj[box_name] = pikepdf.Array(coordinates)
+            pdf.save(path)
+
+        with pytest.raises(OCRError, match=message):
+            _preflight_ocr_input(path)
+
+    @pytest.mark.parametrize(
+        ("page_size", "rotate_pages", "exceeds_limit"),
+        [
+            (2666.0, True, False),
+            (2667.0, True, True),
+            (2667.0, False, False),
+        ],
+    )
+    def test_enforces_orientation_render_pixel_limit_on_text_pages(
+        self,
+        tmp_dir: Path,
+        page_size: float,
+        rotate_pages: bool,
+        exceeds_limit: bool,
+    ) -> None:
+        path = tmp_dir / f"orientation-{page_size}-{rotate_pages}.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, visible_text=True)
+            page = pdf.pages[0]
+            page.obj[Name.MediaBox] = pikepdf.Array(
+                [10, 20, 10 + page_size, 20 + page_size]
+            )
+            page.obj[Name.CropBox] = page.obj[Name.MediaBox]
+            page.obj[Name.Rotate] = 90
+            page.obj[Name.UserUnit] = 2.5
+            pdf.save(path)
+
+        if exceeds_limit:
+            with pytest.raises(
+                OCRError,
+                match="Paddle orientation page 1.*at 108 dpi",
+            ):
+                _preflight_ocr_input(path, rotate_pages=rotate_pages)
+        else:
+            _preflight_ocr_input(path, rotate_pages=rotate_pages)
+
+    @pytest.mark.parametrize("rotate_pages", [False, True])
+    def test_user_unit_cannot_bypass_raster_preflight(
+        self,
+        tmp_dir: Path,
+        rotate_pages: bool,
+    ) -> None:
+        path = tmp_dir / f"large-user-unit-{rotate_pages}.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            page.obj[Name.UserUnit] = 1000
+            pdf.save(path)
+
+        with pytest.raises(OCRError, match="safety limit"):
+            _preflight_ocr_input(path, rotate_pages=rotate_pages)
+
+    def test_rejects_fractional_inherited_rotation(self, tmp_dir: Path) -> None:
+        path = tmp_dir / "fractional-rotation.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            page.obj.Parent[Name.Rotate] = 90.5
+            if Name.Rotate in page.obj:
+                del page.obj[Name.Rotate]
+            pdf.save(path)
+
+        with pytest.raises(OCRError, match="rotation is not a multiple of 90"):
+            _preflight_ocr_input(path)
+
+
+def test_ocr_cleanup_reports_failures_after_attempting_every_resource() -> None:
+    first = MagicMock()
+    second = MagicMock()
+    third = MagicMock()
+    first.cleanup.side_effect = RuntimeError("locked")
+
+    with patch(
+        "pdftopdfa.ocr._release_ocr_models",
+        side_effect=RuntimeError("close failed"),
+    ) as release_models:
+        with pytest.raises(OCRError, match="OCR cleanup failed"):
+            _cleanup_ocr_resources(
+                (
+                    ("first", first),
+                    ("second", second),
+                    ("third", third),
+                )
+            )
+
+    release_models.assert_called_once_with()
+    first.cleanup.assert_called_once_with()
+    second.cleanup.assert_called_once_with()
+    third.cleanup.assert_called_once_with()
+
+
+def test_ocr_cleanup_preserves_primary_error(caplog: pytest.LogCaptureFixture) -> None:
+    first = MagicMock()
+    second = MagicMock()
+    first.cleanup.side_effect = RuntimeError("locked")
+
+    with patch(
+        "pdftopdfa.ocr._release_ocr_models",
+        side_effect=RuntimeError("close failed"),
+    ):
+        _cleanup_ocr_resources(
+            (("first", first), ("second", second)),
+            preserve_primary_error=True,
+        )
+
+    first.cleanup.assert_called_once_with()
+    second.cleanup.assert_called_once_with()
+    assert "Could not release OCR models" in caplog.text
+    assert "Could not clean up first" in caplog.text
 
 
 class TestLanguages:
@@ -820,6 +1771,34 @@ def test_invisible_form_cleanup_preserves_text_show_operator(
 
 
 class TestApplyOcr:
+    @pytest.mark.parametrize("manifest_alias", ["input", "output"])
+    def test_rejects_manifest_path_aliasing_pdf_paths(
+        self,
+        tmp_dir: Path,
+        manifest_alias: str,
+    ) -> None:
+        input_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "output.pdf"
+        output_sentinel = b"existing output"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page()
+            pdf.save(input_path)
+        input_sentinel = input_path.read_bytes()
+        output_path.write_bytes(output_sentinel)
+        manifest_path = input_path if manifest_alias == "input" else output_path
+
+        with pytest.raises(OCRError, match="manifest path must differ"):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=tmp_dir / "unused-detection-model",
+                recognition_model_dir=tmp_dir / "unused-recognition-model",
+                _manifest_output_path=manifest_path,
+            )
+
+        assert input_path.read_bytes() == input_sentinel
+        assert output_path.read_bytes() == output_sentinel
+
     """Tests for the fixed PaddleOCR/OCRmyPDF boundary."""
 
     def test_deskew_analysis_handles_scan_in_1200_nested_forms(self) -> None:
@@ -871,7 +1850,12 @@ class TestApplyOcr:
             )
 
         mock_ocr.assert_called_once()
-        assert mock_ocr.call_args.args == (input_path, output_path)
+        source, staged_output = mock_ocr.call_args.args
+        assert source == input_path
+        assert staged_output.parent.parent == output_path.parent
+        assert staged_output.parent.name.startswith(".output_ocr_")
+        assert staged_output != output_path
+        assert output_path.exists()
         kwargs = mock_ocr.call_args.kwargs
         assert kwargs["deskew"] is True
         assert kwargs["pages"] == "1"
@@ -880,7 +1864,120 @@ class TestApplyOcr:
         assert "force_ocr" not in kwargs
         assert "redo_ocr" not in kwargs
 
-    def test_deskew_copies_digital_page_without_ocrmypdf(
+    @pytest.mark.parametrize("deskew", [False, True])
+    def test_mixed_full_page_scan_uses_redo_and_preserves_native_page_content(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        deskew: bool,
+    ) -> None:
+        input_path = tmp_dir / "mixed-scan.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, visible_text=True)
+            page = pdf.pages[0]
+            page.obj[Name.CropBox] = pikepdf.Array([5, 10, 95, 90])
+            page.obj[Name.Rotate] = 90
+            page.obj[Name.UserUnit] = 2
+            page.obj[Name.Annots] = pikepdf.Array(
+                [
+                    Dictionary(
+                        Type=Name.Annot,
+                        Subtype=Name.Link,
+                        Rect=pikepdf.Array([10, 20, 30, 40]),
+                    )
+                ]
+            )
+            pdf.save(input_path)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=deskew,
+            )
+
+        mock_ocr.assert_called_once()
+        assert mock_ocr.call_args.kwargs["pages"] == "1"
+        assert mock_ocr.call_args.kwargs["redo_ocr"] is True
+        assert mock_ocr.call_args.kwargs["deskew"] is False
+        assert "skip_text" not in mock_ocr.call_args.kwargs
+        with Pdf.open(input_path) as source, Pdf.open(output_path) as output:
+            assert source.pages[0].Contents.read_bytes() == (
+                output.pages[0].Contents.read_bytes()
+            )
+            assert list(output.pages[0].CropBox) == [5, 10, 95, 90]
+            assert int(output.pages[0].Rotate) == 90
+            assert int(output.pages[0].UserUnit) == 2
+            assert list(output.pages[0].Annots[0].Rect) == [10, 20, 30, 40]
+
+    @pytest.mark.parametrize("deskew", [False, True])
+    @pytest.mark.parametrize("in_form", [False, True])
+    def test_mixed_scan_filling_visible_cropbox_uses_redo(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        deskew: bool,
+        in_form: bool,
+    ) -> None:
+        input_path = tmp_dir / "cropped-mixed-scan.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, visible_text=True)
+            page = pdf.pages[0]
+            image_name = b"/Im0 Do"
+            if in_form:
+                form = pdf.make_stream(b"/Im0 Do")
+                form[Name.Type] = Name.XObject
+                form[Name.Subtype] = Name.Form
+                form[Name.BBox] = pikepdf.Array([0, 0, 1, 1])
+                form[Name.Resources] = Dictionary(
+                    XObject=Dictionary(Im0=page.Resources.XObject.Im0)
+                )
+                page.Resources.XObject[Name.CropScan] = form
+                image_name = b"/CropScan Do"
+            page.Contents.write(
+                b"q 80 0 0 80 10 10 cm "
+                + image_name
+                + b" Q\nBT /F1 12 Tf 0 Tr 20 50 Td (Native text) Tj ET"
+            )
+            page.obj[Name.CropBox] = pikepdf.Array([10, 10, 90, 90])
+            page.obj[Name.Rotate] = 90
+            page.obj[Name.UserUnit] = 2
+            assert _page_paint_analysis(page).image_candidates == [(1.0, 1)]
+            pdf.save(input_path)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=deskew,
+            )
+
+        mock_ocr.assert_called_once()
+        kwargs = mock_ocr.call_args.kwargs
+        assert kwargs["pages"] == "1"
+        assert kwargs["redo_ocr"] is True
+        assert kwargs["deskew"] is False
+        assert "skip_text" not in kwargs
+        with Pdf.open(output_path) as pdf:
+            assert list(pdf.pages[0].CropBox) == [10, 10, 90, 90]
+            assert int(pdf.pages[0].Rotate) == 90
+            assert int(pdf.pages[0].UserUnit) == 2
+
+    def test_deskew_copies_digital_text_with_decorative_image_without_ocrmypdf(
         self,
         tmp_dir: Path,
         model_dirs: tuple[Path, Path],
@@ -889,7 +1986,7 @@ class TestApplyOcr:
         input_path = tmp_dir / "digital.pdf"
         output_path = tmp_dir / "output.pdf"
         with Pdf.new() as pdf:
-            _add_content_page(pdf, visible_text=True)
+            _add_content_page(pdf, image_scale=50, visible_text=True)
             pdf.save(input_path)
 
         with patch("pdftopdfa.ocr.ocrmypdf.ocr") as mock_ocr:
@@ -906,6 +2003,516 @@ class TestApplyOcr:
             assert source.pages[0].Contents.read_bytes() == (
                 output.pages[0].Contents.read_bytes()
             )
+
+    def test_clipped_text_after_full_page_image_fails_closed(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "clipped-text.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            pdf.pages[0].Contents.write(
+                b"q 100 0 0 100 0 0 cm /Im0 Do Q\n"
+                b"0 0 1 1 re W n\n"
+                b"BT /F1 12 Tf 0 Tr 50 50 Td (Clipped text) Tj ET"
+            )
+            pdf.save(input_path)
+
+        with (
+            patch("pdftopdfa.ocr.ocrmypdf.ocr") as mock_ocr,
+            pytest.raises(OCRError, match="ambiguous scan-like page"),
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=True,
+            )
+
+        mock_ocr.assert_not_called()
+        assert not output_path.exists()
+
+    def test_manifest_failure_preserves_existing_output_atomically(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "output.pdf"
+        manifest_path = tmp_dir / "manifest.json"
+        sentinel = b"existing output must survive"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page()
+            pdf.save(input_path)
+        output_path.write_bytes(sentinel)
+
+        with (
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=_copy_ocr_input,
+            ),
+            patch(
+                "pdftopdfa.ocr._write_ocr_document_manifest",
+                side_effect=OCRError("manifest failed"),
+            ),
+            pytest.raises(OCRError, match="manifest failed"),
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                _manifest_output_path=manifest_path,
+            )
+
+        assert output_path.read_bytes() == sentinel
+        assert not manifest_path.exists()
+        assert not list(tmp_dir.glob(".output_ocr_*.pdf"))
+
+    def test_finalized_ocr_output_cannot_be_swapped_before_publish(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        output_path = tmp_dir / "output.pdf"
+        sentinel = b"existing output"
+        output_path.write_bytes(sentinel)
+        swapped = False
+
+        def swap_before_verification(
+            path: Path,
+            snapshot: StagedFileSnapshot,
+        ) -> None:
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                replacement = Path(path).with_name("replacement.pdf")
+                replacement.write_bytes(b"different bytes")
+                os.replace(replacement, path)
+            verify_staged_file_snapshot(path, snapshot)
+
+        with (
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=_copy_ocr_input,
+            ),
+            patch(
+                "pdftopdfa.staging.verify_staged_file",
+                side_effect=swap_before_verification,
+            ),
+            pytest.raises(OCRError, match="publish OCR output atomically"),
+        ):
+            apply_ocr(
+                sample_pdf,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+            )
+
+        assert output_path.read_bytes() == sentinel
+        assert not list(tmp_dir.glob(".output_ocr_*"))
+
+    def test_failed_publish_recovery_retains_original_backup(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "output.pdf"
+        manifest_path = tmp_dir / "manifest.json"
+        output_sentinel = b"original output"
+        manifest_sentinel = b"original manifest"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page()
+            pdf.save(input_path)
+        output_path.write_bytes(output_sentinel)
+        manifest_path.write_bytes(manifest_sentinel)
+
+        def publish_with_failed_recovery(
+            staged: Path,
+            destination: Path,
+            expected: StagedFileSnapshot,
+            **kwargs: object,
+        ) -> StagedFileSnapshot:
+            if destination == manifest_path:
+                raise PermissionError("manifest locked")
+            return publish_staged_file_impl(
+                staged,
+                destination,
+                expected,
+                **kwargs,
+            )
+
+        def fail_output_recovery(
+            destination: Path,
+            candidate: StagedFileSnapshot,
+            **kwargs: object,
+        ) -> None:
+            if Path(destination) == output_path:
+                raise PermissionError("output restore locked")
+            rollback_staged_publication_impl(
+                destination,
+                candidate,
+                **kwargs,
+            )
+
+        def write_staged_manifest(destination: Path, *_args: object) -> None:
+            Path(destination).write_text("{}", encoding="utf-8")
+
+        with (
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=_copy_ocr_input,
+            ),
+            patch(
+                "pdftopdfa.ocr._write_ocr_document_manifest",
+                side_effect=write_staged_manifest,
+            ),
+            patch(
+                "pdftopdfa.ocr.publish_staged_file",
+                side_effect=publish_with_failed_recovery,
+            ),
+            patch(
+                "pdftopdfa.ocr.rollback_staged_publication",
+                side_effect=fail_output_recovery,
+            ),
+            pytest.raises(OCRError, match="recovery copy retained"),
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                _manifest_output_path=manifest_path,
+            )
+
+        backups = list(tmp_dir.glob(".output_ocr_*/backup.pdf"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == output_sentinel
+        assert manifest_path.read_bytes() == manifest_sentinel
+
+    def test_manifest_publish_failure_restores_existing_targets(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "output.pdf"
+        manifest_path = tmp_dir / "manifest.json"
+        output_sentinel = b"original output"
+        manifest_sentinel = b"original manifest"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page()
+            pdf.save(input_path)
+        output_path.write_bytes(output_sentinel)
+        manifest_path.write_bytes(manifest_sentinel)
+        output_peer = tmp_dir / "output-peer.pdf"
+        try:
+            os.link(output_path, output_peer)
+        except OSError as exc:
+            pytest.skip(f"Hard links are not supported: {exc}")
+
+        def fail_manifest_publish(
+            staged: Path,
+            destination: Path,
+            expected: StagedFileSnapshot,
+            **kwargs: object,
+        ) -> StagedFileSnapshot:
+            if Path(destination) == manifest_path:
+                raise PermissionError("manifest locked")
+            return publish_staged_file_impl(
+                staged,
+                destination,
+                expected,
+                **kwargs,
+            )
+
+        def write_staged_manifest(destination: Path, *_args: object) -> None:
+            Path(destination).write_text("{}", encoding="utf-8")
+
+        with (
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=_copy_ocr_input,
+            ),
+            patch(
+                "pdftopdfa.ocr._write_ocr_document_manifest",
+                side_effect=write_staged_manifest,
+            ),
+            patch(
+                "pdftopdfa.ocr.publish_staged_file",
+                side_effect=fail_manifest_publish,
+            ),
+            pytest.raises(OCRError, match="publish OCR output atomically"),
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                _manifest_output_path=manifest_path,
+            )
+
+        assert output_path.read_bytes() == output_sentinel
+        assert os.path.samefile(output_path, output_peer)
+        assert manifest_path.read_bytes() == manifest_sentinel
+        assert not list(tmp_dir.glob(".*_ocr_*"))
+        assert not list(tmp_dir.glob(".*_backup_*"))
+
+    def test_manifest_failure_restores_target_created_during_publication(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "output.pdf"
+        manifest_path = tmp_dir / "manifest.json"
+        concurrent_output = b"concurrent output"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page()
+            pdf.save(input_path)
+
+        def publish_with_concurrent_target(
+            staged: Path,
+            destination: Path,
+            expected: StagedFileSnapshot,
+            **kwargs: object,
+        ) -> StagedFileSnapshot:
+            if Path(destination) == output_path:
+                output_path.write_bytes(concurrent_output)
+            else:
+                raise PermissionError("manifest locked")
+            return publish_staged_file_impl(
+                staged,
+                destination,
+                expected,
+                **kwargs,
+            )
+
+        def write_staged_manifest(destination: Path, *_args: object) -> None:
+            Path(destination).write_text("{}", encoding="utf-8")
+
+        with (
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=_copy_ocr_input,
+            ),
+            patch(
+                "pdftopdfa.ocr._write_ocr_document_manifest",
+                side_effect=write_staged_manifest,
+            ),
+            patch(
+                "pdftopdfa.ocr.publish_staged_file",
+                side_effect=publish_with_concurrent_target,
+            ),
+            pytest.raises(OCRError, match="publish OCR output atomically"),
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                _manifest_output_path=manifest_path,
+            )
+
+        assert output_path.read_bytes() == concurrent_output
+        assert not manifest_path.exists()
+        assert not list(tmp_dir.glob(".*_ocr_*"))
+
+    def test_missing_hardlink_support_fails_before_publication(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        output_path = tmp_dir / "output.pdf"
+        sentinel = b"original output"
+        output_path.write_bytes(sentinel)
+
+        with (
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=_copy_ocr_input,
+            ),
+            patch(
+                "pdftopdfa.staging.os.link",
+                side_effect=OSError("hard links unavailable"),
+            ),
+            pytest.raises(OCRError, match="retain publication target"),
+        ):
+            apply_ocr(
+                sample_pdf,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+            )
+
+        assert output_path.read_bytes() == sentinel
+        assert not list(tmp_dir.glob(".*_ocr_*"))
+
+    @pytest.mark.parametrize("existing_targets", [False, True])
+    def test_keyboard_interrupt_after_manifest_publish_restores_both_targets(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        existing_targets: bool,
+    ) -> None:
+        input_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "output.pdf"
+        manifest_path = tmp_dir / "manifest.json"
+        output_sentinel = b"original output"
+        manifest_sentinel = b"original manifest"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page()
+            pdf.save(input_path)
+        if existing_targets:
+            output_path.write_bytes(output_sentinel)
+            manifest_path.write_bytes(manifest_sentinel)
+
+        def publish_then_interrupt(
+            staged: Path,
+            destination: Path,
+            expected: StagedFileSnapshot,
+            **kwargs: object,
+        ) -> StagedFileSnapshot:
+            published = publish_staged_file_impl(
+                staged,
+                destination,
+                expected,
+                **kwargs,
+            )
+            if Path(destination) == manifest_path:
+                raise KeyboardInterrupt
+            return published
+
+        def write_staged_manifest(destination: Path, *_args: object) -> None:
+            Path(destination).write_text("{}", encoding="utf-8")
+
+        with (
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=_copy_ocr_input,
+            ),
+            patch(
+                "pdftopdfa.ocr._write_ocr_document_manifest",
+                side_effect=write_staged_manifest,
+            ),
+            patch(
+                "pdftopdfa.ocr.publish_staged_file",
+                side_effect=publish_then_interrupt,
+            ),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                _manifest_output_path=manifest_path,
+            )
+
+        if existing_targets:
+            assert output_path.read_bytes() == output_sentinel
+            assert manifest_path.read_bytes() == manifest_sentinel
+        else:
+            assert not output_path.exists()
+            assert not manifest_path.exists()
+        assert not list(tmp_dir.glob(".*_ocr_*"))
+
+    def test_cleanup_failure_does_not_mask_publish_error(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        input_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "output.pdf"
+        manifest_path = tmp_dir / "manifest.json"
+        output_sentinel = b"original output"
+        manifest_sentinel = b"original manifest"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page()
+            pdf.save(input_path)
+        output_path.write_bytes(output_sentinel)
+        manifest_path.write_bytes(manifest_sentinel)
+        real_cleanup = TemporaryDirectory.cleanup
+        manifest_publish_failed = False
+
+        def fail_manifest_publish(
+            staged: Path,
+            destination: Path,
+            expected: StagedFileSnapshot,
+            **kwargs: object,
+        ) -> StagedFileSnapshot:
+            nonlocal manifest_publish_failed
+            if Path(destination) == manifest_path:
+                manifest_publish_failed = True
+                raise PermissionError("manifest locked")
+            return publish_staged_file_impl(
+                staged,
+                destination,
+                expected,
+                **kwargs,
+            )
+
+        def fail_staged_manifest_cleanup(
+            directory: TemporaryDirectory[str],
+        ) -> None:
+            if manifest_publish_failed and Path(directory.name).name.startswith(
+                ".manifest_ocr_"
+            ):
+                raise PermissionError("staged manifest locked")
+            real_cleanup(directory)
+
+        def write_staged_manifest(destination: Path, *_args: object) -> None:
+            Path(destination).write_text("{}", encoding="utf-8")
+
+        monkeypatch.setattr(
+            TemporaryDirectory,
+            "cleanup",
+            fail_staged_manifest_cleanup,
+        )
+        with (
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=_copy_ocr_input,
+            ),
+            patch(
+                "pdftopdfa.ocr._write_ocr_document_manifest",
+                side_effect=write_staged_manifest,
+            ),
+            patch(
+                "pdftopdfa.ocr.publish_staged_file",
+                side_effect=fail_manifest_publish,
+            ),
+            pytest.raises(OCRError, match="publish OCR output atomically"),
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                _manifest_output_path=manifest_path,
+            )
+
+        assert output_path.read_bytes() == output_sentinel
+        assert manifest_path.read_bytes() == manifest_sentinel
+        assert not list(tmp_dir.glob(".*_backup_*"))
+        assert "Could not remove private OCR staging directory" in caplog.text
 
     def test_deskew_accepts_scan_with_invisible_form_text(
         self,
@@ -949,7 +2556,7 @@ class TestApplyOcr:
         assert "force_ocr" not in mock_ocr.call_args.kwargs
         assert prepared_page_has_text == [False]
 
-    def test_prior_ocr_fallback_preserves_deskew_text_layer(
+    def test_regular_ocr_replaces_invisible_scan_text_with_paddle_output(
         self,
         tmp_dir: Path,
         model_dirs: tuple[Path, Path],
@@ -961,9 +2568,80 @@ class TestApplyOcr:
             _add_content_page(pdf, hidden_form_text=True)
             pdf.save(input_path)
 
+        prepared_page_has_text = []
+
+        def inspect_and_copy(
+            source: Path,
+            destination: Path,
+            **_kwargs: object,
+        ) -> None:
+            with Pdf.open(source) as pdf:
+                prepared_page_has_text.append(_page_has_text(pdf.pages[0]))
+            shutil.copy2(source, destination)
+
         with patch(
             "pdftopdfa.ocr.ocrmypdf.ocr",
-            side_effect=PriorOcrFoundError(),
+            side_effect=inspect_and_copy,
+        ) as mock_ocr:
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+            )
+
+        mock_ocr.assert_called_once()
+        assert mock_ocr.call_args.kwargs["pages"] == "1"
+        assert mock_ocr.call_args.kwargs["skip_text"] is True
+        assert prepared_page_has_text == [False]
+
+    @pytest.mark.parametrize("deskew", [False, True])
+    def test_ambiguous_scan_with_foreign_text_fails_closed(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        deskew: bool,
+    ) -> None:
+        input_path = tmp_dir / "ambiguous-ocr-scan.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, hidden_form_text=True, vector=True)
+            pdf.save(input_path)
+
+        with (
+            patch("pdftopdfa.ocr.ocrmypdf.ocr") as mock_ocr,
+            pytest.raises(OCRError, match="ambiguous scan-like page"),
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=deskew,
+            )
+
+        mock_ocr.assert_not_called()
+        assert not output_path.exists()
+
+    def test_prior_ocr_aborts_deskew_without_publishing_foreign_text(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "ocr-scan.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, hidden_form_text=True)
+            pdf.save(input_path)
+
+        with (
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=PriorOcrFoundError(),
+            ),
+            pytest.raises(OCRError, match="already contains an OCR text layer"),
         ):
             apply_ocr(
                 input_path,
@@ -973,10 +2651,40 @@ class TestApplyOcr:
                 deskew=True,
             )
 
-        with Pdf.open(output_path) as pdf:
-            assert b"(Form text)" in (
-                pdf.pages[0].Resources.XObject.HiddenText.read_bytes()
+        assert not output_path.exists()
+
+    def test_prior_ocr_aborts_regular_run_and_preserves_atomic_targets(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        output_path = tmp_dir / "output.pdf"
+        manifest_path = tmp_dir / "manifest.json"
+        output_sentinel = b"existing output"
+        manifest_sentinel = b"existing manifest"
+        output_path.write_bytes(output_sentinel)
+        manifest_path.write_bytes(manifest_sentinel)
+
+        with (
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=PriorOcrFoundError(),
+            ),
+            pytest.raises(OCRError, match="already contains an OCR text layer"),
+        ):
+            apply_ocr(
+                sample_pdf,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                _manifest_output_path=manifest_path,
             )
+
+        assert output_path.read_bytes() == output_sentinel
+        assert manifest_path.read_bytes() == manifest_sentinel
+        assert not list(tmp_dir.glob(".*_ocr_*"))
 
     def test_deskew_handles_mixed_pdf_page_by_page_in_disjoint_calls(
         self,
@@ -1005,16 +2713,106 @@ class TestApplyOcr:
                 deskew=True,
             )
 
-        assert mock_ocr.call_count == 2
-        regular_call, deskew_call = mock_ocr.call_args_list
+        assert mock_ocr.call_count == 3
+        regular_call, deskew_call, redo_call = mock_ocr.call_args_list
         assert regular_call.kwargs["pages"] == "4"
         assert regular_call.kwargs["deskew"] is False
         assert deskew_call.kwargs["pages"] == "1,3"
         assert deskew_call.kwargs["deskew"] is True
+        assert redo_call.kwargs["pages"] == "2"
+        assert redo_call.kwargs["deskew"] is False
+        assert redo_call.kwargs["redo_ocr"] is True
+        assert "skip_text" not in redo_call.kwargs
         assert all(
             call.kwargs["skip_text"] is True and "force_ocr" not in call.kwargs
-            for call in mock_ocr.call_args_list
+            for call in (regular_call, deskew_call)
         )
+
+    def test_regular_and_redo_pages_are_disjoint_without_deskew(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "mixed-without-deskew.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            _add_content_page(pdf, visible_text=True)
+            _add_content_page(pdf, image_scale=50, visible_text=True)
+            pdf.save(input_path)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+            )
+
+        assert mock_ocr.call_count == 2
+        regular_call, redo_call = mock_ocr.call_args_list
+        assert regular_call.kwargs["pages"] == "1"
+        assert regular_call.kwargs["skip_text"] is True
+        assert regular_call.kwargs["deskew"] is False
+        assert redo_call.kwargs["pages"] == "2"
+        assert redo_call.kwargs["redo_ocr"] is True
+        assert redo_call.kwargs["deskew"] is False
+        assert "skip_text" not in redo_call.kwargs
+
+    def test_prior_ocr_in_second_stage_does_not_publish_partial_result(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "mixed-without-deskew.pdf"
+        output_path = tmp_dir / "output.pdf"
+        manifest_path = tmp_dir / "manifest.json"
+        output_sentinel = b"existing output"
+        manifest_sentinel = b"existing manifest"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            _add_content_page(pdf, visible_text=True)
+            pdf.save(input_path)
+        output_path.write_bytes(output_sentinel)
+        manifest_path.write_bytes(manifest_sentinel)
+        calls = 0
+
+        def copy_then_reject_prior_ocr(
+            source: Path,
+            destination: Path,
+            **_kwargs: object,
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                shutil.copy2(source, destination)
+                return
+            raise PriorOcrFoundError()
+
+        with (
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=copy_then_reject_prior_ocr,
+            ) as mock_ocr,
+            pytest.raises(OCRError, match="already contains an OCR text layer"),
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                _manifest_output_path=manifest_path,
+            )
+
+        assert mock_ocr.call_count == 2
+        assert output_path.read_bytes() == output_sentinel
+        assert manifest_path.read_bytes() == manifest_sentinel
+        assert not list(tmp_dir.glob(".*_ocr_*"))
 
     def test_deskew_rejects_vector_and_small_image_pages(
         self,
@@ -1601,7 +3399,356 @@ class TestApplyOcr:
             for call in mock_ocr.call_args_list
         )
 
-    def test_deskew_preserves_tagging_on_unselected_digital_page(
+    def test_level_a_manifest_merges_all_isolated_runs_by_physical_page(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        _mock_paddle_orientation: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "two-raster-pages.pdf"
+        output_path = tmp_dir / "output.pdf"
+        manifest_path = tmp_dir / "ocr-manifest.json"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            _add_content_page(pdf, image_scale=50)
+            _add_content_page(pdf, visible_text=True)
+            pdf.save(input_path)
+
+        run_directories: list[Path] = []
+
+        def emit_sidecars_and_forms(
+            source: Path,
+            destination: Path,
+            **kwargs: object,
+        ) -> None:
+            shutil.copy2(source, destination)
+            run_directory = Path(kwargs["paddle_manifest_dir"])
+            run_number = len(run_directories)
+            run_directories.append(run_directory)
+            page_numbers = [int(value) - 1 for value in str(kwargs["pages"]).split(",")]
+            for page_index in page_numbers:
+                text = {
+                    0: "Förderung",
+                    1: "Kärchow",
+                    2: "Straße",
+                }[page_index]
+                sidecar = run_directory / f"page-{page_index:06d}.json"
+                sidecar.write_text(
+                    json.dumps(
+                        _ocr_page_manifest(page_index, text),
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+
+            with Pdf.open(destination, allow_overwriting_input=True) as pdf:
+                for page_index in page_numbers:
+                    form = pdf.make_stream(b"/Span <</MCID 0>> BDC BT ET EMC")
+                    form[Name.Type] = Name.XObject
+                    form[Name.Subtype] = Name.Form
+                    form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+                    form[Name.Resources] = Dictionary()
+                    name = Name(f"/OCR-run-{run_number}-page-{page_index}")
+                    pdf.pages[page_index].Resources.XObject[name] = form
+                pdf.save(destination)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=emit_sidecars_and_forms,
+        ) as mock_ocr:
+            result = apply_ocr(
+                input_path,
+                output_path,
+                ["de", "en"],
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=True,
+                rotate_pages=True,
+                _manifest_output_path=manifest_path,
+            )
+
+        assert result == output_path
+        assert mock_ocr.call_count == 3
+        assert len(set(run_directories)) == 3
+        assert run_directories[0].parent == run_directories[1].parent
+        assert all(not directory.exists() for directory in run_directories)
+        assert all(
+            call.kwargs["paddle_manifest_dir"] == run_directory
+            for call, run_directory in zip(
+                mock_ocr.call_args_list,
+                run_directories,
+                strict=True,
+            )
+        )
+        _mock_paddle_orientation.assert_called_once()
+        regular_call, deskew_call, redo_call = mock_ocr.call_args_list
+        assert regular_call.kwargs["pages"] == "2"
+        assert deskew_call.kwargs["pages"] == "1"
+        assert deskew_call.kwargs["deskew"] is True
+        assert redo_call.kwargs["pages"] == "3"
+        assert redo_call.kwargs["redo_ocr"] is True
+        assert "skip_text" not in redo_call.kwargs
+
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        assert b"\xef\xbf\xbd" not in manifest_bytes
+        assert manifest["schema_version"] == 1
+        assert manifest["type"] == "pdftopdfa-ocr-document"
+        assert manifest["page_count"] == 3
+        assert manifest["languages"] == ["de", "en"]
+        assert [page["page_index"] for page in manifest["pages"]] == [0, 1, 2]
+        assert [page["lines"][0]["text"] for page in manifest["pages"]] == [
+            "Förderung",
+            "Kärchow",
+            "Straße",
+        ]
+        assert [page["form_name"] for page in manifest["pages"]] == [
+            "/OCR-run-1-page-0",
+            "/OCR-run-0-page-1",
+            "/OCR-run-2-page-2",
+        ]
+        with Pdf.open(output_path) as pdf:
+            assert b"(Native text)" in pdf.pages[2].Contents.read_bytes()
+            assert "/OCR-run-2-page-2" in pdf.pages[2].Resources.XObject
+
+    def test_level_a_manifest_rejects_malformed_run_sidecar(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        output_path = tmp_dir / "output.pdf"
+        manifest_path = tmp_dir / "ocr-manifest.json"
+        run_directories: list[Path] = []
+
+        def emit_malformed_sidecar(
+            source: Path,
+            destination: Path,
+            **kwargs: object,
+        ) -> None:
+            shutil.copy2(source, destination)
+            run_directory = Path(kwargs["paddle_manifest_dir"])
+            run_directories.append(run_directory)
+            (run_directory / "page-000000.json").write_text("{}", encoding="utf-8")
+
+        with (
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=emit_malformed_sidecar,
+            ),
+            pytest.raises(OCRError, match="Invalid OCR manifest"),
+        ):
+            apply_ocr(
+                sample_pdf,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                _manifest_output_path=manifest_path,
+            )
+
+        assert not manifest_path.exists()
+        assert len(run_directories) == 1
+        assert not run_directories[0].exists()
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "bbox_outside",
+            "polygon_mismatch",
+            "layout_outside",
+            "word_outside_line",
+        ],
+    )
+    def test_level_a_sidecar_rejects_inconsistent_geometry(
+        self,
+        tmp_dir: Path,
+        mutation: str,
+    ) -> None:
+        run_directory = tmp_dir / mutation
+        run_directory.mkdir()
+        manifest = _ocr_page_manifest(0, "geometry")
+        line = manifest["lines"][0]
+        if mutation == "bbox_outside":
+            line["bbox"]["left"] = -1.0
+            line["polygon"][0][0] = -1.0
+            line["polygon"][3][0] = -1.0
+        elif mutation == "polygon_mismatch":
+            line["polygon"][1][0] = 80.0
+            line["polygon"][2][0] = 80.0
+        elif mutation == "layout_outside":
+            manifest["layout"]["selected_columns"][0]["right"] = 101.0
+        else:
+            word = line["words"][0]
+            word["bbox"] = deepcopy(word["bbox"])
+            word["polygon"] = deepcopy(word["polygon"])
+            word["bbox"]["left"] = 5.0
+            word["polygon"][0][0] = 5.0
+            word["polygon"][3][0] = 5.0
+        (run_directory / "page-000000.json").write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(OCRError, match="Invalid OCR manifest"):
+            _read_ocr_run_sidecars(run_directory)
+
+    def test_document_manifest_validation_is_exact(self) -> None:
+        page = _ocr_page_manifest(0, "strict")
+        page["form_name"] = "/OCR-0"
+        document = {
+            "schema_version": 1,
+            "type": "pdftopdfa-ocr-document",
+            "page_count": 1,
+            "languages": ["de", "en"],
+            "pages": [page],
+        }
+
+        assert _validate_ocr_document_manifest(document, "test") is document
+
+        malformed = deepcopy(document)
+        malformed["unexpected"] = True
+        with pytest.raises(OCRError, match="unexpected keys"):
+            _validate_ocr_document_manifest(malformed, "test")
+
+    def test_document_manifest_is_revalidated_after_atomic_write(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        pdf_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "manifest.json"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page(page_size=(100, 100))
+            _add_ocr_form(pdf, 0, "/OCR-0", [0])
+            pdf.save(pdf_path)
+        pages = {0: _ocr_page_manifest(0, "strict")}
+
+        def write_corrupt_manifest(path: Path, _value: object) -> None:
+            path.write_text('{"schema_version":1}', encoding="utf-8")
+
+        with (
+            patch(
+                "pdftopdfa.ocr._write_json_atomic",
+                side_effect=write_corrupt_manifest,
+            ),
+            pytest.raises(OCRError, match="Invalid OCR manifest"),
+        ):
+            _write_ocr_document_manifest(
+                output_path,
+                pdf_path,
+                ["de", "en"],
+                pages,
+                {0: ("/OCR-0",)},
+            )
+
+    @staticmethod
+    def _multi_line_page(page_index: int, count: int) -> dict[str, object]:
+        page = _ocr_page_manifest(page_index, "line")
+        line = page["lines"][0]
+        page["lines"] = []
+        for mcid in range(count):
+            clone = deepcopy(line)
+            clone["mcid"] = mcid
+            clone["text"] = f"line {mcid}"
+            clone["words"][0]["text"] = f"line{mcid}"
+            page["lines"].append(clone)
+        return page
+
+    def test_document_manifest_drops_suppressed_lines(self, tmp_dir: Path) -> None:
+        """Lines the renderer discarded are removed instead of aborting."""
+        pdf_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "manifest.json"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page(page_size=(100, 100))
+            _add_ocr_form(pdf, 0, "/OCR-0", [0, 2])
+            pdf.save(pdf_path)
+        pages = {0: self._multi_line_page(0, 3)}
+
+        _write_ocr_document_manifest(
+            output_path,
+            pdf_path,
+            ["de", "en"],
+            pages,
+            {0: ("/OCR-0",)},
+        )
+
+        manifest = json.loads(output_path.read_text(encoding="utf-8"))
+        assert [line["mcid"] for line in manifest["pages"][0]["lines"]] == [0, 2]
+        assert [line["text"] for line in manifest["pages"][0]["lines"]] == [
+            "line 0",
+            "line 2",
+        ]
+        # The sidecar is not modified by reconciliation.
+        assert len(pages[0]["lines"]) == 3
+
+    def test_document_manifest_keeps_page_without_emitted_lines(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        """A page whose lines were all suppressed stays in the manifest."""
+        pdf_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "manifest.json"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page(page_size=(100, 100))
+            _add_ocr_form(pdf, 0, "/OCR-0", [])
+            pdf.save(pdf_path)
+
+        _write_ocr_document_manifest(
+            output_path,
+            pdf_path,
+            ["de", "en"],
+            {0: self._multi_line_page(0, 2)},
+            {0: ("/OCR-0",)},
+        )
+
+        manifest = json.loads(output_path.read_text(encoding="utf-8"))
+        assert manifest["pages"][0]["lines"] == []
+
+    def test_document_manifest_rejects_undeclared_mcids(self, tmp_dir: Path) -> None:
+        """Marked content without a manifest line is a defect, not a drop."""
+        pdf_path = tmp_dir / "input.pdf"
+        output_path = tmp_dir / "manifest.json"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page(page_size=(100, 100))
+            _add_ocr_form(pdf, 0, "/OCR-0", [0, 5])
+            pdf.save(pdf_path)
+
+        with pytest.raises(OCRError, match=r"undeclared MCIDs: \[5\]"):
+            _write_ocr_document_manifest(
+                output_path,
+                pdf_path,
+                ["de", "en"],
+                {0: _ocr_page_manifest(0, "strict")},
+                {0: ("/OCR-0",)},
+            )
+
+        assert not output_path.exists()
+
+    def test_run_sidecar_still_requires_contiguous_mcids(self, tmp_dir: Path) -> None:
+        """Only reconciled document manifests may contain MCID gaps."""
+        run_directory = tmp_dir / "run"
+        run_directory.mkdir()
+        page = self._multi_line_page(0, 2)
+        page["lines"][1]["mcid"] = 2
+        (run_directory / "page-000000.json").write_text(
+            json.dumps(page),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(OCRError, match=r"lines\[1\].mcid: expected 1"):
+            _read_ocr_run_sidecars(run_directory)
+
+    def test_document_manifest_rejects_unordered_mcids(self) -> None:
+        """MCIDs must stay in reading order even with gaps."""
+        page = self._multi_line_page(0, 2)
+        page["form_name"] = "/OCR-0"
+        page["lines"][0]["mcid"] = 3
+
+        with pytest.raises(OCRError, match="strictly increasing MCID"):
+            _validate_ocr_page_manifest(page, "test", document_page=True)
+
+    def test_deskew_preserves_tagging_on_mixed_redo_page(
         self,
         tmp_dir: Path,
         model_dirs: tuple[Path, Path],
@@ -1750,7 +3897,10 @@ class TestApplyOcr:
         validate_models.assert_called_once_with(detection, recognition)
         mock_ocr.assert_called_once()
         args, kwargs = mock_ocr.call_args
-        assert args == (sample_pdf, output)
+        assert args[0] == sample_pdf
+        assert args[1].parent.parent == output.parent
+        assert args[1].parent.name.startswith(".output_ocr_")
+        assert args[1] != output
         assert kwargs == {
             "language": ["de", "en"],
             "ocr_engine": "paddle",
@@ -1758,6 +3908,7 @@ class TestApplyOcr:
             "rasterizer": "pypdfium",
             "output_type": "pdf",
             "oversample": 600,
+            "max_image_mpixels": 100.0,
             "optimize": 0,
             "jobs": 1,
             "skip_text": True,
@@ -1772,6 +3923,7 @@ class TestApplyOcr:
             "paddle_recognition_model_dir": recognition,
             "paddle_execution_provider": "cpu",
             "paddle_layout": False,
+            "pages": "1",
         }
 
     def test_passes_layout_configuration(
@@ -1809,7 +3961,7 @@ class TestApplyOcr:
         output_path = tmp_dir / "output.pdf"
         with Pdf.new() as pdf:
             _add_content_page(pdf)
-            _add_content_page(pdf, visible_text=True)
+            _add_content_page(pdf, image_scale=50, visible_text=True)
             page = pdf.pages[0]
             page.Contents.write(
                 page.Contents.read_bytes() + b"\nBT /F1 11 Tf [( )] TJ ET"
@@ -1921,7 +4073,7 @@ class TestApplyOcr:
         assert kwargs["redo_ocr"] is True
         assert "skip_text" not in kwargs
 
-    def test_prior_ocr_fallback_preserves_existing_ocr_form(
+    def test_prior_ocr_aborts_force_without_publishing_foreign_form(
         self,
         tmp_dir: Path,
         model_dirs: tuple[Path, Path],
@@ -1941,9 +4093,12 @@ class TestApplyOcr:
             page.obj[Name.Contents] = pdf.make_stream(b"/OCR-existing Do")
             pdf.save(input_path)
 
-        with patch(
-            "pdftopdfa.ocr.ocrmypdf.ocr",
-            side_effect=PriorOcrFoundError(),
+        with (
+            patch(
+                "pdftopdfa.ocr.ocrmypdf.ocr",
+                side_effect=PriorOcrFoundError(),
+            ),
+            pytest.raises(OCRError, match="already contains an OCR text layer"),
         ):
             apply_ocr(
                 input_path,
@@ -1953,10 +4108,7 @@ class TestApplyOcr:
                 force=True,
             )
 
-        with Pdf.open(output_path) as pdf:
-            assert b"(old OCR)" in (
-                pdf.pages[0].Resources.XObject["/OCR-existing"].read_bytes()
-            )
+        assert not output_path.exists()
 
     def test_force_removes_only_invisible_text_from_existing_ocr_forms(
         self,
@@ -2134,7 +4286,7 @@ class TestApplyOcr:
         input_path = tmp_dir / "mixed-annotation.pdf"
         with Pdf.new() as pdf:
             _add_content_page(pdf)
-            _add_content_page(pdf, visible_text=True)
+            _add_content_page(pdf, image_scale=50, visible_text=True)
             pdf.pages[1].obj[Name.Annots] = pikepdf.Array(
                 [
                     Dictionary(

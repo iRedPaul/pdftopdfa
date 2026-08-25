@@ -5,13 +5,14 @@
 """Core logic for PDF to PDF/A conversion."""
 
 # Standard Library
+import json
 import logging
 import os
-import shutil
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -53,6 +54,12 @@ from .sanitizers import (
     sanitize_signatures,
     sanitize_structure_limits,
     sanitize_truetype_encoding,
+)
+from .staging import (
+    copy_to_private_stage,
+    private_staging_directory,
+    publish_staged_file,
+    staged_file_snapshot,
 )
 from .tagging import ensure_logical_structure
 from .utils import get_required_pdf_version, is_pdf_encrypted, validate_pdfa_level
@@ -247,6 +254,9 @@ _SIGNATURE_SKIP_WARNING = (
     "Conversion skipped: PDF contains digital signatures; conversion would "
     "invalidate them"
 )
+_VALIDATION_PUBLICATION_WARNING = (
+    "Output was not published because validation did not complete successfully"
+)
 
 
 def _signature_invalidation_warning(count: int, *, pdfa: bool = True) -> str:
@@ -316,7 +326,8 @@ class ConversionResult:
     Attributes:
         success: True if the conversion was successful.
         input_path: Path to the input PDF.
-        output_path: Path to the output PDF.
+        output_path: Requested path for the output PDF. A failed requested
+            validation leaves any existing file at this path unchanged.
         level: Requested level for a converted output, detected level for a
             validated compliant skip, or None when PDF/A conversion was
             disabled or an unsupported input was copied unchanged.
@@ -325,7 +336,7 @@ class ConversionResult:
         error: Error message if success=False.
         validation_failed: True if veraPDF reported non-conformance or could
             not complete, or if a preserved embedded PDF could not be
-            converted.
+            converted. The candidate output is not published in this case.
         skipped: True if the original PDF was copied through unchanged.
     """
 
@@ -375,8 +386,40 @@ def _path_identity(path: Path) -> tuple[object, ...]:
     return ("path", os.path.normcase(str(path.resolve())))
 
 
-def _copy_input_to_output(input_path: Path, output_path: Path) -> None:
-    """Copy the input file to the requested output location.
+@contextmanager
+def _staged_input_copy(input_path: Path, output_path: Path) -> Iterator[Path]:
+    """Yield a same-directory snapshot of an unchanged input."""
+    staging = private_staging_directory(
+        output_path.parent,
+        prefix=f".{output_path.stem}_copy_",
+        delete=False,
+    )
+    staged_output = Path(staging.name) / f"snapshot{output_path.suffix}"
+    try:
+        copy_to_private_stage(
+            input_path,
+            Path(staging.name),
+            staged_output.name,
+        )
+        yield staged_output
+    finally:
+        try:
+            staging.cleanup()
+        except Exception as cleanup_error:
+            logger.warning(
+                "Could not delete staged unchanged copy: %s (%s)",
+                staged_output,
+                cleanup_error,
+            )
+
+
+def _copy_input_to_output(
+    input_path: Path,
+    output_path: Path,
+    *,
+    allow_overwrite: bool = True,
+) -> None:
+    """Atomically copy an unchanged input to the requested output location.
 
     Overwrites an existing output file, matching the behavior of the
     regular conversion path. Overwrite protection is enforced by the
@@ -389,8 +432,38 @@ def _copy_input_to_output(input_path: Path, output_path: Path) -> None:
     if _path_identity(input_path) == _path_identity(output_path):
         return
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(str(input_path), str(output_path))
+    with _staged_input_copy(input_path, output_path) as staged_output:
+        snapshot = staged_file_snapshot(staged_output)
+        publish_staged_file(
+            staged_output,
+            output_path,
+            snapshot,
+            backup=staged_output.with_name(f"backup{output_path.suffix}"),
+            require_absent=not allow_overwrite,
+        )
+
+
+def _validate_input_snapshot_and_publish(
+    input_path: Path,
+    output_path: Path,
+    level: str,
+    warnings: list[str],
+    *,
+    allow_overwrite: bool = True,
+) -> bool:
+    """Validate and publish the exact snapshot of an unchanged input."""
+    with _staged_input_copy(input_path, output_path) as staged_input:
+        snapshot = staged_file_snapshot(staged_input)
+        validation_failed = _validate_pdfa_output(staged_input, level, warnings)
+        if not validation_failed:
+            publish_staged_file(
+                staged_input,
+                output_path,
+                snapshot,
+                backup=staged_input.with_name(f"backup{output_path.suffix}"),
+                require_absent=not allow_overwrite,
+            )
+    return validation_failed
 
 
 def _copy_encrypted_input(
@@ -401,6 +474,7 @@ def _copy_encrypted_input(
     validate: bool,
     level: str,
     start_time: float,
+    allow_overwrite: bool = True,
 ) -> ConversionResult:
     """Copy an encrypted input unchanged and validate it when requested."""
     warning = (
@@ -409,12 +483,25 @@ def _copy_encrypted_input(
         else "Processing skipped: PDF is encrypted and cannot be processed"
     )
     logger.warning("%s: %s", warning, input_path)
-    _copy_input_to_output(input_path, output_path)
     warnings = [warning]
+    validation_failed = False
+    if validate:
+        validation_failed = _validate_input_snapshot_and_publish(
+            input_path,
+            output_path,
+            level,
+            warnings,
+            allow_overwrite=allow_overwrite,
+        )
+    else:
+        _copy_input_to_output(
+            input_path,
+            output_path,
+            allow_overwrite=allow_overwrite,
+        )
+    if validation_failed:
+        warnings.append(_VALIDATION_PUBLICATION_WARNING)
     processing_time = time.perf_counter() - start_time
-    validation_failed = (
-        _validate_pdfa_output(output_path, level, warnings) if validate else False
-    )
     return ConversionResult(
         success=True,
         input_path=input_path,
@@ -457,15 +544,13 @@ def _truncate_trailing_data(output_path: Path) -> bool:
     """
     try:
         data = output_path.read_bytes()
-    except Exception as e:
-        logger.warning("Could not read file for %%%%EOF check: %s", e)
-        return False
+    except Exception as exc:
+        raise ConversionError(f"Could not read file for %%EOF check: {exc}") from exc
 
     eof_marker = b"%%EOF"
     last_eof = data.rfind(eof_marker)
     if last_eof == -1:
-        logger.warning("No %%%%EOF marker found in output file")
-        return False
+        raise ConversionError("No %%EOF marker found in output file")
 
     # Allow %%EOF + optional single EOL
     cut = last_eof + len(eof_marker)
@@ -482,9 +567,8 @@ def _truncate_trailing_data(output_path: Path) -> bool:
     logger.debug("Truncating %d byte(s) after %%%%EOF (ISO 19005-2, 6.1.3)", trailing)
     try:
         output_path.write_bytes(data[:cut])
-    except Exception as e:
-        logger.warning("Could not truncate trailing data: %s", e)
-        return False
+    except Exception as exc:
+        raise ConversionError(f"Could not truncate trailing data: {exc}") from exc
 
     return True
 
@@ -507,16 +591,17 @@ def _ensure_binary_comment(output_path: Path, required_version: str) -> bool:
     try:
         with open(output_path, "rb") as f:
             header = f.read(64)
-    except Exception as e:
-        logger.warning("Could not read header for binary comment check: %s", e)
-        return False
+    except Exception as exc:
+        raise ConversionError(
+            f"Could not read header for binary comment check: {exc}"
+        ) from exc
 
     # Locate end of first line (%PDF-x.y)
     nl = header.find(b"\n")
     if nl == -1:
         nl = header.find(b"\r")
     if nl == -1:
-        return False
+        raise ConversionError("PDF header has no line ending")
 
     after = nl + 1
     if after < len(header) and header[after : after + 1] == b"%":
@@ -533,19 +618,22 @@ def _ensure_binary_comment(output_path: Path, required_version: str) -> bool:
     # Re-save through pikepdf — QPDF always writes a binary comment.
     logger.debug("Re-saving to add binary comment (ISO 19005-2, 6.1.2)")
     fd, tmp_path = tempfile.mkstemp(suffix=".pdf", dir=output_path.parent)
-    os.close(fd)
     tmp = Path(tmp_path)
     try:
+        os.close(fd)
         with pikepdf.open(output_path) as pdf:
             pdf.save(tmp, **_get_pdfa_save_settings_for_version(required_version))
         os.replace(str(tmp), str(output_path))
-    except Exception as e:
-        logger.warning("Could not add binary comment: %s", e)
+    except Exception as exc:
         try:
-            tmp.unlink()
-        except Exception:
-            pass
-        return False
+            tmp.unlink(missing_ok=True)
+        except Exception as cleanup_error:
+            logger.warning(
+                "Could not delete failed binary-comment rewrite: %s (%s)",
+                tmp,
+                cleanup_error,
+            )
+        raise ConversionError(f"Could not add binary comment: {exc}") from exc
 
     return True
 
@@ -554,8 +642,7 @@ def _verify_file_structure(output_path: Path, required_version: str) -> None:
     """Lightweight post-save verification of PDF file structure.
 
     Checks that the output file has the expected PDF header and a /ID
-    array in the trailer.  Logs warnings on failure but does not
-    raise — the file may still be valid.
+    array in the trailer. Verification failures prevent publication.
 
     Args:
         output_path: Path to the saved PDF file.
@@ -564,32 +651,44 @@ def _verify_file_structure(output_path: Path, required_version: str) -> None:
     try:
         with open(output_path, "rb") as f:
             header = f.read(20)
-    except Exception as e:
-        logger.warning("Post-save verification: could not read file: %s", e)
-        return
+    except Exception as exc:
+        raise ConversionError(
+            f"Post-save verification could not read file: {exc}"
+        ) from exc
 
     # 1. Check header starts with %PDF-<version>
     expected_header = f"%PDF-{required_version}".encode("ascii")
     if not header.startswith(expected_header):
         actual = header[:15].decode("ascii", errors="replace")
-        logger.warning(
-            "Post-save verification: file header '%s' does not start "
-            "with expected '%s'",
-            actual,
-            expected_header.decode("ascii"),
+        raise ConversionError(
+            "Post-save verification: file header "
+            f"'{actual}' does not start with expected "
+            f"'{expected_header.decode('ascii')}'"
         )
 
     # 2. Check trailer /ID
     try:
         with pikepdf.open(output_path) as check_pdf:
             id_array = check_pdf.trailer.get("/ID")
-            if id_array is None or len(id_array) != 2:
-                logger.warning(
-                    "Post-save verification: trailer /ID missing or "
-                    "does not have 2 elements"
+            valid_id = (
+                isinstance(id_array, pikepdf.Array)
+                and len(id_array) == 2
+                and all(
+                    isinstance(value, pikepdf.String) and bool(bytes(value))
+                    for value in id_array
                 )
-    except Exception as e:
-        logger.warning("Post-save verification: could not reopen file: %s", e)
+            )
+            if not valid_id:
+                raise ConversionError(
+                    "Post-save verification: trailer /ID must contain two "
+                    "non-empty byte strings"
+                )
+    except ConversionError:
+        raise
+    except Exception as exc:
+        raise ConversionError(
+            f"Post-save verification could not reopen file: {exc}"
+        ) from exc
 
 
 def save_pdfa(
@@ -880,6 +979,7 @@ def convert_to_pdfa(
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
+    _allow_output_overwrite: bool = True,
 ) -> ConversionResult:
     """Converts a PDF file to PDF/A or applies only requested OCR processing.
 
@@ -945,6 +1045,9 @@ def convert_to_pdfa(
     ocr_signature_temp_file: Path | None = None
     ocr_clean_temp_file: Path | None = None
     ocr_merged_temp_file: Path | None = None
+    ocr_manifest_temp_file: Path | None = None
+    final_output_temp_file: Path | None = None
+    final_output_temp_directory: tempfile.TemporaryDirectory[str] | None = None
     pdf: pikepdf.Pdf | None = None
     source_info: dict | None = None
     source_xmp_tree = None
@@ -967,6 +1070,7 @@ def convert_to_pdfa(
         # 0. Check if PDF is already PDF/A compliant (before OCR)
         with pikepdf.open(input_path) as check_pdf:
             if is_pdf_encrypted(check_pdf):
+                check_pdf.close()
                 return _copy_encrypted_input(
                     input_path,
                     output_path,
@@ -974,6 +1078,7 @@ def convert_to_pdfa(
                     validate=validate,
                     level=level,
                     start_time=start_time,
+                    allow_overwrite=_allow_output_overwrite,
                 )
             if pdfa and len(check_pdf.pages) == 0:
                 raise UnsupportedPDFError(
@@ -982,7 +1087,12 @@ def convert_to_pdfa(
             if not pdfa and not ocr_requested:
                 processing_time = time.perf_counter() - start_time
                 warning = "No processing options requested; input copied unchanged"
-                _copy_input_to_output(input_path, output_path)
+                check_pdf.close()
+                _copy_input_to_output(
+                    input_path,
+                    output_path,
+                    allow_overwrite=_allow_output_overwrite,
+                )
                 return ConversionResult(
                     success=True,
                     input_path=input_path,
@@ -1006,13 +1116,25 @@ def convert_to_pdfa(
                     )
                 )
                 logger.warning("%s: %s", signature_skip_warning, input_path)
-                _copy_input_to_output(input_path, output_path)
                 branch_warnings = [signature_skip_warning]
-                validation_failed = (
-                    _validate_pdfa_output(output_path, level, branch_warnings)
-                    if validate
-                    else False
-                )
+                validation_failed = False
+                check_pdf.close()
+                if validate:
+                    validation_failed = _validate_input_snapshot_and_publish(
+                        input_path,
+                        output_path,
+                        level,
+                        branch_warnings,
+                        allow_overwrite=_allow_output_overwrite,
+                    )
+                else:
+                    _copy_input_to_output(
+                        input_path,
+                        output_path,
+                        allow_overwrite=_allow_output_overwrite,
+                    )
+                if validation_failed:
+                    branch_warnings.append(_VALIDATION_PUBLICATION_WARNING)
                 return ConversionResult(
                     success=True,
                     input_path=input_path,
@@ -1037,48 +1159,58 @@ def convert_to_pdfa(
 
         if detected_level is not None and not explicit_ocr_processing_requested:
             should_validate_for_skip = skip_any_pdfa
-            if not should_validate_for_skip:
+            if not should_validate_for_skip and not level.endswith("a"):
                 level_cmp = _compare_pdfa_levels(detected_level, level)
                 should_validate_for_skip = level_cmp >= 0
 
             if should_validate_for_skip:
-                try:
-                    verapdf_result = validate_with_verapdf(
-                        input_path,
-                        flavour=detected_level,
-                        non_compliant_log_level=logging.WARNING,
-                    )
-                except VeraPDFError:
-                    logger.debug(
-                        "veraPDF not available, skipping PDF/A pre-check for %s",
-                        input_path,
-                    )
-                    verapdf_result = None
+                with _staged_input_copy(input_path, output_path) as staged_input:
+                    staged_snapshot = staged_file_snapshot(staged_input)
+                    try:
+                        verapdf_result = validate_with_verapdf(
+                            staged_input,
+                            flavour=detected_level,
+                            non_compliant_log_level=logging.WARNING,
+                        )
+                    except VeraPDFError:
+                        logger.debug(
+                            "veraPDF not available, skipping PDF/A pre-check for %s",
+                            input_path,
+                        )
+                        verapdf_result = None
 
-                if verapdf_result is not None and verapdf_result.compliant:
-                    processing_time = time.perf_counter() - start_time
-                    logger.info(
-                        "Skipping conversion: PDF is already valid PDF/A-%s",
-                        detected_level,
-                    )
-                    _copy_input_to_output(input_path, output_path)
-                    return ConversionResult(
-                        success=True,
-                        input_path=input_path,
-                        output_path=output_path,
-                        level=detected_level,
-                        warnings=[
-                            "Conversion skipped: PDF already valid PDF/A "
-                            "(veraPDF compliant)"
-                        ],
-                        processing_time=processing_time,
-                        skipped=True,
-                    )
-                elif verapdf_result is not None:
-                    logger.info(
-                        "PDF claims PDF/A-%s but validation failed, converting",
-                        detected_level,
-                    )
+                    if verapdf_result is not None and verapdf_result.compliant:
+                        processing_time = time.perf_counter() - start_time
+                        logger.info(
+                            "Skipping conversion: PDF is already valid PDF/A-%s",
+                            detected_level,
+                        )
+                        publish_staged_file(
+                            staged_input,
+                            output_path,
+                            staged_snapshot,
+                            backup=staged_input.with_name(
+                                f"backup{output_path.suffix}"
+                            ),
+                            require_absent=not _allow_output_overwrite,
+                        )
+                        return ConversionResult(
+                            success=True,
+                            input_path=input_path,
+                            output_path=output_path,
+                            level=detected_level,
+                            warnings=[
+                                "Conversion skipped: PDF already valid PDF/A "
+                                "(veraPDF compliant)"
+                            ],
+                            processing_time=processing_time,
+                            skipped=True,
+                        )
+                    if verapdf_result is not None:
+                        logger.info(
+                            "PDF claims PDF/A-%s but validation failed, converting",
+                            detected_level,
+                        )
             elif not skip_any_pdfa:
                 logger.debug(
                     "PDF is PDF/A-%s, converting to PDF/A-%s",
@@ -1109,6 +1241,15 @@ def convert_to_pdfa(
             os.close(fd)
             ocr_temp_file = Path(tmp_path)
             ocr_source_base = input_path
+
+            if pdfa and level.endswith("a"):
+                manifest_fd, manifest_tmp = tempfile.mkstemp(
+                    suffix=".json",
+                    prefix=f".{input_path.stem}_ocr_semantics_",
+                )
+                os.close(manifest_fd)
+                ocr_manifest_temp_file = Path(manifest_tmp)
+                ocr_manifest_temp_file.unlink()
 
             fd_sig, sig_tmp = tempfile.mkstemp(
                 suffix=".pdf",
@@ -1164,6 +1305,7 @@ def convert_to_pdfa(
                 ocr_execution_provider=ocr_execution_provider,
                 layout=ocr_layout,
                 _annotated_pages=annotated_pages,
+                _manifest_output_path=ocr_manifest_temp_file,
             )
 
             # Re-inject original annotations into OCR output.
@@ -1214,7 +1356,11 @@ def convert_to_pdfa(
             warnings.append(f"OCR performed (languages: {lang_str})")
 
         if not pdfa:
-            _copy_input_to_output(actual_input, output_path)
+            _copy_input_to_output(
+                actual_input,
+                output_path,
+                allow_overwrite=_allow_output_overwrite,
+            )
             processing_time = time.perf_counter() - start_time
             logger.info(
                 "PDF processing successful: %s (%.2f seconds)",
@@ -1419,11 +1565,134 @@ def convert_to_pdfa(
             warnings.append(f"{count} .notdef usage operator(s) fixed")
 
         if level.endswith("a"):
-            tagging_result = ensure_logical_structure(pdf)
-            if tagging_result["structure_rebuilt"]:
+            ocr_manifest = None
+            if ocr_manifest_temp_file is not None and ocr_manifest_temp_file.exists():
+                try:
+                    ocr_manifest = json.loads(
+                        ocr_manifest_temp_file.read_text(encoding="utf-8")
+                    )
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise OCRError(
+                        f"Could not read OCR semantic manifest: {exc}"
+                    ) from exc
+            # No preflight rehearsal: any failure below propagates out of this
+            # try block, which closes `pdf` unsaved and unlinks the staged
+            # output, so a partially built structure tree never reaches disk.
+            tagging_result = ensure_logical_structure(
+                pdf,
+                semantic=True,
+                ocr_manifest=ocr_manifest,
+                preflight=False,
+            )
+            if tagging_result.get("semantic_repairs", 0):
+                repair_count = tagging_result["semantic_repairs"]
+                repair_label = "property" if repair_count == 1 else "properties"
                 warnings.append(
-                    "Tagged PDF structure generated from page content order"
+                    f"{repair_count} semantic structure {repair_label} repaired"
                 )
+            alternative_review_count = tagging_result.get(
+                "semantic_alternatives_review_required",
+                0,
+            )
+            if alternative_review_count:
+                element_label = (
+                    "element" if alternative_review_count == 1 else "elements"
+                )
+                review_verb = "requires" if alternative_review_count == 1 else "require"
+                warnings.append(
+                    f"{alternative_review_count} Figure/Formula {element_label} "
+                    f"{review_verb} manual review: no trustworthy Alt, "
+                    "ActualText, or Caption is available"
+                )
+            vector_review_count = tagging_result.get(
+                "semantic_vector_review_required",
+                0,
+            )
+            if vector_review_count:
+                page_label = "page" if vector_review_count == 1 else "pages"
+                warnings.append(
+                    f"{vector_review_count} {page_label} require manual review: "
+                    "unclassified direct vector painting was retained as a "
+                    "Layout artifact"
+                )
+            scanned_visual_review_count = tagging_result.get(
+                "semantic_scanned_visual_review_required",
+                0,
+            )
+            if scanned_visual_review_count:
+                page_label = (
+                    "OCR page" if scanned_visual_review_count == 1 else "OCR pages"
+                )
+                review_verb = (
+                    "requires" if scanned_visual_review_count == 1 else "require"
+                )
+                scan_label = (
+                    "a full-page scan"
+                    if scanned_visual_review_count == 1
+                    else "full-page scans"
+                )
+                warnings.append(
+                    f"{scanned_visual_review_count} {page_label} {review_verb} "
+                    f"manual review: {scan_label} may contain meaningful non-text "
+                    "visuals that available OCR layout evidence cannot represent"
+                )
+            link_review_count = tagging_result.get(
+                "semantic_link_review_required",
+                0,
+            )
+            if link_review_count:
+                link_label = (
+                    "Link annotation" if link_review_count == 1 else "Link annotations"
+                )
+                review_verb = "requires" if link_review_count == 1 else "require"
+                warnings.append(
+                    f"{link_review_count} {link_label} {review_verb} manual review: "
+                    "the link could not be safely associated with content owned by "
+                    "a single logical structure element"
+                )
+            form_review_count = tagging_result.get(
+                "semantic_form_review_required",
+                0,
+            )
+            if form_review_count:
+                field_label = "Form field" if form_review_count == 1 else "Form fields"
+                review_verb = "requires" if form_review_count == 1 else "require"
+                warnings.append(
+                    f"{form_review_count} {field_label} {review_verb} manual review: "
+                    "no trustworthy tooltip or field name is available"
+                )
+            if tagging_result["structure_rebuilt"]:
+                if tagging_result.get("semantic_structure_generated"):
+                    if ocr_manifest is not None:
+                        semantic_generation_warning = (
+                            "Semantic Tagged PDF structure generated from final "
+                            "digital content"
+                        )
+                        if ocr_manifest.get("pages"):
+                            semantic_generation_warning += (
+                                " and available OCR layout evidence"
+                            )
+                        if any(
+                            (
+                                alternative_review_count,
+                                vector_review_count,
+                                scanned_visual_review_count,
+                                link_review_count,
+                                form_review_count,
+                            )
+                        ):
+                            semantic_generation_warning += (
+                                "; review reported semantic uncertainties"
+                            )
+                        warnings.append(semantic_generation_warning)
+                    else:
+                        warnings.append(
+                            "Semantic Tagged PDF structure generated from PDF layout"
+                        )
+                else:
+                    warnings.append(
+                        "Tagged PDF structure generated from page content order"
+                    )
                 if remove_pdfua_identification(pdf):
                     warnings.append(
                         "PDF/UA identification removed from XMP metadata "
@@ -1438,7 +1707,18 @@ def convert_to_pdfa(
         # Keep output non-linearized because QPDF linearization can still
         # produce invalid /Length values on generated hint streams
         # (rule 6.1.7.1) for specific inputs.
-        logger.debug("Saving PDF/A: %s", output_path)
+        final_output_temp_directory = private_staging_directory(
+            output_path.parent,
+            prefix=f".{output_path.stem}_pdfa_stage_",
+            delete=False,
+        )
+        final_output_temp_file = (
+            Path(final_output_temp_directory.name)
+            / f".{output_path.stem}_pdfa_output.pdf"
+        )
+        final_output_temp_file.touch(exist_ok=False)
+
+        logger.debug("Saving staged PDF/A: %s", final_output_temp_file)
         required_version = get_required_pdf_version(level)
         current_version = pdf.pdf_version
         if current_version != required_version:
@@ -1452,7 +1732,8 @@ def convert_to_pdfa(
                 f"PDF version {direction} from {current_version} to {required_version}"
             )
 
-        save_pdfa(pdf, output_path, level, verify=True)
+        save_pdfa(pdf, final_output_temp_file, level, verify=True)
+        final_output_snapshot = staged_file_snapshot(final_output_temp_file)
         pdf.close()
         pdf = None
 
@@ -1465,8 +1746,21 @@ def convert_to_pdfa(
         if validate:
             logger.debug("Validating output with veraPDF")
             validation_failed = (
-                _validate_pdfa_output(output_path, level, warnings) or validation_failed
+                _validate_pdfa_output(final_output_temp_file, level, warnings)
+                or validation_failed
             )
+
+        if validation_failed:
+            warnings.append(_VALIDATION_PUBLICATION_WARNING)
+        else:
+            publish_staged_file(
+                final_output_temp_file,
+                output_path,
+                final_output_snapshot,
+                backup=final_output_temp_file.with_name(f"backup{output_path.suffix}"),
+                require_absent=not _allow_output_overwrite,
+            )
+            final_output_temp_file = None
 
         logger.info(
             "Conversion successful: %s (%.2f seconds)",
@@ -1492,6 +1786,7 @@ def convert_to_pdfa(
             validate=validate,
             level=level,
             start_time=start_time,
+            allow_overwrite=_allow_output_overwrite,
         )
 
     except pikepdf.PdfError as e:
@@ -1526,12 +1821,33 @@ def convert_to_pdfa(
             except Exception:
                 pass
 
+        if final_output_temp_file is not None:
+            try:
+                final_output_temp_file.unlink(missing_ok=True)
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Could not delete staged PDF/A output: %s (%s)",
+                    final_output_temp_file,
+                    cleanup_error,
+                )
+
+        if final_output_temp_directory is not None:
+            try:
+                final_output_temp_directory.cleanup()
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Could not delete private PDF/A staging directory: %s (%s)",
+                    final_output_temp_directory.name,
+                    cleanup_error,
+                )
+
         # Cleanup: Delete OCR temporary files
         ocr_cleanup_files = (
             (ocr_temp_file, "OCR temporary file"),
             (ocr_signature_temp_file, "OCR signature temporary file"),
             (ocr_clean_temp_file, "OCR annotation-stripped temporary file"),
             (ocr_merged_temp_file, "OCR annotation-merged temporary file"),
+            (ocr_manifest_temp_file, "OCR semantic manifest temporary file"),
         )
         for cleanup_file, cleanup_label in ocr_cleanup_files:
             if cleanup_file is None or not cleanup_file.exists():
@@ -1684,6 +2000,7 @@ def convert_files(
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 allow_signature_invalidation=allow_signature_invalidation,
+                _allow_output_overwrite=force_overwrite,
             )
             results.append(result)
 

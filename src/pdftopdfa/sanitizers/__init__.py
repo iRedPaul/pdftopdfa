@@ -47,6 +47,7 @@ from .base import (
 )
 from .catalog import (
     ensure_catalog_lang,
+    ensure_display_doc_title,
     ensure_mark_info,
     remove_catalog_version,
     remove_forbidden_catalog_entries,
@@ -223,6 +224,9 @@ def sanitize_for_pdfa(
     # Remove forbidden ViewerPreferences entries (ISO 19005-2, 6.1.2)
     result["viewer_prefs_entries_removed"] = remove_forbidden_viewer_preferences(pdf)
 
+    # Present the document title for semantic Level A output.
+    result["display_doc_title_set"] = ensure_display_doc_title(pdf, level)
+
     # Ensure /Lang key in catalog (ISO 19005-2, 6.7.4)
     result["catalog_lang_set"] = ensure_catalog_lang(pdf)
 
@@ -286,16 +290,19 @@ def sanitize_for_pdfa(
     sanitize_colorspaces(pdf, level)
 
     # Sanitize optional content (layers) for PDF/A-2/3 compliance
-    oc_result = sanitize_optional_content(pdf)
+    try:
+        oc_result = sanitize_optional_content(pdf)
+    except ValueError as exc:
+        raise ConversionError(
+            f"Optional content cannot be made PDF/A compliant: {exc}"
+        ) from exc
     result["oc_as_entries_removed"] = oc_result.get("as_entries_removed", 0)
-    result["oc_intents_fixed"] = oc_result.get("intents_fixed", 0)
     result["oc_d_created"] = oc_result.get("d_created", False)
     result["oc_d_name_added"] = oc_result.get("d_name_added", False)
-    result["oc_list_mode_fixed"] = oc_result.get("list_mode_fixed", 0)
     result["oc_base_state_fixed"] = oc_result.get("base_state_fixed", 0)
+    result["oc_default_intent_fixed"] = oc_result.get("default_intent_fixed", 0)
     result["oc_config_names_added"] = oc_result.get("config_names_added", 0)
     result["oc_missing_ocgs_added"] = oc_result.get("missing_ocgs_added", 0)
-    result["oc_rbgroups_fixed"] = oc_result.get("rbgroups_fixed", 0)
     result["oc_ocg_names_added"] = oc_result.get("ocg_names_added", 0)
     result["oc_order_ocgs_added"] = oc_result.get("order_ocgs_added", 0)
 
@@ -500,6 +507,7 @@ __all__ = [
     "remove_non_compliant_embedded_files",
     "sanitize_embedded_file_filters",
     "ensure_catalog_lang",
+    "ensure_display_doc_title",
     "ensure_mark_info",
     "remove_catalog_version",
     "remove_forbidden_catalog_entries",

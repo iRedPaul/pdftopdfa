@@ -620,7 +620,7 @@ class TestConvertNonCompliantEmbeddedFiles:
     def test_failed_attachment_conversion_marks_outer_result_invalid(
         self, tmp_path: Path
     ) -> None:
-        """The outer conversion reports failure while preserving the attachment."""
+        """An invalid outer candidate is withheld while the source stays intact."""
         input_path = tmp_path / "input.pdf"
         output_path = tmp_path / "output.pdf"
         pdf = _make_pdf_with_embedded(b"%PDF-1.4 unconvertible", "bad.pdf")
@@ -632,8 +632,10 @@ class TestConvertNonCompliantEmbeddedFiles:
         assert result.success is True
         assert result.validation_failed is True
         assert any("attachment" in warning for warning in result.warnings)
-        with pikepdf.open(output_path) as output_pdf:
-            names_array = output_pdf.Root.Names.EmbeddedFiles.Names
+        assert any("not published" in warning for warning in result.warnings)
+        assert not output_path.exists()
+        with pikepdf.open(input_path) as source_pdf:
+            names_array = source_pdf.Root.Names.EmbeddedFiles.Names
             filespec = _resolve_indirect(names_array[1])
             stream = _resolve_indirect(_resolve_indirect(filespec.EF).F)
             assert bytes(stream.read_bytes()) == b"%PDF-1.4 unconvertible"

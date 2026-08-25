@@ -55,9 +55,12 @@ pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with 
 4. **Sanitization** -- removes or fixes non-compliant elements (JavaScript, non-standard actions, transparency groups, annotations, optional content, etc.)
 5. **Metadata** -- synchronizes XMP metadata with the document info dictionary and sets the PDF/A conformance level
 6. **Color profiles** -- detects color spaces and embeds the required ICC profiles (sRGB, CMYK/FOGRA39, sGray)
-7. **Logical structure** -- for level A, preserves an existing Tagged PDF
-   structure or creates a structure tree from the final page and annotation
-   order, including OCR-processed scans
+7. **Logical structure** -- for level A, preserves and safely repairs valid
+   rich tags or builds headings, paragraphs, lists, tables, figures, artifacts,
+   links, forms, and reading order from final digital-PDF provenance or the
+   internal OCR engine's line and layout data. A provably inverted
+   single-column block order is rebuilt; ambiguous or multi-column existing
+   orders are preserved
 8. **Save** -- writes the output with the correct PDF version header
 
 ## Installation
@@ -180,8 +183,8 @@ pdftopdfa document.pdf
 # Specific PDF/A level
 pdftopdfa -l 2b document.pdf
 
-# Accessible PDF/A output
-pdftopdfa -l 2a document.pdf
+# Tagged PDF/A-2a output with veraPDF validation
+pdftopdfa -l 2a --validate document.pdf
 
 # With validation (note: -v = --validate, not verbose; use --verbose for logs)
 pdftopdfa -v document.pdf
@@ -199,8 +202,8 @@ pdftopdfa -r ./documents/ ./output/
 DET_MODEL=/opt/pdftopdfa/models/PP-OCRv6_medium_det_onnx
 REC_MODEL=/opt/pdftopdfa/models/PP-OCRv6_medium_rec_onnx
 
-# OCR a German/English scan to tagged PDF/A-2a
-pdftopdfa -l 2a --ocr-lang de+en \
+# OCR a German/English scan to tagged PDF/A-2a and validate it
+pdftopdfa -l 2a --validate --ocr-lang de+en \
   --ocr-detection-model-dir "$DET_MODEL" \
   --ocr-recognition-model-dir "$REC_MODEL" \
   document.pdf
@@ -266,12 +269,8 @@ ocr_result = convert_to_pdfa(
     output_path=Path("scan_pdfa.pdf"),
     level="2b",
     ocr_languages=["de", "en"],
-    ocr_detection_model_dir=Path(
-        "/opt/pdftopdfa/models/PP-OCRv6_medium_det_onnx"
-    ),
-    ocr_recognition_model_dir=Path(
-        "/opt/pdftopdfa/models/PP-OCRv6_medium_rec_onnx"
-    ),
+    ocr_detection_model_dir=Path("/opt/pdftopdfa/models/PP-OCRv6_medium_det_onnx"),
+    ocr_recognition_model_dir=Path("/opt/pdftopdfa/models/PP-OCRv6_medium_rec_onnx"),
     ocr_execution_provider="cpu",
 )
 ```
@@ -298,11 +297,23 @@ image, table, and reusable `OCRSession` APIs.
 ## Limitations
 
 - **No PDF/A-1 support** -- only PDF/A-2 and PDF/A-3 levels are supported
-- **Automatic level A semantics** -- generated tags follow page and PDF
-  content-stream order and include annotations. They provide the structural
-  basis required by PDF/A-2a and PDF/A-3a, but automatic conversion cannot
-  infer authorial semantics such as heading levels, table relationships, or
-  alternative descriptions. PDF/A level A does not imply PDF/UA conformance.
+- **Automatic level A semantics** -- generated tags infer headings, paragraphs,
+  lists, conservative tables, figures, artifacts, links, forms, and reading
+  order from text styles, geometry, direct painting provenance, and, for scans,
+  the internal OCR engine's line and layout data. Ambiguous content falls back
+  to conservative paragraph or division structure. Trustworthy existing Alt,
+  marked-content ActualText, and textual Captions are retained or propagated;
+  software cannot invent an authoritative description for an otherwise
+  undescribed image. Such Figure/Formula elements are reported for manual
+  review instead of receiving invented descriptions. Pages with unclassified
+  vector painting are likewise reported because decorative rules and
+  meaningful vector diagrams cannot always be distinguished automatically.
+  Full-page OCR scans that may contain unrecognized non-text visuals, Link
+  annotations that cannot be associated with one content owner, and form fields
+  without a trustworthy tooltip or field name are retained and reported for the
+  same reason.
+  Review automatically inferred semantics for accessibility-critical
+  publications. PDF/A level A does not by itself imply PDF/UA conformance.
 - **Encrypted PDFs** -- password-protected PDFs cannot be converted and are
   copied unchanged. With an automatically generated output name, the unchanged
   copy still receives the `_pdfa.pdf` suffix; it is not a converted PDF/A file
@@ -333,6 +344,24 @@ python -m pytest
 The test suite covers fonts, color profiles, metadata, sanitization, OCR, and
 end-to-end conversion.
 
+The real-model semantic OCR tests are opt-in and never modify the configured
+model directories. Set `PDFTOPDFA_TEST_OCR_DETECTION_MODEL_DIR` and
+`PDFTOPDFA_TEST_OCR_RECOGNITION_MODEL_DIR`, install veraPDF, then run:
+
+```bash
+python -m pytest tests/test_semantic_ocr_e2e.py
+```
+
+With the upstream `veraPDF-corpus-staging` checkout present at the repository
+root, the corpus runner converts and validates every fixture against every
+supported PDF/A level and writes a detailed report. It also records the exact
+corpus hashes and execution environment in `run_metadata.json`; set
+`PDFTOPDFA_CORPUS_WORKERS` to override the default worker count capped at eight:
+
+```bash
+python run_corpus_test.py
+```
+
 ### Code Quality
 
 ```bash
@@ -359,8 +388,8 @@ Contributions are welcome! Please open an [issue](https://github.com/iredpaul/pd
 - [pikepdf](https://pikepdf.readthedocs.io/) -- PDF manipulation (based on QPDF)
 - [lxml](https://lxml.de/) -- XMP metadata processing
 - [fonttools](https://github.com/fonttools/fonttools) -- Font analysis, subsetting, and embedding
-- [pdfminer.six](https://github.com/pdfminer/pdfminer.six) -- CMap decoding for
-  font-to-Unicode mappings
+- [pdfminer.six](https://github.com/pdfminer/pdfminer.six) -- read-only digital
+  text, layout, and painting-provenance extraction
 - [NumPy](https://numpy.org/) -- Array processing for OCR and table recognition
 - [click](https://click.palletsprojects.com/) -- CLI framework
 - [colorama](https://pypi.org/project/colorama/) -- Colored terminal output

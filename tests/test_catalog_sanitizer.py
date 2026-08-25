@@ -12,6 +12,7 @@ from pdftopdfa.sanitizers import sanitize_for_pdfa
 from pdftopdfa.sanitizers.catalog import (
     _is_valid_bcp47,
     ensure_catalog_lang,
+    ensure_display_doc_title,
     ensure_mark_info,
     remove_catalog_version,
     remove_forbidden_catalog_entries,
@@ -611,6 +612,13 @@ class TestRemoveForbiddenViewerPreferences:
         pdf = new_pdf()
         assert remove_forbidden_viewer_preferences(pdf) == 0
 
+    def test_malformed_viewer_preferences_is_removed(self):
+        pdf = new_pdf()
+        pdf.Root["/ViewerPreferences"] = pikepdf.Name("/Invalid")
+
+        assert remove_forbidden_viewer_preferences(pdf) == 1
+        assert "/ViewerPreferences" not in pdf.Root
+
     def test_other_keys_preserved(self):
         pdf = new_pdf()
         pdf.Root["/ViewerPreferences"] = pikepdf.Dictionary(
@@ -654,6 +662,63 @@ class TestRemoveForbiddenViewerPreferences:
         result = sanitize_for_pdfa(pdf, level="3b")
         assert result["viewer_prefs_entries_removed"] == 2
         assert "/ViewerPreferences" not in pdf.Root
+
+
+class TestEnsureDisplayDocTitle:
+    """Tests for Level A document-title display preferences."""
+
+    @pytest.mark.parametrize("level", ["2a", "3a"])
+    def test_level_a_adds_display_doc_title(self, level):
+        pdf = new_pdf()
+
+        assert ensure_display_doc_title(pdf, level) is True
+        assert pdf.Root["/ViewerPreferences"]["/DisplayDocTitle"] is True
+
+    def test_preserves_existing_viewer_preferences(self):
+        pdf = new_pdf()
+        pdf.Root["/ViewerPreferences"] = pikepdf.Dictionary(HideToolbar=True)
+
+        assert ensure_display_doc_title(pdf, "2a") is True
+        viewer_preferences = pdf.Root["/ViewerPreferences"]
+        assert viewer_preferences["/HideToolbar"] is True
+        assert viewer_preferences["/DisplayDocTitle"] is True
+
+    @pytest.mark.parametrize(
+        "value",
+        [False, 1, pikepdf.Name("/True")],
+    )
+    def test_repairs_invalid_display_doc_title(self, value):
+        pdf = new_pdf()
+        pdf.Root["/ViewerPreferences"] = pikepdf.Dictionary(DisplayDocTitle=value)
+
+        assert ensure_display_doc_title(pdf, "3a") is True
+        assert pdf.Root["/ViewerPreferences"]["/DisplayDocTitle"] is True
+
+    def test_replaces_malformed_viewer_preferences(self):
+        pdf = new_pdf()
+        pdf.Root["/ViewerPreferences"] = pikepdf.Name("/Invalid")
+
+        assert ensure_display_doc_title(pdf, "2a") is True
+        assert pdf.Root["/ViewerPreferences"]["/DisplayDocTitle"] is True
+
+    @pytest.mark.parametrize("level", ["2b", "2u", "3b", "3u"])
+    def test_non_level_a_is_unchanged(self, level):
+        pdf = new_pdf()
+
+        assert ensure_display_doc_title(pdf, level) is False
+        assert "/ViewerPreferences" not in pdf.Root
+
+    @pytest.mark.parametrize("level", ["2a", "3a"])
+    def test_integration_via_sanitize_for_pdfa(self, level):
+        pdf = new_pdf()
+        pdf.Root["/ViewerPreferences"] = pikepdf.Dictionary(HideMenubar=True)
+
+        result = sanitize_for_pdfa(pdf, level=level)
+
+        assert result["display_doc_title_set"] is True
+        viewer_preferences = pdf.Root["/ViewerPreferences"]
+        assert viewer_preferences["/HideMenubar"] is True
+        assert viewer_preferences["/DisplayDocTitle"] is True
 
 
 class TestEnsureMarkInfo:

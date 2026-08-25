@@ -11,9 +11,21 @@ from PaddleOCR 3.7 through ONNX Runtime. CPU inference is the default;
 DirectML inference is an explicit opt-in. OCRmyPDF is used for page
 rasterization, searchable text-layer generation, page merging, and PDF geometry.
 
-PDF/A-2a and PDF/A-3a are supported for scans. The final OCR page content is
-tagged after OCR and linked into the document structure tree in page and
-content-stream order.
+PDF/A-2a and PDF/A-3a are supported for scans. During level-A conversion,
+semantic OCR lines receive MCIDs in the final OCR Form. Repeated headers,
+footers, page numbers, and native-text duplicates can instead become typed
+layout artifacts without an MCID. Lines wholly outside the CropBox likewise
+remain typed layout artifacts; partially clipped lines use their visible words
+as ActualText. Lines the text-layer renderer discards as implausible (for
+example a line whose aspect ratio cannot be matched by any font size) never
+reach the page, are reported as a warning, and are removed from the OCR
+manifest, so a single discarded line does not fail the conversion. The
+remaining MCIDs keep their original numbers and may therefore contain gaps.
+The internal OCR text, confidence, language, word and line
+geometry, and layout reading order are transported to the tagger, which creates
+line-level marked-content references, paragraph and heading structure, typed
+artifacts, and the required ParentTree links. No secondary recognition engine
+is used.
 
 The external text-detection and recognition models are supplied explicitly by
 the application. There is no automatic model resolution, runtime download, or
@@ -25,8 +37,24 @@ pages and released when conversion ends, including after an error. OCRmyPDF runs
 one page job at a time and Paddle predictions are serialized, avoiding
 concurrent access to the PaddleX session. The detector limits its inference
 image to 1,600 pixels on the longest side. OCR uses a minimum rasterization
-resolution of 600 DPI; higher-resolution source images can therefore still
-require more memory while the source raster is prepared.
+resolution of 600 DPI. Before rasterization, every selected page is checked at
+the effective OCR resolution and rejected if it would exceed 100 million
+pixels. This admits A3 at 600 DPI while bounding a grayscale page raster to
+about 100 MB before decoder and renderer overhead. Page boxes that would later
+be normalized or clipped for PDF/A are rejected before OCR so text-layer and
+semantic coordinates cannot diverge. When page orientation is enabled, every
+page is also checked at the orientation model's actual 108 DPI render size,
+including text pages that OCRmyPDF itself skips. Model and temporary-resource
+cleanup is always attempted independently; a cleanup failure aborts an
+otherwise successful call, but is only logged when another OCR error is already
+propagating so that the primary failure remains visible.
+
+Aggregate orientation and OCR raster work is limited to one billion pixels per
+document, and OCR input is limited to 10,000 pages so that arbitrarily many tiny
+pages cannot bypass the raster budget. PDF and semantic-manifest candidates are
+created in private same-filesystem staging directories, then checked for
+pathname identity and byte-for-byte stability immediately before atomic
+publication.
 
 ## Installation
 
@@ -145,8 +173,10 @@ models across image calls.
 
 `--ocr-layout` detects clear vertical columns from OCR word geometry and orders
 all lines in the left column before the next column. It does not run another
-OCR pass and does not require an additional model. Without the flag,
-PaddleOCR's original line order is preserved.
+OCR pass and does not require an additional model. Level-A conversion applies
+the same safe layout ordering automatically because the tagger requires a
+logical reading order. For other conformance levels, omitting the flag preserves
+PaddleOCR's original line order.
 
 The option cannot separate text that the full-page recognition already merged
 into one line. If no safe column boundary is found, it only normalizes the
@@ -256,12 +286,8 @@ result = convert_to_pdfa(
     input_path=Path("scan.pdf"),
     output_path=Path("scan_pdfa.pdf"),
     ocr_languages=["de", "en"],
-    ocr_detection_model_dir=Path(
-        "/opt/pdftopdfa/models/PP-OCRv6_medium_det"
-    ),
-    ocr_recognition_model_dir=Path(
-        "/opt/pdftopdfa/models/PP-OCRv6_medium_rec"
-    ),
+    ocr_detection_model_dir=Path("/opt/pdftopdfa/models/PP-OCRv6_medium_det"),
+    ocr_recognition_model_dir=Path("/opt/pdftopdfa/models/PP-OCRv6_medium_rec"),
     ocr_execution_provider="cpu",
     ocr_rotate_pages=True,
 )
@@ -287,12 +313,8 @@ result_path = apply_ocr(
     Path("scan.pdf"),
     Path("scan_processed.pdf"),
     ["de", "en"],
-    detection_model_dir=Path(
-        "/opt/pdftopdfa/models/PP-OCRv6_medium_det"
-    ),
-    recognition_model_dir=Path(
-        "/opt/pdftopdfa/models/PP-OCRv6_medium_rec"
-    ),
+    detection_model_dir=Path("/opt/pdftopdfa/models/PP-OCRv6_medium_det"),
+    recognition_model_dir=Path("/opt/pdftopdfa/models/PP-OCRv6_medium_rec"),
     ocr_execution_provider="cpu",
     deskew=True,
 )
@@ -311,12 +333,8 @@ from pdftopdfa import recognize_image
 
 results = recognize_image(
     Path("serial-number.png"),
-    detection_model_dir=Path(
-        "/opt/pdftopdfa/models/PP-OCRv6_medium_det"
-    ),
-    recognition_model_dir=Path(
-        "/opt/pdftopdfa/models/PP-OCRv6_medium_rec"
-    ),
+    detection_model_dir=Path("/opt/pdftopdfa/models/PP-OCRv6_medium_det"),
+    recognition_model_dir=Path("/opt/pdftopdfa/models/PP-OCRv6_medium_rec"),
     layout="single_line",
     allowed_characters="0123456789",
 )
@@ -342,12 +360,8 @@ from pathlib import Path
 from pdftopdfa import OCRSession
 
 with OCRSession(
-    detection_model_dir=Path(
-        "/opt/pdftopdfa/models/PP-OCRv6_medium_det"
-    ),
-    recognition_model_dir=Path(
-        "/opt/pdftopdfa/models/PP-OCRv6_medium_rec"
-    ),
+    detection_model_dir=Path("/opt/pdftopdfa/models/PP-OCRv6_medium_det"),
+    recognition_model_dir=Path("/opt/pdftopdfa/models/PP-OCRv6_medium_rec"),
 ) as session:
     first = session.recognize_image(Path("page-1.png"))
     second = session.recognize_image(Path("page-2.png"))
@@ -381,12 +395,8 @@ result = recognize_table(
     wireless_table_cells_detection_model_dir=Path(
         "/opt/pdftopdfa/models/RT-DETR-L_wireless_table_cell_det"
     ),
-    detection_model_dir=Path(
-        "/opt/pdftopdfa/models/PP-OCRv6_medium_det"
-    ),
-    recognition_model_dir=Path(
-        "/opt/pdftopdfa/models/PP-OCRv6_medium_rec"
-    ),
+    detection_model_dir=Path("/opt/pdftopdfa/models/PP-OCRv6_medium_det"),
+    recognition_model_dir=Path("/opt/pdftopdfa/models/PP-OCRv6_medium_rec"),
     ocr_execution_provider="cpu",
 )
 ```
@@ -448,7 +458,9 @@ When OCR is enabled, processing runs for the document:
 
 - Pages without meaningful text receive OCR; whitespace-only extracted text is
   treated as no text.
-- Pages with non-whitespace text are skipped.
+- Digital pages with non-whitespace text are skipped. A conservatively
+  identified full-page scan with a visible native text overlay is instead
+  re-OCRed in a targeted run that retains the native text.
 - Mixed documents are handled page by page.
 
 With deskew enabled, scan-like pages are selected separately as described
@@ -493,16 +505,24 @@ text models are still required because `--rotate-pages` activates OCR.
 
 Deskew first selects pages where one opaque, unclipped raster image visibly
 covers at least 80% of the page and where there is no painted vector content or
-shading. Visible native text is also disqualifying unless it was painted before
-a later image whose visible coverage is the full page. Image coverage is
-intersected with the page, so off-page or tightly clipped images do not qualify.
-This leaves digitally generated pages unchanged and handles mixed documents
-page by page. Invisible OCR text, including clipping-only or fully transparent
-text, is allowed and is removed from a temporary page-local copy before the
-selected scan is processed.
+shading. A visible native text overlay painted after an otherwise qualifying
+full-page image selects a separate non-deskew `redo_ocr` run; OCRmyPDF retains
+that native text while the internal engine recognizes the underlying scan.
+Text painted before a later full-page image is treated as occluded. Image
+coverage is intersected with the page, so off-page or tightly clipped images do
+not qualify. Unknown clipping, transparency, blend, optional-content, or
+overprint states fail closed. If such a page combines an apparent full-page scan
+with an existing text layer, OCR aborts instead of publishing text of uncertain
+provenance. This leaves ordinary digitally generated pages and pages with only
+decorative small images unchanged and handles mixed documents page by page.
+Text that is provably non-painting from its render mode or alpha state is removed
+from a temporary page-local copy before a selected OCR run; clipping-only text
+is not assumed invisible because arbitrary clip geometry is ambiguous.
 
-Non-deskew raster pages and selected scan pages are OCRed in disjoint targeted
-page runs. No page receives OCR twice, and a pure scan needs only one run.
+Regular OCR pages, selected deskew pages, and mixed-content redo pages are
+OCRed in disjoint targeted page runs. No page receives OCR twice, and a pure
+scan needs only one run. Per-run Level-A sidecars are isolated and merged in
+physical page order.
 
 For each selected page, PaddleOCR derives a correction angle from at least two
 sufficiently long text polygons within ±10 degrees. With insufficient evidence

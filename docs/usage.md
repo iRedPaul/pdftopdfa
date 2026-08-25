@@ -150,15 +150,17 @@ except PDFToPDFAError as exc:
     print(f"Conversion failed: {exc}")
 else:
     if result.validation_failed:
-        print("Conversion completed, but validation failed")
+        print("Validation failed; no candidate was published")
     else:
         print("Done")
 ```
 
 `convert_to_pdfa()` raises on conversion failure and otherwise returns a result
-with `success=True`. The batch APIs represent handled per-file failures with
-`success=False` and an `error` message so that later files can still be
-processed.
+with `success=True`. If explicit validation fails, the result also has
+`validation_failed=True`, the rejected candidate is not published, and an
+existing destination remains unchanged (or a new destination remains absent).
+The batch APIs represent handled per-file failures with `success=False` and an
+`error` message so that later files can still be processed.
 
 Signature:
 
@@ -197,12 +199,8 @@ result = convert_to_pdfa(
     input_path=Path("scan.pdf"),
     output_path=Path("scan_pdfa.pdf"),
     ocr_languages=["de", "en"],
-    ocr_detection_model_dir=Path(
-        "/opt/pdftopdfa/models/PP-OCRv6_medium_det"
-    ),
-    ocr_recognition_model_dir=Path(
-        "/opt/pdftopdfa/models/PP-OCRv6_medium_rec"
-    ),
+    ocr_detection_model_dir=Path("/opt/pdftopdfa/models/PP-OCRv6_medium_det"),
+    ocr_recognition_model_dir=Path("/opt/pdftopdfa/models/PP-OCRv6_medium_rec"),
     ocr_execution_provider="cpu",
 )
 ```
@@ -234,13 +232,40 @@ maximum archival robustness. Set `preserve_stamps=True` or pass
 `--preserve-stamps` to convert known proprietary stamp annotations to standard
 `/Stamp` annotations instead.
 
-For PDF/A-2a and PDF/A-3a, `pdftopdfa` preserves an existing Tagged PDF
-structure when the page content remains unchanged. Untagged inputs and
-OCR-processed documents receive a new structure tree based on page,
-content-stream, and annotation order. This provides the logical structure
-required by level A, including for scans, but cannot infer authorial semantics
-such as heading levels, table relationships, or alternative descriptions.
-PDF/A level A therefore does not imply PDF/UA conformance.
+For PDF/A-2a and PDF/A-3a, `pdftopdfa` preserves a valid rich Tagged PDF
+structure when the page content remains unchanged and locally repairs safe,
+missing properties such as table-header scope. Trustworthy existing Alt,
+marked-content ActualText, and textual Captions are preserved or propagated.
+An otherwise valid single-column structure is rebuilt only when final-content
+provenance and geometry prove that its block order is inverted. Ambiguous and
+multi-column existing orders are preserved rather than guessed.
+For untagged digital PDFs it binds tags to final direct text, image, Form, and
+annotation operations, then infers headings, paragraphs, lists, conservative
+tables, figures, artifacts, links, forms, and reading order from styles and
+geometry. OCR-processed pages use the internal OCR engine's line MCIDs, text,
+confidence, geometry, language, and layout ordering. Mixed documents combine
+both evidence sources page by page.
+
+Strongly evidenced paragraph, list, and table continuations are joined across
+page breaks. A structure element that genuinely spans pages has no `/Pg` entry;
+its marked-content references and page-local descendants retain their exact
+page references.
+
+Automatic semantics remain an inference. Ambiguous layouts deliberately use
+conservative paragraph or division structure. An image or formula without a
+trustworthy existing Alt, ActualText, or Caption is left without an invented
+description and reported for manual review. Accessibility-critical output
+should therefore receive author review. Pages containing unclassified
+vector painting are also reported because a decorative rule cannot always be
+distinguished reliably from a meaningful vector diagram. PDF/A level A does
+not by itself imply PDF/UA conformance. OCR pages with a full-page scan are
+reported when the available OCR layout evidence cannot rule out an unrecognized
+photo or diagram. Link annotations that cannot be associated safely with
+content owned by one logical structure element are likewise retained and
+reported instead of reassigning heading or paragraph content speculatively.
+Form fields without a trustworthy tooltip or field name receive a generic
+structural tooltip and are reported for author review rather than receiving an
+invented accessible name.
 
 ### `convert_directory()`
 
@@ -370,7 +395,7 @@ the pages need OCR.
 
 | Field | Type | Description |
 |---|---|---|
-| `success` | `bool` | `True` if processing and output creation succeeded; does not imply successful PDF/A validation |
+| `success` | `bool` | `True` if processing reached a handled result; inspect `validation_failed` and `skipped` to determine whether a newly validated PDF/A candidate was published |
 | `input_path` | `Path` | Input file path |
 | `output_path` | `Path` | Output file path |
 | `level` | `str \| None` | Requested level for converted output, detected level for a compliant skip, or `None` when no PDF/A level was produced or detected, such as a protected input copied unchanged or `pdfa=False` output |
@@ -483,9 +508,30 @@ Notes:
 - If the metadata claim fails veraPDF validation, conversion is not skipped.
 - If veraPDF is unavailable, conversion is not skipped based only on metadata.
 - Skipped files return warning: `Conversion skipped: PDF already valid PDF/A (veraPDF compliant)`.
+- Level A targets (`1a`, `2a`, `3a`) never skip. Even an already compliant input
+  is reconverted so that its logical structure is produced by the semantic
+  tagger rather than trusted as authored.
 - Any requested OCR processing bypasses this document-level skip logic.
 - OCR does not bypass the signed-PDF protection; use
   `--allow-signature-invalidation` explicitly to convert signed inputs.
+
+## Structural Defects Fail the Conversion
+
+Repairs that cannot be made without changing how the document renders are
+reported as a conversion failure instead of being applied approximately. A
+`ConversionError` is raised when:
+
+- Optional content (layers) is malformed, cyclic, references unregistered
+  groups, or has a default configuration whose visibility cannot be normalized
+  to `/BaseState /ON` without changing which layers are visible.
+- The saved candidate fails post-save structure verification -- missing binary
+  comment, wrong `%PDF-` header version, no `%%EOF` marker, or a trailer `/ID`
+  that is not two non-empty byte strings.
+- Level A semantic tagging cannot bind tags to page content safely.
+
+Earlier releases logged a warning in these cases and continued with a
+best-effort result. Nothing is published on failure: an existing destination
+keeps its previous contents and a new destination stays absent.
 
 ## Validation
 
@@ -497,9 +543,10 @@ Install veraPDF separately and make its executable available on `PATH`, or set
 - API: pass `validate=True`
 
 Explicit validation is fail-closed: if veraPDF is missing or cannot complete,
-the Python APIs return a result with `validation_failed=True`. The CLI checks
-for veraPDF before conversion and exits with the validation-failure code if it
-is unavailable.
+the Python APIs return a result with `validation_failed=True`, do not publish
+the rejected candidate, and leave any pre-existing destination unchanged. The
+CLI checks for veraPDF before conversion and exits with the validation-failure
+code if it is unavailable.
 
 ## Environment Variables
 

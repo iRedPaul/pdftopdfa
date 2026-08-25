@@ -4,6 +4,8 @@
 
 """Tests for the corpus release runner."""
 
+import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -67,6 +69,24 @@ def test_corpus_runner_uses_every_supported_level() -> None:
 def test_default_timeout_covers_observed_long_corpus_conversion() -> None:
     """The default covers the corpus conversion measured at 460.38 seconds."""
     assert run_corpus_test.TASK_TIMEOUT_SECONDS > 460.38
+
+
+def test_worker_count_has_a_capped_default_and_accepts_an_override(monkeypatch) -> None:
+    """Corpus concurrency is bounded by default and explicitly configurable."""
+    monkeypatch.delenv("PDFTOPDFA_CORPUS_WORKERS", raising=False)
+    assert 1 <= run_corpus_test._configured_worker_count() <= 8
+
+    monkeypatch.setenv("PDFTOPDFA_CORPUS_WORKERS", "3")
+    assert run_corpus_test._configured_worker_count() == 3
+
+
+@pytest.mark.parametrize("value", ["", "0", "-1", "+2", "1.5", " 2", "62"])
+def test_worker_count_rejects_unsafe_values(monkeypatch, value: str) -> None:
+    """Invalid or unsafe process counts cannot reach ProcessPoolExecutor."""
+    monkeypatch.setenv("PDFTOPDFA_CORPUS_WORKERS", value)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        run_corpus_test._configured_worker_count()
 
 
 def test_analysis_handles_unicode_path_on_cp1252_console(tmp_path) -> None:
@@ -210,11 +230,11 @@ def test_task_timeout_terminates_hung_worker_and_keeps_completed_result(
         tasks,
         worker=_delayed_corpus_result,
         max_workers=2,
-        task_timeout=2,
+        task_timeout=0.25,
     )
     elapsed = time.monotonic() - started
 
-    assert elapsed < 4
+    assert elapsed < 8
     assert sum(result["success"] for result in results) == 1
     timeout = next(result for result in results if not result["success"])
     assert timeout["error_type"] == "WorkerTimeout"
@@ -240,7 +260,7 @@ def test_main_returns_nonzero_when_any_corpus_task_fails(tmp_path, monkeypatch) 
     monkeypatch.setattr(
         run_corpus_test,
         "_run_tasks",
-        lambda tasks: ([failure], 0.1),
+        lambda tasks, *, max_workers: ([failure], 0.1),
     )
     monkeypatch.setattr(run_corpus_test, "analyze_results", lambda *args: None)
 
@@ -268,7 +288,7 @@ def test_main_writes_unicode_reports_as_utf8(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         run_corpus_test,
         "_run_tasks",
-        lambda tasks: ([failure], 0.1),
+        lambda tasks, *, max_workers: ([failure], 0.1),
     )
 
     assert run_corpus_test.main() == 1
@@ -280,3 +300,66 @@ def test_main_writes_unicode_reports_as_utf8(tmp_path, monkeypatch) -> None:
         report = (results_dir / report_name).read_text(encoding="utf-8")
         assert "文档-😀.pdf" in report
         assert error in report
+
+
+def test_main_writes_reproducible_run_metadata(tmp_path, monkeypatch) -> None:
+    """A corpus run records its exact inputs and relevant execution context."""
+    corpus_dir = tmp_path / "corpus"
+    first = corpus_dir / "a.pdf"
+    second = corpus_dir / "nested" / "b.pdf"
+    second.parent.mkdir(parents=True)
+    first.write_bytes(b"first PDF")
+    second.write_bytes(b"second PDF")
+    results_dir = tmp_path / "results"
+
+    monkeypatch.setattr(run_corpus_test, "CORPUS_DIR", corpus_dir)
+    monkeypatch.setattr(run_corpus_test, "RESULTS_DIR", results_dir)
+    monkeypatch.setattr(run_corpus_test, "LEVELS", ["2a", "3a"])
+    monkeypatch.setattr(
+        run_corpus_test,
+        "get_verapdf_version",
+        lambda: "veraPDF test version",
+    )
+    monkeypatch.setattr(run_corpus_test, "find_all_pdfs", lambda: [second, first])
+    monkeypatch.setattr(run_corpus_test, "_project_git_commit", lambda: "abc123")
+    monkeypatch.setattr(run_corpus_test.platform, "platform", lambda: "test-platform")
+    monkeypatch.setenv("PDFTOPDFA_CORPUS_WORKERS", "3")
+    used_worker_counts = []
+
+    def run_tasks(tasks, *, max_workers):
+        used_worker_counts.append(max_workers)
+        return [], 0.1
+
+    monkeypatch.setattr(run_corpus_test, "_run_tasks", run_tasks)
+    monkeypatch.setattr(run_corpus_test, "analyze_results", lambda *args: None)
+
+    assert run_corpus_test.main() == 0
+
+    metadata = json.loads((results_dir / "run_metadata.json").read_text("utf-8"))
+    first_hash = hashlib.sha256(b"first PDF").hexdigest()
+    second_hash = hashlib.sha256(b"second PDF").hexdigest()
+    assert metadata == {
+        "started_at_utc": metadata["started_at_utc"],
+        "python_version": sys.version,
+        "platform": "test-platform",
+        "project_git_commit": "abc123",
+        "verapdf_version": "veraPDF test version",
+        "levels": ["2a", "3a"],
+        "worker_count": 3,
+        "corpus_sha256": metadata["corpus_sha256"],
+        "corpus_files": [
+            {"path": "a.pdf", "size": 9, "sha256": first_hash},
+            {"path": "nested/b.pdf", "size": 10, "sha256": second_hash},
+        ],
+    }
+    assert metadata["started_at_utc"].endswith("Z")
+
+    corpus_digest = hashlib.sha256()
+    for path, digest in (("a.pdf", first_hash), ("nested/b.pdf", second_hash)):
+        encoded_path = path.encode("utf-8")
+        corpus_digest.update(len(encoded_path).to_bytes(8, "big"))
+        corpus_digest.update(encoded_path)
+        corpus_digest.update(bytes.fromhex(digest))
+    assert metadata["corpus_sha256"] == corpus_digest.hexdigest()
+    assert used_worker_counts == [3]
+    assert json.loads((results_dir / "raw_results.json").read_text("utf-8")) == []

@@ -12,14 +12,19 @@ import csv
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
+import platform
+import queue
 import re
+import subprocess
 import sys
 import tempfile
 import time
 import warnings
 from collections import Counter, defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pikepdf
@@ -34,8 +39,101 @@ from pdftopdfa.verapdf import get_verapdf_version
 CORPUS_DIR = Path(__file__).parent / "veraPDF-corpus-staging"
 LEVELS = sorted(SUPPORTED_LEVELS)
 RESULTS_DIR = Path(__file__).parent / "corpus_test_results"
-MAX_WORKERS = os.cpu_count() or 4
+MAX_WORKERS = min(os.cpu_count() or 4, 8)
+MAX_CONFIGURED_WORKERS = 61
 TASK_TIMEOUT_SECONDS = 900
+WORKER_START_TIMEOUT_SECONDS = 120
+
+_worker_start_queue = None
+
+
+def _configured_worker_count():
+    """Return the validated corpus worker count for this run."""
+    value = os.environ.get("PDFTOPDFA_CORPUS_WORKERS")
+    if value is None:
+        return MAX_WORKERS
+    if not value or not value.isascii() or not value.isdecimal():
+        raise ValueError(
+            "PDFTOPDFA_CORPUS_WORKERS must be a positive integer no greater than "
+            f"{MAX_CONFIGURED_WORKERS}"
+        )
+    workers = int(value)
+    if not 1 <= workers <= MAX_CONFIGURED_WORKERS:
+        raise ValueError(
+            "PDFTOPDFA_CORPUS_WORKERS must be a positive integer no greater than "
+            f"{MAX_CONFIGURED_WORKERS}"
+        )
+    return workers
+
+
+def _project_git_commit():
+    """Return the current project commit when Git metadata is available."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    commit = result.stdout.strip()
+    return commit if result.returncode == 0 and commit else None
+
+
+def _corpus_fingerprint(pdfs):
+    """Return sorted per-file hashes and one deterministic corpus hash."""
+    records = []
+    corpus_digest = hashlib.sha256()
+    sorted_pdfs = sorted(
+        pdfs,
+        key=lambda path: path.relative_to(CORPUS_DIR).as_posix(),
+    )
+    for pdf_path in sorted_pdfs:
+        relative_path = pdf_path.relative_to(CORPUS_DIR).as_posix()
+        file_digest = hashlib.sha256()
+        with pdf_path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                file_digest.update(chunk)
+        digest = file_digest.hexdigest()
+        records.append(
+            {
+                "path": relative_path,
+                "size": pdf_path.stat().st_size,
+                "sha256": digest,
+            }
+        )
+        encoded_path = relative_path.encode("utf-8")
+        corpus_digest.update(len(encoded_path).to_bytes(8, "big"))
+        corpus_digest.update(encoded_path)
+        corpus_digest.update(file_digest.digest())
+    return records, corpus_digest.hexdigest()
+
+
+def _write_run_metadata(pdfs, verapdf_version, worker_count):
+    """Persist independently auditable metadata for one corpus run."""
+    started_at_utc = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    corpus_files, corpus_sha256 = _corpus_fingerprint(pdfs)
+    metadata = {
+        "started_at_utc": started_at_utc,
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "project_git_commit": _project_git_commit(),
+        "verapdf_version": verapdf_version,
+        "levels": list(LEVELS),
+        "worker_count": worker_count,
+        "corpus_sha256": corpus_sha256,
+        "corpus_files": corpus_files,
+    }
+    metadata_path = RESULTS_DIR / "run_metadata.json"
+    with open(metadata_path, "w", encoding="utf-8") as metadata_file:
+        json.dump(metadata, metadata_file, ensure_ascii=False, indent=2)
+    return metadata_path
 
 
 def _configure_console_output():
@@ -257,13 +355,23 @@ class _CapturedPdftopdfaLogHandler(logging.Handler):
         self.messages.append(f"{record.levelname}: {message}")
 
 
-def _init_worker():
+def _init_worker(start_queue=None):
     """Initialize subprocess: suppress pikepdf warnings for malformed streams."""
+    global _worker_start_queue
+
+    _worker_start_queue = start_queue
     warnings.filterwarnings(
         "ignore",
         message="Unexpected end of stream",
         module="pikepdf",
     )
+
+
+def _run_notified_worker(worker, token, task):
+    """Report when execution starts so process startup does not consume task time."""
+    if _worker_start_queue is not None:
+        _worker_start_queue.put((token, time.monotonic()))
+    return worker(task)
 
 
 def convert_single(args):
@@ -390,32 +498,70 @@ def _run_tasks(
     """Run a bounded task set and replace a pool when one worker times out."""
     queued = deque(tasks)
     pending = {}
+    pending_by_token = {}
     results = []
     total = len(tasks)
     started = time.monotonic()
-    executor = ProcessPoolExecutor(
-        max_workers=max_workers,
-        initializer=_init_worker,
-    )
+    next_token = 0
+    process_context = multiprocessing.get_context()
+
+    def new_executor():
+        start_queue = process_context.Queue()
+        executor = ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_init_worker,
+            initargs=(start_queue,),
+            mp_context=process_context,
+        )
+        return executor, start_queue
+
+    def record_worker_starts():
+        while True:
+            try:
+                token, task_started = start_queue.get_nowait()
+            except queue.Empty:
+                return
+            future = pending_by_token.get(token)
+            if future in pending:
+                pending[future]["started"] = task_started
+
+    executor, start_queue = new_executor()
 
     try:
         while queued or pending:
             while queued and len(pending) < max_workers:
                 task = queued.popleft()
-                future = executor.submit(worker, task)
-                pending[future] = (task, time.monotonic())
+                token = next_token
+                next_token += 1
+                future = executor.submit(_run_notified_worker, worker, token, task)
+                pending[future] = {
+                    "task": task,
+                    "submitted": time.monotonic(),
+                    "started": None,
+                    "token": token,
+                }
+                pending_by_token[token] = future
+
+            record_worker_starts()
 
             next_deadline = min(
-                task_started + task_timeout for _, task_started in pending.values()
+                (
+                    state["started"] + task_timeout
+                    if state["started"] is not None
+                    else state["submitted"] + WORKER_START_TIMEOUT_SECONDS
+                )
+                for state in pending.values()
             )
             done, _ = wait(
                 pending,
-                timeout=max(0.0, next_deadline - time.monotonic()),
+                timeout=min(0.1, max(0.0, next_deadline - time.monotonic())),
                 return_when=FIRST_COMPLETED,
             )
 
             for future in done:
-                task, _ = pending.pop(future)
+                state = pending.pop(future)
+                pending_by_token.pop(state["token"], None)
+                task = state["task"]
                 try:
                     results.append(future.result())
                 except Exception as exc:
@@ -427,37 +573,56 @@ def _run_tasks(
                         )
                     )
 
+            record_worker_starts()
+
             now = time.monotonic()
             expired = [
                 future
-                for future, (_, task_started) in pending.items()
-                if now - task_started >= task_timeout
+                for future, state in pending.items()
+                if now
+                >= (
+                    state["started"] + task_timeout
+                    if state["started"] is not None
+                    else state["submitted"] + WORKER_START_TIMEOUT_SECONDS
+                )
             ]
             if expired:
                 expired_set = set(expired)
                 retry = [
-                    task
-                    for future, (task, _) in pending.items()
+                    state["task"]
+                    for future, state in pending.items()
                     if future not in expired_set
                 ]
                 for future in expired:
-                    task, _ = pending[future]
+                    state = pending[future]
+                    task = state["task"]
+                    task_started = state["started"]
+                    if task_started is None:
+                        message = (
+                            "Worker did not start within "
+                            f"{WORKER_START_TIMEOUT_SECONDS:g} seconds"
+                        )
+                        error_type = "WorkerStartupTimeout"
+                    else:
+                        message = f"Worker timeout after {task_timeout:g} seconds"
+                        error_type = "WorkerTimeout"
                     results.append(
                         _worker_failure_result(
                             task,
-                            f"Worker timeout after {task_timeout:g} seconds",
-                            "WorkerTimeout",
+                            message,
+                            error_type,
                         )
                     )
                 pending.clear()
+                pending_by_token.clear()
                 _terminate_executor(executor)
                 executor = None
+                start_queue.close()
+                start_queue.join_thread()
+                start_queue = None
                 queued.extendleft(reversed(retry))
                 if queued:
-                    executor = ProcessPoolExecutor(
-                        max_workers=max_workers,
-                        initializer=_init_worker,
-                    )
+                    executor, start_queue = new_executor()
 
             completed = len(results)
             if completed and (completed % 200 == 0 or completed == total):
@@ -475,6 +640,9 @@ def _run_tasks(
     finally:
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
+        if start_queue is not None:
+            start_queue.close()
+            start_queue.join_thread()
 
     return results, time.monotonic() - started
 
@@ -501,6 +669,12 @@ def main():
         module="pikepdf",
     )
 
+    try:
+        worker_count = _configured_worker_count()
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     verapdf_version = get_verapdf_version()
     if verapdf_version is None:
         print(
@@ -517,22 +691,25 @@ def main():
         print("No PDFs found!")
         return 1
 
+    try:
+        metadata_file = _write_run_metadata(pdfs, verapdf_version, worker_count)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: Could not record corpus run metadata: {exc}", file=sys.stderr)
+        return 1
+    print(f"Run metadata saved to: {metadata_file}")
+
     total_tasks = len(pdfs) * len(LEVELS)
     print(
         f"Running {total_tasks} conversions ({len(pdfs)} PDFs × {len(LEVELS)} levels)"
     )
-    print(f"Using {MAX_WORKERS} workers")
+    print(f"Using {worker_count} workers")
     print()
 
     # Use a temporary directory for outputs
     with tempfile.TemporaryDirectory(prefix="pdftopdfa_test_") as tmpdir:
-        # Build task list
-        tasks = []
-        for pdf_path in pdfs:
-            for level in LEVELS:
-                tasks.append((pdf_path, level, tmpdir))
+        tasks = [(pdf_path, level, tmpdir) for pdf_path in pdfs for level in LEVELS]
 
-        all_results, total_time = _run_tasks(tasks)
+        all_results, total_time = _run_tasks(tasks, max_workers=worker_count)
 
     # Save raw results as JSON
     results_file = RESULTS_DIR / "raw_results.json"

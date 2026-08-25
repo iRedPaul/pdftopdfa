@@ -28,6 +28,9 @@ Rule 6.10 forbids /PresSteps entries in Page dictionaries.
 
 ISO 19005-2, clause 6.7.4 defines the /Lang key in the Document
 Catalog for accessibility and structural compliance.
+
+Level A output also enables /ViewerPreferences /DisplayDocTitle so PDF
+viewers present the document title instead of only the file name.
 """
 
 import logging
@@ -163,6 +166,12 @@ def remove_forbidden_viewer_preferences(pdf: Pdf) -> int:
     if vp is None:
         return 0
 
+    vp = _resolve_indirect(vp)
+    if not isinstance(vp, Dictionary):
+        del pdf.Root["/ViewerPreferences"]
+        logger.info("Malformed /ViewerPreferences entry removed")
+        return 1
+
     removed_count = 0
     for key in FORBIDDEN_VIEWER_PREF_KEYS:
         if key in vp:
@@ -182,6 +191,37 @@ def remove_forbidden_viewer_preferences(pdf: Pdf) -> int:
         logger.debug("Empty /ViewerPreferences dictionary removed")
 
     return removed_count
+
+
+def ensure_display_doc_title(pdf: Pdf, level: str = "3b") -> bool:
+    """Enable document-title display for semantic Level A output.
+
+    Existing valid ViewerPreferences entries are preserved. A malformed
+    dictionary, or a malformed/false /DisplayDocTitle value, is repaired only
+    for Level A; other conformance levels are left unchanged.
+
+    Args:
+        pdf: Opened pikepdf PDF object (modified in place).
+        level: Target PDF/A conformance level.
+
+    Returns:
+        True if /ViewerPreferences or /DisplayDocTitle was changed, otherwise
+        False.
+    """
+    if not level.lower().endswith("a"):
+        return False
+
+    viewer_preferences = _resolve_indirect(pdf.Root.get("/ViewerPreferences"))
+    if not isinstance(viewer_preferences, Dictionary):
+        viewer_preferences = Dictionary()
+        pdf.Root["/ViewerPreferences"] = viewer_preferences
+
+    if viewer_preferences.get("/DisplayDocTitle") is True:
+        return False
+
+    viewer_preferences["/DisplayDocTitle"] = True
+    logger.info("Enabled /ViewerPreferences /DisplayDocTitle for Level A output")
+    return True
 
 
 def _sanitize_catalog_perms(pdf: Pdf) -> tuple[int, bool]:

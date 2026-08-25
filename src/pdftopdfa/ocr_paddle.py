@@ -40,7 +40,13 @@ from ._ocr_runtime import (
     validate_ocr_execution_provider,
 )
 from .exceptions import OCRError
-from .ocr import PADDLE_OCR_LANGUAGES
+from .ocr import (
+    _OCR_MANIFEST_SCHEMA_VERSION,
+    _OCR_PAGE_MANIFEST_TYPE,
+    PADDLE_OCR_LANGUAGES,
+    _validate_ocr_page_manifest,
+    _write_json_atomic,
+)
 
 if TYPE_CHECKING:
     import pluggy
@@ -71,10 +77,10 @@ _RECOGNITION_MODEL = _ModelSpec(name="PP-OCRv6_medium_rec")
 
 @dataclass(frozen=True)
 class _LayoutRegion:
-    left: int
-    top: int
-    right: int
-    bottom: int
+    left: float
+    top: float
+    right: float
+    bottom: float
 
 
 class _PaddleOptions(BaseModel):
@@ -84,6 +90,7 @@ class _PaddleOptions(BaseModel):
     recognition_model_dir: Path | None = None
     execution_provider: str = "cpu"
     layout: bool = False
+    manifest_dir: Path | None = None
 
 
 class _TesseractCompatibilityOptions(BaseModel):
@@ -870,6 +877,16 @@ def _confidence(value: Any) -> float | None:
     return confidence
 
 
+def _text_direction(text: str) -> str:
+    for character in text:
+        bidi_class = unicodedata.bidirectional(character)
+        if bidi_class in {"R", "AL"}:
+            return "rtl"
+        if bidi_class == "L":
+            return "ltr"
+    return "ltr"
+
+
 def _fallback_word(
     text: str,
     polygon: list[tuple[float, float]],
@@ -883,7 +900,7 @@ def _fallback_word(
         poly=polygon,
         text=text,
         confidence=confidence,
-        direction="ltr",
+        direction=_text_direction(text),
         language=language,
     )
 
@@ -1285,50 +1302,47 @@ def _result_text_region_sections(
 ) -> list[list[_LayoutRegion]]:
     texts, _scores, polygons, _boxes = _parallel_line_data(result)
     word_data = _optional_word_data(result, len(texts))
-    if word_data is not None:
-        _word_texts, word_regions = word_data
-        lines = []
-        for polygon, line_regions in zip(polygons, word_regions, strict=True):
-            line_region = _region_from_geometry(polygon, width, height)
-            try:
-                values = list(line_regions)
-            except TypeError:
-                continue
-            regions = []
-            for value in values:
-                region = _region_from_geometry(value, width, height)
-                if region is not None:
-                    regions.append(region)
-            if line_region is not None and regions:
-                lines.append((line_region, regions))
-        if lines:
-            sections: list[list[_LayoutRegion]] = [[]]
-            for line_region, regions in sorted(
-                lines,
-                key=lambda item: (
-                    item[0].top,
-                    item[0].left,
-                    item[0].bottom,
-                    item[0].right,
-                ),
+    word_regions = word_data[1] if word_data is not None else [()] * len(texts)
+    lines = []
+    fallback_regions = []
+    for polygon, line_regions in zip(polygons, word_regions, strict=True):
+        line_region = _region_from_geometry(polygon, width, height)
+        if line_region is None:
+            continue
+        fallback_regions.append(line_region)
+        try:
+            values = list(line_regions)
+        except TypeError:
+            values = []
+        regions = []
+        for value in values:
+            region = _region_from_geometry(value, width, height)
+            if region is not None:
+                regions.append(region)
+        lines.append((line_region, regions or [line_region]))
+    if lines:
+        sections: list[list[_LayoutRegion]] = [[]]
+        for line_region, regions in sorted(
+            lines,
+            key=lambda item: (
+                item[0].top,
+                item[0].left,
+                item[0].bottom,
+                item[0].right,
+            ),
+        ):
+            if (
+                line_region.right - line_region.left
+                >= width * _SPANNING_LINE_WIDTH_RATIO
             ):
-                if (
-                    line_region.right - line_region.left
-                    >= width * _SPANNING_LINE_WIDTH_RATIO
-                ):
-                    if sections[-1]:
-                        sections.append([])
-                    continue
-                sections[-1].extend(regions)
-            if any(sections):
-                return [section for section in sections if section]
+                if sections[-1]:
+                    sections.append([])
+                continue
+            sections[-1].extend(regions)
+        if any(sections):
+            return [section for section in sections if section]
 
-    regions = []
-    for value in polygons:
-        region = _region_from_geometry(value, width, height)
-        if region is not None:
-            regions.append(region)
-    return [regions]
+    return [fallback_regions]
 
 
 def _column_regions(
@@ -1340,7 +1354,7 @@ def _column_regions(
         return [_LayoutRegion(0, 0, width, height)]
 
     intervals = sorted((region.left, region.right) for region in content_regions)
-    merged: list[list[int]] = []
+    merged: list[list[float]] = []
     for left, right in intervals:
         if merged and left <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], right)
@@ -1418,6 +1432,49 @@ def _line_column_index(
     )
 
 
+def _line_spans_columns(
+    line: OcrElement,
+    columns: list[_LayoutRegion],
+) -> bool:
+    if line.bbox is None:
+        return False
+    for left_column, right_column in zip(columns, columns[1:]):
+        boundary = left_column.right
+        minimum_overlap = (
+            min(
+                left_column.right - left_column.left,
+                right_column.right - right_column.left,
+            )
+            * 0.1
+        )
+        if (
+            line.bbox.left <= boundary - minimum_overlap
+            and line.bbox.right >= boundary + minimum_overlap
+        ):
+            return True
+    return False
+
+
+def _section_has_unambiguous_rtl_text(
+    lines: list[OcrElement],
+    columns: list[_LayoutRegion],
+) -> bool:
+    has_ltr = False
+    has_rtl = False
+    for line in lines:
+        if line.bbox is None or _line_spans_columns(line, columns):
+            continue
+        for character in line.text:
+            bidi_class = unicodedata.bidirectional(character)
+            if bidi_class in {"R", "AL"}:
+                has_rtl = True
+            elif bidi_class == "L":
+                has_ltr = True
+            if has_ltr and has_rtl:
+                return False
+    return has_rtl
+
+
 def _sort_lines(
     lines: list[OcrElement],
     columns: list[_LayoutRegion],
@@ -1428,28 +1485,15 @@ def _sort_lines(
             line.bbox.left if line.bbox is not None else math.inf,
         )
 
-    def sort_key(line: OcrElement) -> tuple[float, float, float]:
-        return (_line_column_index(line, columns), *position_key(line))
+    rtl_columns = _section_has_unambiguous_rtl_text(lines, columns)
 
-    spanning_lines = []
-    for line in lines:
-        if line.bbox is None:
-            continue
-        for left_column, right_column in zip(columns, columns[1:]):
-            boundary = left_column.right
-            minimum_overlap = (
-                min(
-                    left_column.right - left_column.left,
-                    right_column.right - right_column.left,
-                )
-                * 0.1
-            )
-            if (
-                line.bbox.left <= boundary - minimum_overlap
-                and line.bbox.right >= boundary + minimum_overlap
-            ):
-                spanning_lines.append(line)
-                break
+    def sort_key(line: OcrElement) -> tuple[float, float, float]:
+        column_index = _line_column_index(line, columns)
+        if rtl_columns:
+            column_index = len(columns) - column_index - 1
+        return (column_index, *position_key(line))
+
+    spanning_lines = [line for line in lines if _line_spans_columns(line, columns)]
 
     spanning_lines.sort(key=position_key)
     if not spanning_lines:
@@ -1470,6 +1514,140 @@ def _sort_lines(
         ordered.append(spanning_line)
     ordered.extend(sorted(remaining, key=sort_key))
     return ordered
+
+
+def _sort_lines_by_sections(
+    lines: list[OcrElement],
+    sections: list[tuple[list[_LayoutRegion], list[_LayoutRegion]]],
+    fallback_columns: list[_LayoutRegion],
+) -> list[OcrElement]:
+    bounds: list[tuple[float, float] | None] = []
+    for regions, _columns in sections:
+        if regions:
+            bounds.append(
+                (
+                    min(region.top for region in regions),
+                    max(region.bottom for region in regions),
+                )
+            )
+        else:
+            bounds.append(None)
+    if not any(bound is not None for bound in bounds):
+        return _sort_lines(lines, fallback_columns)
+
+    section_lines: list[list[OcrElement]] = [[] for _section in sections]
+    unassigned: list[tuple[int, OcrElement]] = []
+    for line_index, line in enumerate(lines):
+        if line.bbox is None:
+            unassigned.append((line_index, line))
+            continue
+        center = (line.bbox.top + line.bbox.bottom) / 2
+        candidates = []
+        for section_index, bound in enumerate(bounds):
+            if bound is None:
+                continue
+            top, bottom = bound
+            overlap = min(line.bbox.bottom, bottom) - max(line.bbox.top, top)
+            if overlap > 0 or top <= center <= bottom:
+                candidates.append(
+                    (
+                        -max(0.0, overlap),
+                        abs(center - (top + bottom) / 2),
+                        section_index,
+                    )
+                )
+        if candidates:
+            section_lines[min(candidates)[2]].append(line)
+        else:
+            unassigned.append((line_index, line))
+
+    events: list[tuple[tuple[float, float, int, int], list[OcrElement]]] = []
+    source_indexes = {id(line): index for index, line in enumerate(lines)}
+    for (_, columns), assigned in zip(sections, section_lines, strict=True):
+        if not assigned:
+            continue
+        ordered = _sort_lines(assigned, columns)
+        positions = [line.bbox for line in assigned if line.bbox is not None]
+        top = min(position.top for position in positions)
+        left = min(position.left for position in positions)
+        first_index = min(source_indexes[id(line)] for line in assigned)
+        events.append(((top, left, 1, first_index), ordered))
+
+    for line_index, line in unassigned:
+        top = line.bbox.top if line.bbox is not None else math.inf
+        left = line.bbox.left if line.bbox is not None else math.inf
+        events.append(((top, left, 0, line_index), [line]))
+
+    return [line for _key, group in sorted(events) for line in group]
+
+
+def _manifest_bbox(value: BoundingBox | _LayoutRegion) -> dict[str, float]:
+    return {
+        "left": float(value.left),
+        "top": float(value.top),
+        "right": float(value.right),
+        "bottom": float(value.bottom),
+    }
+
+
+def _manifest_region(
+    region: _LayoutRegion,
+    scale: float,
+) -> dict[str, float]:
+    return {
+        "left": float(region.left * scale),
+        "top": float(region.top * scale),
+        "right": float(region.right * scale),
+        "bottom": float(region.bottom * scale),
+    }
+
+
+def _manifest_element(
+    element: OcrElement,
+    *,
+    index: int,
+    mcid: int | None = None,
+) -> dict[str, Any]:
+    baseline = (
+        {
+            "slope": float(element.baseline.slope),
+            "intercept": float(element.baseline.intercept),
+        }
+        if element.baseline is not None
+        else None
+    )
+    value: dict[str, Any] = {
+        "ocr_class": str(element.ocr_class),
+        "text": element.text,
+        "confidence": (
+            float(element.confidence) if element.confidence is not None else None
+        ),
+        "bbox": _manifest_bbox(element.bbox) if element.bbox is not None else None,
+        "polygon": (
+            [[float(x), float(y)] for x, y in element.poly]
+            if element.poly is not None
+            else None
+        ),
+        "language": element.language,
+        "direction": element.direction,
+        "baseline": baseline,
+        "text_angle": (
+            float(element.textangle) if element.textangle is not None else None
+        ),
+    }
+    if mcid is None:
+        value["index"] = index
+    else:
+        value["mcid"] = mcid
+        value["words"] = [
+            _manifest_element(word, index=word_index)
+            for word_index, word in enumerate(
+                word
+                for word in element.children
+                if word.ocr_class == OcrClass.WORD and word.text
+            )
+        ]
+    return value
 
 
 def _image_properties(input_file: Path) -> tuple[int, int, float]:
@@ -1580,7 +1758,7 @@ def _lines_from_result(
                 text=text,
                 confidence=confidence,
                 children=words,
-                direction="ltr",
+                direction=_text_direction(text),
                 language=language,
                 baseline=baseline,
                 textangle=textangle,
@@ -1669,6 +1847,8 @@ class PaddleOcrEngine(OcrEngine):
         coordinate_dpi, scale = _take_coordinate_scale(input_file, raster_dpi)
         language = _language_metadata(options)
         layout = bool(getattr(options.paddle, "layout", False))
+        manifest_dir = getattr(options.paddle, "manifest_dir", None)
+        level_a = manifest_dir is not None
         result = _predict(input_file, options, latin_only=_latin_only(options))
         lines = _lines_from_result(
             result,
@@ -1677,8 +1857,9 @@ class PaddleOcrEngine(OcrEngine):
             scale,
             language,
         )
-        if layout:
-            columns = [_LayoutRegion(0, 0, width, height)]
+        columns = [_LayoutRegion(0, 0, width, height)]
+        sections: list[tuple[list[_LayoutRegion], list[_LayoutRegion]]] = []
+        if layout or level_a:
             largest_section = 0
             for content_regions in _result_text_region_sections(
                 result,
@@ -1686,19 +1867,59 @@ class PaddleOcrEngine(OcrEngine):
                 height,
             ):
                 candidate = _column_regions(content_regions, width, height)
+                sections.append((content_regions, candidate))
                 if len(candidate) > 1 and len(content_regions) > largest_section:
                     columns = candidate
                     largest_section = len(content_regions)
             scaled_columns = [
                 _LayoutRegion(
-                    round(column.left * scale),
-                    round(column.top * scale),
-                    round(column.right * scale),
-                    round(column.bottom * scale),
+                    column.left * scale,
+                    column.top * scale,
+                    column.right * scale,
+                    column.bottom * scale,
                 )
                 for column in columns
             ]
-            lines = _sort_lines(lines, scaled_columns)
+            scaled_sections = [
+                (
+                    [
+                        _LayoutRegion(
+                            region.left * scale,
+                            region.top * scale,
+                            region.right * scale,
+                            region.bottom * scale,
+                        )
+                        for region in content_regions
+                    ],
+                    [
+                        _LayoutRegion(
+                            column.left * scale,
+                            column.top * scale,
+                            column.right * scale,
+                            column.bottom * scale,
+                        )
+                        for column in section_columns
+                    ],
+                )
+                for content_regions, section_columns in sections
+            ]
+            lines = _sort_lines_by_sections(
+                lines,
+                scaled_sections,
+                scaled_columns,
+            )
+
+        if level_a:
+            if (
+                isinstance(page_number, bool)
+                or not isinstance(page_number, int)
+                or page_number < 0
+            ):
+                raise OCRError(
+                    "OCR manifest page number must be a non-negative integer"
+                )
+            for mcid, line in enumerate(lines):
+                line._pdftopdfa_mcid = mcid
 
         page = OcrElement(
             ocr_class=OcrClass.PAGE,
@@ -1709,11 +1930,64 @@ class PaddleOcrEngine(OcrEngine):
                 bottom=height * scale,
             ),
             children=lines,
-            direction="ltr",
+            direction=_text_direction(" ".join(line.text for line in lines)),
             language=language,
             dpi=coordinate_dpi,
             page_number=page_number,
         )
+        if level_a:
+            page_manifest = {
+                "schema_version": _OCR_MANIFEST_SCHEMA_VERSION,
+                "type": _OCR_PAGE_MANIFEST_TYPE,
+                "page_index": page_number,
+                "raster": {
+                    "width": width,
+                    "height": height,
+                    "dpi": raster_dpi,
+                },
+                "coordinates": {
+                    "width": float(width * scale),
+                    "height": float(height * scale),
+                    "dpi": coordinate_dpi,
+                    "scale_from_raster": scale,
+                },
+                "languages": list(options.languages),
+                "layout": {
+                    "reading_order_applied": True,
+                    "sections": [
+                        {
+                            "regions": [
+                                _manifest_region(region, scale) for region in regions
+                            ],
+                            "columns": [
+                                _manifest_region(column, scale)
+                                for column in section_columns
+                            ],
+                        }
+                        for regions, section_columns in sections
+                    ],
+                    "selected_columns": [
+                        _manifest_region(column, scale) for column in columns
+                    ],
+                },
+                "lines": [
+                    _manifest_element(line, index=mcid, mcid=mcid)
+                    for mcid, line in enumerate(lines)
+                ],
+            }
+            _validate_ocr_page_manifest(
+                page_manifest,
+                f"page {page_number}",
+            )
+            try:
+                _write_json_atomic(
+                    Path(manifest_dir) / f"page-{page_number:06d}.json",
+                    page_manifest,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                raise OCRError(
+                    f"Could not write OCR manifest page {page_number}: {exc}"
+                ) from exc
         return page, "\n".join(line.text for line in lines)
 
     @staticmethod
@@ -1789,6 +2063,11 @@ def add_options(parser: Any) -> None:
     parser.add_argument(
         "--paddle-layout",
         action="store_true",
+        help=SUPPRESS,
+    )
+    parser.add_argument(
+        "--paddle-manifest-dir",
+        type=Path,
         help=SUPPRESS,
     )
 

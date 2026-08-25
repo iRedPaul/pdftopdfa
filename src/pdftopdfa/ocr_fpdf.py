@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from collections.abc import Iterator
@@ -24,6 +25,8 @@ from ocrmypdf.fpdf_renderer.renderer import (
 )
 from ocrmypdf.models.ocr_element import OcrClass, OcrElement
 from pikepdf import Matrix
+
+logger = logging.getLogger(__name__)
 
 _renderer_lock = threading.RLock()
 
@@ -70,6 +73,31 @@ class PolygonFpdf2PdfRenderer(_Fpdf2PdfRenderer):
     """Render valid line and word polygons without reducing them to page AABBs."""
 
     def _render_line(self, pdf: FPDF, line: OcrElement) -> None:
+        previous_mcid = getattr(self, "_pdftopdfa_mcid", None)
+        previous_emitted = getattr(self, "_pdftopdfa_emitted", False)
+        mcid = getattr(line, "_pdftopdfa_mcid", None)
+        self._pdftopdfa_mcid = (
+            mcid
+            if isinstance(mcid, int) and not isinstance(mcid, bool) and mcid >= 0
+            else None
+        )
+        self._pdftopdfa_emitted = False
+        try:
+            self._render_polygon_line(pdf, line)
+            # Every suppression path returns without emitting text, so the
+            # manifest line has no marked content to bind to. Report it here;
+            # the document manifest drops the line during reconciliation.
+            if self._pdftopdfa_mcid is not None and not self._pdftopdfa_emitted:
+                logger.warning(
+                    "OCR line with MCID %d was suppressed by the renderer: %r",
+                    self._pdftopdfa_mcid,
+                    line.text,
+                )
+        finally:
+            self._pdftopdfa_mcid = previous_mcid
+            self._pdftopdfa_emitted = previous_emitted
+
+    def _render_polygon_line(self, pdf: FPDF, line: OcrElement) -> None:
         line_polygon = _valid_polygon(line.poly)
         try:
             textangle = float(line.textangle or 0.0)
@@ -244,6 +272,38 @@ class PolygonFpdf2PdfRenderer(_Fpdf2PdfRenderer):
             font_size,
             -textangle + slope_angle,
         )
+
+    def _emit_line_bt_block(
+        self,
+        pdf: FPDF,
+        word_render_data: list[WordRenderData],
+        baseline_matrix: Matrix,
+        font_size: float,
+        total_rotation_deg: float,
+    ) -> None:
+        self._pdftopdfa_emitted = True
+        mcid = getattr(self, "_pdftopdfa_mcid", None)
+        if mcid is None:
+            super()._emit_line_bt_block(
+                pdf,
+                word_render_data,
+                baseline_matrix,
+                font_size,
+                total_rotation_deg,
+            )
+            return
+
+        pdf._out(f"/Span <</MCID {mcid}>> BDC")
+        try:
+            super()._emit_line_bt_block(
+                pdf,
+                word_render_data,
+                baseline_matrix,
+                font_size,
+                total_rotation_deg,
+            )
+        finally:
+            pdf._out("EMC")
 
 
 @contextmanager

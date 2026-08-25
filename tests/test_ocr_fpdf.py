@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from pathlib import Path
+from unittest.mock import patch
 
 import ocrmypdf
 import ocrmypdf.fpdf_renderer as fpdf_renderer
@@ -22,7 +24,7 @@ from ocrmypdf.models.ocr_element import (
 )
 from pdfminer.high_level import extract_text
 
-from pdftopdfa.ocr_fpdf import install_fpdf_renderer
+from pdftopdfa.ocr_fpdf import PolygonFpdf2PdfRenderer, install_fpdf_renderer
 
 
 def _ocr_page(
@@ -96,6 +98,74 @@ def test_renderer_installation_is_scoped() -> None:
         with install_fpdf_renderer():
             raise RuntimeError("test")
     assert fpdf_renderer.Fpdf2PdfRenderer is original_renderer
+
+
+def test_renderer_wraps_only_emitted_level_a_lines(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    polygon = [(20, 20), (120, 20), (120, 60), (20, 60)]
+    page = _ocr_page(
+        polygon,
+        BoundingBox(left=20, top=20, right=120, bottom=60),
+        page_bbox=BoundingBox(left=0, top=0, right=200, bottom=100),
+        text="Tagged",
+        textangle=0,
+        baseline=Baseline(slope=0, intercept=0),
+        dpi=300,
+    )
+    page.children[0]._pdftopdfa_mcid = 7
+    tagged_output = tmp_path / "tagged.pdf"
+    discarded_output = tmp_path / "discarded.pdf"
+
+    _render(page, 300, tagged_output)
+    with (
+        caplog.at_level(logging.WARNING, logger="pdftopdfa.ocr_fpdf"),
+        patch.object(
+            PolygonFpdf2PdfRenderer,
+            "_check_aspect_ratio_plausible",
+            return_value=False,
+        ),
+    ):
+        _render(page, 300, discarded_output)
+
+    assert "OCR line with MCID 7 was suppressed by the renderer" in caplog.text
+
+    with (
+        pikepdf.Pdf.open(tagged_output) as tagged_pdf,
+        pikepdf.Pdf.open(discarded_output) as discarded_pdf,
+    ):
+        tagged_stream = tagged_pdf.pages[0].Contents.read_bytes()
+        discarded_stream = discarded_pdf.pages[0].Contents.read_bytes()
+
+    marker = b"/Span <</MCID 7>> BDC"
+    assert tagged_stream.count(marker) == 1
+    assert tagged_stream.index(marker) < tagged_stream.index(b"BT")
+    assert tagged_stream.index(b"ET") < tagged_stream.index(b"EMC")
+    assert b"MCID" not in discarded_stream
+    assert b"BDC" not in discarded_stream
+    assert b"EMC" not in discarded_stream
+
+
+def test_renderer_does_not_mark_normal_ocr_lines(tmp_path: Path) -> None:
+    page = _ocr_page(
+        [(20, 20), (120, 20), (120, 60), (20, 60)],
+        BoundingBox(left=20, top=20, right=120, bottom=60),
+        page_bbox=BoundingBox(left=0, top=0, right=200, bottom=100),
+        text="Normal",
+        textangle=0,
+        baseline=Baseline(slope=0, intercept=0),
+        dpi=300,
+    )
+    output = tmp_path / "normal.pdf"
+
+    _render(page, 300, output)
+
+    with pikepdf.Pdf.open(output) as document:
+        stream = document.pages[0].Contents.read_bytes()
+    assert b"MCID" not in stream
+    assert b"BDC" not in stream
+    assert b"EMC" not in stream
 
 
 def test_renderer_uses_polygon_rotation_and_height(tmp_path: Path) -> None:

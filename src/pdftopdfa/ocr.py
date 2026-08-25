@@ -10,15 +10,17 @@ in image-based PDFs (scanned documents).
 
 import copy
 import gc
+import json
 import logging
 import math
+import os
 import shutil
 import threading
 import time
 from dataclasses import dataclass, field
 from numbers import Number
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import SpooledTemporaryFile, TemporaryDirectory, mkstemp
 from typing import TYPE_CHECKING, Any
 
 # Optional import of ocrmypdf
@@ -50,8 +52,19 @@ if TYPE_CHECKING:
 
 # Local
 from ._ocr_runtime import execution_provider_base, onnxruntime_engine_config
-from .exceptions import OCRError
-from .orientation import _effective_page_rotate, normalize_pdf_orientation
+from .exceptions import ConversionError, OCRError
+from .orientation import (
+    ORIENTATION_RENDER_SCALE,
+    _effective_page_rotate,
+    normalize_pdf_orientation,
+)
+from .staging import (
+    StagedFileSnapshot,
+    private_staging_directory,
+    publish_staged_file,
+    rollback_staged_publication,
+    staged_file_snapshot,
+)
 from .utils import log_suppressed_error
 
 logger = logging.getLogger(__name__)
@@ -60,6 +73,18 @@ _PADDLE_OCR_PLUGIN = "pdftopdfa.ocr_paddle"
 _ROTATION_FIX_PLUGIN = "pdftopdfa.ocr_rotation_fix"
 _SCAN_IMAGE_AREA_RATIO = 0.8
 _FULL_PAGE_IMAGE_AREA_RATIO = 1.0
+_OCR_MANIFEST_SCHEMA_VERSION = 1
+_OCR_PAGE_MANIFEST_TYPE = "pdftopdfa-ocr-page"
+_OCR_DOCUMENT_MANIFEST_TYPE = "pdftopdfa-ocr-document"
+_OCR_RASTER_DPI = 600
+# Keeps one grayscale raster near 100 MB while still admitting A3 at 600 dpi.
+_OCR_MAX_PAGE_RASTER_PIXELS = 100_000_000
+# Bound aggregate raster work from small PDFs with arbitrarily many pages.
+_OCR_MAX_DOCUMENT_RASTER_PIXELS = 1_000_000_000
+# Bound non-raster page inspection and planning work as well.
+_OCR_MAX_DOCUMENT_PAGES = 10_000
+_OCR_MANIFEST_GEOMETRY_TOLERANCE = 1e-6
+_MAX_PDF_USER_UNIT = 75_000.0
 _ObjectKey = tuple[int, int] | tuple[str, bytes]
 _PADDLE_LANGUAGE_TAGS = {
     "ch": "zh-Hans",
@@ -321,7 +346,9 @@ class _ContentAnalysisFrame:
 class _DeskewPlan:
     deskew_pages: tuple[int, ...]
     regular_ocr_pages: tuple[int, ...]
+    redo_ocr_pages: tuple[int, ...]
     strip_text_pages: tuple[int, ...]
+    ambiguous_scan_pages: tuple[int, ...]
 
 
 def _object_key(value: "pikepdf.Object") -> _ObjectKey:
@@ -351,9 +378,9 @@ def _matrix_from_operands(operands: object) -> "pikepdf.Matrix":
 
 def _rect_coverage(
     matrix: "pikepdf.Matrix",
-    media_box: tuple[float, float, float, float],
+    visible_box: tuple[float, float, float, float],
 ) -> float:
-    """Return the page-area fraction covered by an axis-aligned image rectangle."""
+    """Return the visible-page fraction covered by an axis-aligned rectangle."""
     values = (matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f)
     if not all(math.isfinite(value) for value in values):
         return 0.0
@@ -372,7 +399,7 @@ def _rect_coverage(
     image_bottom = min(point[1] for point in corners)
     image_right = max(point[0] for point in corners)
     image_top = max(point[1] for point in corners)
-    page_left, page_bottom, page_right, page_top = media_box
+    page_left, page_bottom, page_right, page_top = visible_box
     page_area = (page_right - page_left) * (page_top - page_bottom)
     if page_area <= 0:
         return 0.0
@@ -552,7 +579,7 @@ def _text_is_visible(
 def _analyze_content(
     container: "pikepdf.Object",
     resources: "pikepdf.Object | None",
-    media_box: tuple[float, float, float, float],
+    visible_box: tuple[float, float, float, float],
     analysis: _PagePaintAnalysis,
     *,
     ctm: "pikepdf.Matrix",
@@ -722,7 +749,17 @@ def _analyze_content(
                     frame.stroke_alpha,
                     frame.soft_mask,
                 ):
-                    if frame.optional_content_depth:
+                    if (
+                        frame.optional_content_depth
+                        or frame.clip_unknown
+                        or not _normal_blend_mode(frame.blend_mode)
+                        or frame.overprint
+                        or frame.transparency_group
+                        or (
+                            frame.soft_mask is not None
+                            and str(frame.soft_mask) != "/None"
+                        )
+                    ):
                         analysis.unsafe = True
                         finish_frame()
                         continue
@@ -796,7 +833,7 @@ def _analyze_content(
                     finish_frame()
                     continue
                 if image_is_opaque:
-                    coverage = _rect_coverage(frame.ctm, media_box)
+                    coverage = _rect_coverage(frame.ctm, visible_box)
                     if coverage >= _SCAN_IMAGE_AREA_RATIO:
                         analysis.image_candidates.append((coverage, analysis.event))
             elif operator_name == "Do":
@@ -871,7 +908,7 @@ def _analyze_content(
                         and not frame.clip_unknown
                     )
                     if image_is_opaque:
-                        coverage = _rect_coverage(frame.ctm, media_box)
+                        coverage = _rect_coverage(frame.ctm, visible_box)
                         if coverage >= _SCAN_IMAGE_AREA_RATIO:
                             analysis.image_candidates.append((coverage, analysis.event))
                     continue
@@ -909,7 +946,7 @@ def _analyze_content(
                         box_values[1],
                     )
                     if (
-                        _rect_coverage(box_matrix @ form_ctm, media_box)
+                        _rect_coverage(box_matrix @ form_ctm, visible_box)
                         < _FULL_PAGE_IMAGE_AREA_RATIO
                     ):
                         form_clip_unknown = True
@@ -967,18 +1004,21 @@ def _page_paint_analysis(page: "pikepdf.Page") -> _PagePaintAnalysis:
 
     analysis = _PagePaintAnalysis()
     try:
-        media_box_values = tuple(float(value) for value in page.MediaBox)
-        if len(media_box_values) != 4 or not all(
-            math.isfinite(value) for value in media_box_values
+        visible_box_values = tuple(float(value) for value in page.cropbox)
+        if (
+            len(visible_box_values) != 4
+            or not all(math.isfinite(value) for value in visible_box_values)
+            or visible_box_values[2] <= visible_box_values[0]
+            or visible_box_values[3] <= visible_box_values[1]
         ):
-            raise ValueError("Invalid MediaBox")
+            raise ValueError("Invalid CropBox")
         group = page.obj.get("/Group")
         if group is not None and str(group.get("/S")) != "/Transparency":
             raise ValueError("Invalid Page Group")
         _analyze_content(
             page,
             page.resources,
-            media_box_values,
+            visible_box_values,
             analysis,
             ctm=pikepdf.Matrix(),
             transparency_group=group is not None,
@@ -1015,7 +1055,9 @@ def _plan_deskew_ocr(
 
             deskew_pages = []
             regular_ocr_pages = []
+            redo_ocr_pages = []
             strip_text_pages = []
+            ambiguous_scan_pages = []
             annotated_scan_pages = 0
             for page_number, (page_info, page) in enumerate(
                 zip(pdfinfo.pages, pdf.pages, strict=True),
@@ -1031,11 +1073,6 @@ def _plan_deskew_ocr(
                 has_renderable_image = any(
                     image.renderable for image in page_info.images
                 )
-                if not safe_raster_content or not has_renderable_image:
-                    if not page_info.has_text:
-                        regular_ocr_pages.append(page_number)
-                    continue
-
                 full_page_image_event = max(
                     (
                         event
@@ -1044,10 +1081,19 @@ def _plan_deskew_ocr(
                     ),
                     default=-1,
                 )
+                if not safe_raster_content or not has_renderable_image:
+                    if page_info.has_text and full_page_image_event >= 0:
+                        ambiguous_scan_pages.append(page_number)
+                    elif not page_info.has_text:
+                        regular_ocr_pages.append(page_number)
+                    continue
+
                 has_visible_text = any(
                     event > full_page_image_event for event in analysis.visible_text
                 )
-                if analysis.image_candidates and not has_visible_text:
+                if full_page_image_event >= 0 and has_visible_text:
+                    redo_ocr_pages.append(page_number)
+                elif analysis.image_candidates and not has_visible_text:
                     page_has_annotations = (
                         page_number in annotated_pages
                         if annotated_pages is not None
@@ -1058,8 +1104,9 @@ def _plan_deskew_ocr(
                     )
                     if page_has_annotations:
                         annotated_scan_pages += 1
-                        if not page_info.has_text:
-                            regular_ocr_pages.append(page_number)
+                        regular_ocr_pages.append(page_number)
+                        if page_info.has_text:
+                            strip_text_pages.append(page_number)
                         continue
                     deskew_pages.append(page_number)
                     if page_info.has_text:
@@ -1068,8 +1115,10 @@ def _plan_deskew_ocr(
                     regular_ocr_pages.append(page_number)
 
         logger.info(
-            "Deskew selected %d/%d scan-like page(s)",
+            "OCR planning selected %d deskew and %d mixed-content redo page(s) "
+            "from %d page(s)",
             len(deskew_pages),
+            len(redo_ocr_pages),
             len(pdfinfo),
         )
         if annotated_scan_pages:
@@ -1080,7 +1129,9 @@ def _plan_deskew_ocr(
         return _DeskewPlan(
             tuple(deskew_pages),
             tuple(regular_ocr_pages),
+            tuple(redo_ocr_pages),
             tuple(strip_text_pages),
+            tuple(ambiguous_scan_pages),
         )
     except Exception as exc:
         log_suppressed_error(
@@ -1330,17 +1381,696 @@ def _strip_invisible_text_from_form(form: "pikepdf.Stream") -> bool:
     return changed
 
 
+def _write_json_atomic(output_path: Path, value: dict[str, Any]) -> None:
+    """Write UTF-8 JSON without exposing a partially written manifest."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = mkstemp(
+        dir=output_path.parent,
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(
+            file_descriptor,
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as stream:
+            file_descriptor = -1
+            json.dump(
+                value,
+                stream,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, output_path)
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        temporary_path.unlink(missing_ok=True)
+
+
+def _manifest_mapping(
+    value: Any,
+    expected_keys: frozenset[str],
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise OCRError(f"Invalid OCR manifest {context}: expected an object")
+    keys = frozenset(value)
+    if keys != expected_keys:
+        missing = sorted(expected_keys - keys)
+        unexpected = sorted(keys - expected_keys)
+        raise OCRError(
+            f"Invalid OCR manifest {context}: missing keys {missing}, "
+            f"unexpected keys {unexpected}"
+        )
+    return value
+
+
+def _manifest_number(
+    value: Any,
+    context: str,
+    *,
+    positive: bool = False,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise OCRError(f"Invalid OCR manifest {context}: expected a number")
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise OCRError(f"Invalid OCR manifest {context}: invalid number") from exc
+    if not math.isfinite(number) or positive and number <= 0:
+        raise OCRError(f"Invalid OCR manifest {context}: invalid number")
+    return number
+
+
+def _validate_manifest_bbox(
+    value: Any,
+    context: str,
+    *,
+    bounds: tuple[float, float] | None = None,
+    parent: tuple[float, float, float, float] | None = None,
+) -> tuple[float, float, float, float]:
+    bbox = _manifest_mapping(
+        value,
+        frozenset({"left", "top", "right", "bottom"}),
+        context,
+    )
+    left = _manifest_number(bbox["left"], f"{context}.left")
+    top = _manifest_number(bbox["top"], f"{context}.top")
+    right = _manifest_number(bbox["right"], f"{context}.right")
+    bottom = _manifest_number(bbox["bottom"], f"{context}.bottom")
+    if right <= left or bottom <= top:
+        raise OCRError(f"Invalid OCR manifest {context}: empty bounding box")
+    coordinates = (left, top, right, bottom)
+    tolerance = _OCR_MANIFEST_GEOMETRY_TOLERANCE
+    if bounds is not None:
+        width, height = bounds
+        if (
+            left < -tolerance
+            or top < -tolerance
+            or right > width + tolerance
+            or bottom > height + tolerance
+        ):
+            raise OCRError(f"Invalid OCR manifest {context}: outside page coordinates")
+    if parent is not None and (
+        left < parent[0] - tolerance
+        or top < parent[1] - tolerance
+        or right > parent[2] + tolerance
+        or bottom > parent[3] + tolerance
+    ):
+        raise OCRError(f"Invalid OCR manifest {context}: outside parent line")
+    return coordinates
+
+
+def _validate_manifest_polygon(
+    value: Any,
+    context: str,
+    *,
+    bbox: tuple[float, float, float, float],
+    bounds: tuple[float, float],
+) -> None:
+    if not isinstance(value, list) or len(value) != 4:
+        raise OCRError(f"Invalid OCR manifest {context}: expected four points")
+    points = []
+    for index, point in enumerate(value):
+        if not isinstance(point, list) or len(point) != 2:
+            raise OCRError(f"Invalid OCR manifest {context}[{index}]: expected a point")
+        points.append(
+            (
+                _manifest_number(point[0], f"{context}[{index}][0]"),
+                _manifest_number(point[1], f"{context}[{index}][1]"),
+            )
+        )
+    area = abs(
+        sum(
+            x1 * y2 - x2 * y1
+            for (x1, y1), (x2, y2) in zip(
+                points,
+                [*points[1:], points[0]],
+                strict=True,
+            )
+        )
+    )
+    if area <= 1e-6:
+        raise OCRError(f"Invalid OCR manifest {context}: empty polygon")
+    tolerance = _OCR_MANIFEST_GEOMETRY_TOLERANCE
+    width, height = bounds
+    if any(
+        x < -tolerance
+        or y < -tolerance
+        or x > width + tolerance
+        or y > height + tolerance
+        for x, y in points
+    ):
+        raise OCRError(f"Invalid OCR manifest {context}: outside page coordinates")
+    polygon_bbox = (
+        min(point[0] for point in points),
+        min(point[1] for point in points),
+        max(point[0] for point in points),
+        max(point[1] for point in points),
+    )
+    if any(
+        not math.isclose(
+            actual,
+            expected,
+            rel_tol=1e-9,
+            abs_tol=tolerance,
+        )
+        for actual, expected in zip(polygon_bbox, bbox, strict=True)
+    ):
+        raise OCRError(
+            f"Invalid OCR manifest {context}: polygon does not match bounding box"
+        )
+
+
+def _validate_manifest_element(
+    value: Any,
+    context: str,
+    *,
+    bounds: tuple[float, float],
+    parent_bbox: tuple[float, float, float, float] | None = None,
+    line_index: int | None = None,
+    word_index: int | None = None,
+    expected_mcid: int | None = None,
+) -> None:
+    common_keys = {
+        "ocr_class",
+        "text",
+        "confidence",
+        "bbox",
+        "polygon",
+        "language",
+        "direction",
+        "baseline",
+        "text_angle",
+    }
+    expected_keys = set(common_keys)
+    if line_index is not None:
+        expected_keys.update({"mcid", "words"})
+    else:
+        expected_keys.add("index")
+    element = _manifest_mapping(value, frozenset(expected_keys), context)
+
+    expected_class = "ocr_line" if line_index is not None else "ocrx_word"
+    if element["ocr_class"] != expected_class:
+        raise OCRError(
+            f"Invalid OCR manifest {context}.ocr_class: expected {expected_class}"
+        )
+    if not isinstance(element["text"], str) or not element["text"]:
+        raise OCRError(f"Invalid OCR manifest {context}.text: expected text")
+
+    confidence = element["confidence"]
+    if confidence is not None:
+        confidence_value = _manifest_number(confidence, f"{context}.confidence")
+        if not 0.0 <= confidence_value <= 1.0:
+            raise OCRError(f"Invalid OCR manifest {context}.confidence: outside 0..1")
+
+    bbox = _validate_manifest_bbox(
+        element["bbox"],
+        f"{context}.bbox",
+        bounds=bounds,
+        parent=parent_bbox,
+    )
+    _validate_manifest_polygon(
+        element["polygon"],
+        f"{context}.polygon",
+        bbox=bbox,
+        bounds=bounds,
+    )
+    language = element["language"]
+    if language is not None and (not isinstance(language, str) or not language):
+        raise OCRError(f"Invalid OCR manifest {context}.language")
+    if element["direction"] not in {None, "ltr", "rtl"}:
+        raise OCRError(f"Invalid OCR manifest {context}.direction")
+
+    baseline = element["baseline"]
+    if baseline is not None:
+        baseline = _manifest_mapping(
+            baseline,
+            frozenset({"slope", "intercept"}),
+            f"{context}.baseline",
+        )
+        _manifest_number(baseline["slope"], f"{context}.baseline.slope")
+        _manifest_number(baseline["intercept"], f"{context}.baseline.intercept")
+    text_angle = element["text_angle"]
+    if text_angle is not None:
+        _manifest_number(text_angle, f"{context}.text_angle")
+
+    if line_index is not None:
+        mcid = element["mcid"]
+        if isinstance(mcid, bool) or not isinstance(mcid, int) or mcid < 0:
+            raise OCRError(f"Invalid OCR manifest {context}.mcid")
+        if expected_mcid is not None and mcid != expected_mcid:
+            raise OCRError(
+                f"Invalid OCR manifest {context}.mcid: expected {expected_mcid}"
+            )
+        words = element["words"]
+        if not isinstance(words, list) or not words:
+            raise OCRError(f"Invalid OCR manifest {context}.words")
+        for index, word in enumerate(words):
+            _validate_manifest_element(
+                word,
+                f"{context}.words[{index}]",
+                bounds=bounds,
+                parent_bbox=bbox,
+                word_index=index,
+            )
+    elif (
+        isinstance(element["index"], bool)
+        or not isinstance(element["index"], int)
+        or element["index"] != word_index
+    ):
+        raise OCRError(f"Invalid OCR manifest {context}.index: expected {word_index}")
+
+
+def _validate_ocr_page_manifest(
+    value: Any,
+    context: str,
+    *,
+    document_page: bool = False,
+) -> dict[str, Any]:
+    expected_keys = {
+        "schema_version",
+        "type",
+        "page_index",
+        "raster",
+        "coordinates",
+        "languages",
+        "layout",
+        "lines",
+    }
+    if document_page:
+        expected_keys.add("form_name")
+    page = _manifest_mapping(value, frozenset(expected_keys), context)
+    if (
+        isinstance(page["schema_version"], bool)
+        or page["schema_version"] != _OCR_MANIFEST_SCHEMA_VERSION
+    ):
+        raise OCRError(f"Invalid OCR manifest {context}.schema_version")
+    if page["type"] != _OCR_PAGE_MANIFEST_TYPE:
+        raise OCRError(f"Invalid OCR manifest {context}.type")
+    page_index = page["page_index"]
+    if (
+        isinstance(page_index, bool)
+        or not isinstance(page_index, int)
+        or page_index < 0
+    ):
+        raise OCRError(f"Invalid OCR manifest {context}.page_index")
+
+    raster = _manifest_mapping(
+        page["raster"],
+        frozenset({"width", "height", "dpi"}),
+        f"{context}.raster",
+    )
+    for dimension in ("width", "height"):
+        if (
+            isinstance(raster[dimension], bool)
+            or not isinstance(raster[dimension], int)
+            or raster[dimension] <= 0
+        ):
+            raise OCRError(f"Invalid OCR manifest {context}.raster.{dimension}")
+    raster_dpi = _manifest_number(
+        raster["dpi"],
+        f"{context}.raster.dpi",
+        positive=True,
+    )
+
+    coordinates = _manifest_mapping(
+        page["coordinates"],
+        frozenset({"width", "height", "dpi", "scale_from_raster"}),
+        f"{context}.coordinates",
+    )
+    coordinate_values = {}
+    for name in ("width", "height", "dpi", "scale_from_raster"):
+        coordinate_values[name] = _manifest_number(
+            coordinates[name],
+            f"{context}.coordinates.{name}",
+            positive=True,
+        )
+    scale = coordinate_values["scale_from_raster"]
+    expected_coordinates = {
+        "width": raster["width"] * scale,
+        "height": raster["height"] * scale,
+        "dpi": raster_dpi * scale,
+    }
+    if any(
+        not math.isclose(
+            coordinate_values[name],
+            expected,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+        for name, expected in expected_coordinates.items()
+    ):
+        raise OCRError(f"Invalid OCR manifest {context}.coordinates: inconsistent")
+    coordinate_bounds = (
+        coordinate_values["width"],
+        coordinate_values["height"],
+    )
+
+    languages = page["languages"]
+    if (
+        not isinstance(languages, list)
+        or not languages
+        or any(not isinstance(language, str) or not language for language in languages)
+    ):
+        raise OCRError(f"Invalid OCR manifest {context}.languages")
+
+    layout = _manifest_mapping(
+        page["layout"],
+        frozenset({"reading_order_applied", "sections", "selected_columns"}),
+        f"{context}.layout",
+    )
+    if not isinstance(layout["reading_order_applied"], bool):
+        raise OCRError(f"Invalid OCR manifest {context}.layout.reading_order_applied")
+    sections = layout["sections"]
+    if not isinstance(sections, list):
+        raise OCRError(f"Invalid OCR manifest {context}.layout.sections")
+    for section_index, section_value in enumerate(sections):
+        section_context = f"{context}.layout.sections[{section_index}]"
+        section = _manifest_mapping(
+            section_value,
+            frozenset({"regions", "columns"}),
+            section_context,
+        )
+        for collection_name in ("regions", "columns"):
+            collection = section[collection_name]
+            if not isinstance(collection, list):
+                raise OCRError(
+                    f"Invalid OCR manifest {section_context}.{collection_name}"
+                )
+            for region_index, region in enumerate(collection):
+                _validate_manifest_bbox(
+                    region,
+                    f"{section_context}.{collection_name}[{region_index}]",
+                    bounds=coordinate_bounds,
+                )
+    selected_columns = layout["selected_columns"]
+    if not isinstance(selected_columns, list) or not selected_columns:
+        raise OCRError(f"Invalid OCR manifest {context}.layout.selected_columns")
+    for column_index, column in enumerate(selected_columns):
+        _validate_manifest_bbox(
+            column,
+            f"{context}.layout.selected_columns[{column_index}]",
+            bounds=coordinate_bounds,
+        )
+
+    lines = page["lines"]
+    if not isinstance(lines, list):
+        raise OCRError(f"Invalid OCR manifest {context}.lines")
+    # Page sidecars are written before rendering, so their MCIDs are still the
+    # line indexes. Document manifests are reconciled against the rendered OCR
+    # Forms, which drops suppressed lines and leaves gaps in the MCID sequence.
+    previous_mcid = -1
+    for line_index, line in enumerate(lines):
+        _validate_manifest_element(
+            line,
+            f"{context}.lines[{line_index}]",
+            bounds=coordinate_bounds,
+            line_index=line_index,
+            expected_mcid=None if document_page else line_index,
+        )
+        mcid = line["mcid"]
+        if mcid <= previous_mcid:
+            raise OCRError(
+                f"Invalid OCR manifest {context}.lines[{line_index}].mcid: "
+                "expected a strictly increasing MCID"
+            )
+        previous_mcid = mcid
+
+    if document_page:
+        form_name = page["form_name"]
+        if not isinstance(form_name, str) or not form_name.startswith("/OCR-"):
+            raise OCRError(f"Invalid OCR manifest {context}.form_name")
+    return page
+
+
+def _validate_ocr_document_manifest(
+    value: Any,
+    context: str,
+    *,
+    expected_page_count: int | None = None,
+) -> dict[str, Any]:
+    document = _manifest_mapping(
+        value,
+        frozenset({"schema_version", "type", "page_count", "languages", "pages"}),
+        context,
+    )
+    if (
+        isinstance(document["schema_version"], bool)
+        or document["schema_version"] != _OCR_MANIFEST_SCHEMA_VERSION
+    ):
+        raise OCRError(f"Invalid OCR manifest {context}.schema_version")
+    if document["type"] != _OCR_DOCUMENT_MANIFEST_TYPE:
+        raise OCRError(f"Invalid OCR manifest {context}.type")
+
+    page_count = document["page_count"]
+    if (
+        isinstance(page_count, bool)
+        or not isinstance(page_count, int)
+        or page_count < 0
+        or expected_page_count is not None
+        and page_count != expected_page_count
+    ):
+        raise OCRError(f"Invalid OCR manifest {context}.page_count")
+
+    languages = document["languages"]
+    if (
+        not isinstance(languages, list)
+        or not languages
+        or any(not isinstance(language, str) or not language for language in languages)
+        or len(set(languages)) != len(languages)
+    ):
+        raise OCRError(f"Invalid OCR manifest {context}.languages")
+
+    pages = document["pages"]
+    if not isinstance(pages, list):
+        raise OCRError(f"Invalid OCR manifest {context}.pages")
+    page_indexes = []
+    for index, page_value in enumerate(pages):
+        page = _validate_ocr_page_manifest(
+            page_value,
+            f"{context}.pages[{index}]",
+            document_page=True,
+        )
+        page_index = page["page_index"]
+        if page_index >= page_count or page["languages"] != languages:
+            raise OCRError(f"Invalid OCR manifest {context}.pages[{index}]")
+        page_indexes.append(page_index)
+    if page_indexes != sorted(set(page_indexes)):
+        raise OCRError(f"Invalid OCR manifest {context}.pages: invalid page order")
+    return document
+
+
+def _read_ocr_run_sidecars(directory: Path) -> dict[int, dict[str, Any]]:
+    """Read and validate one isolated OCRmyPDF run's page sidecars."""
+    pages = {}
+    try:
+        entries = sorted(directory.iterdir(), key=lambda entry: entry.name)
+    except OSError as exc:
+        raise OCRError(f"Could not read OCR manifest sidecars: {exc}") from exc
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file() or entry.suffix != ".json":
+            raise OCRError(f"Invalid OCR manifest sidecar entry: {entry.name}")
+        try:
+            value = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise OCRError(
+                f"Could not read OCR manifest sidecar {entry.name}: {exc}"
+            ) from exc
+        page = _validate_ocr_page_manifest(value, entry.name)
+        page_index = page["page_index"]
+        if entry.name != f"page-{page_index:06d}.json":
+            raise OCRError(
+                f"Invalid OCR manifest sidecar filename for page {page_index}"
+            )
+        if page_index in pages:
+            raise OCRError(f"Duplicate OCR manifest page {page_index}")
+        pages[page_index] = page
+    return pages
+
+
+def _emitted_form_mcids(form, context: str) -> set[int]:
+    """Return the MCIDs the renderer actually emitted into an OCR Form."""
+    import pikepdf
+
+    try:
+        instructions = pikepdf.parse_content_stream(form)
+    except Exception as exc:
+        raise OCRError(f"Could not parse {context}: {exc}") from exc
+
+    mcids: set[int] = set()
+    for instruction in instructions:
+        if not isinstance(instruction, pikepdf.ContentStreamInstruction):
+            continue
+        operands = instruction.operands
+        if str(instruction.operator) != "BDC" or len(operands) < 2:
+            continue
+        properties = operands[1]
+        if not isinstance(properties, pikepdf.Dictionary):
+            raise OCRError(f"Unexpected marked content properties in {context}")
+        if "/MCID" not in properties:
+            continue
+        mcid = properties["/MCID"]
+        try:
+            mcid = int(mcid)
+        except (TypeError, ValueError) as exc:
+            raise OCRError(f"Invalid marked content MCID in {context}") from exc
+        if mcid < 0 or mcid in mcids:
+            raise OCRError(f"Invalid marked content MCID in {context}")
+        mcids.add(mcid)
+    return mcids
+
+
+def _reconcile_manifest_lines(page, manifest_page: dict[str, Any]) -> None:
+    """Drop manifest lines the renderer suppressed instead of emitting them.
+
+    The fpdf2 renderer discards implausible OCR lines (for example when the
+    aspect-ratio check fails), so the page sidecar can declare more lines than
+    the rendered OCR Form contains. The manifest must describe the PDF as it
+    was written, not as it was planned.
+    """
+    page_index = manifest_page["page_index"]
+    form_name = manifest_page["form_name"]
+    context = f"OCR Form {form_name} on page {page_index}"
+    try:
+        xobjects = page.resources.get("/XObject")
+        form = xobjects[form_name] if xobjects is not None else None
+    except (AttributeError, KeyError):
+        form = None
+    if form is None:
+        raise OCRError(f"Could not read {context}")
+
+    emitted = _emitted_form_mcids(form, context)
+    declared = {line["mcid"] for line in manifest_page["lines"]}
+    unexpected = sorted(emitted - declared)
+    if unexpected:
+        raise OCRError(f"{context} contains undeclared MCIDs: {unexpected}")
+
+    suppressed = sorted(declared - emitted)
+    if not suppressed:
+        return
+    manifest_page["lines"] = [
+        line for line in manifest_page["lines"] if line["mcid"] in emitted
+    ]
+    logger.warning(
+        "OCR page %d: %d line(s) were suppressed by the renderer and removed "
+        "from the OCR manifest (MCIDs %s)",
+        page_index,
+        len(suppressed),
+        suppressed,
+    )
+
+
+def _reconciled_document_pages(
+    pdf,
+    languages: list[str],
+    pages: dict[int, dict[str, Any]],
+    form_names: dict[int, tuple[str, ...]],
+    page_count: int,
+) -> list[dict[str, Any]]:
+    """Return document manifest pages reconciled against the rendered PDF."""
+    document_pages = []
+    for page_index in sorted(pages):
+        if page_index >= page_count:
+            raise OCRError(f"OCR manifest page {page_index} is outside the PDF")
+        page_form_names = form_names[page_index]
+        if len(page_form_names) != 1:
+            raise OCRError(
+                f"OCR manifest page {page_index} has {len(page_form_names)} "
+                "new OCR Forms"
+            )
+        page = copy.deepcopy(pages[page_index])
+        if page["languages"] != languages:
+            raise OCRError(
+                f"OCR manifest page {page_index} languages do not match the run"
+            )
+        page["form_name"] = page_form_names[0]
+        _reconcile_manifest_lines(pdf.pages[page_index], page)
+        _validate_ocr_page_manifest(
+            page,
+            f"pages[{page_index}]",
+            document_page=True,
+        )
+        document_pages.append(page)
+    return document_pages
+
+
+def _write_ocr_document_manifest(
+    output_path: Path,
+    pdf_path: Path,
+    languages: list[str],
+    pages: dict[int, dict[str, Any]],
+    form_names: dict[int, tuple[str, ...]],
+) -> None:
+    """Merge validated page sidecars with their final OCR Form names."""
+    import pikepdf
+
+    manifest_page_indexes = frozenset(pages)
+    form_page_indexes = frozenset(form_names)
+    if manifest_page_indexes != form_page_indexes:
+        raise OCRError(
+            "OCR manifest pages do not match final OCR Forms: "
+            f"pages={sorted(manifest_page_indexes)}, "
+            f"forms={sorted(form_page_indexes)}"
+        )
+
+    with pikepdf.open(pdf_path) as pdf:
+        page_count = len(pdf.pages)
+        document_pages = _reconciled_document_pages(
+            pdf,
+            languages,
+            pages,
+            form_names,
+            page_count,
+        )
+
+    document = {
+        "schema_version": _OCR_MANIFEST_SCHEMA_VERSION,
+        "type": _OCR_DOCUMENT_MANIFEST_TYPE,
+        "page_count": page_count,
+        "languages": list(languages),
+        "pages": document_pages,
+    }
+    _validate_ocr_document_manifest(
+        document,
+        "document",
+        expected_page_count=page_count,
+    )
+    _write_json_atomic(output_path, document)
+    try:
+        serialized = json.loads(output_path.read_text(encoding="utf-8"))
+        _validate_ocr_document_manifest(
+            serialized,
+            output_path.name,
+            expected_page_count=page_count,
+        )
+    except OCRError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise OCRError(f"Could not revalidate OCR document manifest: {exc}") from exc
+
+
 def _finalize_ocr_output(
     pdf_path: Path,
     languages: list[str],
     existing_ocr_form_names: list[frozenset[str]],
     *,
     strip_existing_ocr_text: bool = False,
-) -> None:
+) -> dict[int, tuple[str, ...]]:
     """Set OCR metadata and finalize OCR Form XObjects."""
     import pikepdf
 
     changed = False
+    new_ocr_form_names: dict[int, list[str]] = {}
     with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
         if "/Lang" not in pdf.Root:
             language = _PADDLE_LANGUAGE_TAGS.get(languages[0], languages[0])
@@ -1348,9 +2078,11 @@ def _finalize_ocr_output(
             changed = True
 
         for page_index, page in enumerate(pdf.pages):
-            if page_index >= len(existing_ocr_form_names):
-                continue
-
+            existing_names = (
+                existing_ocr_form_names[page_index]
+                if page_index < len(existing_ocr_form_names)
+                else frozenset()
+            )
             xobjects = page.resources.get("/XObject")
             if xobjects is None:
                 continue
@@ -1358,7 +2090,7 @@ def _finalize_ocr_output(
             for name, xobject in xobjects.items():
                 if not str(name).startswith("/OCR-"):
                     continue
-                is_existing = str(name) in existing_ocr_form_names[page_index]
+                is_existing = str(name) in existing_names
                 if (
                     strip_existing_ocr_text
                     and is_existing
@@ -1370,27 +2102,45 @@ def _finalize_ocr_output(
                     continue
                 if xobject.get("/Subtype") != pikepdf.Name.Form:
                     continue
-                rotation = _effective_page_rotate(page)
-                if rotation not in {90, 270}:
-                    continue
-
-                box = xobject.get("/BBox")
-                if box is None or len(box) != 4:
-                    continue
-                media_box = [float(value) for value in page.MediaBox]
+                new_ocr_form_names.setdefault(page_index, []).append(str(name))
+                rotation = _validated_ocr_page_rotation(page, page_index + 1)
+                try:
+                    media_box = [float(value) for value in page.mediabox]
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise OCRError(
+                        f"OCR page {page_index + 1} has an invalid MediaBox"
+                    ) from exc
+                if len(media_box) != 4 or not all(
+                    math.isfinite(value) for value in media_box
+                ):
+                    raise OCRError(f"OCR page {page_index + 1} has an invalid MediaBox")
                 width = media_box[2] - media_box[0]
                 height = media_box[3] - media_box[1]
-                values = [float(value) for value in box]
-                box_width = values[2] - values[0]
-                box_height = values[3] - values[1]
-                if abs(box_width - width) > 0.01 or abs(box_height - height) > 0.01:
-                    continue
-
-                xobject[pikepdf.Name.BBox] = pikepdf.Array([0, 0, height, width])
-                changed = True
+                if width <= 0 or height <= 0:
+                    raise OCRError(f"OCR page {page_index + 1} has an invalid MediaBox")
+                form_width, form_height = (
+                    (height, width) if rotation in {90, 270} else (width, height)
+                )
+                expected_box = (0.0, 0.0, form_width, form_height)
+                box = xobject.get("/BBox")
+                try:
+                    current_box = (
+                        tuple(float(value) for value in box)
+                        if box is not None and len(box) == 4
+                        else ()
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    current_box = ()
+                if current_box != expected_box:
+                    xobject[pikepdf.Name.BBox] = pikepdf.Array(expected_box)
+                    changed = True
 
         if changed:
             pdf.save(pdf_path)
+    return {
+        page_index: tuple(sorted(names))
+        for page_index, names in new_ocr_form_names.items()
+    }
 
 
 def is_ocr_available() -> bool:
@@ -1400,6 +2150,47 @@ def is_ocr_available() -> bool:
         True if ocrmypdf is installed, False otherwise.
     """
     return HAS_OCR
+
+
+def _validate_ocr_content_work_budget(
+    pdf: "pikepdf.Pdf",
+    *,
+    force: bool = False,
+) -> None:
+    """Validate canonical PDF content before any OCR-specific content walk."""
+    import pikepdf
+
+    from .digital_layout import (
+        _SERIALIZED_PDF_MEMORY_LIMIT,
+        _DecodedContentBudget,
+        _validate_content_work_budget,
+    )
+
+    if len(pdf.pages) > _OCR_MAX_DOCUMENT_PAGES:
+        raise OCRError(
+            f"OCR input contains more than {_OCR_MAX_DOCUMENT_PAGES:,} pages"
+        )
+    try:
+        with SpooledTemporaryFile(
+            max_size=_SERIALIZED_PDF_MEMORY_LIMIT,
+            mode="w+b",
+        ) as serialized:
+            pdf.save(serialized, compress_streams=False)
+            serialized.seek(0)
+            with pikepdf.open(serialized) as canonical_pdf:
+                if force:
+                    _include_forced_ocr_forms_in_content_preflight(canonical_pdf)
+                _validate_content_work_budget(
+                    canonical_pdf,
+                    frozenset(range(len(canonical_pdf.pages))),
+                    _DecodedContentBudget(),
+                )
+    except OCRError:
+        raise
+    except ConversionError as exc:
+        raise OCRError(f"OCR content-stream preflight failed: {exc}") from exc
+    except Exception as exc:
+        raise OCRError(f"Could not preflight OCR content: {exc}") from exc
 
 
 def needs_ocr(pdf: "pikepdf.Pdf", *, threshold: float = 0.5) -> bool:
@@ -1424,6 +2215,8 @@ def needs_ocr(pdf: "pikepdf.Pdf", *, threshold: float = 0.5) -> bool:
     """
     if len(pdf.pages) == 0:
         return False
+
+    _validate_ocr_content_work_budget(pdf)
 
     pages_needing_ocr = 0
 
@@ -1500,6 +2293,7 @@ def _page_has_text(page: "pikepdf.Page") -> bool:
 
     text_operators = frozenset(["Tj", "TJ", "'", '"'])
 
+    form_calls = []
     try:
         for operands, operator in pikepdf.parse_content_stream(page):
             operator_name = str(operator)
@@ -1507,25 +2301,32 @@ def _page_has_text(page: "pikepdf.Page") -> bool:
                 operands, operator_name
             ):
                 return True
+            if operator_name == "Do" and len(operands) == 1:
+                form_calls.append(operands[0])
     except Exception as e:
         log_suppressed_error(logger, e, "Error during text analysis: %s", e)
 
-    # Check Form XObjects for text operators
+    # Check only invoked Form XObjects; unused resources do not paint page text.
     try:
-        resources = page.get("/Resources")
-        if resources is None:
+        resources = page.resources
+        if not isinstance(resources, pikepdf.Dictionary):
             return False
         xobjects = resources.get("/XObject")
-        if xobjects is None:
+        if not isinstance(xobjects, pikepdf.Dictionary):
             return False
 
-        visited: set[_ObjectKey] = set()
-        for name in xobjects.keys():
+        visited: set[tuple[_ObjectKey, _ObjectKey]] = set()
+        for name in form_calls:
             try:
                 xobj = xobjects[name].get_object()
             except (AttributeError, TypeError, ValueError):
-                xobj = xobjects[name]
-            if _form_xobject_has_text(xobj, text_operators, visited):
+                xobj = xobjects.get(name)
+            if _form_xobject_has_text(
+                xobj,
+                resources,
+                text_operators,
+                visited,
+            ):
                 return True
     except Exception as e:
         log_suppressed_error(logger, e, "Error checking XObjects for text: %s", e)
@@ -1535,24 +2336,26 @@ def _page_has_text(page: "pikepdf.Page") -> bool:
 
 def _form_xobject_has_text(
     xobj: "pikepdf.Object",
+    inherited_resources: "pikepdf.Object",
     text_operators: frozenset[str],
-    visited: set[_ObjectKey],
+    visited: set[tuple[_ObjectKey, _ObjectKey]],
 ) -> bool:
     """Check a Form XObject and its descendants for text operators.
 
     Args:
         xobj: The XObject to check.
+        inherited_resources: Resources inherited by a Form without its own.
         text_operators: Set of PDF text operator names.
-        visited: Set of already-visited object IDs to prevent cycles.
+        visited: Set of already-visited Form/resource contexts to prevent cycles.
 
     Returns:
         True if the Form XObject (or nested Form XObjects) contains text.
     """
     import pikepdf
 
-    pending = [xobj]
+    pending = [(xobj, inherited_resources)]
     while pending:
-        current = pending.pop()
+        current, inherited = pending.pop()
         try:
             subtype = current.get("/Subtype")
             if subtype is None or str(subtype) != "/Form":
@@ -1560,18 +2363,24 @@ def _form_xobject_has_text(
         except Exception:
             continue
 
-        key = _object_key(current)
-        if key in visited:
+        resources = current.get("/Resources")
+        if not isinstance(resources, pikepdf.Dictionary) or not resources:
+            resources = inherited
+        context = (_object_key(current), _object_key(resources))
+        if context in visited:
             continue
-        visited.add(key)
+        visited.add(context)
 
         try:
+            form_calls = []
             for operands, operator in pikepdf.parse_content_stream(current):
                 operator_name = str(operator)
                 if operator_name in text_operators and _text_show_has_content(
                     operands, operator_name
                 ):
                     return True
+                if operator_name == "Do" and len(operands) == 1:
+                    form_calls.append(operands[0])
         except Exception as e:
             log_suppressed_error(
                 logger, e, "Error parsing Form XObject content stream: %s", e
@@ -1579,20 +2388,19 @@ def _form_xobject_has_text(
             continue
 
         try:
-            resources = current.get("/Resources")
-            if resources is None:
+            if not isinstance(resources, pikepdf.Dictionary):
                 continue
             nested_xobjects = resources.get("/XObject")
-            if nested_xobjects is None:
+            if not isinstance(nested_xobjects, pikepdf.Dictionary):
                 continue
 
             nested_forms = []
-            for name in nested_xobjects.keys():
+            for name in form_calls:
                 try:
                     nested = nested_xobjects[name].get_object()
                 except (AttributeError, TypeError, ValueError):
-                    nested = nested_xobjects[name]
-                nested_forms.append(nested)
+                    nested = nested_xobjects.get(name)
+                nested_forms.append((nested, resources))
             pending.extend(reversed(nested_forms))
         except Exception as e:
             log_suppressed_error(logger, e, "Error checking nested XObjects: %s", e)
@@ -1656,6 +2464,330 @@ def _find_whitespace_only_text_pages(pdf_path: Path) -> tuple[int, ...]:
         return ()
 
 
+def _ocr_page_box_coordinates(
+    value: object,
+    page_number: int,
+    name: str,
+) -> tuple[float, float, float, float]:
+    import pikepdf
+
+    if not isinstance(value, pikepdf.Array) or len(value) != 4:
+        raise OCRError(f"OCR page {page_number} has a malformed {name}")
+    try:
+        coordinates = tuple(float(item) for item in value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise OCRError(f"OCR page {page_number} has a malformed {name}") from exc
+    if not all(math.isfinite(item) for item in coordinates):
+        raise OCRError(f"OCR page {page_number} has a malformed {name}")
+    left, bottom, right, top = coordinates
+    if right <= left or top <= bottom:
+        raise OCRError(f"OCR page {page_number} has a non-normalized {name}")
+
+    from .sanitizers.page_boxes import (
+        _MAX_PAGE_BOUNDARY_SIZE,
+        _MIN_PAGE_BOUNDARY_SIZE,
+    )
+
+    width = right - left
+    height = top - bottom
+    if not (
+        _MIN_PAGE_BOUNDARY_SIZE <= width <= _MAX_PAGE_BOUNDARY_SIZE
+        and _MIN_PAGE_BOUNDARY_SIZE <= height <= _MAX_PAGE_BOUNDARY_SIZE
+    ):
+        raise OCRError(
+            f"OCR page {page_number} {name} is outside PDF page-boundary limits"
+        )
+    return coordinates
+
+
+def _validated_ocr_page_rotation(page: Any, page_number: int) -> int:
+    """Return an inherited page rotation only when it is an exact 90-degree step."""
+    current = page.obj
+    visited: set[tuple[int, int]] = set()
+    while current is not None:
+        objgen = getattr(current, "objgen", None)
+        if isinstance(objgen, tuple):
+            if objgen in visited:
+                break
+            visited.add(objgen)
+
+        if "/Rotate" in current:
+            raw_rotation = current.get("/Rotate")
+            try:
+                numeric_rotation = float(raw_rotation)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise OCRError(
+                    f"OCR page {page_number} has an invalid rotation"
+                ) from exc
+            if (
+                not math.isfinite(numeric_rotation)
+                or not numeric_rotation.is_integer()
+                or int(numeric_rotation) % 90
+            ):
+                raise OCRError(
+                    f"OCR page {page_number} rotation is not a multiple of 90"
+                )
+            return _effective_page_rotate(page)
+        current = current.get("/Parent")
+    return 0
+
+
+def _include_forced_ocr_forms_in_content_preflight(pdf: "pikepdf.Pdf") -> None:
+    """Make every existing OCR Form visible to the read-only work validator."""
+    import pikepdf
+
+    from .digital_layout import _inherited_page_resources
+
+    for page_number, page in enumerate(pdf.pages, start=1):
+        resources = _inherited_page_resources(page)
+        xobjects = resources.get("/XObject")
+        if xobjects is None:
+            continue
+        if not isinstance(xobjects, pikepdf.Dictionary):
+            raise ConversionError(
+                f"OCR page {page_number} XObject resources are malformed"
+            )
+        calls = []
+        for name, value in xobjects.items():
+            if not str(name).startswith("/OCR-"):
+                continue
+            try:
+                xobject = value.get_object()
+            except (AttributeError, TypeError, ValueError):
+                xobject = value
+            if not isinstance(xobject, (pikepdf.Dictionary, pikepdf.Stream)):
+                raise ConversionError(
+                    f"OCR page {page_number} OCR Form resource is malformed"
+                )
+            if (
+                isinstance(xobject, pikepdf.Stream)
+                and str(xobject.get("/Subtype")) == "/Form"
+            ):
+                calls.append(pikepdf.Name(str(name)).unparse() + b" Do")
+        if not calls:
+            continue
+        validation_stream = pdf.make_stream(b"\n".join(calls))
+        contents = page.obj.get("/Contents")
+        if isinstance(contents, pikepdf.Array):
+            page.obj[pikepdf.Name.Contents] = pikepdf.Array(
+                [*contents, validation_stream]
+            )
+        elif contents is None:
+            page.obj[pikepdf.Name.Contents] = validation_stream
+        else:
+            page.obj[pikepdf.Name.Contents] = pikepdf.Array(
+                [contents, validation_stream]
+            )
+
+
+def _preflight_ocr_input(
+    pdf_path: Path,
+    *,
+    force: bool = False,
+    deskew: bool = False,
+    rotate_pages: bool = False,
+) -> None:
+    """Reject page geometry or raster work that cannot be processed safely."""
+    import pikepdf
+    from ocrmypdf.pdfinfo import PdfInfo
+
+    try:
+        page_dimensions = []
+        non_whitespace_text = []
+        scan_like_pages = []
+        with pikepdf.open(pdf_path) as pdf:
+            if not pdf.pages:
+                raise OCRError("OCR input contains no pages")
+            _validate_ocr_content_work_budget(pdf, force=force)
+            for page_number, page in enumerate(pdf.pages, start=1):
+                media_box = _ocr_page_box_coordinates(
+                    page.mediabox,
+                    page_number,
+                    "MediaBox",
+                )
+                crop_box = _ocr_page_box_coordinates(
+                    page.cropbox,
+                    page_number,
+                    "CropBox",
+                )
+                tolerance = _OCR_MANIFEST_GEOMETRY_TOLERANCE
+                if (
+                    crop_box[0] < media_box[0] - tolerance
+                    or crop_box[1] < media_box[1] - tolerance
+                    or crop_box[2] > media_box[2] + tolerance
+                    or crop_box[3] > media_box[3] + tolerance
+                ):
+                    raise OCRError(
+                        f"OCR page {page_number} CropBox is outside its MediaBox"
+                    )
+                for name in ("/BleedBox", "/TrimBox", "/ArtBox"):
+                    value = page.obj.get(name)
+                    if value is None:
+                        continue
+                    box = _ocr_page_box_coordinates(
+                        value,
+                        page_number,
+                        name[1:],
+                    )
+                    if (
+                        box[0] < media_box[0] - tolerance
+                        or box[1] < media_box[1] - tolerance
+                        or box[2] > media_box[2] + tolerance
+                        or box[3] > media_box[3] + tolerance
+                    ):
+                        raise OCRError(
+                            f"OCR page {page_number} {name[1:]} is outside its MediaBox"
+                        )
+
+                _validated_ocr_page_rotation(page, page_number)
+                user_unit_value = page.obj.get("/UserUnit", 1.0)
+                try:
+                    user_unit = float(user_unit_value)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise OCRError(
+                        f"OCR page {page_number} has an invalid UserUnit"
+                    ) from exc
+                if (
+                    not math.isfinite(user_unit)
+                    or user_unit <= 0
+                    or user_unit > _MAX_PDF_USER_UNIT
+                ):
+                    raise OCRError(f"OCR page {page_number} has an invalid UserUnit")
+
+                page_dimensions.append(
+                    (
+                        (
+                            (media_box[2] - media_box[0]) * user_unit,
+                            (media_box[3] - media_box[1]) * user_unit,
+                        ),
+                        (
+                            (crop_box[2] - crop_box[0]) * user_unit,
+                            (crop_box[3] - crop_box[1]) * user_unit,
+                        ),
+                    )
+                )
+                non_whitespace_text.append(_page_has_text(page))
+                scan_like_pages.append(
+                    any(
+                        coverage >= _FULL_PAGE_IMAGE_AREA_RATIO
+                        for coverage, _event in _page_paint_analysis(
+                            page
+                        ).image_candidates
+                    )
+                )
+
+        pdfinfo = PdfInfo(pdf_path, max_workers=1)
+        if len(pdfinfo.pages) != len(page_dimensions):
+            raise OCRError("Page count changed during OCR resource preflight")
+        document_raster_pixels = 0
+        for page_number, (page_info, dimensions, has_text, scan_like) in enumerate(
+            zip(
+                pdfinfo.pages,
+                page_dimensions,
+                non_whitespace_text,
+                scan_like_pages,
+                strict=True,
+            ),
+            start=1,
+        ):
+            if page_info is None:
+                raise OCRError(
+                    f"Could not inspect OCR resources for page {page_number}"
+                )
+            media_dimensions, crop_dimensions = dimensions
+            if rotate_pages:
+                orientation_dpi = 72.0 * ORIENTATION_RENDER_SCALE
+                orientation_width = math.ceil(
+                    crop_dimensions[0] * ORIENTATION_RENDER_SCALE
+                )
+                orientation_height = math.ceil(
+                    crop_dimensions[1] * ORIENTATION_RENDER_SCALE
+                )
+                orientation_pixels = orientation_width * orientation_height
+                if orientation_pixels > _OCR_MAX_PAGE_RASTER_PIXELS:
+                    raise OCRError(
+                        f"Paddle orientation page {page_number} would require "
+                        f"{orientation_pixels:,} pixels at {orientation_dpi:g} dpi; "
+                        f"the safety limit is {_OCR_MAX_PAGE_RASTER_PIXELS:,} pixels"
+                    )
+                document_raster_pixels += orientation_pixels
+                if document_raster_pixels > _OCR_MAX_DOCUMENT_RASTER_PIXELS:
+                    raise OCRError(
+                        "OCR document raster work would require more than "
+                        f"{_OCR_MAX_DOCUMENT_RASTER_PIXELS:,} pixels"
+                    )
+            renderable_image = any(image.renderable for image in page_info.images)
+            will_rasterize = (
+                force
+                or not page_info.has_text
+                or not has_text
+                or scan_like
+                or deskew
+                and renderable_image
+            )
+            if not will_rasterize:
+                continue
+            raster_dpi = max(
+                float(_OCR_RASTER_DPI),
+                float(page_info.dpi.x),
+                float(page_info.dpi.y),
+            )
+            pixel_width = math.ceil(media_dimensions[0] * raster_dpi / 72.0)
+            pixel_height = math.ceil(media_dimensions[1] * raster_dpi / 72.0)
+            pixel_count = pixel_width * pixel_height
+            if pixel_count > _OCR_MAX_PAGE_RASTER_PIXELS:
+                raise OCRError(
+                    f"OCR page {page_number} would require {pixel_count:,} pixels "
+                    f"at {raster_dpi:g} dpi; the safety limit is "
+                    f"{_OCR_MAX_PAGE_RASTER_PIXELS:,} pixels"
+                )
+            document_raster_pixels += pixel_count
+            if document_raster_pixels > _OCR_MAX_DOCUMENT_RASTER_PIXELS:
+                raise OCRError(
+                    "OCR document raster work would require more than "
+                    f"{_OCR_MAX_DOCUMENT_RASTER_PIXELS:,} pixels"
+                )
+    except OCRError:
+        raise
+    except ConversionError as exc:
+        raise OCRError(f"OCR content-stream preflight failed: {exc}") from exc
+    except Exception as exc:
+        raise OCRError(f"Could not preflight OCR input: {exc}") from exc
+
+
+def _cleanup_ocr_resources(
+    temporary_directories: tuple[
+        tuple[str, TemporaryDirectory[str] | None],
+        ...,
+    ],
+    *,
+    preserve_primary_error: bool = False,
+) -> None:
+    """Release every resource, preserving an already propagating OCR error."""
+    failures: list[tuple[str, Exception]] = []
+    try:
+        _release_ocr_models()
+    except Exception as exc:
+        failures.append(("release OCR models", exc))
+
+    for label, directory in temporary_directories:
+        if directory is None:
+            continue
+        try:
+            directory.cleanup()
+        except Exception as exc:
+            failures.append((f"clean up {label}", exc))
+
+    if not failures:
+        return
+    if preserve_primary_error:
+        for action, exc in failures:
+            logger.warning("Could not %s: %s", action, exc)
+        return
+    details = "; ".join(f"could not {action}: {exc}" for action, exc in failures)
+    raise OCRError(f"OCR cleanup failed: {details}") from failures[0][1]
+
+
 def apply_ocr(
     input_path: Path,
     output_path: Path,
@@ -1669,12 +2801,14 @@ def apply_ocr(
     ocr_execution_provider: str = "cpu",
     layout: bool = False,
     _annotated_pages: frozenset[int] | None = None,
+    _manifest_output_path: Path | None = None,
 ) -> Path:
     """Performs OCR on a PDF.
 
     Uses PaddleOCR for recognition and OCRmyPDF for rasterization, text-layer
-    rendering, and PDF merging. Pages that already contain text are skipped
-    unless ``force=True`` or a scan-like page is selected for deskewing.
+    rendering, and PDF merging. Digital text pages are skipped unless
+    ``force=True``. Raster-dominant full-page scans with a visible native text
+    overlay are re-OCRed while retaining that native text.
 
     Args:
         input_path: Path to the input PDF.
@@ -1695,6 +2829,9 @@ def apply_ocr(
             models: ``"cpu"`` (default), ``"directml"`` or
             ``"directml:<index>"`` to select a specific adapter.
         layout: If True, order OCR lines by detected page columns.
+        _manifest_output_path: Private Level-A integration path for an atomic,
+            versioned OCR document manifest. Supplying it also enables MCID
+            markers and layout-derived reading order in the OCR text Forms.
 
     Returns:
         Path to the OCR-processed PDF.
@@ -1702,6 +2839,21 @@ def apply_ocr(
     Raises:
         OCRError: If OCR is not available or fails.
     """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    manifest_output_path = (
+        Path(_manifest_output_path) if _manifest_output_path is not None else None
+    )
+    if manifest_output_path is not None:
+        try:
+            manifest_target = manifest_output_path.resolve()
+            protected_targets = {input_path.resolve(), output_path.resolve()}
+        except OSError as exc:
+            raise OCRError(f"Could not resolve OCR output paths: {exc}") from exc
+        if manifest_target in protected_targets:
+            raise OCRError(
+                "OCR manifest path must differ from the input and PDF output paths"
+            )
     if languages is None:
         languages = ["en"]
     if force and deskew:
@@ -1714,6 +2866,13 @@ def apply_ocr(
         validate_ocr_languages(languages)
     except ValueError as exc:
         raise OCRError(str(exc)) from exc
+
+    _preflight_ocr_input(
+        input_path,
+        force=force,
+        deskew=deskew,
+        rotate_pages=rotate_pages,
+    )
 
     detection_model_dir, recognition_model_dir = validate_model_directories(
         detection_model_dir,
@@ -1735,8 +2894,43 @@ def apply_ocr(
     ocr_input_path = input_path
     orientation_temp: TemporaryDirectory[str] | None = None
     pipeline_temp: TemporaryDirectory[str] | None = None
+    manifest_temp: TemporaryDirectory[str] | None = None
+    output_staging: TemporaryDirectory[str] | None = None
+    manifest_staging: TemporaryDirectory[str] | None = None
+    staged_manifest_path: Path | None = None
+    try:
+        output_staging = private_staging_directory(
+            output_path.parent,
+            prefix=f".{output_path.stem}_ocr_",
+            delete=False,
+        )
+        staged_output_path = Path(output_staging.name) / "output.pdf"
+        if manifest_output_path is not None:
+            manifest_staging = private_staging_directory(
+                manifest_output_path.parent,
+                prefix=f".{manifest_output_path.stem}_ocr_",
+                delete=False,
+            )
+            staged_manifest_path = Path(manifest_staging.name) / "manifest.json"
+    except OSError as exc:
+        for directory in (manifest_staging, output_staging):
+            if directory is None:
+                continue
+            try:
+                directory.cleanup()
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "Could not remove private OCR staging directory %s: %s",
+                    directory.name,
+                    cleanup_exc,
+                )
+        raise OCRError(f"Could not stage OCR output: {exc}") from exc
+    manifest_pages: dict[int, dict[str, Any]] = {}
+    manifest_run_number = 0
     existing_ocr_form_names: list[frozenset[str]] = []
-    completed_input_path = input_path
+    completed_successfully = False
+    staged_output_snapshot: StagedFileSnapshot | None = None
+    staged_manifest_snapshot: StagedFileSnapshot | None = None
 
     def run_ocr(
         source: Path,
@@ -1746,12 +2940,15 @@ def apply_ocr(
         deskew_run: bool = False,
         redo: bool = False,
     ) -> None:
+        nonlocal manifest_run_number
+
         ocr_kwargs: dict[str, object] = {
             "ocr_engine": "paddle",
             "pdf_renderer": "fpdf2",
             "rasterizer": "pypdfium",
             "output_type": "pdf",
-            "oversample": 600,
+            "oversample": _OCR_RASTER_DPI,
+            "max_image_mpixels": _OCR_MAX_PAGE_RASTER_PIXELS / 1_000_000,
             "optimize": 0,
             "jobs": 1,
             "skip_text": True,
@@ -1770,6 +2967,15 @@ def apply_ocr(
             ocr_kwargs.pop("skip_text", None)
             ocr_kwargs["redo_ocr"] = True
 
+        run_manifest_directory: Path | None = None
+        if manifest_temp is not None:
+            run_manifest_directory = (
+                Path(manifest_temp.name) / f"run-{manifest_run_number:04d}"
+            )
+            manifest_run_number += 1
+            run_manifest_directory.mkdir()
+            ocr_kwargs["paddle_manifest_dir"] = run_manifest_directory
+
         from .ocr_fpdf import install_fpdf_renderer
 
         with install_fpdf_renderer():
@@ -1779,8 +2985,20 @@ def apply_ocr(
                 language=languages,
                 **ocr_kwargs,
             )
+        if run_manifest_directory is not None:
+            run_pages = _read_ocr_run_sidecars(run_manifest_directory)
+            duplicate_pages = frozenset(manifest_pages).intersection(run_pages)
+            if duplicate_pages:
+                raise OCRError(
+                    "OCR manifest pages were emitted by multiple runs: "
+                    f"{sorted(duplicate_pages)}"
+                )
+            manifest_pages.update(run_pages)
 
     try:
+        if manifest_output_path is not None:
+            manifest_temp = TemporaryDirectory(prefix="pdftopdfa_ocr_manifest_")
+
         if rotate_pages:
             orientation_temp = TemporaryDirectory(
                 prefix="pdftopdfa_paddle_orientation_"
@@ -1800,7 +3018,6 @@ def apply_ocr(
             )
 
         existing_ocr_form_names = _ocr_form_names(ocr_input_path)
-        completed_input_path = ocr_input_path
 
         if not force:
             whitespace_text_pages = _find_whitespace_only_text_pages(ocr_input_path)
@@ -1813,12 +3030,58 @@ def apply_ocr(
                     whitespace_text_pages,
                 )
                 ocr_input_path = prepared_input
-                completed_input_path = prepared_input
 
         if force:
-            run_ocr(ocr_input_path, output_path, redo=True)
+            run_ocr(ocr_input_path, staged_output_path, redo=True)
         elif not deskew:
-            run_ocr(ocr_input_path, output_path)
+            plan = _plan_deskew_ocr(
+                ocr_input_path,
+                annotated_pages=_annotated_pages,
+            )
+            if plan is None:
+                run_ocr(ocr_input_path, staged_output_path)
+            else:
+                if plan.ambiguous_scan_pages:
+                    raise OCRError(
+                        "OCR cannot safely replace an existing text layer on "
+                        "ambiguous scan-like page(s): "
+                        f"{list(plan.ambiguous_scan_pages)}"
+                    )
+                regular_pages = tuple(
+                    sorted((*plan.regular_ocr_pages, *plan.deskew_pages))
+                )
+                if (regular_pages or plan.redo_ocr_pages) and pipeline_temp is None:
+                    pipeline_temp = TemporaryDirectory(prefix="pdftopdfa_paddle_ocr_")
+                current_input = ocr_input_path
+                if plan.strip_text_pages:
+                    prepared_input = Path(pipeline_temp.name) / "ocr_input.pdf"
+                    _prepare_deskew_input(
+                        current_input,
+                        prepared_input,
+                        plan.strip_text_pages,
+                    )
+                    current_input = prepared_input
+                if regular_pages:
+                    regular_output = (
+                        staged_output_path
+                        if not plan.redo_ocr_pages
+                        else Path(pipeline_temp.name) / "regular_ocr.pdf"
+                    )
+                    run_ocr(
+                        current_input,
+                        regular_output,
+                        pages=regular_pages,
+                    )
+                    current_input = regular_output
+                if plan.redo_ocr_pages:
+                    run_ocr(
+                        current_input,
+                        staged_output_path,
+                        pages=plan.redo_ocr_pages,
+                        redo=True,
+                    )
+                elif not regular_pages:
+                    shutil.copy2(current_input, staged_output_path)
         else:
             plan = _plan_deskew_ocr(
                 ocr_input_path,
@@ -1829,9 +3092,19 @@ def apply_ocr(
                     "Deskew disabled because scan-like pages could not be "
                     "identified safely"
                 )
-                run_ocr(ocr_input_path, output_path)
-            elif not plan.deskew_pages and not plan.regular_ocr_pages:
-                shutil.copy2(ocr_input_path, output_path)
+                run_ocr(ocr_input_path, staged_output_path)
+            elif plan.ambiguous_scan_pages:
+                raise OCRError(
+                    "OCR cannot safely replace an existing text layer on "
+                    "ambiguous scan-like page(s): "
+                    f"{list(plan.ambiguous_scan_pages)}"
+                )
+            elif (
+                not plan.deskew_pages
+                and not plan.regular_ocr_pages
+                and not plan.redo_ocr_pages
+            ):
+                shutil.copy2(ocr_input_path, staged_output_path)
             else:
                 if pipeline_temp is None:
                     pipeline_temp = TemporaryDirectory(
@@ -1839,10 +3112,19 @@ def apply_ocr(
                     )
                 current_input = ocr_input_path
 
+                if plan.strip_text_pages:
+                    prepared_input = Path(pipeline_temp.name) / "ocr_input.pdf"
+                    _prepare_deskew_input(
+                        current_input,
+                        prepared_input,
+                        plan.strip_text_pages,
+                    )
+                    current_input = prepared_input
+
                 if plan.regular_ocr_pages:
                     regular_output = (
-                        output_path
-                        if not plan.deskew_pages
+                        staged_output_path
+                        if not plan.deskew_pages and not plan.redo_ocr_pages
                         else Path(pipeline_temp.name) / "regular_ocr.pdf"
                     )
                     run_ocr(
@@ -1851,47 +3133,56 @@ def apply_ocr(
                         pages=plan.regular_ocr_pages,
                     )
                     current_input = regular_output
-                    completed_input_path = current_input
 
                 if plan.deskew_pages:
-                    if plan.strip_text_pages:
-                        prepared_input = Path(pipeline_temp.name) / "deskew_input.pdf"
-                        _prepare_deskew_input(
-                            current_input,
-                            prepared_input,
-                            plan.strip_text_pages,
-                        )
-                        current_input = prepared_input
+                    deskew_output = (
+                        staged_output_path
+                        if not plan.redo_ocr_pages
+                        else Path(pipeline_temp.name) / "deskew_ocr.pdf"
+                    )
                     run_ocr(
                         current_input,
-                        output_path,
+                        deskew_output,
                         pages=plan.deskew_pages,
                         deskew_run=True,
                     )
+                    current_input = deskew_output
 
-        _finalize_ocr_output(
-            output_path,
+                if plan.redo_ocr_pages:
+                    run_ocr(
+                        current_input,
+                        staged_output_path,
+                        pages=plan.redo_ocr_pages,
+                        redo=True,
+                    )
+
+        new_ocr_form_names = _finalize_ocr_output(
+            staged_output_path,
             languages,
             existing_ocr_form_names,
             strip_existing_ocr_text=force,
         )
-        logger.info("OCR completed successfully: %s", output_path)
-        return output_path
+        if staged_manifest_path is not None:
+            _write_ocr_document_manifest(
+                staged_manifest_path,
+                staged_output_path,
+                languages,
+                manifest_pages,
+                new_ocr_form_names,
+            )
+        staged_output_snapshot = staged_file_snapshot(staged_output_path)
+        if staged_manifest_path is not None:
+            staged_manifest_snapshot = staged_file_snapshot(staged_manifest_path)
+        completed_successfully = True
 
     except EncryptedPdfError as e:
         raise OCRError(f"OCR failed: PDF is encrypted ({input_path})") from e
 
-    except PriorOcrFoundError:
-        # PDF already has OCR text, just copy it
-        logger.info("PDF already contains OCR text, skipping OCR")
-        shutil.copy2(completed_input_path, output_path)
-        _finalize_ocr_output(
-            output_path,
-            languages,
-            existing_ocr_form_names,
-            strip_existing_ocr_text=False,
-        )
-        return output_path
+    except PriorOcrFoundError as e:
+        raise OCRError(
+            "OCR failed: the selected page already contains an OCR text layer; "
+            "refusing to publish it as PaddleOCR output"
+        ) from e
 
     except MissingDependencyError as e:
         raise OCRError(f"OCR failed: {_format_ocr_exception(e)}") from e
@@ -1903,8 +3194,153 @@ def apply_ocr(
         raise OCRError(f"OCR failed: {_format_ocr_exception(e)}") from e
 
     finally:
-        _release_ocr_models()
-        if pipeline_temp is not None:
-            pipeline_temp.cleanup()
-        if orientation_temp is not None:
-            orientation_temp.cleanup()
+        cleanup_completed = False
+        try:
+            _cleanup_ocr_resources(
+                (
+                    ("OCR manifest temporary directory", manifest_temp),
+                    ("OCR pipeline temporary directory", pipeline_temp),
+                    ("OCR orientation temporary directory", orientation_temp),
+                ),
+                preserve_primary_error=not completed_successfully,
+            )
+            cleanup_completed = True
+        finally:
+            if not completed_successfully or not cleanup_completed:
+                for directory in (manifest_staging, output_staging):
+                    if directory is None:
+                        continue
+                    try:
+                        directory.cleanup()
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not remove private OCR staging directory %s: %s",
+                            directory.name,
+                            exc,
+                        )
+
+    output_backup = Path(output_staging.name) / f"backup{output_path.suffix}"
+    manifest_backup = (
+        Path(manifest_staging.name) / f"backup{manifest_output_path.suffix}"
+        if manifest_staging is not None and manifest_output_path is not None
+        else None
+    )
+    output_publication_attempted = False
+    manifest_publication_attempted = False
+    keep_output_backup = False
+    keep_manifest_backup = False
+
+    def rollback_publication(
+        destination: Path,
+        candidate: StagedFileSnapshot,
+        backup: Path,
+    ) -> None:
+        if backup.exists():
+            original = staged_file_snapshot(backup)
+        else:
+            try:
+                current = staged_file_snapshot(destination)
+            except ConversionError:
+                return
+            if (current.device, current.inode) != (candidate.device, candidate.inode):
+                return
+            original = None
+        rollback_staged_publication(
+            destination,
+            candidate,
+            original=original,
+            backup=backup if original is not None else None,
+        )
+
+    try:
+        if staged_output_snapshot is None:
+            raise OCRError("OCR output was not finalized for publication")
+        if staged_manifest_path is not None:
+            if staged_manifest_snapshot is None:
+                raise OCRError("OCR manifest was not finalized for publication")
+
+        output_publication_attempted = True
+        publish_staged_file(
+            staged_output_path,
+            output_path,
+            staged_output_snapshot,
+            backup=output_backup,
+        )
+        if staged_manifest_path is not None and manifest_output_path is not None:
+            manifest_publication_attempted = True
+            publish_staged_file(
+                staged_manifest_path,
+                manifest_output_path,
+                staged_manifest_snapshot,
+                backup=manifest_backup,
+            )
+    except BaseException as exc:
+        recovery_failures: list[str] = []
+        if (
+            manifest_publication_attempted
+            and manifest_output_path is not None
+            and manifest_backup is not None
+        ):
+            try:
+                rollback_publication(
+                    manifest_output_path,
+                    staged_manifest_snapshot,
+                    manifest_backup,
+                )
+            except BaseException as recovery_exc:
+                keep_manifest_backup = bool(
+                    manifest_backup is not None and manifest_backup.exists()
+                )
+                recovery_failures.append(
+                    "manifest recovery failed: "
+                    f"{type(recovery_exc).__name__}: {recovery_exc}"
+                )
+        if output_publication_attempted:
+            try:
+                rollback_publication(
+                    output_path,
+                    staged_output_snapshot,
+                    output_backup,
+                )
+            except BaseException as recovery_exc:
+                keep_output_backup = output_backup.exists()
+                recovery_failures.append(
+                    "output recovery failed: "
+                    f"{type(recovery_exc).__name__}: {recovery_exc}"
+                )
+        recovery_message = ""
+        if recovery_failures:
+            recovery_message = f"; {'; '.join(recovery_failures)}"
+            if keep_output_backup:
+                recovery_message += f"; recovery copy retained at {output_backup}"
+            if keep_manifest_backup and manifest_backup is not None:
+                recovery_message += (
+                    f"; manifest recovery copy retained at {manifest_backup}"
+                )
+        if not isinstance(exc, Exception):
+            if recovery_message:
+                exc.add_note(f"OCR publication recovery{recovery_message}")
+            raise
+        raise OCRError(
+            f"Could not publish OCR output atomically: {exc}{recovery_message}"
+        ) from exc
+    finally:
+        directories = []
+        if not keep_manifest_backup:
+            directories.append(manifest_staging)
+        if not keep_output_backup:
+            directories.append(output_staging)
+        for directory in directories:
+            if directory is None:
+                continue
+            try:
+                directory.cleanup()
+            except Exception as exc:
+                logger.warning(
+                    "Could not remove private OCR staging directory %s: %s",
+                    directory.name,
+                    exc,
+                )
+
+    logger.info("OCR completed successfully: %s", output_path)
+    return output_path

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -20,7 +21,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 from ocrmypdf.helpers import Resolution
-from ocrmypdf.hocrtransform import Baseline, BoundingBox, OcrClass
+from ocrmypdf.hocrtransform import Baseline, BoundingBox, OcrClass, OcrElement
 from pdfminer.high_level import extract_text
 from pikepdf import Dictionary, Name, Pdf, parse_content_stream
 from PIL import Image, ImageDraw, ImageFont
@@ -29,6 +30,17 @@ import pdftopdfa.ocr_paddle as ocr_paddle
 from pdftopdfa import OCRSession
 from pdftopdfa.exceptions import OCRError
 from pdftopdfa.ocr import apply_ocr, validate_ocr_languages
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("Invoice 42", "ltr"), ("مرحبا 42", "rtl"), ("1234", "ltr")],
+)
+def test_text_direction_uses_first_strong_character(
+    text: str,
+    expected: str,
+) -> None:
+    assert ocr_paddle._text_direction(text) == expected
 
 
 @pytest.fixture(autouse=True)
@@ -87,6 +99,7 @@ def _options(
     clean: bool = False,
     execution_provider: str = "cpu",
     layout: bool = False,
+    manifest_dir: Path | None = None,
 ) -> SimpleNamespace:
     detection_dir, recognition_dir = model_dirs
     return SimpleNamespace(
@@ -95,6 +108,7 @@ def _options(
             recognition_model_dir=recognition_dir,
             execution_provider=execution_provider,
             layout=layout,
+            manifest_dir=manifest_dir,
         ),
         languages=languages or ["en"],
         ocr_engine="paddle",
@@ -888,6 +902,7 @@ def test_generate_ocr_maps_lines_words_geometry_and_metadata(
         bottom=40,
     )
     assert page.children[1].textangle == pytest.approx(-math.degrees(math.atan2(5, 90)))
+    assert all(not hasattr(line, "_pdftopdfa_mcid") for line in page.children)
 
 
 def test_column_detection_prefers_structural_gap_over_amount_columns() -> None:
@@ -930,6 +945,72 @@ def test_layout_orders_detected_columns_without_rerunning_ocr(
     ]
     assert plain_text == "Left top\nLeft bottom\nRight top\nRight bottom"
     predict.assert_called_once()
+
+
+def test_level_a_manifest_preserves_unicode_layout_and_stable_mcids(
+    tmp_path: Path,
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    manifest_dir = tmp_path / "manifest"
+    result = _two_column_result()
+    texts = ["Rückgabe", "Förderung", "Kärchow", "Größe"]
+    result["rec_texts"] = texts
+    result["text_word"] = [[text] for text in texts]
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(
+                model_dirs,
+                ["de", "en"],
+                manifest_dir=manifest_dir,
+            ),
+            page_number=3,
+        )
+
+    expected = ["Förderung", "Größe", "Rückgabe", "Kärchow"]
+    assert [line.text for line in page.children] == expected
+    assert plain_text == "\n".join(expected)
+    assert [line._pdftopdfa_mcid for line in page.children] == [0, 1, 2, 3]
+    assert [entry.name for entry in manifest_dir.iterdir()] == ["page-000003.json"]
+
+    manifest_bytes = (manifest_dir / "page-000003.json").read_bytes()
+    manifest = json.loads(manifest_bytes.decode("utf-8"))
+    assert b"\xef\xbf\xbd" not in manifest_bytes
+    assert "Förderung" in manifest_bytes.decode("utf-8")
+    assert manifest["schema_version"] == 1
+    assert manifest["type"] == "pdftopdfa-ocr-page"
+    assert manifest["page_index"] == 3
+    assert manifest["raster"] == {"dpi": 300.0, "height": 200, "width": 400}
+    assert manifest["coordinates"] == {
+        "dpi": 300.0,
+        "height": 200.0,
+        "scale_from_raster": 1.0,
+        "width": 400.0,
+    }
+    assert manifest["languages"] == ["de", "en"]
+    assert manifest["layout"]["reading_order_applied"] is True
+    assert len(manifest["layout"]["sections"]) == 1
+    assert len(manifest["layout"]["selected_columns"]) == 2
+    assert [line["text"] for line in manifest["lines"]] == expected
+    assert [line["mcid"] for line in manifest["lines"]] == [0, 1, 2, 3]
+    assert manifest["lines"][0]["ocr_class"] == "ocr_line"
+    assert manifest["lines"][0]["confidence"] == pytest.approx(0.9)
+    assert manifest["lines"][0]["baseline"] == {
+        "intercept": 0.0,
+        "slope": 0.0,
+    }
+    assert manifest["lines"][0]["text_angle"] == pytest.approx(0.0)
+    assert manifest["lines"][0]["words"][0]["index"] == 0
+    assert manifest["lines"][0]["words"][0]["text"] == "Förderung"
+    assert manifest["lines"][0]["words"][0]["bbox"] == {
+        "bottom": 40.0,
+        "left": 20.0,
+        "right": 100.0,
+        "top": 20.0,
+    }
+    assert len(manifest["lines"][0]["words"][0]["polygon"]) == 4
 
 
 def test_layout_orders_columns_between_full_width_blocks(
@@ -985,6 +1066,440 @@ def test_layout_orders_columns_between_full_width_blocks(
     ]
     assert [line.text for line in page.children] == expected
     assert plain_text == "\n".join(expected)
+
+
+def test_layout_uses_each_vertical_sections_own_columns(
+    tmp_path: Path,
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    entries = [
+        ("Indented lower", 40, 160, 170, 175),
+        ("Upper right top", 270, 20, 370, 35),
+        ("Section title", 40, 105, 360, 120),
+        ("Upper left bottom", 20, 70, 100, 85),
+        ("Centered upper", 220, 130, 340, 145),
+        ("Upper right bottom", 270, 70, 370, 85),
+        ("Upper left top", 20, 20, 100, 35),
+    ]
+    polygons = [
+        [[left, top], [right, top], [right, bottom], [left, bottom]]
+        for _text, left, top, right, bottom in entries
+    ]
+    result = _result(
+        texts=[entry[0] for entry in entries],
+        scores=[0.9] * len(entries),
+        polygons=polygons,
+        boxes=[list(entry[1:]) for entry in entries],
+        text_word=[[entry[0]] for entry in entries],
+        text_word_region=[[polygon] for polygon in polygons],
+    )
+    manifest_dir = tmp_path / "manifest"
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(
+                model_dirs,
+                layout=True,
+                manifest_dir=manifest_dir,
+            ),
+        )
+
+    expected = [
+        "Upper left top",
+        "Upper left bottom",
+        "Upper right top",
+        "Upper right bottom",
+        "Section title",
+        "Centered upper",
+        "Indented lower",
+    ]
+    assert [line.text for line in page.children] == expected
+    assert plain_text == "\n".join(expected)
+    assert [line._pdftopdfa_mcid for line in page.children] == list(range(7))
+    manifest = json.loads(
+        (manifest_dir / "page-000000.json").read_text(encoding="utf-8")
+    )
+    assert [len(section["columns"]) for section in manifest["layout"]["sections"]] == [
+        2,
+        1,
+    ]
+    assert len(manifest["layout"]["selected_columns"]) == 2
+    assert [line["text"] for line in manifest["lines"]] == expected
+    assert [line["mcid"] for line in manifest["lines"]] == list(range(7))
+
+
+def test_layout_orders_unsorted_scaled_two_one_three_column_sections(
+    tmp_path: Path,
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    entries = [
+        ("Three middle bottom", 165, 125, 235, 135),
+        ("One lower", 40, 72, 120, 81),
+        ("Two right top", 300, 15, 380, 25),
+        ("Footer", 40, 150, 360, 160),
+        ("Three left top", 15, 105, 85, 115),
+        ("Two left bottom", 20, 30, 100, 40),
+        ("Lower section", 40, 87, 360, 95),
+        ("Three right bottom", 315, 125, 385, 135),
+        ("One upper", 300, 60, 380, 69),
+        ("Header", 40, 2, 360, 10),
+        ("Three middle top", 165, 105, 235, 115),
+        ("Two right bottom", 300, 30, 380, 40),
+        ("Middle section", 40, 45, 360, 53),
+        ("Three left bottom", 15, 125, 85, 135),
+        ("Two left top", 20, 15, 100, 25),
+        ("Three right top", 315, 105, 385, 115),
+    ]
+    polygons = [
+        [[left, top], [right, top], [right, bottom], [left, bottom]]
+        for _text, left, top, right, bottom in entries
+    ]
+    result = _result(
+        texts=[entry[0] for entry in entries],
+        scores=[0.9] * len(entries),
+        polygons=polygons,
+        boxes=[list(entry[1:]) for entry in entries],
+        text_word=[[entry[0]] for entry in entries],
+        text_word_region=[[polygon] for polygon in polygons],
+    )
+    page_context = SimpleNamespace(
+        pageinfo=SimpleNamespace(dpi=SimpleNamespace(to_scalar=lambda: 150.0)),
+        get_path=lambda _name: page_image,
+    )
+    ocr_paddle.filter_ocr_image(
+        page_context,
+        Image.new("RGB", (400, 200), "white"),
+    )
+    manifest_dir = tmp_path / "manifest"
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(model_dirs, manifest_dir=manifest_dir),
+        )
+
+    expected = [
+        "Header",
+        "Two left top",
+        "Two left bottom",
+        "Two right top",
+        "Two right bottom",
+        "Middle section",
+        "One upper",
+        "One lower",
+        "Lower section",
+        "Three left top",
+        "Three left bottom",
+        "Three middle top",
+        "Three middle bottom",
+        "Three right top",
+        "Three right bottom",
+        "Footer",
+    ]
+    assert page.bbox == BoundingBox(left=0, top=0, right=200, bottom=100)
+    assert [line.text for line in page.children] == expected
+    assert plain_text == "\n".join(expected)
+    manifest = json.loads(
+        (manifest_dir / "page-000000.json").read_text(encoding="utf-8")
+    )
+    assert [len(section["columns"]) for section in manifest["layout"]["sections"]] == [
+        2,
+        1,
+        3,
+    ]
+    assert len(manifest["layout"]["selected_columns"]) == 3
+    assert manifest["layout"]["selected_columns"][-1]["right"] == 200.0
+    assert [line["text"] for line in manifest["lines"]] == expected
+
+
+def test_layout_keeps_a_spanning_line_inside_its_column_section(
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    entries = [
+        ("Right bottom", 300, 80, 380, 95),
+        ("Spanning note", 150, 50, 250, 65),
+        ("Left top", 20, 20, 100, 35),
+        ("Right top", 300, 20, 380, 35),
+        ("Left bottom", 20, 80, 100, 95),
+    ]
+    polygons = [
+        [[left, top], [right, top], [right, bottom], [left, bottom]]
+        for _text, left, top, right, bottom in entries
+    ]
+    result = _result(
+        texts=[entry[0] for entry in entries],
+        scores=[0.9] * len(entries),
+        polygons=polygons,
+        boxes=[list(entry[1:]) for entry in entries],
+        text_word=[[entry[0]] for entry in entries],
+        text_word_region=[
+            [polygon] if entry[0] != "Spanning note" else []
+            for entry, polygon in zip(entries, polygons, strict=True)
+        ],
+    )
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(model_dirs, layout=True),
+        )
+
+    expected = [
+        "Left top",
+        "Right top",
+        "Spanning note",
+        "Left bottom",
+        "Right bottom",
+    ]
+    assert [line.text for line in page.children] == expected
+    assert plain_text == "\n".join(expected)
+
+
+@pytest.mark.parametrize(
+    "word_geometry",
+    ["missing", "separator_missing"],
+)
+def test_layout_orders_sections_with_missing_word_geometry(
+    word_geometry: str,
+    tmp_path: Path,
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    entries = [
+        ("Right bottom", 270, 35, 370, 45),
+        ("Lower bottom", 40, 100, 180, 110),
+        ("Left top", 20, 15, 100, 25),
+        ("Section divider", 40, 60, 360, 70),
+        ("Right top", 270, 15, 370, 25),
+        ("Lower top", 40, 80, 180, 90),
+        ("Left bottom", 20, 35, 100, 45),
+    ]
+    polygons = [
+        [[left, top], [right, top], [right, bottom], [left, bottom]]
+        for _text, left, top, right, bottom in entries
+    ]
+    word_data = {}
+    if word_geometry == "separator_missing":
+        word_data = {
+            "text_word": [[entry[0]] for entry in entries],
+            "text_word_region": [
+                [] if entry[0] == "Section divider" else [polygon]
+                for entry, polygon in zip(entries, polygons, strict=True)
+            ],
+        }
+    result = _result(
+        texts=[entry[0] for entry in entries],
+        scores=[0.9] * len(entries),
+        polygons=polygons,
+        boxes=[list(entry[1:]) for entry in entries],
+        **word_data,
+    )
+    manifest_dir = tmp_path / "manifest"
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(
+                model_dirs,
+                layout=True,
+                manifest_dir=manifest_dir,
+            ),
+        )
+
+    expected = [
+        "Left top",
+        "Left bottom",
+        "Right top",
+        "Right bottom",
+        "Section divider",
+        "Lower top",
+        "Lower bottom",
+    ]
+    assert [line.text for line in page.children] == expected
+    assert plain_text == "\n".join(expected)
+    assert [line._pdftopdfa_mcid for line in page.children] == list(range(7))
+    manifest = json.loads(
+        (manifest_dir / "page-000000.json").read_text(encoding="utf-8")
+    )
+    assert [len(section["columns"]) for section in manifest["layout"]["sections"]] == [
+        2,
+        1,
+    ]
+    assert len(manifest["layout"]["selected_columns"]) == 2
+    assert [line["text"] for line in manifest["lines"]] == expected
+    assert [line["mcid"] for line in manifest["lines"]] == list(range(7))
+
+
+@pytest.mark.parametrize("scale", [0.03, 0.0001])
+def test_layout_section_order_is_scale_invariant(
+    scale: float,
+    tmp_path: Path,
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    entries = [
+        ("Right bottom", 270, 35, 370, 45),
+        ("Lower bottom", 40, 100, 180, 110),
+        ("Left top", 20, 15, 100, 25),
+        ("Section divider", 40, 60, 360, 70),
+        ("Right top", 270, 15, 370, 25),
+        ("Lower top", 40, 80, 180, 90),
+        ("Left bottom", 20, 35, 100, 45),
+    ]
+    polygons = [
+        [[left, top], [right, top], [right, bottom], [left, bottom]]
+        for _text, left, top, right, bottom in entries
+    ]
+    result = _result(
+        texts=[entry[0] for entry in entries],
+        scores=[0.9] * len(entries),
+        polygons=polygons,
+        boxes=[list(entry[1:]) for entry in entries],
+        text_word=[[entry[0]] for entry in entries],
+        text_word_region=[[polygon] for polygon in polygons],
+    )
+    manifest_dir = tmp_path / "manifest"
+    options = _options(model_dirs, layout=True, manifest_dir=manifest_dir)
+    expected = [
+        "Left top",
+        "Left bottom",
+        "Right top",
+        "Right bottom",
+        "Section divider",
+        "Lower top",
+        "Lower bottom",
+    ]
+
+    with (
+        patch.object(ocr_paddle, "_predict", return_value=result),
+        patch.object(
+            ocr_paddle,
+            "_take_coordinate_scale",
+            return_value=(300.0 * scale, scale),
+        ),
+    ):
+        first_page, first_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            options,
+        )
+        manifest_path = manifest_dir / "page-000000.json"
+        first_manifest_bytes = manifest_path.read_bytes()
+        second_page, second_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            options,
+        )
+
+    assert [line.text for line in first_page.children] == expected
+    assert [line.text for line in second_page.children] == expected
+    assert first_text == second_text == "\n".join(expected)
+    assert [line._pdftopdfa_mcid for line in first_page.children] == list(range(7))
+    assert [line._pdftopdfa_mcid for line in second_page.children] == list(range(7))
+    assert manifest_path.read_bytes() == first_manifest_bytes
+    manifest = json.loads(first_manifest_bytes.decode("utf-8"))
+    assert manifest["coordinates"]["scale_from_raster"] == scale
+    assert manifest["coordinates"]["width"] == pytest.approx(400 * scale)
+    assert manifest["coordinates"]["height"] == pytest.approx(200 * scale)
+    assert [len(section["columns"]) for section in manifest["layout"]["sections"]] == [
+        2,
+        1,
+    ]
+    assert len(manifest["layout"]["selected_columns"]) == 2
+    assert manifest["layout"]["selected_columns"][-1]["right"] == pytest.approx(
+        400 * scale
+    )
+    assert [line["text"] for line in manifest["lines"]] == expected
+    assert [line["mcid"] for line in manifest["lines"]] == list(range(7))
+
+
+def test_layout_orders_rtl_columns_per_section(
+    tmp_path: Path,
+    model_dirs: tuple[Path, Path],
+    page_image: Path,
+) -> None:
+    entries = [
+        ("يسار أسفل", 20, 70, 100, 85),
+        ("يمين أعلى", 270, 20, 370, 35),
+        ("English header", 40, 2, 360, 10),
+        ("يمين أسفل", 270, 70, 370, 85),
+        ("يسار أعلى", 20, 20, 100, 35),
+    ]
+    polygons = [
+        [[left, top], [right, top], [right, bottom], [left, bottom]]
+        for _text, left, top, right, bottom in entries
+    ]
+    result = _result(
+        texts=[entry[0] for entry in entries],
+        scores=[0.9] * len(entries),
+        polygons=polygons,
+        boxes=[list(entry[1:]) for entry in entries],
+        text_word=[[entry[0]] for entry in entries],
+        text_word_region=[[polygon] for polygon in polygons],
+    )
+    manifest_dir = tmp_path / "manifest"
+
+    with patch.object(ocr_paddle, "_predict", return_value=result):
+        page, plain_text = ocr_paddle.PaddleOcrEngine.generate_ocr(
+            page_image,
+            _options(model_dirs, layout=True, manifest_dir=manifest_dir),
+        )
+
+    expected = [
+        "English header",
+        "يمين أعلى",
+        "يمين أسفل",
+        "يسار أعلى",
+        "يسار أسفل",
+    ]
+    assert [line.text for line in page.children] == expected
+    assert plain_text == "\n".join(expected)
+    assert [line._pdftopdfa_mcid for line in page.children] == list(range(5))
+    manifest = json.loads(
+        (manifest_dir / "page-000000.json").read_text(encoding="utf-8")
+    )
+    assert [line["text"] for line in manifest["lines"]] == expected
+    assert [line["direction"] for line in manifest["lines"]] == [
+        "ltr",
+        "rtl",
+        "rtl",
+        "rtl",
+        "rtl",
+    ]
+    assert [line["mcid"] for line in manifest["lines"]] == list(range(5))
+
+
+@pytest.mark.parametrize(
+    "texts",
+    [
+        ("يسار 1", "يسار 2", "Right 1", "Right 2"),
+        ("100", "200", "300", "400"),
+    ],
+)
+def test_layout_keeps_ltr_order_for_mixed_or_neutral_sections(
+    texts: tuple[str, str, str, str],
+) -> None:
+    lines = [
+        OcrElement(
+            ocr_class=OcrClass.LINE,
+            bbox=BoundingBox(left, top, right, bottom),
+            text=text,
+        )
+        for text, left, top, right, bottom in (
+            (texts[2], 270, 20, 370, 35),
+            (texts[1], 20, 70, 100, 85),
+            (texts[3], 270, 70, 370, 85),
+            (texts[0], 20, 20, 100, 35),
+        )
+    ]
+    columns = [
+        ocr_paddle._LayoutRegion(0, 0, 200, 200),
+        ocr_paddle._LayoutRegion(200, 0, 400, 200),
+    ]
+
+    assert [line.text for line in ocr_paddle._sort_lines(lines, columns)] == list(texts)
 
 
 @pytest.mark.parametrize(
@@ -1502,6 +2017,7 @@ def test_vector_only_force_page_completes_without_zero_dpi(
 ) -> None:
     input_path = tmp_path / "vector.pdf"
     output_path = tmp_path / "forced.pdf"
+    manifest_path = tmp_path / "forced.json"
     with Pdf.new() as pdf:
         page = pdf.add_blank_page(page_size=(72, 72))
         font = Dictionary(
@@ -1526,10 +2042,14 @@ def test_vector_only_force_page_completes_without_zero_dpi(
             detection_model_dir=model_dirs[0],
             recognition_model_dir=model_dirs[1],
             force=True,
+            _manifest_output_path=manifest_path,
         )
 
     with Pdf.open(output_path) as pdf:
         assert len(pdf.pages) == 1
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["pages"][0]["page_index"] == 0
+    assert manifest["pages"][0]["lines"] == []
 
 
 def test_rotated_page_grafts_polygon_text_layer(
@@ -1538,6 +2058,7 @@ def test_rotated_page_grafts_polygon_text_layer(
 ) -> None:
     input_path = tmp_path / "rotated.pdf"
     output_path = tmp_path / "rotated-ocr.pdf"
+    manifest_path = tmp_path / "rotated-ocr.json"
     with Pdf.new() as pdf:
         image = pdf.make_stream(b"\x80")
         image[Name.Type] = Name.XObject
@@ -1570,19 +2091,29 @@ def test_rotated_page_grafts_polygon_text_layer(
             output_path,
             detection_model_dir=model_dirs[0],
             recognition_model_dir=model_dirs[1],
+            _manifest_output_path=manifest_path,
         )
 
     assert "".join(extract_text(output_path).split()) == "Rotatetest"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert len(manifest["pages"]) == 1
+    assert manifest["pages"][0]["page_index"] == 0
+    assert manifest["pages"][0]["lines"][0]["mcid"] == 0
+    assert manifest["pages"][0]["lines"][0]["text"] == "Rotate test"
     with Pdf.open(output_path) as pdf:
         page = pdf.pages[0]
         assert int(page.Rotate) == 90
         forms = [
-            xobject
+            (str(name), xobject)
             for name, xobject in page.Resources.XObject.items()
             if str(name).startswith("/OCR-")
         ]
         assert len(forms) == 1
-        assert [float(value) for value in forms[0].BBox] == [0, 0, 144, 72]
+        form_name, form = forms[0]
+        assert manifest["pages"][0]["form_name"] == form_name
+        assert [float(value) for value in form.BBox] == [0, 0, 144, 72]
+        assert b"/Span <</MCID 0>> BDC" in form.read_bytes()
+        assert b"EMC" in form.read_bytes()
         page_matrix = next(
             instruction.operands
             for instruction in parse_content_stream(page)
@@ -1592,7 +2123,7 @@ def test_rotated_page_grafts_polygon_text_layer(
             [0, 1, -1, 0, 72, 0]
         )
 
-        form_instructions = list(parse_content_stream(forms[0]))
+        form_instructions = list(parse_content_stream(form))
         line_matrix = next(
             instruction.operands
             for instruction in form_instructions
