@@ -586,8 +586,8 @@ class TestConvertNonCompliantEmbeddedFiles:
         assert "embedded_files_converted" in result
         assert isinstance(result["embedded_files_converted"], int)
 
-    def test_encrypted_embedded_pdf_is_not_returned_as_converted(self) -> None:
-        """An encrypted input copied unchanged is not a successful conversion."""
+    def test_openable_encrypted_embedded_pdf_is_converted(self) -> None:
+        """An encrypted input with an empty user password is converted."""
         from pdftopdfa.sanitizers.files import (
             _try_convert_embedded_pdf_to_pdfa2,
         )
@@ -600,7 +600,10 @@ class TestConvertNonCompliantEmbeddedFiles:
                 _create_encrypted_pdf_bytes()
             )
 
-        assert converted is None
+        assert converted is not None
+        with Pdf.open(BytesIO(converted)) as converted_pdf:
+            assert converted_pdf.is_encrypted is False
+            assert converted_pdf.Root["/Metadata"]["/Type"] == Name.Metadata
 
     def test_signed_non_compliant_embedded_pdf_is_preserved(self) -> None:
         """A signed input skipped by conversion is retained and reported."""

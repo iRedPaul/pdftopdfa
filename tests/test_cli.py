@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 from colorama import Fore, Style
+from pikepdf import Pdf
 
 import pdftopdfa.cli as cli_module
 from pdftopdfa import __version__
@@ -436,19 +437,20 @@ class TestCliConvert:
         # Success messages are suppressed
         assert "Converting" not in result.output
 
-    def test_cli_convert_encrypted_pdf_is_skipped(
+    def test_cli_convert_encrypted_pdf_is_converted(
         self, runner: CliRunner, encrypted_pdf: Path, tmp_dir: Path
     ) -> None:
-        """Encrypted PDFs are copied unchanged and reported as skipped."""
+        """An encrypted PDF with an empty user password is converted."""
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(main, [str(encrypted_pdf), str(output_path)])
 
         assert result.exit_code == EXIT_SUCCESS
         assert output_path.exists()
-        assert output_path.read_bytes() == encrypted_pdf.read_bytes()
-        assert "Skipped:" in result.output
-        assert "encrypted" in result.output
+        assert output_path.read_bytes() != encrypted_pdf.read_bytes()
+        with Pdf.open(output_path) as pdf:
+            assert pdf.is_encrypted is False
+        assert "Converted to PDF/A" in result.output
 
     def test_cli_password_encrypted_pdf_is_skipped(
         self,
@@ -679,10 +681,10 @@ class TestCliDirectory:
         # File was re-created (content should be valid PDF)
         assert output_file.read_bytes()[:5] == b"%PDF-"
 
-    def test_cli_convert_directory_reports_skipped_files(
+    def test_cli_convert_directory_converts_openable_encrypted_files(
         self, runner: CliRunner, encrypted_pdf: Path, tmp_dir: Path
     ) -> None:
-        """Directory mode reports skipped encrypted PDFs as warnings."""
+        """Directory mode converts encrypted PDFs that need no password."""
         input_dir = tmp_dir / "input"
         input_dir.mkdir()
         (input_dir / "encrypted.pdf").write_bytes(encrypted_pdf.read_bytes())
@@ -690,9 +692,10 @@ class TestCliDirectory:
         result = runner.invoke(main, [str(input_dir)])
 
         assert result.exit_code == EXIT_SUCCESS
-        assert "0 file(s) successfully converted" in result.output
-        assert "1 file(s) skipped and copied unchanged" in result.output
-        assert "encrypted.pdf: Conversion skipped: PDF is encrypted" in result.output
+        assert "1 file(s) successfully converted" in result.output
+        assert "skipped and copied unchanged" not in result.output
+        with Pdf.open(input_dir / "encrypted_pdfa.pdf") as pdf:
+            assert pdf.is_encrypted is False
 
 
 class TestCliValidation:

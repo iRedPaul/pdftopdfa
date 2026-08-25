@@ -42,8 +42,9 @@ preserving the original content, fonts, and layout where possible.
 
 pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with the PDF/A standard:
 
-1. **Pre-check** -- copies encrypted and, by default, digitally signed PDFs
-   unchanged; otherwise, detects if the PDF is already a valid PDF/A file
+1. **Pre-check** -- converts encrypted PDFs that open with an empty user
+   password, copies password-protected and, by default, digitally signed PDFs
+   unchanged, and otherwise detects if the PDF is already a valid PDF/A file
    (skips conversion if the existing conformance level meets or exceeds the
    target within the same PDF/A part; optionally skips any veraPDF-compliant
    PDF/A via `--skip-any-pdfa`; see the [Usage Guide](https://github.com/iRedPaul/pdftopdfa/blob/main/docs/usage.md#already-compliant-pdfs) for details)
@@ -314,9 +315,10 @@ image, table, and reusable `OCRSession` APIs.
   same reason.
   Review automatically inferred semantics for accessibility-critical
   publications. PDF/A level A does not by itself imply PDF/UA conformance.
-- **Encrypted PDFs** -- password-protected PDFs cannot be converted and are
-  copied unchanged. With an automatically generated output name, the unchanged
-  copy still receives the `_pdfa.pdf` suffix; it is not a converted PDF/A file
+- **Encrypted PDFs** -- encryption is removed from PDFs that open with an empty
+  user password. PDFs that require a password cannot be converted and are copied
+  unchanged. With an automatically generated output name, the unchanged copy
+  still receives the `_pdfa.pdf` suffix; it is not a converted PDF/A file
 - **Digitally signed PDFs** -- signed PDFs are copied unchanged by default because conversion would invalidate their signatures; use `--allow-signature-invalidation` only when an unsigned archival copy is intentional
 - **Font replacement** -- fonts without a suitable metrically compatible replacement produce a warning; the resulting file may not be fully compliant
 - **Non-embedded CIDFonts (Identity encoding)** -- content streams reference glyph IDs of the original font; after replacement with a substitute font the same glyph IDs point to different or missing glyphs, so the affected text may render incorrectly or invisibly. Text extraction and copy/paste stay correct because the original ToUnicode mapping is preserved. A warning is emitted for each replaced CIDFont

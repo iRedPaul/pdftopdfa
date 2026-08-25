@@ -388,7 +388,6 @@ class TestConvertToPdfa:
     @pytest.mark.parametrize(
         ("branch", "options"),
         [
-            ("encrypted", {"validate": True}),
             ("signed", {"validate": True}),
             ("no-processing", {"pdfa": False}),
         ],
@@ -412,23 +411,15 @@ class TestConvertToPdfa:
                 original_close()
 
             check_pdf.close = tracked_close
-            return branch == "encrypted"
+            return False
 
         def early_callback(*_args: object, **_kwargs: object):
             assert closed
-            if branch == "encrypted":
-                return ConversionResult(
-                    success=True,
-                    input_path=sample_pdf,
-                    output_path=tmp_dir / "output.pdf",
-                    level=None,
-                )
             if branch == "signed":
                 return False
             return None
 
         helper = {
-            "encrypted": "_copy_encrypted_input",
             "signed": "_validate_input_snapshot_and_publish",
             "no-processing": "_copy_input_to_output",
         }[branch]
@@ -1323,16 +1314,24 @@ class TestConvertToPdfa:
             convert_to_pdfa(input_path, output_path, level="invalid")
 
     def test_convert_encrypted_pdf(self, encrypted_pdf: Path, tmp_dir: Path) -> None:
-        """Encrypted PDF is copied unchanged and reported as skipped."""
+        """An encrypted PDF with an empty user password is converted."""
         output_path = tmp_dir / "output.pdf"
         result = convert_to_pdfa(encrypted_pdf, output_path)
 
         assert result.success is True
-        assert result.skipped is True
-        assert result.level is None
-        assert any("encrypted" in w for w in result.warnings)
+        assert result.skipped is False
+        assert result.level == "3b"
+        assert "Encryption removed for PDF/A compliance" in result.warnings
         assert output_path.exists()
-        assert output_path.read_bytes() == encrypted_pdf.read_bytes()
+        assert output_path.read_bytes() != encrypted_pdf.read_bytes()
+
+        with Pdf.open(output_path) as pdf:
+            assert pdf.is_encrypted is False
+            metadata = pdf.Root["/Metadata"]
+            assert metadata["/Type"] == Name.Metadata
+            assert metadata["/Subtype"] == Name.XML
+            output_intent = pdf.Root["/OutputIntents"][0]
+            assert output_intent["/DestOutputProfile"]["/N"] == 3
 
     @pytest.mark.parametrize("pdfa", [True, False])
     def test_password_encrypted_pdf_is_copied_unchanged(
@@ -1849,7 +1848,7 @@ class TestConvertToPdfa:
     def test_encrypted_skip_is_still_validated_when_requested(
         self,
         mock_verapdf: MagicMock,
-        encrypted_pdf: Path,
+        password_encrypted_pdf: Path,
         tmp_dir: Path,
     ) -> None:
         """Explicit validation does not silently bypass encrypted skip output."""
@@ -1862,7 +1861,7 @@ class TestConvertToPdfa:
         sentinel = b"existing output"
         output_path.write_bytes(sentinel)
 
-        result = convert_to_pdfa(encrypted_pdf, output_path, validate=True)
+        result = convert_to_pdfa(password_encrypted_pdf, output_path, validate=True)
 
         assert result.skipped is True
         assert result.validation_failed is True
@@ -1870,7 +1869,7 @@ class TestConvertToPdfa:
         assert any("not published" in warning for warning in result.warnings)
         assert output_path.read_bytes() == sentinel
         validated_path = mock_verapdf.call_args.kwargs["path"]
-        assert validated_path != encrypted_pdf
+        assert validated_path != password_encrypted_pdf
         assert validated_path.parent.parent == output_path.parent
         assert not validated_path.exists()
 
@@ -1878,7 +1877,7 @@ class TestConvertToPdfa:
     def test_encrypted_skip_publishes_after_successful_validation(
         self,
         mock_verapdf: MagicMock,
-        encrypted_pdf: Path,
+        password_encrypted_pdf: Path,
         tmp_dir: Path,
     ) -> None:
         """A validated unchanged encrypted input is published atomically."""
@@ -1886,13 +1885,13 @@ class TestConvertToPdfa:
         output_path = tmp_dir / "output.pdf"
         output_path.write_bytes(b"existing output")
 
-        result = convert_to_pdfa(encrypted_pdf, output_path, validate=True)
+        result = convert_to_pdfa(password_encrypted_pdf, output_path, validate=True)
 
         assert result.validation_failed is False
         assert result.level == "3b"
-        assert output_path.read_bytes() == encrypted_pdf.read_bytes()
+        assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
         validated_path = mock_verapdf.call_args.kwargs["path"]
-        assert validated_path != encrypted_pdf
+        assert validated_path != password_encrypted_pdf
         assert validated_path.parent.parent == output_path.parent
         assert not validated_path.exists()
 
@@ -1900,23 +1899,23 @@ class TestConvertToPdfa:
     def test_encrypted_skip_publishes_exact_validated_snapshot(
         self,
         mock_verapdf: MagicMock,
-        encrypted_pdf: Path,
+        password_encrypted_pdf: Path,
         tmp_dir: Path,
     ) -> None:
         """A source change during validation cannot change published bytes."""
-        expected = encrypted_pdf.read_bytes()
+        expected = password_encrypted_pdf.read_bytes()
 
         def validate_snapshot(*, path: Path, flavour: str) -> VeraPDFResult:
             assert flavour == "3b"
             assert path.read_bytes() == expected
-            encrypted_pdf.write_bytes(b"changed after snapshot")
+            password_encrypted_pdf.write_bytes(b"changed after snapshot")
             return VeraPDFResult(compliant=True, flavour=flavour)
 
         mock_verapdf.side_effect = validate_snapshot
         output_path = tmp_dir / "output.pdf"
         output_path.write_bytes(b"existing output")
 
-        result = convert_to_pdfa(encrypted_pdf, output_path, validate=True)
+        result = convert_to_pdfa(password_encrypted_pdf, output_path, validate=True)
 
         assert result.validation_failed is False
         assert output_path.read_bytes() == expected

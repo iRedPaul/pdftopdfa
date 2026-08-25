@@ -1070,16 +1070,18 @@ def convert_to_pdfa(
         # 0. Check if PDF is already PDF/A compliant (before OCR)
         with pikepdf.open(input_path) as check_pdf:
             if is_pdf_encrypted(check_pdf):
-                check_pdf.close()
-                return _copy_encrypted_input(
-                    input_path,
-                    output_path,
-                    pdfa=pdfa,
-                    validate=validate,
-                    level=level,
-                    start_time=start_time,
-                    allow_overwrite=_allow_output_overwrite,
-                )
+                if not pdfa:
+                    check_pdf.close()
+                    return _copy_encrypted_input(
+                        input_path,
+                        output_path,
+                        pdfa=False,
+                        validate=validate,
+                        level=level,
+                        start_time=start_time,
+                        allow_overwrite=_allow_output_overwrite,
+                    )
+                warnings.append("Encryption removed for PDF/A compliance")
             if pdfa and len(check_pdf.pages) == 0:
                 raise UnsupportedPDFError(
                     "PDF contains no pages and cannot be converted to PDF/A"
