@@ -19,6 +19,7 @@ preserving the original content, fonts, and layout where possible.
 - **PDF/A-2a, 2b, 2u, 3a, 3b, 3u** -- supports modern PDF/A levels
   (ISO 19005-2 and ISO 19005-3), including Tagged PDF output for scanned
   documents
+- **PDF/UA-1** -- optional dual-conformance output with PDF/A-2a or PDF/A-3a
 - **Automatic font embedding** -- uses policy-approved Windows system fonts or bundled replacements
 - **Font subsetting** -- reduces file size by removing unused glyphs
 - **CJK support** -- embeds Noto Sans CJK for Chinese, Japanese, and Korean text
@@ -54,7 +55,9 @@ pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with 
    OCRmyPDF rasterizes OCR target pages and creates the searchable text layer
 3. **Font compliance** -- analyzes all fonts, embeds missing ones, adds ToUnicode mappings, subsets embedded fonts, and fixes encoding issues
 4. **Sanitization** -- removes or fixes non-compliant elements (JavaScript, non-standard actions, transparency groups, annotations, optional content, etc.)
-5. **Metadata** -- synchronizes XMP metadata with the document info dictionary and sets the PDF/A conformance level
+5. **Metadata** -- synchronizes XMP metadata with the document info dictionary,
+   sets the PDF/A conformance level, and optionally adds PDF/UA-1 identification
+   with the required PDF/A extension schema
 6. **Color profiles** -- detects color spaces and embeds the required ICC profiles (sRGB, CMYK/FOGRA39, sGray)
 7. **Logical structure** -- for level A, preserves and safely repairs valid
    rich tags or builds headings, paragraphs, lists, tables, figures, artifacts,
@@ -81,12 +84,13 @@ python -m pip install pdftopdfa
 If the `pdftopdfa` console script is not on `PATH`, use
 `python -m pdftopdfa` in the examples below.
 
-### Optional: PDF/A validation
+### Optional: PDF/A and PDF/UA validation
 
 Validation uses the external [veraPDF](https://verapdf.org/) application, which
 is not bundled. Install it and make its launcher available on `PATH`, or set
 `VERAPDF_PATH` to the executable or its parent directory, before using
-`--validate` or `validate=True`.
+`--validate` or `validate=True`. PDF/UA output is checked against both the
+selected PDF/A profile and veraPDF's `ua1` profile.
 
 ### Optional: OCR support
 
@@ -187,6 +191,9 @@ pdftopdfa -l 2b document.pdf
 # Tagged PDF/A-2a output with veraPDF validation
 pdftopdfa -l 2a --validate document.pdf
 
+# PDF/A-2a and PDF/UA-1 output, validated against both profiles
+pdftopdfa -l 2a --pdfua --validate document.pdf
+
 # With validation (note: -v = --validate, not verbose; use --verbose for logs)
 pdftopdfa -v document.pdf
 
@@ -265,6 +272,14 @@ result = convert_to_pdfa(
     level="2b",
 )
 
+accessible_result = convert_to_pdfa(
+    input_path=Path("input.pdf"),
+    output_path=Path("accessible.pdf"),
+    level="2a",
+    pdfua=True,
+    validate=True,
+)
+
 ocr_result = convert_to_pdfa(
     input_path=Path("scan.pdf"),
     output_path=Path("scan_pdfa.pdf"),
@@ -314,7 +329,10 @@ image, table, and reusable `OCRSession` APIs.
   without a trustworthy tooltip or field name are retained and reported for the
   same reason.
   Review automatically inferred semantics for accessibility-critical
-  publications. PDF/A level A does not by itself imply PDF/UA conformance.
+  publications. PDF/A level A does not by itself imply PDF/UA conformance;
+  request the additional PDF/UA-1 requirements with `--pdfua` or
+  `pdfua=True`. veraPDF checks machine-verifiable requirements, while reported
+  semantic uncertainties still require human review.
 - **Encrypted PDFs** -- encryption is removed from PDFs that open with an empty
   user password. PDFs that require a password cannot be converted and are copied
   unchanged. With an automatically generated output name, the unchanged copy

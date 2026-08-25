@@ -2623,6 +2623,9 @@ def create_xmp_metadata(
     existing_xmp_tree: etree._Element | None = None,
     non_catalog_extension_needs: dict[str, set[str]] | None = None,
     factur_x_properties: Mapping[str, str] | None = None,
+    *,
+    pdfua: bool = False,
+    fallback_title: str | None = None,
 ) -> bytes:
     """
     Create XMP metadata XML for PDF/A.
@@ -2644,6 +2647,10 @@ def create_xmp_metadata(
              declarations in the catalog XMP.
         factur_x_properties: Canonical Factur-X properties inferred from an
              embedded XRechnung, or None.
+        pdfua: If True, identify the document as PDF/UA-1 and include the
+             required PDF/A extension schema declaration.
+        fallback_title: Document title to use for PDF/UA when the source has
+             no title metadata.
 
     Returns:
         UTF-8 encoded XMP metadata bytes with packet wrapper.
@@ -2656,6 +2663,7 @@ def create_xmp_metadata(
     ns_xmp = NAMESPACES["xmp"]
     ns_pdf = NAMESPACES["pdf"]
     ns_pdfaid = NAMESPACES["pdfaid"]
+    ns_pdfuaid = NAMESPACES["pdfuaid"]
     ns_fx = NAMESPACES["fx"]
     ns_xmpmm = NAMESPACES["xmpMM"]
 
@@ -2673,6 +2681,8 @@ def create_xmp_metadata(
     }
     if factur_x_properties is not None:
         nsmap["fx"] = ns_fx
+    if pdfua:
+        nsmap["pdfuaid"] = ns_pdfuaid
 
     # Create namespace-aware element makers (only rdf and dc are used as
     # factory functions; other namespaces use etree.SubElement directly)
@@ -2690,6 +2700,8 @@ def create_xmp_metadata(
     # so they are not lost.
     if title is None:
         title = _extract_lang_alt_xmp_property(existing_xmp_tree, ns_dc, "title")
+    if title is None and pdfua:
+        title = _clean_metadata_text(fallback_title) or "Untitled"
     if author is None:
         creators = _extract_array_xmp_property(existing_xmp_tree, ns_dc, "creator")
         if creators:
@@ -2737,6 +2749,9 @@ def create_xmp_metadata(
     part_elem.text = str(pdfa_part)
     conformance_elem = etree.SubElement(description, f"{{{ns_pdfaid}}}conformance")
     conformance_elem.text = pdfa_conformance.upper()
+    if pdfua:
+        pdfua_part_elem = etree.SubElement(description, f"{{{ns_pdfuaid}}}part")
+        pdfua_part_elem.text = "1"
 
     # Add Dublin Core elements
     format_elem = dc("format")
@@ -2810,6 +2825,18 @@ def create_xmp_metadata(
                 name: value
                 for name, value in preserved_attrs.items()
                 if name not in factur_x_tags
+            }
+
+        if pdfua:
+            preserved_elems = [
+                elem
+                for elem in preserved_elems
+                if etree.QName(elem).namespace != ns_pdfuaid
+            ]
+            preserved_attrs = {
+                name: value
+                for name, value in preserved_attrs.items()
+                if etree.QName(name).namespace != ns_pdfuaid
             }
 
         # Register extra namespaces for serialization
@@ -3623,6 +3650,8 @@ def sync_metadata(
     *,
     source_info: Mapping[str, Any] | None = None,
     source_xmp_tree: etree._Element | None = None,
+    pdfua: bool = False,
+    fallback_title: str | None = None,
 ) -> None:
     """
     Synchronize PDF metadata and embed XMP for PDF/A compliance.
@@ -3639,6 +3668,9 @@ def sync_metadata(
         source_xmp_tree: Optional parsed XMP tree captured from the original
             input PDF. When provided, preserved non-managed XMP properties are
             taken from this tree instead of the current in-memory PDF.
+        pdfua: If True, add PDF/UA-1 identification metadata.
+        fallback_title: Document title to use for PDF/UA when the source has
+            no title metadata.
 
     Raises:
         ConversionError: If level is invalid or metadata sync fails.
@@ -3693,6 +3725,8 @@ def sync_metadata(
         existing_xmp_tree=existing_xmp_tree,
         non_catalog_extension_needs=non_catalog_needs or None,
         factur_x_properties=factur_x_properties,
+        pdfua=pdfua,
+        fallback_title=fallback_title,
     )
 
     # Embed in PDF

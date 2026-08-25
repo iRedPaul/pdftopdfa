@@ -4,7 +4,7 @@
 
 """veraPDF integration for pdftopdfa.
 
-This module provides functions for ISO-compliant PDF/A validation
+This module provides functions for ISO-compliant PDF/A and PDF/UA validation
 using veraPDF. veraPDF is a Java-based CLI tool that must be
 installed externally: https://verapdf.org/
 
@@ -32,7 +32,7 @@ from .exceptions import VeraPDFError
 
 logger = logging.getLogger(__name__)
 
-# Valid PDF/A flavours
+# Valid veraPDF flavours used by pdftopdfa
 VALID_FLAVOURS = frozenset(
     {
         "1a",
@@ -46,6 +46,7 @@ VALID_FLAVOURS = frozenset(
         "4",
         "4e",
         "4f",
+        "ua1",
     }
 )
 
@@ -103,7 +104,7 @@ class VeraPDFResult:
 
     Attributes:
         compliant: True if the PDF conforms to the specified flavour.
-        flavour: Detected/validated PDF/A flavour (e.g. "2b").
+        flavour: Detected/validated flavour (e.g. "2b" or "ua1").
         passed_rules: Number of passed rules.
         failed_rules: Number of failed rules.
         errors: List of critical errors.
@@ -166,12 +167,13 @@ def get_verapdf_version() -> str | None:
 
 
 def _normalize_flavour(flavour: str) -> str:
-    """Normalizes a PDF/A flavour for veraPDF.
+    """Normalizes a PDF/A or PDF/UA flavour for veraPDF.
 
     Converts various notations to the veraPDF format.
 
     Args:
-        flavour: The flavour to normalize (e.g. "2b", "PDFA_2_B", "PDF/A-2B").
+        flavour: The flavour to normalize (e.g. "2b", "PDF/A-2B",
+            or "PDF/UA-1").
 
     Returns:
         Normalized flavour (e.g. "2b").
@@ -182,23 +184,32 @@ def _normalize_flavour(flavour: str) -> str:
     # Remove prefixes and normalize
     normalized = flavour.upper()
 
-    # Remove common prefixes
-    for prefix in ("PDF/A-", "PDFA-", "PDFA_", "PDF/A", "PDFA"):
+    pdfua = False
+    for prefix in ("PDF/UA-", "PDFUA-", "PDF/UA", "PDFUA"):
         if normalized.startswith(prefix):
             normalized = normalized[len(prefix) :]
+            pdfua = True
             break
+    if not pdfua:
+        for prefix in ("PDF/A-", "PDFA-", "PDFA_", "PDF/A", "PDFA"):
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix) :]
+                break
 
     # Remove underscores and hyphens
     normalized = normalized.replace("_", "").replace("-", "")
 
     # Convert to lowercase
     normalized = normalized.lower()
+    if pdfua:
+        normalized = f"ua{normalized.removeprefix('ua')}"
 
     # Validate
     if normalized not in VALID_FLAVOURS:
         valid_list = ", ".join(sorted(VALID_FLAVOURS))
         raise VeraPDFError(
-            f"Invalid PDF/A flavour: '{flavour}'. Valid values: {valid_list}"
+            f"Invalid PDF/A flavour or PDF/UA flavour: '{flavour}'. "
+            f"Valid values: {valid_list}"
         )
 
     return normalized
@@ -370,10 +381,11 @@ def _extract_flavour_from_profile(profile_name: str) -> str | None:
     """Extracts the flavour from a veraPDF profile name.
 
     Args:
-        profile_name: Profile name like "PDF/A-2B validation profile".
+        profile_name: Profile name like "PDF/A-2B validation profile" or
+            "PDF/UA-1 validation profile".
 
     Returns:
-        Flavour like "2b" or None.
+        Flavour like "2b", "ua1", or None.
     """
     # Typical formats: "PDF/A-2B validation profile", "PDF/A-1A", "PDF/A-4"
     match = re.search(r"PDF/A-(\d)([ABUEFabuef])?", profile_name, re.IGNORECASE)
@@ -383,6 +395,10 @@ def _extract_flavour_from_profile(profile_name: str) -> str | None:
         if conformance:
             return f"{part}{conformance.lower()}"
         return part
+
+    match = re.search(r"PDF/UA-(\d)", profile_name, re.IGNORECASE)
+    if match:
+        return f"ua{match.group(1)}"
 
     return None
 
@@ -397,7 +413,8 @@ def validate_with_verapdf(
 
     Args:
         path: Path to the PDF file to validate.
-        flavour: Optional PDF/A flavour for validation (e.g. "2b").
+        flavour: Optional PDF/A or PDF/UA flavour for validation (e.g. "2b"
+            or "ua1").
             If not specified, veraPDF detects automatically.
         timeout: Timeout in seconds (default: 300).
         non_compliant_log_level: Log level used when veraPDF reports a

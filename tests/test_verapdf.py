@@ -268,6 +268,9 @@ class TestNormalizeFlavour:
             ("PDF/A-4", "4"),
             ("PDF/A-4E", "4e"),
             ("PDF/A-4F", "4f"),
+            ("ua1", "ua1"),
+            ("PDF/UA-1", "ua1"),
+            ("PDFUA-1", "ua1"),
         ],
     )
     def test_normalizes_valid_flavours(self, input_flavour: str, expected: str) -> None:
@@ -300,6 +303,7 @@ class TestExtractFlavourFromProfile:
             ("PDF/A-4 validation profile", "4"),
             ("PDF/A-4E validation profile", "4e"),
             ("PDF/A-4F validation profile", "4f"),
+            ("PDF/UA-1 validation profile", "ua1"),
         ],
     )
     def test_extracts_flavour(self, profile_name: str, expected: str) -> None:
@@ -1122,6 +1126,7 @@ class TestValidFlavours:
             "4",
             "4e",
             "4f",
+            "ua1",
         }
 
         assert VALID_FLAVOURS == expected

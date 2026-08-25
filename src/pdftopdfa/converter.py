@@ -319,6 +319,31 @@ def _validate_pdfa_output(
     return True
 
 
+def _validate_pdfua_output(output_path: Path, warnings: list[str]) -> bool:
+    """Validate PDF/UA-1 conformance and append all reported errors."""
+    try:
+        result = validate_with_verapdf(path=output_path, flavour="ua1")
+    except VeraPDFError as exc:
+        warnings.append(f"PDF/UA validation: veraPDF could not run: {exc}")
+        return True
+    if result.compliant:
+        return False
+    warnings.extend(f"PDF/UA validation: {error}" for error in result.errors)
+    return True
+
+
+def _validate_pdfua_options(*, pdfa: bool, level: str, pdfua: bool) -> None:
+    """Reject PDF/UA-1 combinations that cannot produce a conforming file."""
+    if not pdfua:
+        return
+    if not pdfa:
+        raise ConversionError("PDF/UA-1 cannot be used when pdfa=False")
+    if level not in {"2a", "3a"}:
+        raise ConversionError(
+            "PDF/UA-1 can only be combined with PDF/A-2a or PDF/A-3a"
+        )
+
+
 @dataclass
 class ConversionResult:
     """Result of a PDF/A conversion.
@@ -449,12 +474,17 @@ def _validate_input_snapshot_and_publish(
     level: str,
     warnings: list[str],
     *,
+    pdfua: bool = False,
     allow_overwrite: bool = True,
 ) -> bool:
     """Validate and publish the exact snapshot of an unchanged input."""
     with _staged_input_copy(input_path, output_path) as staged_input:
         snapshot = staged_file_snapshot(staged_input)
         validation_failed = _validate_pdfa_output(staged_input, level, warnings)
+        if pdfua:
+            validation_failed = (
+                _validate_pdfua_output(staged_input, warnings) or validation_failed
+            )
         if not validation_failed:
             publish_staged_file(
                 staged_input,
@@ -473,6 +503,7 @@ def _copy_encrypted_input(
     pdfa: bool,
     validate: bool,
     level: str,
+    pdfua: bool,
     start_time: float,
     allow_overwrite: bool = True,
 ) -> ConversionResult:
@@ -491,6 +522,7 @@ def _copy_encrypted_input(
             output_path,
             level,
             warnings,
+            pdfua=pdfua,
             allow_overwrite=allow_overwrite,
         )
     else:
@@ -966,6 +998,7 @@ def convert_to_pdfa(
     level: str = "3b",
     *,
     pdfa: bool = True,
+    pdfua: bool = False,
     validate: bool = False,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
@@ -991,6 +1024,8 @@ def convert_to_pdfa(
         pdfa: If False, skip all PDF/A-specific processing and save only the
             requested OCR processing result. PDF/A-specific options are
             ignored in this mode.
+        pdfua: If True, also produce PDF/UA-1 output. This requires PDF/A-2a
+            or PDF/A-3a.
         validate: If True, the result is validated.
         skip_any_pdfa: If True, skip conversion for any input that veraPDF
             validates as compliant PDF/A, regardless of target level.
@@ -1035,10 +1070,11 @@ def convert_to_pdfa(
         ocr_execution_provider=ocr_execution_provider,
         ocr_layout=ocr_layout,
     )
-    if not pdfa and validate:
-        raise ConversionError("PDF/A validation cannot be used when pdfa=False")
     if pdfa:
         level = validate_pdfa_level(level)
+    _validate_pdfua_options(pdfa=pdfa, level=level, pdfua=pdfua)
+    if not pdfa and validate:
+        raise ConversionError("PDF/A validation cannot be used when pdfa=False")
     start_time = time.perf_counter()
     warnings: list[str] = []
     ocr_temp_file: Path | None = None
@@ -1058,10 +1094,11 @@ def convert_to_pdfa(
 
     if pdfa:
         logger.info(
-            "Starting conversion: %s -> %s (PDF/A-%s)",
+            "Starting conversion: %s -> %s (PDF/A-%s%s)",
             input_path,
             output_path,
             level,
+            " + PDF/UA-1" if pdfua else "",
         )
     else:
         logger.info("Starting PDF processing: %s -> %s", input_path, output_path)
@@ -1078,6 +1115,7 @@ def convert_to_pdfa(
                         pdfa=False,
                         validate=validate,
                         level=level,
+                        pdfua=pdfua,
                         start_time=start_time,
                         allow_overwrite=_allow_output_overwrite,
                     )
@@ -1127,6 +1165,7 @@ def convert_to_pdfa(
                         output_path,
                         level,
                         branch_warnings,
+                        pdfua=pdfua,
                         allow_overwrite=_allow_output_overwrite,
                     )
                 else:
@@ -1181,7 +1220,33 @@ def convert_to_pdfa(
                         )
                         verapdf_result = None
 
-                    if verapdf_result is not None and verapdf_result.compliant:
+                    pdfua_result = None
+                    if (
+                        pdfua
+                        and verapdf_result is not None
+                        and verapdf_result.compliant
+                    ):
+                        try:
+                            pdfua_result = validate_with_verapdf(
+                                staged_input,
+                                flavour="ua1",
+                                non_compliant_log_level=logging.WARNING,
+                            )
+                        except VeraPDFError:
+                            logger.debug(
+                                "veraPDF PDF/UA-1 pre-check unavailable for %s",
+                                input_path,
+                            )
+
+                    pdfua_compliant = (
+                        not pdfua
+                        or (pdfua_result is not None and pdfua_result.compliant)
+                    )
+                    if (
+                        verapdf_result is not None
+                        and verapdf_result.compliant
+                        and pdfua_compliant
+                    ):
                         processing_time = time.perf_counter() - start_time
                         logger.info(
                             "Skipping conversion: PDF is already valid PDF/A-%s",
@@ -1515,6 +1580,8 @@ def convert_to_pdfa(
             level,
             source_info=source_info,
             source_xmp_tree=source_xmp_tree,
+            pdfua=pdfua,
+            fallback_title=input_path.stem,
         )
 
         # 5.5. Add Extensions dictionary for PDF/A-3
@@ -1695,7 +1762,7 @@ def convert_to_pdfa(
                     warnings.append(
                         "Tagged PDF structure generated from page content order"
                     )
-                if remove_pdfua_identification(pdf):
+                if not pdfua and remove_pdfua_identification(pdf):
                     warnings.append(
                         "PDF/UA identification removed from XMP metadata "
                         "(logical structure rebuilt)"
@@ -1751,6 +1818,11 @@ def convert_to_pdfa(
                 _validate_pdfa_output(final_output_temp_file, level, warnings)
                 or validation_failed
             )
+            if pdfua:
+                validation_failed = (
+                    _validate_pdfua_output(final_output_temp_file, warnings)
+                    or validation_failed
+                )
 
         if validation_failed:
             warnings.append(_VALIDATION_PUBLICATION_WARNING)
@@ -1787,6 +1859,7 @@ def convert_to_pdfa(
             pdfa=pdfa,
             validate=validate,
             level=level,
+            pdfua=pdfua,
             start_time=start_time,
             allow_overwrite=_allow_output_overwrite,
         )
@@ -1871,6 +1944,7 @@ def convert_files(
     level: str = "3b",
     *,
     pdfa: bool = True,
+    pdfua: bool = False,
     validate: bool = False,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
@@ -1896,6 +1970,8 @@ def convert_files(
         file_pairs: List of (input_path, output_path) tuples.
         level: PDF/A conformance level (e.g. '2b', '3b').
         pdfa: If False, apply only requested OCR processing.
+        pdfua: If True, also produce PDF/UA-1 output. This requires PDF/A-2a
+            or PDF/A-3a.
         validate: If True, results are validated.
         skip_any_pdfa: If True, skip conversion for any input that veraPDF
             validates as compliant PDF/A, regardless of target level.
@@ -1938,10 +2014,11 @@ def convert_files(
         ocr_execution_provider=ocr_execution_provider,
         ocr_layout=ocr_layout,
     )
-    if not pdfa and validate:
-        raise ConversionError("PDF/A validation cannot be used when pdfa=False")
     if pdfa:
         level = validate_pdfa_level(level)
+    _validate_pdfua_options(pdfa=pdfa, level=level, pdfua=pdfua)
+    if not pdfa and validate:
+        raise ConversionError("PDF/A validation cannot be used when pdfa=False")
 
     results: list[ConversionResult] = []
     total = len(file_pairs)
@@ -1989,6 +2066,7 @@ def convert_files(
                 output_path=output_path,
                 level=level,
                 pdfa=pdfa,
+                pdfua=pdfua,
                 validate=validate,
                 skip_any_pdfa=skip_any_pdfa,
                 ocr_languages=ocr_languages,
@@ -2033,6 +2111,7 @@ def convert_directory(
     level: str = "3b",
     *,
     pdfa: bool = True,
+    pdfua: bool = False,
     recursive: bool = False,
     validate: bool = False,
     skip_any_pdfa: bool = False,
@@ -2058,6 +2137,8 @@ def convert_directory(
             in the same directory as the input.
         level: PDF/A conformance level.
         pdfa: If False, apply only requested OCR processing.
+        pdfua: If True, also produce PDF/UA-1 output. This requires PDF/A-2a
+            or PDF/A-3a.
         recursive: If True, subdirectories are included.
         validate: If True, results are validated.
         skip_any_pdfa: If True, skip conversion for any input that veraPDF
@@ -2101,10 +2182,11 @@ def convert_directory(
         ocr_execution_provider=ocr_execution_provider,
         ocr_layout=ocr_layout,
     )
-    if not pdfa and validate:
-        raise ConversionError("PDF/A validation cannot be used when pdfa=False")
     if pdfa:
         level = validate_pdfa_level(level)
+    _validate_pdfua_options(pdfa=pdfa, level=level, pdfua=pdfua)
+    if not pdfa and validate:
+        raise ConversionError("PDF/A validation cannot be used when pdfa=False")
 
     input_dir = input_dir.resolve()
     output_dir = output_dir.resolve() if output_dir is not None else None
@@ -2197,6 +2279,7 @@ def convert_directory(
         file_pairs=file_pairs,
         level=level,
         pdfa=pdfa,
+        pdfua=pdfua,
         validate=validate,
         skip_any_pdfa=skip_any_pdfa,
         ocr_languages=ocr_languages,

@@ -141,7 +141,12 @@ def _print_validation_result(
     """
     if result.compliant:
         if not quiet:
-            print_success(f"Validation successful: PDF/A-{result.flavour}")
+            standard = (
+                "PDF/UA-1"
+                if result.flavour == "ua1"
+                else f"PDF/A-{result.flavour}"
+            )
+            print_success(f"Validation successful: {standard}")
     else:
         print_error(f"Validation failed for {file_path.name}")
         for error in result.errors:
@@ -180,6 +185,11 @@ def _ocr_execution_provider_callback(
     "do_validate",
     is_flag=True,
     help="Validate after conversion (note: -v is not verbose; use --verbose)",
+)
+@click.option(
+    "--pdfua",
+    is_flag=True,
+    help="Also produce PDF/UA-1 (requires --level 2a or 3a).",
 )
 @click.option(
     "--no-pdfa",
@@ -309,6 +319,7 @@ def main(
     output: str | None,
     level: str,
     do_validate: bool,
+    pdfua: bool,
     pdfa: bool,
     recursive: bool,
     force: bool,
@@ -345,6 +356,10 @@ def main(
 
     input_path_obj = Path(input_path)
 
+    if pdfua and not pdfa:
+        raise click.UsageError("--pdfua cannot be combined with --no-pdfa")
+    if pdfua and level not in {"2a", "3a"}:
+        raise click.UsageError("--pdfua requires --level 2a or 3a")
     if not pdfa and do_validate:
         raise click.UsageError("--validate cannot be combined with --no-pdfa")
 
@@ -405,6 +420,7 @@ def main(
                 force,
                 quiet,
                 pdfa=pdfa,
+                pdfua=pdfua,
                 ocr_languages=ocr_languages,
                 ocr_detection_model_dir=ocr_detection_model_dir,
                 ocr_recognition_model_dir=ocr_recognition_model_dir,
@@ -429,6 +445,7 @@ def main(
                 recursive,
                 quiet,
                 pdfa=pdfa,
+                pdfua=pdfua,
                 ocr_languages=ocr_languages,
                 ocr_detection_model_dir=ocr_detection_model_dir,
                 ocr_recognition_model_dir=ocr_recognition_model_dir,
@@ -478,6 +495,7 @@ def _convert_single_file(
     quiet: bool,
     *,
     pdfa: bool = True,
+    pdfua: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_detection_model_dir: Path | None = None,
     ocr_recognition_model_dir: Path | None = None,
@@ -501,6 +519,7 @@ def _convert_single_file(
         force: Whether to overwrite existing files.
         quiet: Whether to only output errors.
         pdfa: Whether to perform PDF/A conversion after OCR processing.
+        pdfua: Whether to also produce PDF/UA-1 output.
         ocr_languages: Optional list of PaddleOCR language codes
             (e.g., ``["de", "en"]``).
         ocr_detection_model_dir: PP-OCRv6 Medium detection model directory.
@@ -537,8 +556,11 @@ def _convert_single_file(
 
     if not quiet:
         if pdfa:
+            target = f"PDF/A-{level}"
+            if pdfua:
+                target += " + PDF/UA-1"
             click.echo(
-                _encode_for_console(f"Converting {input_path.name} -> PDF/A-{level}...")
+                _encode_for_console(f"Converting {input_path.name} -> {target}...")
             )
         else:
             click.echo(
@@ -553,6 +575,7 @@ def _convert_single_file(
         output_path=output_path,
         level=level,
         pdfa=pdfa,
+        pdfua=pdfua,
         validate=False,  # Validate manually later
         skip_any_pdfa=skip_any_pdfa,
         ocr_languages=ocr_languages,
@@ -584,33 +607,43 @@ def _convert_single_file(
             click.echo("Validating output with veraPDF...")
 
         validation_flavour = result.level if result.skipped and result.level else level
-        try:
-            verapdf_result = validate_with_verapdf(
-                path=output_path,
-                flavour=validation_flavour,
-                timeout=300,
-            )
-        except VeraPDFError as e:
-            click.echo(
-                _encode_for_console(
-                    f"Validation failed: veraPDF could not run ({e})",
-                    err=True,
-                ),
-                err=True,
-            )
-            return EXIT_VALIDATION_FAILED
-
-        _print_validation_result(verapdf_result, output_path, quiet)
-
-        if not quiet:
-            click.echo(
-                _encode_for_console(
-                    f"  veraPDF: {verapdf_result.passed_rules} rules passed, "
-                    f"{verapdf_result.failed_rules} failed"
+        flavours = [validation_flavour]
+        if pdfua:
+            flavours.append("ua1")
+        validation_failed = False
+        for flavour in flavours:
+            try:
+                verapdf_result = validate_with_verapdf(
+                    path=output_path,
+                    flavour=flavour,
+                    timeout=300,
                 )
-            )
+            except VeraPDFError as e:
+                click.echo(
+                    _encode_for_console(
+                        f"Validation failed: veraPDF could not run ({e})",
+                        err=True,
+                    ),
+                    err=True,
+                )
+                validation_failed = True
+                continue
 
-        if not verapdf_result.compliant:
+            _print_validation_result(verapdf_result, output_path, quiet)
+
+            if not quiet:
+                click.echo(
+                    _encode_for_console(
+                        f"  veraPDF ({flavour}): "
+                        f"{verapdf_result.passed_rules} rules passed, "
+                        f"{verapdf_result.failed_rules} failed"
+                    )
+                )
+
+            if not verapdf_result.compliant:
+                validation_failed = True
+
+        if validation_failed:
             return EXIT_VALIDATION_FAILED
 
     return EXIT_SUCCESS
@@ -626,6 +659,7 @@ def _convert_directory(
     quiet: bool,
     *,
     pdfa: bool = True,
+    pdfua: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_detection_model_dir: Path | None = None,
     ocr_recognition_model_dir: Path | None = None,
@@ -650,6 +684,7 @@ def _convert_directory(
         recursive: Whether to process recursively.
         quiet: Whether to only output errors.
         pdfa: Whether to perform PDF/A conversion after OCR processing.
+        pdfua: Whether to also produce PDF/UA-1 output.
         ocr_languages: Optional list of PaddleOCR language codes
             (e.g., ``["de", "en"]``).
         ocr_detection_model_dir: PP-OCRv6 Medium detection model directory.
@@ -676,9 +711,12 @@ def _convert_directory(
     if not quiet:
         mode = "recursive" if recursive else "non-recursive"
         if pdfa:
+            target = f"PDF/A-{level}"
+            if pdfua:
+                target += " + PDF/UA-1"
             click.echo(
                 _encode_for_console(
-                    f"Converting directory {input_dir} ({mode}) -> PDF/A-{level}..."
+                    f"Converting directory {input_dir} ({mode}) -> {target}..."
                 )
             )
         else:
@@ -694,6 +732,7 @@ def _convert_directory(
         output_dir=output_dir,
         level=level,
         pdfa=pdfa,
+        pdfua=pdfua,
         recursive=recursive,
         validate=do_validate,
         skip_any_pdfa=skip_any_pdfa,

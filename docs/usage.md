@@ -9,7 +9,9 @@ OCR users must install exactly one runtime extra: `pdftopdfa[ocr]` for CPU or
 Windows 11. CPU is the default execution provider; DirectML must be selected
 explicitly.
 
-For the full list of PDF/A-2/3 compliance rules, see the [veraPDF PDF/A-2 and PDF/A-3 rules reference](https://github.com/veraPDF/veraPDF-validation-profiles/wiki/PDFA-Parts-2-and-3-rules).
+For the full rule lists, see the veraPDF references for
+[PDF/A-2 and PDF/A-3](https://github.com/veraPDF/veraPDF-validation-profiles/wiki/PDFA-Parts-2-and-3-rules)
+and [PDF/UA-1](https://github.com/veraPDF/veraPDF-validation-profiles/wiki/PDFUA-Part-1-rules).
 
 ## Basic Usage
 
@@ -27,6 +29,9 @@ pdftopdfa -l 2b input.pdf
 
 # Validate output with veraPDF
 pdftopdfa -v input.pdf
+
+# Create dual-conformance PDF/A-2a and PDF/UA-1 output
+pdftopdfa --level 2a --pdfua --validate input.pdf
 
 # Overwrite an existing output
 pdftopdfa -f input.pdf output.pdf
@@ -96,6 +101,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 |---|---|
 | `-l, --level [2a\|2b\|2u\|3a\|3b\|3u]` | Target PDF/A level (default: `3b`) |
 | `-v, --validate` | Validate output with veraPDF. Note: unlike the common CLI convention, `-v` does **not** mean verbose — use `--verbose` for detailed logs |
+| `--pdfua` | Also produce PDF/UA-1; requires PDF/A level `2a` or `3a`. With `--validate`, both conformance profiles are checked |
 | `--no-pdfa` | Apply requested OCR processing without running the PDF/A conversion pipeline |
 | `-r, --recursive` | Process directories recursively |
 | `-f, --force` | Overwrite existing output files |
@@ -144,6 +150,7 @@ try:
         input_path=Path("input.pdf"),
         output_path=Path("output.pdf"),
         level="2a",
+        pdfua=True,
         validate=True,
     )
 except PDFToPDFAError as exc:
@@ -171,6 +178,7 @@ def convert_to_pdfa(
     level: str = "3b",
     *,
     pdfa: bool = True,
+    pdfua: bool = False,
     validate: bool = False,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
@@ -246,6 +254,11 @@ geometry. OCR-processed pages use the internal OCR engine's line MCIDs, text,
 confidence, geometry, language, and layout ordering. Mixed documents combine
 both evidence sources page by page.
 
+Pass `pdfua=True` or `--pdfua` with either Level A target to add PDF/UA-1
+identification, the required PDF/A extension schema, and a document-title
+fallback when the source has none. `validate=True` and `--validate` then run
+veraPDF once for the selected PDF/A profile and once for `ua1`.
+
 Strongly evidenced paragraph, list, and table continuations are joined across
 page breaks. A structure element that genuinely spans pages has no `/Pg` entry;
 its marked-content references and page-local descendants retain their exact
@@ -293,6 +306,7 @@ def convert_directory(
     level: str = "3b",
     *,
     pdfa: bool = True,
+    pdfua: bool = False,
     recursive: bool = False,
     validate: bool = False,
     skip_any_pdfa: bool = False,
@@ -334,6 +348,7 @@ def convert_files(
     level: str = "3b",
     *,
     pdfa: bool = True,
+    pdfua: bool = False,
     validate: bool = False,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,

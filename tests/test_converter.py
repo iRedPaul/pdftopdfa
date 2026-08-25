@@ -1382,6 +1382,48 @@ class TestConvertToPdfa:
         assert result.level == level
         assert output_path.exists()
 
+    @pytest.mark.parametrize("level", ["2b", "2u", "3b", "3u"])
+    def test_pdfua_requires_level_a(
+        self, sample_pdf: Path, tmp_dir: Path, level: str
+    ) -> None:
+        """PDF/UA-1 is only emitted with PDF/A-2a or PDF/A-3a."""
+        with pytest.raises(ConversionError, match="PDF/A-2a or PDF/A-3a"):
+            convert_to_pdfa(
+                sample_pdf,
+                tmp_dir / "output.pdf",
+                level=level,
+                pdfua=True,
+            )
+
+    @pytest.mark.parametrize("level", ["2a", "3a"])
+    def test_convert_pdfua_adds_identification_and_catalog_requirements(
+        self, sample_pdf: Path, tmp_dir: Path, level: str
+    ) -> None:
+        """The opt-in output declares PDF/UA-1 and keeps Level A structure."""
+        output_path = tmp_dir / f"output_{level}_pdfua.pdf"
+
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            level=level,
+            pdfua=True,
+        )
+
+        assert result.success is True
+        with Pdf.open(output_path) as pdf:
+            standards = {
+                (standard.standard, standard.version)
+                for standard in detect_iso_standards(pdf)
+            }
+            assert ("PDF/UA", "1") in standards
+            assert bool(pdf.Root.MarkInfo.Marked) is True
+            assert bool(pdf.Root.ViewerPreferences.DisplayDocTitle) is True
+            assert str(pdf.Root.Lang)
+            assert pdf.Root.StructTreeRoot.Type == Name.StructTreeRoot
+            metadata = bytes(pdf.Root.Metadata.read_bytes())
+            assert b"pdfaExtension:schemas" in metadata
+            assert sample_pdf.stem.encode() in metadata
+
     @pytest.mark.parametrize("level", ["2a", "3a"])
     def test_convert_level_a_preserves_tagged_structure(
         self, tagged_pdf: Path, tmp_dir: Path, level: str
@@ -1780,6 +1822,22 @@ class TestConvertToPdfa:
         assert validation.flavour == level
         assert validation.failed_rules == 0
 
+    @pytest.mark.skipif(
+        not is_verapdf_available(),
+        reason="veraPDF is not installed",
+    )
+    @pytest.mark.parametrize("level", ["2a", "3a"])
+    def test_convert_pdfua_passes_both_verapdf_profiles(
+        self, tagged_pdf: Path, tmp_dir: Path, level: str
+    ) -> None:
+        """Opt-in output passes its PDF/A and PDF/UA-1 machine checks."""
+        output_path = tmp_dir / f"validated_{level}_pdfua.pdf"
+
+        convert_to_pdfa(tagged_pdf, output_path, level=level, pdfua=True)
+
+        assert validate_with_verapdf(output_path, flavour=level).compliant is True
+        assert validate_with_verapdf(output_path, flavour="ua1").compliant is True
+
     @patch("pdftopdfa.converter.validate_with_verapdf")
     def test_convert_with_validation_flag(
         self, mock_verapdf: MagicMock, sample_pdf: Path, tmp_dir: Path
@@ -1795,6 +1853,31 @@ class TestConvertToPdfa:
         assert not has_validation_error
         assert result.validation_failed is False
         mock_verapdf.assert_called_once()
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_convert_pdfua_validation_checks_both_profiles(
+        self, mock_verapdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """validate=True checks both requested conformance claims."""
+        mock_verapdf.side_effect = lambda *, path, flavour: VeraPDFResult(
+            compliant=True,
+            flavour=flavour,
+        )
+        output_path = tmp_dir / "output.pdf"
+
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            level="2a",
+            pdfua=True,
+            validate=True,
+        )
+
+        assert result.validation_failed is False
+        assert [call.kwargs["flavour"] for call in mock_verapdf.call_args_list] == [
+            "2a",
+            "ua1",
+        ]
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
     def test_convert_with_failing_validation_sets_flag(
@@ -4118,15 +4201,22 @@ class TestConvertDirectory:
     def test_convert_directory_passes_skip_any_pdfa(
         self, mock_convert_files: MagicMock, tmp_dir: Path, sample_pdf_bytes: bytes
     ) -> None:
-        """convert_directory forwards skip_any_pdfa to convert_files."""
+        """convert_directory forwards PDF/A and PDF/UA conformance options."""
         input_dir = tmp_dir / "input"
         input_dir.mkdir()
         (input_dir / "test.pdf").write_bytes(sample_pdf_bytes)
         mock_convert_files.return_value = []
 
-        convert_directory(input_dir, show_progress=False, skip_any_pdfa=True)
+        convert_directory(
+            input_dir,
+            level="2a",
+            pdfua=True,
+            show_progress=False,
+            skip_any_pdfa=True,
+        )
 
         assert mock_convert_files.call_args.kwargs["skip_any_pdfa"] is True
+        assert mock_convert_files.call_args.kwargs["pdfua"] is True
 
     @patch("pdftopdfa.converter.onnxruntime_engine_config")
     @patch("pdftopdfa.converter.convert_files")
@@ -4521,7 +4611,7 @@ class TestConvertFiles:
     def test_convert_files_passes_skip_any_pdfa(
         self, mock_convert_to_pdfa: MagicMock, tmp_dir: Path
     ) -> None:
-        """convert_files forwards skip_any_pdfa to convert_to_pdfa."""
+        """convert_files forwards PDF/A and PDF/UA conformance options."""
         in_path = tmp_dir / "test.pdf"
         out_path = tmp_dir / "test_pdfa.pdf"
         in_path.write_bytes(b"%PDF-1.4 dummy")
@@ -4532,9 +4622,15 @@ class TestConvertFiles:
             level="3b",
         )
 
-        convert_files([(in_path, out_path)], skip_any_pdfa=True)
+        convert_files(
+            [(in_path, out_path)],
+            level="2a",
+            pdfua=True,
+            skip_any_pdfa=True,
+        )
 
         assert mock_convert_to_pdfa.call_args.kwargs["skip_any_pdfa"] is True
+        assert mock_convert_to_pdfa.call_args.kwargs["pdfua"] is True
 
     @patch("pdftopdfa.converter.convert_to_pdfa")
     def test_convert_files_passes_allow_signature_invalidation(
