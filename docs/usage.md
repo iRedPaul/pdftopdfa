@@ -259,6 +259,15 @@ identification, the required PDF/A extension schema, and a document-title
 fallback when the source has none. `validate=True` and `--validate` then run
 veraPDF once for the selected PDF/A profile and once for `ua1`.
 
+PDF/UA mode also applies deterministic WCAG 2.1 PDF techniques: every page
+uses structure order for keyboard traversal, the fallback title is synchronized
+to both XMP and the document information dictionary, and required form controls
+include their required state in a trustworthy tooltip or field name. A missing
+or undetermined document language is reported for manual review against success
+criterion 3.1.1. Requirements that depend on authorial or visual judgement,
+such as semantic accuracy, contrast, use of color, and media alternatives,
+still need human review; `--pdfua` is not by itself a WCAG conformance claim.
+
 Strongly evidenced paragraph, list, and table continuations are joined across
 page breaks. A structure element that genuinely spans pages has no `/Pg` entry;
 its marked-content references and page-local descendants retain their exact

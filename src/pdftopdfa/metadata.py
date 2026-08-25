@@ -3708,6 +3708,16 @@ def sync_metadata(
         if source_xmp_tree is not None
         else _extract_existing_xmp(pdf)
     )
+    if pdfua and _clean_metadata_text(info.get("title")) is None:
+        info["title"] = (
+            _extract_lang_alt_xmp_property(
+                existing_xmp_tree,
+                NAMESPACES["dc"],
+                "title",
+            )
+            or _clean_metadata_text(fallback_title)
+            or "Untitled"
+        )
     factur_x_properties = (
         _infer_factur_x_properties(pdf, existing_xmp_tree) if pdfa_part == 3 else None
     )

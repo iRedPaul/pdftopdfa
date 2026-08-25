@@ -65,6 +65,7 @@ from .tagging import ensure_logical_structure
 from .utils import get_required_pdf_version, is_pdf_encrypted, validate_pdfa_level
 from .validator import detect_iso_standards, detect_pdfa_level
 from .verapdf import validate_with_verapdf
+from .wcag import apply_wcag_21
 
 logger = logging.getLogger(__name__)
 
@@ -1763,6 +1764,14 @@ def convert_to_pdfa(
                     warnings.append(
                         "PDF/UA identification removed from XMP metadata "
                         "(logical structure rebuilt)"
+                    )
+
+            if pdfua:
+                wcag_result = apply_wcag_21(pdf)
+                if wcag_result["language_review_required"]:
+                    warnings.append(
+                        "WCAG 2.1 3.1.1 requires manual review: the document "
+                        "language is undetermined"
                     )
 
         # 7. Create output directory if needed
