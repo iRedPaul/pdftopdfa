@@ -596,6 +596,27 @@ class TestSyncMetadata:
             # Check if title was transferred
             assert b"Test Title" in xmp_bytes
 
+    def test_pdfua_syncs_xmp_only_title_to_docinfo(
+        self, sample_pdf_bytes: bytes
+    ) -> None:
+        """WCAG document titles stay synchronized in XMP and DocInfo."""
+        from io import BytesIO
+
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
+        embed_xmp_metadata(
+            pdf,
+            create_xmp_metadata(
+                {"title": "Accessible title"},
+                pdfa_part=2,
+                pdfa_conformance="A",
+            ),
+        )
+
+        sync_metadata(pdf, "2a", pdfua=True, fallback_title="fallback")
+
+        assert str(pdf.docinfo["/Title"]) == "Accessible title"
+        assert b"Accessible title" in bytes(pdf.Root.Metadata.read_bytes())
+
     def test_sync_prefers_original_creator_and_producer_snapshot(
         self, pdf_with_metadata: Path
     ) -> None:
