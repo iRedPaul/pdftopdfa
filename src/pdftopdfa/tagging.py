@@ -4,6 +4,8 @@
 
 """Preserve, repair, or create logical structure for PDF/A level A."""
 
+from __future__ import annotations
+
 import math
 import re
 import unicodedata
@@ -3843,7 +3845,7 @@ class _SemanticFormInvocation:
     span_ids: frozenset[str]
     expected_xobjects: dict[int, tuple[str, str | None]]
     source_prefix: str
-    children: tuple["_SemanticFormInvocation", ...] = ()
+    children: tuple[_SemanticFormInvocation, ...] = ()
     clone: Stream | None = None
     target_name: Name | None = None
 
@@ -6379,10 +6381,8 @@ def _digital_semantic_inputs(
     import statistics
 
     from .digital_layout import (
-        ClipPolygon,
         DirectTextSpan,
         DirectXObjectSpan,
-        InvocationPaintState,
         _clip_bbox_to_polygon,
         _inverse_matrix,
         _transform_polygon,
