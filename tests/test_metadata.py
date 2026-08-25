@@ -323,6 +323,35 @@ class TestCreateXmpMetadata:
         assert b">2<" in xmp  # Part = 2
         assert b">B<" in xmp  # Conformance = B
 
+    def test_xmp_contains_pdfua_identification_and_extension_schema(self) -> None:
+        """Opt-in PDF/UA-1 metadata includes its PDF/A extension schema."""
+        xmp = create_xmp_metadata(
+            {},
+            pdfa_part=2,
+            pdfa_conformance="A",
+            pdfua=True,
+            fallback_title="sample",
+        )
+        tree = _parse_xmp_bytes(xmp)
+
+        assert tree is not None
+        assert (
+            tree.xpath(
+                "string(//pdfuaid:part)",
+                namespaces={"pdfuaid": NAMESPACES["pdfuaid"]},
+            )
+            == "1"
+        )
+        assert (
+            tree.xpath(
+                "string(//dc:title/rdf:Alt/rdf:li)",
+                namespaces={"dc": NAMESPACES["dc"], "rdf": NAMESPACES["rdf"]},
+            )
+            == "sample"
+        )
+        assert NAMESPACES["pdfuaid"] in xmp.decode("utf-8")
+        assert b"pdfaExtension:schemas" in xmp
+
     def test_xmp_contains_title(self) -> None:
         """XMP contains the title."""
         info = {"title": "Mein Test Title"}

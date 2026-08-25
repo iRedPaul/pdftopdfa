@@ -5,6 +5,7 @@
 ### Features
 
 - Add semantic tagging for digital and OCR content in PDF/A level A output
+- Add opt-in PDF/UA-1 output for PDF/A-2a and PDF/A-3a
 
 ### Changes
 

@@ -74,6 +74,7 @@ class TestCliHelp:
         assert "--level" in result.output
         assert "[2a|2b|2u|3a|3b|3u]" in result.output
         assert "--validate" in result.output
+        assert "--pdfua" in result.output
         assert "--recursive" in result.output
         assert "--force" in result.output
         assert "--quiet" in result.output
@@ -253,6 +254,35 @@ class TestCliConvert:
         assert result.exit_code != EXIT_SUCCESS
         assert "--validate cannot be combined with --no-pdfa" in result.output
 
+    @pytest.mark.parametrize("level", ["2b", "2u", "3b", "3u"])
+    def test_cli_pdfua_requires_level_a(
+        self, runner: CliRunner, sample_pdf: Path, level: str
+    ) -> None:
+        """--pdfua is limited to the compatible PDF/A Level A targets."""
+        result = runner.invoke(main, [str(sample_pdf), "--pdfua", "--level", level])
+
+        assert result.exit_code != EXIT_SUCCESS
+        assert "--pdfua requires --level 2a or 3a" in result.output
+
+    @patch("pdftopdfa.cli._convert_single_file", return_value=EXIT_SUCCESS)
+    def test_cli_pdfua_is_forwarded(
+        self,
+        mock_convert_single: MagicMock,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """The CLI forwards the PDF/UA opt-in flag."""
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [str(sample_pdf), str(output_path), "--level", "2a", "--pdfua"],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert mock_convert_single.call_args.kwargs["pdfua"] is True
+
     @patch("pdftopdfa.cli._convert_single_file")
     def test_cli_convert_passes_skip_any_pdfa(
         self,
@@ -334,6 +364,117 @@ class TestCliConvert:
             flavour="2b",
             timeout=300,
         )
+
+    @patch("pdftopdfa.cli.validate_with_verapdf")
+    @patch("pdftopdfa.cli.convert_to_pdfa")
+    def test_cli_pdfua_validation_checks_both_profiles(
+        self,
+        mock_convert_to_pdfa: MagicMock,
+        mock_validate: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """PDF/UA CLI validation checks the PDF/A and UA-1 profiles."""
+        output_path = tmp_dir / "output.pdf"
+        mock_convert_to_pdfa.return_value = ConversionResult(
+            success=True,
+            input_path=sample_pdf,
+            output_path=output_path,
+            level="2a",
+        )
+        mock_validate.return_value = MagicMock(
+            compliant=True,
+            passed_rules=1,
+            failed_rules=0,
+        )
+
+        result = cli_module._convert_single_file(
+            sample_pdf,
+            str(output_path),
+            "2a",
+            do_validate=True,
+            force=False,
+            quiet=True,
+            pdfua=True,
+        )
+
+        assert result == EXIT_SUCCESS
+        assert [call.kwargs["flavour"] for call in mock_validate.call_args_list] == [
+            "2a",
+            "ua1",
+        ]
+
+    @patch("pdftopdfa.cli.validate_with_verapdf")
+    @patch("pdftopdfa.cli.convert_to_pdfa")
+    def test_cli_pdfua_validation_checks_ua_after_pdfa_failure(
+        self,
+        mock_convert_to_pdfa: MagicMock,
+        mock_validate: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """PDF/UA validation still runs when PDF/A validation fails."""
+        output_path = tmp_dir / "output.pdf"
+        mock_convert_to_pdfa.return_value = ConversionResult(
+            success=True,
+            input_path=sample_pdf,
+            output_path=output_path,
+            level="2a",
+        )
+        mock_validate.side_effect = [
+            MagicMock(
+                compliant=False,
+                passed_rules=0,
+                failed_rules=1,
+                errors=[],
+                warnings=[],
+            ),
+            MagicMock(
+                compliant=True,
+                passed_rules=1,
+                failed_rules=0,
+                errors=[],
+                warnings=[],
+            ),
+        ]
+
+        result = cli_module._convert_single_file(
+            sample_pdf,
+            str(output_path),
+            "2a",
+            do_validate=True,
+            force=False,
+            quiet=True,
+            pdfua=True,
+        )
+
+        assert result == EXIT_VALIDATION_FAILED
+        assert [call.kwargs["flavour"] for call in mock_validate.call_args_list] == [
+            "2a",
+            "ua1",
+        ]
+
+    def test_pdfua_validation_success_uses_pdfua_label(
+        self,
+        capsys: pytest.CaptureFixture[str],
+        tmp_dir: Path,
+    ) -> None:
+        """PDF/UA validation output names the correct standard."""
+        result = MagicMock(
+            compliant=True,
+            flavour="ua1",
+            warnings=[],
+        )
+
+        cli_module._print_validation_result(
+            result,
+            tmp_dir / "output.pdf",
+            quiet=False,
+        )
+
+        output = capsys.readouterr().out
+        assert "PDF/UA-1" in output
+        assert "PDF/A-ua1" not in output
 
     @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
