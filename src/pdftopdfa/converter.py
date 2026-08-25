@@ -339,9 +339,7 @@ def _validate_pdfua_options(*, pdfa: bool, level: str, pdfua: bool) -> None:
     if not pdfa:
         raise ConversionError("PDF/UA-1 cannot be used when pdfa=False")
     if level not in {"2a", "3a"}:
-        raise ConversionError(
-            "PDF/UA-1 can only be combined with PDF/A-2a or PDF/A-3a"
-        )
+        raise ConversionError("PDF/UA-1 can only be combined with PDF/A-2a or PDF/A-3a")
 
 
 @dataclass
@@ -1238,9 +1236,8 @@ def convert_to_pdfa(
                                 input_path,
                             )
 
-                    pdfua_compliant = (
-                        not pdfua
-                        or (pdfua_result is not None and pdfua_result.compliant)
+                    pdfua_compliant = not pdfua or (
+                        pdfua_result is not None and pdfua_result.compliant
                     )
                     if (
                         verapdf_result is not None

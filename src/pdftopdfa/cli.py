@@ -142,9 +142,7 @@ def _print_validation_result(
     if result.compliant:
         if not quiet:
             standard = (
-                "PDF/UA-1"
-                if result.flavour == "ua1"
-                else f"PDF/A-{result.flavour}"
+                "PDF/UA-1" if result.flavour == "ua1" else f"PDF/A-{result.flavour}"
             )
             print_success(f"Validation successful: {standard}")
     else:

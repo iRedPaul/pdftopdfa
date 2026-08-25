@@ -335,14 +335,20 @@ class TestCreateXmpMetadata:
         tree = _parse_xmp_bytes(xmp)
 
         assert tree is not None
-        assert tree.xpath(
-            "string(//pdfuaid:part)",
-            namespaces={"pdfuaid": NAMESPACES["pdfuaid"]},
-        ) == "1"
-        assert tree.xpath(
-            "string(//dc:title/rdf:Alt/rdf:li)",
-            namespaces={"dc": NAMESPACES["dc"], "rdf": NAMESPACES["rdf"]},
-        ) == "sample"
+        assert (
+            tree.xpath(
+                "string(//pdfuaid:part)",
+                namespaces={"pdfuaid": NAMESPACES["pdfuaid"]},
+            )
+            == "1"
+        )
+        assert (
+            tree.xpath(
+                "string(//dc:title/rdf:Alt/rdf:li)",
+                namespaces={"dc": NAMESPACES["dc"], "rdf": NAMESPACES["rdf"]},
+            )
+            == "sample"
+        )
         assert NAMESPACES["pdfuaid"] in xmp.decode("utf-8")
         assert b"pdfaExtension:schemas" in xmp
 
