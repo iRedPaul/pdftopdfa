@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.9.5] - 2026-08-25
+
+### Features
+
+- Add semantic tagging for digital and OCR content in PDF/A level A output
+
+### Changes
+
+- Convert encrypted PDFs that open with an empty user password to PDF/A while preserving password-protected PDFs unchanged
+- Publish PDF output only after structural checks and requested validation succeed
+- Simplify semantic tagging type annotations and imports
+
+### Documentation
+
+- Document inferred semantics, review limitations, and fail-closed publication behavior
+
 ## [0.9.4] - 2026-08-17
 
 ### Bug Fixes
