@@ -101,9 +101,10 @@ def _print_result(result: ConversionResult, quiet: bool) -> None:
         result: The conversion result.
         quiet: If True, only output errors.
     """
-    if quiet and result.validation_failed:
+    validation_prefixes = ("Validation:", "PDF/UA validation:")
+    if result.validation_failed:
         for warning in result.warnings:
-            if warning.startswith(("Validation:", "PDF/UA validation:")):
+            if warning.startswith(validation_prefixes):
                 print_error(warning)
 
     if result.success:
@@ -127,6 +128,8 @@ def _print_result(result: ConversionResult, quiet: bool) -> None:
                 f"{result.output_path.name} ({details})"
             )
             for warning in result.warnings:
+                if result.validation_failed and warning.startswith(validation_prefixes):
+                    continue
                 print_warning(warning)
     else:
         print_error(f"{result.input_path.name}: {result.error}")

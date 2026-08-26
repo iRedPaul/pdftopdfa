@@ -11,6 +11,7 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, NumberTree, Pdf, String
 
 from .accessibility import AccessibilityStrings, accessibility_strings, primary_language
+from .tagging import _effective_structure_role, _number_tree_keys
 from .utils import resolve_indirect
 
 logger = logging.getLogger(__name__)
@@ -162,6 +163,8 @@ def _valid_page_labels(pdf: Pdf) -> bool:
     root = resolve_indirect(pdf.Root.get("/PageLabels"))
     if not isinstance(root, Dictionary):
         return False
+    if _number_tree_keys(root) is None:
+        return False
     try:
         entries = list(NumberTree(root).items())
     except (TypeError, ValueError, RuntimeError, pikepdf.PdfError):
@@ -214,6 +217,31 @@ def _structure_children(element: Dictionary) -> list[Dictionary]:
     return children
 
 
+def _content_page_reference(element: Dictionary) -> object | None:
+    """Return the first page referenced by a nested MCR or OBJR dictionary."""
+    pending = [resolve_indirect(element.get("/K"))]
+    visited: set[tuple[int, int] | int] = set()
+    while pending:
+        value = resolve_indirect(pending.pop())
+        if isinstance(value, Array):
+            pending.extend(reversed(value))
+            continue
+        if not isinstance(value, Dictionary):
+            continue
+        identity = _object_identity(value)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if resolve_indirect(value.get("/Type")) in {Name.MCR, Name.OBJR}:
+            page = resolve_indirect(value.get("/Pg"))
+            if page is not None:
+                return page
+        child = resolve_indirect(value.get("/K"))
+        if child is not None:
+            pending.append(child)
+    return None
+
+
 def _heading_level(role: object) -> int | None:
     match = re.fullmatch(r"/H([1-6])", str(resolve_indirect(role)))
     if match:
@@ -243,6 +271,9 @@ def _heading_bookmarks(
     structure_root = resolve_indirect(pdf.Root.get("/StructTreeRoot"))
     if not isinstance(structure_root, Dictionary):
         return []
+    role_map = resolve_indirect(structure_root.get("/RoleMap"))
+    if not isinstance(role_map, Dictionary):
+        role_map = None
     page_objects = {_object_identity(page.obj): page.obj for page in pdf.pages}
     bookmarks = []
     raw_root = resolve_indirect(structure_root.get("/K"))
@@ -260,10 +291,15 @@ def _heading_bookmarks(
         if identity in visited:
             continue
         visited.add(identity)
-        page_reference = element.get("/Pg", inherited_page)
-        level = _heading_level(element.get("/S"))
+        page_reference = resolve_indirect(element.get("/Pg"))
+        if page_reference is None:
+            page_reference = inherited_page
+        level = _heading_level(_effective_structure_role(element.get("/S"), role_map))
         title = _bookmark_title(element) if level is not None else None
-        page = page_objects.get(_object_identity(page_reference))
+        heading_page_reference = page_reference
+        if level is not None and heading_page_reference is None:
+            heading_page_reference = _content_page_reference(element)
+        page = page_objects.get(_object_identity(heading_page_reference))
         if level is not None and title is not None and page is not None:
             bookmarks.append((level, title, page))
         children = _structure_children(element)
@@ -328,6 +364,27 @@ def _ensure_heading_bookmarks(pdf: Pdf) -> int:
     return len(headings)
 
 
+def _annotation_structure_owner(
+    structure_root: Dictionary | None,
+    annotation: Dictionary,
+) -> Dictionary | None:
+    if structure_root is None:
+        return None
+    parent_key = resolve_indirect(annotation.get("/StructParent"))
+    parent_tree = resolve_indirect(structure_root.get("/ParentTree"))
+    if (
+        not isinstance(parent_key, int)
+        or isinstance(parent_key, bool)
+        or not isinstance(parent_tree, Dictionary)
+    ):
+        return None
+    try:
+        owner = resolve_indirect(NumberTree(parent_tree).get(parent_key))
+    except (TypeError, ValueError, RuntimeError, pikepdf.PdfError):
+        return None
+    return owner if isinstance(owner, Dictionary) and "/S" in owner else None
+
+
 def apply_wcag_21(pdf: Pdf) -> dict[str, int | bool]:
     """Apply machine-enforceable WCAG 2.1 PDF techniques.
 
@@ -343,6 +400,9 @@ def apply_wcag_21(pdf: Pdf) -> dict[str, int | bool]:
     seen_widgets: set[tuple[int, int] | int] = set()
     language = str(resolve_indirect(pdf.Root.get("/Lang")) or "").strip().casefold()
     strings = accessibility_strings(language)
+    structure_root = resolve_indirect(pdf.Root.get("/StructTreeRoot"))
+    if not isinstance(structure_root, Dictionary):
+        structure_root = None
 
     page_labels_added = 0
     page_labels_repaired = 0
@@ -372,6 +432,7 @@ def apply_wcag_21(pdf: Pdf) -> dict[str, int | bool]:
                 contents = resolve_indirect(annotation.get("/Contents"))
                 if not isinstance(contents, String) or not str(contents).strip():
                     description = None
+                    fallback_generated = False
                     if subtype == Name.Popup:
                         parent = resolve_indirect(annotation.get("/Parent"))
                         candidate = (
@@ -403,8 +464,16 @@ def apply_wcag_21(pdf: Pdf) -> dict[str, int | bool]:
                             if subtype == Name.Link
                             else strings.annotation.format(subtype=subtype_name)
                         )
+                        fallback_generated = True
                         annotation_descriptions_review_required += 1
                     annotation["/Contents"] = _bounded_string(description)
+                    if (
+                        fallback_generated
+                        and primary_language(language) != strings.language
+                    ):
+                        owner = _annotation_structure_owner(structure_root, annotation)
+                        if owner is not None and "/Lang" not in owner:
+                            owner["/Lang"] = String(strings.language)
                     annotation_descriptions_added += 1
             if subtype != Name.Widget:
                 continue

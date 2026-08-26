@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import re
-from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -107,11 +106,9 @@ def accessibility_strings(language: object) -> AccessibilityStrings:
 
 def infer_document_language(texts: Iterable[str]) -> str | None:
     """Infer German or English only when document text gives strong evidence."""
-    tokens = Counter(
-        token for text in texts for token in _WORD.findall(text.casefold())
-    )
+    tokens = {token for text in texts for token in _WORD.findall(text.casefold())}
     scores = {
-        language: sum(min(tokens[word], 3) for word in markers)
+        language: len(tokens & markers)
         for language, markers in _LANGUAGE_MARKERS.items()
     }
     language, score = max(scores.items(), key=lambda item: item[1])

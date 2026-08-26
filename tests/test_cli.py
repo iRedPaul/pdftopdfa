@@ -425,26 +425,29 @@ class TestCliConvert:
 
     @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
+    @pytest.mark.parametrize("quiet", [False, True])
     def test_cli_single_file_known_validation_failure_returns_exit_code(
         self,
         mock_convert_to_pdfa,
         mock_validate,
+        quiet: bool,
         sample_pdf: Path,
         tmp_dir: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """Quiet PDF/UA failures report both automatic validation profiles."""
+        """PDF/UA failures report both automatic validation profiles."""
         output_path = tmp_dir / "output.pdf"
         validation_errors = [
             "Validation: PDF/A rule failed",
             "PDF/UA validation: PDF/UA rule failed",
         ]
         mock_convert_to_pdfa.return_value = ConversionResult(
-            success=True,
+            success=False,
             input_path=sample_pdf,
             output_path=output_path,
             level="2b",
             warnings=validation_errors,
+            error="Validation failed; output candidate was published",
             validation_failed=True,
         )
 
@@ -454,7 +457,7 @@ class TestCliConvert:
             "2b",
             do_validate=True,
             force=False,
-            quiet=True,
+            quiet=quiet,
             pdfua=True,
         )
 

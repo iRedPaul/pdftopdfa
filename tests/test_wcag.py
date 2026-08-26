@@ -4,6 +4,7 @@
 
 """Tests for WCAG 2.1 PDF accessibility requirements."""
 
+import pytest
 from pikepdf import Array, Dictionary, Name, NumberTree, String
 
 from pdftopdfa.utils import resolve_indirect
@@ -240,6 +241,24 @@ def test_apply_wcag_repairs_page_labels_with_noninteger_start(
     assert result["page_labels_repaired"] == 1
 
 
+@pytest.mark.parametrize("keys", [(0, 0), (1, 0)])
+def test_apply_wcag_repairs_malformed_raw_page_label_keys(
+    sample_pdf_obj,
+    keys: tuple[int, int],
+) -> None:
+    sample_pdf_obj.add_blank_page()
+    label = Dictionary(S=Name.D, St=1)
+    sample_pdf_obj.Root["/PageLabels"] = Dictionary(
+        Nums=Array([keys[0], label, keys[1], label])
+    )
+
+    result = apply_wcag_21(sample_pdf_obj)
+
+    repaired = resolve_indirect(sample_pdf_obj.Root["/PageLabels"])
+    assert [int(value) for value in resolve_indirect(repaired["/Nums"])[::2]] == [0]
+    assert result["page_labels_repaired"] == 1
+
+
 def test_apply_wcag_builds_hierarchical_bookmarks_from_heading_titles(
     sample_pdf_obj,
 ) -> None:
@@ -278,6 +297,79 @@ def test_apply_wcag_builds_hierarchical_bookmarks_from_heading_titles(
     assert str(first["/Title"]) == "Overview"
     assert str(child["/Title"]) == "Details"
     assert resolve_indirect(child["/Dest"])[0].objgen == second_page.obj.objgen
+    assert result["bookmarks_added"] == 2
+
+
+def test_apply_wcag_builds_bookmarks_from_role_mapped_headings(
+    sample_pdf_obj,
+) -> None:
+    second_page = sample_pdf_obj.add_blank_page()
+    root = sample_pdf_obj.make_indirect(
+        Dictionary(
+            Type=Name.StructTreeRoot,
+            RoleMap=Dictionary(SectionHeading=Name.H1),
+        )
+    )
+    headings = [
+        sample_pdf_obj.make_indirect(
+            Dictionary(
+                Type=Name.StructElem,
+                S=Name("/SectionHeading"),
+                P=root,
+                Pg=page.obj,
+                T=String(title),
+            )
+        )
+        for page, title in zip(
+            sample_pdf_obj.pages,
+            ("Overview", "Details"),
+            strict=True,
+        )
+    ]
+    root["/K"] = Array(headings)
+    sample_pdf_obj.Root["/StructTreeRoot"] = root
+
+    result = apply_wcag_21(sample_pdf_obj)
+
+    outlines = resolve_indirect(sample_pdf_obj.Root["/Outlines"])
+    first = resolve_indirect(outlines["/First"])
+    second = resolve_indirect(first["/Next"])
+    assert str(first["/Title"]) == "Overview"
+    assert str(second["/Title"]) == "Details"
+    assert resolve_indirect(second["/Dest"])[0].objgen == second_page.obj.objgen
+    assert result["bookmarks_added"] == 2
+
+
+def test_apply_wcag_builds_bookmarks_from_heading_mcr_pages(sample_pdf_obj) -> None:
+    second_page = sample_pdf_obj.add_blank_page()
+    root = sample_pdf_obj.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    headings = [
+        sample_pdf_obj.make_indirect(
+            Dictionary(
+                Type=Name.StructElem,
+                S=Name.H1,
+                P=root,
+                K=Dictionary(Type=Name.MCR, Pg=page.obj, MCID=0),
+                T=String(title),
+            )
+        )
+        for page, title in zip(
+            sample_pdf_obj.pages,
+            ("Overview", "Details"),
+            strict=True,
+        )
+    ]
+    root["/K"] = Array(headings)
+    sample_pdf_obj.Root["/StructTreeRoot"] = root
+
+    result = apply_wcag_21(sample_pdf_obj)
+
+    outlines = resolve_indirect(sample_pdf_obj.Root["/Outlines"])
+    first = resolve_indirect(outlines["/First"])
+    second = resolve_indirect(first["/Next"])
+    first_page = resolve_indirect(first["/Dest"])[0]
+    assert first_page.objgen == sample_pdf_obj.pages[0].obj.objgen
+    assert resolve_indirect(second["/Dest"])[0].objgen == second_page.obj.objgen
     assert result["bookmarks_added"] == 2
 
 
@@ -368,6 +460,39 @@ def test_apply_wcag_adds_annotation_descriptions_and_reports_placeholders(
     assert str(attachment["/Contents"]) == "Source data"
     assert result["annotation_descriptions_added"] == 2
     assert result["annotation_descriptions_review_required"] == 1
+
+
+def test_apply_wcag_tags_fallback_annotation_description_language(
+    sample_pdf_obj,
+) -> None:
+    sample_pdf_obj.Root["/Lang"] = String("fr")
+    page = sample_pdf_obj.pages[0]
+    annotation = sample_pdf_obj.make_indirect(
+        Dictionary(
+            Type=Name.Annot,
+            Subtype=Name.Link,
+            Rect=Array([0, 0, 10, 10]),
+            StructParent=0,
+        )
+    )
+    root = sample_pdf_obj.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    owner = sample_pdf_obj.make_indirect(
+        Dictionary(Type=Name.StructElem, S=Name.Link, P=root, Pg=page.obj)
+    )
+    owner["/K"] = sample_pdf_obj.make_indirect(
+        Dictionary(Type=Name.OBJR, Pg=page.obj, Obj=annotation)
+    )
+    root["/K"] = owner
+    parent_tree = NumberTree.new(sample_pdf_obj)
+    parent_tree[0] = owner
+    root["/ParentTree"] = parent_tree.obj
+    sample_pdf_obj.Root["/StructTreeRoot"] = root
+    page.obj["/Annots"] = Array([annotation])
+
+    apply_wcag_21(sample_pdf_obj)
+
+    assert str(annotation["/Contents"]) == "Link"
+    assert str(owner["/Lang"]) == "en"
 
 
 def test_apply_wcag_describes_popup_and_printer_mark_annotations(

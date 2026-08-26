@@ -20,6 +20,7 @@ def test_infers_german_only_from_strong_document_evidence() -> None:
 
 def test_infers_english_only_from_strong_document_evidence() -> None:
     assert infer_document_language(["Invoice", "Customer", "Quantity"]) == "en"
+    assert infer_document_language(["total", "total", "total"]) is None
 
 
 def test_localizes_supported_language_and_tags_english_fallback() -> None:

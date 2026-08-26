@@ -141,7 +141,9 @@ class TestGetVerapdfCmd:
         """validate_with_verapdf uses VERAPDF_PATH in the command."""
         mock_available.return_value = True
         xml_response = (
-            "<report><jobs><job>"
+            "<report><buildInformation>"
+            '<releaseDetails id="apps" version="1.30.2"/>'
+            "</buildInformation><jobs><job>"
             '<validationReport isCompliant="true" profileName="PDF/A-2B">'
             '<details passedRules="1" failedRules="0"></details>'
             "</validationReport></job></jobs></report>"
@@ -172,7 +174,9 @@ class TestGetVerapdfCmd:
         launcher.write_text("@echo off\n")
         mock_which.return_value = str(launcher)
         xml_response = (
-            "<report><jobs><job>"
+            "<report><buildInformation>"
+            '<releaseDetails id="apps" version="1.30.2"/>'
+            "</buildInformation><jobs><job>"
             '<validationReport isCompliant="true" profileName="PDF/A-2B">'
             '<details passedRules="1" failedRules="0"></details>'
             "</validationReport></job></jobs></report>"
@@ -595,6 +599,14 @@ class TestParseVerapdfXml:
 class TestValidateWithVerapdf:
     """Tests for validate_with_verapdf."""
 
+    @pytest.fixture(autouse=True)
+    def _supported_version_fallback(self):
+        with patch(
+            "pdftopdfa.verapdf.get_verapdf_version",
+            return_value="veraPDF 1.30.2",
+        ):
+            yield
+
     @patch("pdftopdfa.verapdf.is_verapdf_available")
     def test_raises_when_not_available(
         self, mock_available: MagicMock, tmp_path: Path
@@ -646,6 +658,62 @@ class TestValidateWithVerapdf:
         pdf_path.touch()
 
         with pytest.raises(VeraPDFError, match="1.30.2 or newer"):
+            validate_with_verapdf(pdf_path, flavour="2b")
+
+    @patch("pdftopdfa.verapdf.get_verapdf_version", return_value="veraPDF 1.28.2")
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available")
+    def test_rejects_old_fallback_for_unparseable_report_version(
+        self,
+        mock_available: MagicMock,
+        mock_run: MagicMock,
+        _mock_version: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        mock_available.return_value = True
+        xml_response = """<report>
+            <buildInformation>
+                <releaseDetails id="apps" version="unknown" />
+            </buildInformation>
+            <jobs><job>
+                <validationReport isCompliant="true" profileName="PDF/A-2B">
+                    <details passedRules="1" failedRules="0" />
+                </validationReport>
+            </job></jobs>
+        </report>"""
+        mock_run.return_value = MagicMock(
+            stdout=xml_response,
+            stderr="",
+            returncode=0,
+        )
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.touch()
+
+        with pytest.raises(VeraPDFError, match="veraPDF 1.28.2 is too old"):
+            validate_with_verapdf(pdf_path, flavour="2b")
+
+    @patch("pdftopdfa.verapdf.get_verapdf_version", return_value=None)
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available")
+    def test_rejects_validator_when_version_cannot_be_determined(
+        self,
+        mock_available: MagicMock,
+        mock_run: MagicMock,
+        _mock_version: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        mock_available.return_value = True
+        xml_response = (
+            "<report><jobs><job>"
+            '<validationReport isCompliant="true" profileName="PDF/A-2B">'
+            '<details passedRules="1" failedRules="0"></details>'
+            "</validationReport></job></jobs></report>"
+        )
+        mock_run.return_value = MagicMock(stdout=xml_response, stderr="", returncode=0)
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.touch()
+
+        with pytest.raises(VeraPDFError, match="Could not determine.*1.30.2"):
             validate_with_verapdf(pdf_path, flavour="2b")
 
     @patch("pdftopdfa.verapdf.subprocess.run")

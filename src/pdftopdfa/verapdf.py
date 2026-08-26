@@ -509,16 +509,31 @@ def validate_with_verapdf(
     # Parse XML result. Incomplete reports and veraPDF execution failures raise
     # VeraPDFError instead of being misclassified as ordinary non-compliance.
     verapdf_result = _parse_verapdf_xml(xml_output)
+    version_text = verapdf_result.validator_version
     installed_version = (
-        _version_tuple(verapdf_result.validator_version)
-        if verapdf_result.validator_version is not None
-        else None
+        _version_tuple(version_text) if version_text is not None else None
     )
+    if installed_version is None:
+        version_output = get_verapdf_version()
+        version_match = (
+            re.search(r"(?<![\d.])\d+\.\d+\.\d+(?:[-+]\S*)?(?![\d.])", version_output)
+            if version_output is not None
+            else None
+        )
+        if version_match is not None:
+            version_text = version_match.group(0)
+            installed_version = _version_tuple(version_text)
+            verapdf_result.validator_version = version_text
     minimum_version = _version_tuple(MIN_VERAPDF_VERSION)
     assert minimum_version is not None
-    if installed_version is not None and installed_version < minimum_version:
+    if installed_version is None:
         raise VeraPDFError(
-            f"veraPDF {verapdf_result.validator_version} is too old; "
+            "Could not determine the installed veraPDF version; "
+            f"version {MIN_VERAPDF_VERSION} or newer is required"
+        )
+    if installed_version < minimum_version:
+        raise VeraPDFError(
+            f"veraPDF {version_text} is too old; "
             f"version {MIN_VERAPDF_VERSION} or newer is required"
         )
     expected_returncode = 0 if verapdf_result.compliant else 1
