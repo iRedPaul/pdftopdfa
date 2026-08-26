@@ -1396,10 +1396,19 @@ class TestConvertToPdfa:
             )
 
     @pytest.mark.parametrize("level", ["2a", "3a"])
+    @patch("pdftopdfa.converter.validate_with_verapdf")
     def test_convert_pdfua_adds_identification_and_catalog_requirements(
-        self, sample_pdf: Path, tmp_dir: Path, level: str
+        self,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        level: str,
     ) -> None:
         """The opt-in output declares PDF/UA-1 and keeps Level A structure."""
+        mock_verapdf.side_effect = lambda *, path, flavour: VeraPDFResult(
+            compliant=True,
+            flavour=flavour,
+        )
         output_path = tmp_dir / f"output_{level}_pdfua.pdf"
 
         result = convert_to_pdfa(
