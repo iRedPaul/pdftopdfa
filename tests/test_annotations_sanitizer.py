@@ -6,7 +6,7 @@
 
 import pikepdf
 import pytest
-from conftest import resolve, save_and_reopen
+from conftest import register_form_widget, resolve, save_and_reopen
 from pikepdf import Array, Dictionary, Name
 
 from pdftopdfa.sanitizers.annotations import (
@@ -621,6 +621,7 @@ class TestFixAnnotationFlags:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = fix_annotation_flags(pdf)
         assert result == 1
@@ -642,6 +643,7 @@ class TestFixAnnotationFlags:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = fix_annotation_flags(pdf)
         assert result == 1
@@ -966,6 +968,7 @@ class TestEnsureAppearanceStreams:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
 
         result = ensure_appearance_streams(pdf)
@@ -1001,6 +1004,7 @@ class TestEnsureAppearanceStreams:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
 
         result = ensure_appearance_streams(pdf)
@@ -1369,6 +1373,7 @@ class TestFixAnnotationOpacity:
         )
         annot[Name("/CA")] = 0.5
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = fix_annotation_opacity(pdf)
         assert result == 1
@@ -1562,6 +1567,7 @@ class TestRemoveAnnotationColors:
         )
         annot[Name("/C")] = Array([0.0, 0.0, 1.0])
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = remove_annotation_colors(pdf)
         assert result == 1
@@ -1611,6 +1617,7 @@ class TestFixButtonAppearanceSubdicts:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = fix_button_appearance_subdicts(pdf)
         assert result == 1
@@ -1643,6 +1650,7 @@ class TestFixButtonAppearanceSubdicts:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = fix_button_appearance_subdicts(pdf)
         assert result == 0
@@ -1664,6 +1672,7 @@ class TestFixButtonAppearanceSubdicts:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = fix_button_appearance_subdicts(pdf)
         assert result == 0
@@ -1690,6 +1699,7 @@ class TestFixButtonAppearanceSubdicts:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = fix_button_appearance_subdicts(pdf)
         assert result == 1
@@ -1712,6 +1722,7 @@ class TestFixButtonAppearanceSubdicts:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = fix_button_appearance_subdicts(pdf)
         assert result == 1

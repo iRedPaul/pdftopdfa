@@ -12,6 +12,7 @@ import sys
 import zlib
 from collections.abc import Sequence
 from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -633,6 +634,31 @@ def _add_content_page(
     page.obj[Name.Contents] = pdf.make_stream(b"\n".join(content))
 
 
+def _add_scan_page(
+    pdf: Pdf,
+    *,
+    page_size: tuple[int, int] = (1700, 2338),
+    image_size: tuple[int, int] = (1700, 2338),
+) -> None:
+    """Add a full-page RGB JPEG scan with controlled geometry and native DPI."""
+    page = pdf.add_blank_page(page_size=page_size)
+    encoded = BytesIO()
+    with Image.new("RGB", image_size, color="white") as image:
+        image.save(encoded, format="JPEG")
+    image = pdf.make_stream(encoded.getvalue())
+    image[Name.Type] = Name.XObject
+    image[Name.Subtype] = Name.Image
+    image[Name.Width] = image_size[0]
+    image[Name.Height] = image_size[1]
+    image[Name.ColorSpace] = Name.DeviceRGB
+    image[Name.BitsPerComponent] = 8
+    image[Name.Filter] = Name.DCTDecode
+    page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Im0=image))
+    page.obj[Name.Contents] = pdf.make_stream(
+        f"q {page_size[0]} 0 0 {page_size[1]} 0 0 cm /Im0 Do Q".encode()
+    )
+
+
 def _nested_form_chain(
     pdf: Pdf,
     leaf: pikepdf.Object,
@@ -1169,17 +1195,17 @@ class TestOcrResourcePreflight:
     """Tests for fail-closed page geometry and raster limits."""
 
     @pytest.mark.parametrize(
-        ("page_size", "exceeds_limit"),
+        ("page_size", "expected_oversample"),
         [
-            (479.0, False),
-            (481.0, True),
+            (479.0, 600),
+            (481.0, 300),
         ],
     )
-    def test_enforces_600_dpi_page_pixel_limit_with_rotation_and_user_unit(
+    def test_plans_safe_dpi_with_rotation_and_user_unit(
         self,
         tmp_dir: Path,
         page_size: float,
-        exceeds_limit: bool,
+        expected_oversample: int,
     ) -> None:
         path = tmp_dir / f"raster-{page_size}.pdf"
         with Pdf.new() as pdf:
@@ -1188,14 +1214,96 @@ class TestOcrResourcePreflight:
             page.obj[Name.UserUnit] = 2.5
             pdf.save(path)
 
-        if exceeds_limit:
-            with pytest.raises(
-                OCRError,
-                match=f"safety limit is {_OCR_MAX_PAGE_RASTER_PIXELS:,}",
-            ):
-                _preflight_ocr_input(path)
-        else:
+        assert _preflight_ocr_input(path) == expected_oversample
+
+    def test_rejects_page_that_exceeds_limit_at_300_dpi(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        path = tmp_dir / "too-large-at-300.pdf"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page(page_size=(2401, 2401))
+            pdf.save(path)
+
+        with pytest.raises(
+            OCRError,
+            match=(
+                "OCR page 1.*at 300 dpi.*"
+                f"safety limit is {_OCR_MAX_PAGE_RASTER_PIXELS:,}"
+            ),
+        ):
             _preflight_ocr_input(path)
+
+    def test_native_dpi_is_capped_at_planned_fallback(
+        self,
+        tmp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        path = tmp_dir / "high-native-dpi.pdf"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page(page_size=(1000, 1000))
+            pdf.save(path)
+        pdfinfo_value = SimpleNamespace(
+            pages=[
+                SimpleNamespace(
+                    has_text=False,
+                    images=[],
+                    dpi=SimpleNamespace(x=800.0, y=800.0),
+                )
+            ]
+        )
+
+        with (
+            patch("ocrmypdf.pdfinfo.PdfInfo", return_value=pdfinfo_value),
+            patch(
+                "pdftopdfa.ocr._OCR_MAX_DOCUMENT_RASTER_PIXELS",
+                17_363_889,
+            ),
+        ):
+            assert _preflight_ocr_input(path) == 300
+
+        assert "preferred 600 dpi oversampling (effective 800 dpi)" in caplog.text
+        assert "using 300 dpi" in caplog.text
+        assert "17,363,889 pixels expected" in caplog.text
+
+    @pytest.mark.parametrize("document_limit", [77_714_648, 77_714_647])
+    def test_document_budget_uses_planned_fallback_dpi(
+        self,
+        tmp_dir: Path,
+        document_limit: int,
+    ) -> None:
+        path = tmp_dir / f"fallback-budget-{document_limit}.pdf"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page(page_size=(1700, 2338))
+            pdf.add_blank_page(page_size=(595, 842))
+            pdf.save(path)
+        pdfinfo_value = SimpleNamespace(
+            pages=[
+                SimpleNamespace(
+                    has_text=False,
+                    images=[],
+                    dpi=SimpleNamespace(x=72.0, y=72.0),
+                ),
+                SimpleNamespace(
+                    has_text=False,
+                    images=[],
+                    dpi=SimpleNamespace(x=0.0, y=0.0),
+                ),
+            ]
+        )
+
+        with (
+            patch("ocrmypdf.pdfinfo.PdfInfo", return_value=pdfinfo_value),
+            patch(
+                "pdftopdfa.ocr._OCR_MAX_DOCUMENT_RASTER_PIXELS",
+                document_limit,
+            ),
+        ):
+            if document_limit == 77_714_648:
+                assert _preflight_ocr_input(path) == 300
+            else:
+                with pytest.raises(OCRError, match="document raster work"):
+                    _preflight_ocr_input(path)
 
     @pytest.mark.parametrize(("page_count", "exceeds_limit"), [(28, False), (29, True)])
     def test_enforces_document_raster_work_limit(
@@ -3870,6 +3978,88 @@ class TestApplyOcr:
             pdf.save(input_path)
 
         assert _find_deskew_pages(input_path) == []
+
+    def test_normal_a4_document_uses_600_dpi(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "a4.pdf"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page(page_size=(595, 842))
+            pdf.save(input_path)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
+            apply_ocr(
+                input_path,
+                tmp_dir / "output.pdf",
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+            )
+
+        assert mock_ocr.call_args.kwargs["oversample"] == 600
+
+    def test_large_72_dpi_scan_uses_300_dpi_fallback(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        input_path = tmp_dir / "large-scan.pdf"
+        with Pdf.new() as pdf:
+            _add_scan_page(pdf)
+            pdf.save(input_path)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
+            apply_ocr(
+                input_path,
+                tmp_dir / "output.pdf",
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+            )
+
+        kwargs = mock_ocr.call_args.kwargs
+        assert kwargs["oversample"] == 300
+        assert kwargs["max_image_mpixels"] == 100.0
+        assert "OCR page 1" in caplog.text
+        assert "preferred 600 dpi" in caplog.text
+        assert "using 300 dpi" in caplog.text
+        assert "69,012,328 pixels expected" in caplog.text
+
+    def test_mixed_text_and_large_scan_document_remains_processable(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+    ) -> None:
+        input_path = tmp_dir / "mixed-large-scan.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, image_scale=50, visible_text=True)
+            _add_scan_page(pdf)
+            pdf.save(input_path)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_copy_ocr_input,
+        ) as mock_ocr:
+            apply_ocr(
+                input_path,
+                tmp_dir / "output.pdf",
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+            )
+
+        mock_ocr.assert_called_once()
+        assert mock_ocr.call_args.kwargs["pages"] == "2"
+        assert mock_ocr.call_args.kwargs["oversample"] == 300
 
     def test_passes_fixed_offline_configuration(
         self,

@@ -12,6 +12,7 @@ from io import BytesIO
 
 import pikepdf
 import pytest
+from conftest import register_form_widget
 from pikepdf import Array, Dictionary, Name, NumberTree, String
 
 import pdftopdfa.digital_layout as digital_layout
@@ -1825,6 +1826,7 @@ def test_rich_existing_structure_is_repaired_without_rebuilding() -> None:
         )
     )
     page.obj["/Annots"] = Array([widget])
+    register_form_widget(pdf, widget)
 
     root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
     document = pdf.make_indirect(
@@ -2478,6 +2480,7 @@ def test_existing_heading_sequence_and_annotation_roles_are_repaired() -> None:
         )
     )
     page.obj["/Annots"] = Array([widget, link_annotation])
+    register_form_widget(pdf, widget)
 
     root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
     document = pdf.make_indirect(
@@ -6903,6 +6906,7 @@ def test_hidden_annotations_are_excluded_before_link_and_widget_review() -> None
         )
     )
     page.obj["/Annots"] = Array([hidden_link, hidden_widget, visible_link])
+    register_form_widget(pdf, hidden_widget)
 
     result = ensure_logical_structure(pdf, semantic=True)
 

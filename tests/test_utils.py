@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pikepdf
 import pytest
-from conftest import new_pdf, open_pdf
+from conftest import new_pdf, open_pdf, register_form_widget
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from pdftopdfa.exceptions import ConversionError
@@ -1400,6 +1400,7 @@ class TestFixAnnotationFlags:
             )
         )
         pdf.pages[0].Annots = Array([widget])
+        register_form_widget(pdf, widget)
 
         # Save and reopen
         test_path = tmp_path / "test_widget.pdf"
@@ -2112,6 +2113,7 @@ class TestEnsureAppearanceStreams:
             )
         )
         pdf.pages[0].Annots = Array([annot])
+        register_form_widget(pdf, annot)
 
         test_path = tmp_path / "test_widget_ap.pdf"
         pdf.save(test_path)

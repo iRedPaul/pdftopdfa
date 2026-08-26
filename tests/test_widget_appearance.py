@@ -6,7 +6,7 @@
 
 import pikepdf
 import pytest
-from conftest import resolve, save_and_reopen
+from conftest import register_form_widget, resolve, save_and_reopen
 from pikepdf import Array, Dictionary, Name, Stream
 
 from pdftopdfa.sanitizers.annotations import ensure_appearance_streams
@@ -774,6 +774,7 @@ class TestBuildSignatureAppearance:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = ensure_appearance_streams(pdf)
         assert result == 1
@@ -957,6 +958,7 @@ class TestIntegration:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = ensure_appearance_streams(pdf)
         assert result == 1
@@ -1013,6 +1015,7 @@ class TestIntegration:
             )
         )
         pdf.pages[0]["/Annots"] = Array([widget, text_annot])
+        register_form_widget(pdf, widget)
         pdf = save_and_reopen(pdf)
         result = ensure_appearance_streams(pdf)
         assert result == 2
@@ -1034,6 +1037,7 @@ class TestIntegration:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = ensure_appearance_streams(pdf)
         assert result == 0
@@ -1052,6 +1056,7 @@ class TestIntegration:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = ensure_appearance_streams(pdf)
         assert result == 1
@@ -1074,7 +1079,8 @@ class TestIntegration:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
-        pdf = save_and_reopen(pdf)
+        with pytest.warns(pikepdf.PageCopyWarning):
+            pdf = save_and_reopen(pdf)
         result = ensure_appearance_streams(pdf)
         assert result == 1
         resolved = resolve(pdf.pages[0].Annots[0])

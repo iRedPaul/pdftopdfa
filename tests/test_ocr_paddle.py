@@ -2011,6 +2011,56 @@ def test_filter_ocr_image_supplies_dpi_for_vector_only_force_page(
     assert ocr_paddle._coordinate_dpi_by_image == {page_image.resolve(): 600.0}
 
 
+def test_high_native_dpi_is_capped_before_real_rasterization(
+    tmp_path: Path,
+    model_dirs: tuple[Path, Path],
+) -> None:
+    input_path = tmp_path / "high-native-dpi.pdf"
+    output_path = tmp_path / "high-native-dpi-ocr.pdf"
+    with Pdf.new() as pdf:
+        image = pdf.make_stream(b"\xff" * (800 * 800))
+        image[Name.Type] = Name.XObject
+        image[Name.Subtype] = Name.Image
+        image[Name.Width] = 800
+        image[Name.Height] = 800
+        image[Name.ColorSpace] = Name.DeviceGray
+        image[Name.BitsPerComponent] = 8
+        page = pdf.add_blank_page(page_size=(72, 72))
+        page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Im0=image))
+        page.obj[Name.Contents] = pdf.make_stream(b"q 72 0 0 72 0 0 cm /Im0 Do Q")
+        pdf.save(input_path)
+
+    real_rasterizer = ocr_paddle.pypdfium_rasterizer.rasterize_pdf_page
+    with (
+        patch("pdftopdfa.ocr._OCR_MAX_PAGE_RASTER_PIXELS", 500_000),
+        patch.object(ocr_paddle, "_OCR_MAX_PAGE_RASTER_PIXELS", 500_000),
+        patch.object(
+            ocr_paddle.pypdfium_rasterizer,
+            "rasterize_pdf_page",
+            wraps=real_rasterizer,
+        ) as rasterize,
+        patch.object(
+            ocr_paddle,
+            "_predict",
+            return_value=_result(),
+        ),
+    ):
+        apply_ocr(
+            input_path,
+            output_path,
+            detection_model_dir=model_dirs[0],
+            recognition_model_dir=model_dirs[1],
+        )
+
+    assert rasterize.call_args.kwargs["raster_dpi"] == Resolution(300.0, 300.0)
+    assert "".join(extract_text(output_path).split()) == "Helloworld"
+    with Pdf.open(output_path) as pdf:
+        page = pdf.pages[0]
+        assert [float(value) for value in page.mediabox] == [0.0, 0.0, 72.0, 72.0]
+        assert int(page.Resources.XObject.Im0.Width) == 800
+        assert int(page.Resources.XObject.Im0.Height) == 800
+
+
 def test_vector_only_force_page_completes_without_zero_dpi(
     tmp_path: Path,
     model_dirs: tuple[Path, Path],
@@ -2812,6 +2862,56 @@ def test_plugin_blocks_tesseract_and_registers_compatibility_only() -> None:
     assert not any(
         callable(getattr(compatibility, name, None))
         for name in ("version", "languages", "generate_ocr", "generate_hocr")
+    )
+
+
+@pytest.mark.parametrize(
+    ("requested_dpi", "oversample", "expected_dpi"),
+    [(700.0, 600, 700.0), (800.0, 300, 300.0)],
+)
+def test_pypdfium_rasterizer_caps_only_unsafe_native_dpi(
+    tmp_path: Path,
+    requested_dpi: float,
+    oversample: int,
+    expected_dpi: float,
+) -> None:
+    input_path = tmp_path / "native-dpi.pdf"
+    output_path = tmp_path / "raster.png"
+    with Pdf.new() as pdf:
+        page = pdf.add_blank_page(page_size=(400, 400))
+        page.obj[Name.UserUnit] = 2.5
+        pdf.save(input_path)
+    options = SimpleNamespace(
+        rasterizer="pypdfium",
+        ocr_engine="paddle",
+        oversample=oversample,
+    )
+
+    with patch.object(
+        ocr_paddle.pypdfium_rasterizer,
+        "rasterize_pdf_page",
+        return_value=output_path,
+    ) as rasterize:
+        result = ocr_paddle.rasterize_pdf_page(
+            input_file=input_path,
+            output_file=output_path,
+            raster_device="pnggray",
+            raster_dpi=Resolution(requested_dpi, requested_dpi),
+            pageno=1,
+            page_dpi=Resolution(requested_dpi * 2.5, requested_dpi * 2.5),
+            rotation=None,
+            filter_vector=False,
+            stop_on_soft_error=True,
+            options=options,
+            use_cropbox=False,
+        )
+
+    assert result == output_path
+    kwargs = rasterize.call_args.kwargs
+    assert kwargs["raster_dpi"] == Resolution(expected_dpi, expected_dpi)
+    assert kwargs["page_dpi"] == Resolution(
+        expected_dpi * 2.5,
+        expected_dpi * 2.5,
     )
 
 
