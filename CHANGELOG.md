@@ -1,12 +1,26 @@
 # Changelog
 
+## [0.9.6] - 2026-08-26
+
+### Features
+
+- Add opt-in PDF/UA-1 output for PDF/A-2a and PDF/A-3a
+- Apply deterministic WCAG 2.1 PDF techniques to PDF/UA output
+
+### Bug Fixes
+
+- Fix semantic tagging by starting path artifact markers before path objects
+- Prevent unsafe OCR rasterization by falling back to 300 DPI and capping high native DPI
+
+### Documentation
+
+- Document PDF/UA-1 output and WCAG 2.1 implementation
+
 ## [0.9.5] - 2026-08-25
 
 ### Features
 
 - Add semantic tagging for digital and OCR content in PDF/A level A output
-- Add opt-in PDF/UA-1 output for PDF/A-2a and PDF/A-3a
-- Apply deterministic WCAG 2.1 PDF techniques to PDF/UA output
 
 ### Changes
 
