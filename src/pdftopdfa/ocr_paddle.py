@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import ocrmypdf
+import pikepdf
+from ocrmypdf.builtin_plugins import pypdfium as pypdfium_rasterizer
 from ocrmypdf.helpers import Resolution
 from ocrmypdf.hocrtransform import Baseline, BoundingBox, OcrClass, OcrElement
 from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
@@ -42,8 +44,10 @@ from ._ocr_runtime import (
 from .exceptions import OCRError
 from .ocr import (
     _OCR_MANIFEST_SCHEMA_VERSION,
+    _OCR_MAX_PAGE_RASTER_PIXELS,
     _OCR_PAGE_MANIFEST_TYPE,
     PADDLE_OCR_LANGUAGES,
+    _ocr_raster_pixel_count,
     _validate_ocr_page_manifest,
     _write_json_atomic,
 )
@@ -2069,6 +2073,76 @@ def add_options(parser: Any) -> None:
         "--paddle-manifest-dir",
         type=Path,
         help=SUPPRESS,
+    )
+
+
+def _physical_page_dimensions(input_file: Path, pageno: int) -> tuple[float, float]:
+    """Return MediaBox dimensions in physical PDF points."""
+    with pikepdf.open(input_file) as pdf:
+        page = pdf.pages[pageno - 1]
+        media_box = [float(value) for value in page.mediabox]
+        user_unit = float(page.obj.get("/UserUnit", 1.0))
+    return (
+        (media_box[2] - media_box[0]) * user_unit,
+        (media_box[3] - media_box[1]) * user_unit,
+    )
+
+
+@ocrmypdf.hookimpl(tryfirst=True)
+def rasterize_pdf_page(
+    input_file: Path,
+    output_file: Path,
+    raster_device: str,
+    raster_dpi: Resolution,
+    pageno: int,
+    page_dpi: Resolution | None,
+    rotation: int | None,
+    filter_vector: bool,
+    stop_on_soft_error: bool,
+    options: OcrOptions | None,
+    use_cropbox: bool,
+) -> Path | None:
+    """Cap native DPI inflation before the OCR page raster is allocated."""
+    if (
+        options is None
+        or options.rasterizer != "pypdfium"
+        or options.ocr_engine != "paddle"
+    ):
+        return None
+
+    requested_dpi = max(float(raster_dpi.x), float(raster_dpi.y))
+    capped_dpi = float(options.oversample)
+    if requested_dpi > capped_dpi > 0:
+        dimensions = _physical_page_dimensions(input_file, pageno)
+        requested_pixels = _ocr_raster_pixel_count(dimensions, requested_dpi)
+        if requested_pixels > _OCR_MAX_PAGE_RASTER_PIXELS:
+            capped_pixels = _ocr_raster_pixel_count(dimensions, capped_dpi)
+            if capped_pixels > _OCR_MAX_PAGE_RASTER_PIXELS:
+                raise OCRError(
+                    f"OCR page {pageno} would require {capped_pixels:,} pixels "
+                    f"at {capped_dpi:g} dpi; the safety limit is "
+                    f"{_OCR_MAX_PAGE_RASTER_PIXELS:,} pixels"
+                )
+            scale = capped_dpi / requested_dpi
+            raster_dpi = Resolution(capped_dpi, capped_dpi)
+            if page_dpi is not None:
+                page_dpi = Resolution(
+                    float(page_dpi.x) * scale,
+                    float(page_dpi.y) * scale,
+                )
+
+    return pypdfium_rasterizer.rasterize_pdf_page(
+        input_file=input_file,
+        output_file=output_file,
+        raster_device=raster_device,
+        raster_dpi=raster_dpi,
+        pageno=pageno,
+        page_dpi=page_dpi,
+        rotation=rotation,
+        filter_vector=filter_vector,
+        stop_on_soft_error=stop_on_soft_error,
+        options=options,
+        use_cropbox=use_cropbox,
     )
 
 

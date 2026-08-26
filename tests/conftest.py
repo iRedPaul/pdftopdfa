@@ -432,6 +432,7 @@ def pdf_with_annotations(tmp_dir: Path) -> Path:
     )
 
     pdf.pages[0].Annots = Array([link_annot, widget_annot, text_annot])
+    register_form_widget(pdf, widget_annot)
 
     pdf_path = tmp_dir / "with_annotations.pdf"
     pdf.save(pdf_path)
@@ -460,6 +461,23 @@ def resolve(obj: object) -> object:
         return obj.get_object()
     except (AttributeError, TypeError, ValueError):
         return obj
+
+
+def register_form_widget(pdf: Pdf, widget: object) -> None:
+    """Make a page widget reachable from the document AcroForm."""
+    field = resolve(widget)
+    while "/Parent" in field:
+        field = resolve(field["/Parent"])
+
+    acroform = pdf.Root.get("/AcroForm")
+    if acroform is None:
+        pdf.Root["/AcroForm"] = pdf.make_indirect(Dictionary(Fields=Array([field])))
+        return
+
+    acroform = resolve(acroform)
+    if "/Fields" not in acroform:
+        acroform["/Fields"] = Array()
+    acroform["/Fields"].append(field)
 
 
 def save_and_reopen(pdf: Pdf) -> Pdf:

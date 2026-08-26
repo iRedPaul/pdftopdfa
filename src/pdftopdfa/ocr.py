@@ -77,6 +77,7 @@ _OCR_MANIFEST_SCHEMA_VERSION = 1
 _OCR_PAGE_MANIFEST_TYPE = "pdftopdfa-ocr-page"
 _OCR_DOCUMENT_MANIFEST_TYPE = "pdftopdfa-ocr-document"
 _OCR_RASTER_DPI = 600
+_OCR_FALLBACK_RASTER_DPI = 300
 # Keeps one grayscale raster near 100 MB while still admitting A3 at 600 dpi.
 _OCR_MAX_PAGE_RASTER_PIXELS = 100_000_000
 # Bound aggregate raster work from small PDFs with arbitrarily many pages.
@@ -2580,14 +2581,24 @@ def _include_forced_ocr_forms_in_content_preflight(pdf: "pikepdf.Pdf") -> None:
             )
 
 
+def _ocr_raster_pixel_count(
+    page_dimensions: tuple[float, float],
+    dpi: float,
+) -> int:
+    """Return a conservative raster pixel count for physical page dimensions."""
+    pixel_width = math.ceil(page_dimensions[0] * dpi / 72.0)
+    pixel_height = math.ceil(page_dimensions[1] * dpi / 72.0)
+    return pixel_width * pixel_height
+
+
 def _preflight_ocr_input(
     pdf_path: Path,
     *,
     force: bool = False,
     deskew: bool = False,
     rotate_pages: bool = False,
-) -> None:
-    """Reject page geometry or raster work that cannot be processed safely."""
+) -> int:
+    """Reject unsafe raster work and return the planned OCR oversample DPI."""
     import pikepdf
     from ocrmypdf.pdfinfo import PdfInfo
 
@@ -2680,6 +2691,7 @@ def _preflight_ocr_input(
         if len(pdfinfo.pages) != len(page_dimensions):
             raise OCRError("Page count changed during OCR resource preflight")
         document_raster_pixels = 0
+        raster_pages = []
         for page_number, (page_info, dimensions, has_text, scan_like) in enumerate(
             zip(
                 pdfinfo.pages,
@@ -2727,26 +2739,67 @@ def _preflight_ocr_input(
             )
             if not will_rasterize:
                 continue
-            raster_dpi = max(
-                float(_OCR_RASTER_DPI),
+            native_dpi = max(
                 float(page_info.dpi.x),
                 float(page_info.dpi.y),
             )
-            pixel_width = math.ceil(media_dimensions[0] * raster_dpi / 72.0)
-            pixel_height = math.ceil(media_dimensions[1] * raster_dpi / 72.0)
-            pixel_count = pixel_width * pixel_height
+            raster_pages.append((page_number, media_dimensions, native_dpi))
+
+        oversized_pages = {}
+        for page_number, media_dimensions, native_dpi in raster_pages:
+            raster_dpi = max(float(_OCR_RASTER_DPI), native_dpi)
+            pixel_count = _ocr_raster_pixel_count(
+                media_dimensions,
+                raster_dpi,
+            )
             if pixel_count > _OCR_MAX_PAGE_RASTER_PIXELS:
-                raise OCRError(
-                    f"OCR page {page_number} would require {pixel_count:,} pixels "
-                    f"at {raster_dpi:g} dpi; the safety limit is "
-                    f"{_OCR_MAX_PAGE_RASTER_PIXELS:,} pixels"
+                oversized_pages[page_number] = (pixel_count, raster_dpi)
+
+        planned_oversample = (
+            _OCR_FALLBACK_RASTER_DPI if oversized_pages else _OCR_RASTER_DPI
+        )
+        planned_pages = []
+        for page_number, media_dimensions, native_dpi in raster_pages:
+            raster_dpi = max(float(planned_oversample), native_dpi)
+            pixel_count = _ocr_raster_pixel_count(media_dimensions, raster_dpi)
+            if pixel_count > _OCR_MAX_PAGE_RASTER_PIXELS:
+                capped_pixel_count = _ocr_raster_pixel_count(
+                    media_dimensions,
+                    planned_oversample,
                 )
+                if capped_pixel_count > _OCR_MAX_PAGE_RASTER_PIXELS:
+                    raise OCRError(
+                        f"OCR page {page_number} would require "
+                        f"{capped_pixel_count:,} pixels at {planned_oversample} dpi; "
+                        "the safety limit is "
+                        f"{_OCR_MAX_PAGE_RASTER_PIXELS:,} pixels"
+                    )
+                raster_dpi = float(planned_oversample)
+                pixel_count = capped_pixel_count
             document_raster_pixels += pixel_count
             if document_raster_pixels > _OCR_MAX_DOCUMENT_RASTER_PIXELS:
                 raise OCRError(
                     "OCR document raster work would require more than "
                     f"{_OCR_MAX_DOCUMENT_RASTER_PIXELS:,} pixels"
                 )
+            planned_pages.append((page_number, raster_dpi, pixel_count))
+        for page_number, raster_dpi, pixel_count in planned_pages:
+            if page_number not in oversized_pages:
+                continue
+            preferred_pixels, preferred_raster_dpi = oversized_pages[page_number]
+            logger.warning(
+                "OCR page %d would require %s pixels with the preferred %d dpi "
+                "oversampling (effective %.3g dpi); using %d dpi for this OCR "
+                "run (%s pixels expected at an effective %.3g dpi)",
+                page_number,
+                f"{preferred_pixels:,}",
+                _OCR_RASTER_DPI,
+                preferred_raster_dpi,
+                _OCR_FALLBACK_RASTER_DPI,
+                f"{pixel_count:,}",
+                raster_dpi,
+            )
+        return planned_oversample
     except OCRError:
         raise
     except ConversionError as exc:
@@ -2867,7 +2920,7 @@ def apply_ocr(
     except ValueError as exc:
         raise OCRError(str(exc)) from exc
 
-    _preflight_ocr_input(
+    planned_oversample = _preflight_ocr_input(
         input_path,
         force=force,
         deskew=deskew,
@@ -2947,7 +3000,7 @@ def apply_ocr(
             "pdf_renderer": "fpdf2",
             "rasterizer": "pypdfium",
             "output_type": "pdf",
-            "oversample": _OCR_RASTER_DPI,
+            "oversample": planned_oversample,
             "max_image_mpixels": _OCR_MAX_PAGE_RASTER_PIXELS / 1_000_000,
             "optimize": 0,
             "jobs": 1,

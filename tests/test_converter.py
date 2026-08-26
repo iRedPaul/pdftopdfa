@@ -547,6 +547,7 @@ class TestConvertToPdfa:
             ],
             check=True,
             capture_output=True,
+            stdin=subprocess.DEVNULL,
         )
         output_path = destination_directory / "output.pdf"
         expected_dacl = None
@@ -561,6 +562,7 @@ class TestConvertToPdfa:
                 ],
                 check=True,
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
             )
             expected_dacl = _windows_dacl_sddl(output_path)
             assert ";;;WD)" in expected_dacl

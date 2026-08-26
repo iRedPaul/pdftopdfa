@@ -5,7 +5,7 @@
 """Tests for sanitizers/actions.py."""
 
 import pikepdf
-from conftest import new_pdf, save_and_reopen
+from conftest import new_pdf, register_form_widget, save_and_reopen
 from pikepdf import Array, Dictionary, Name
 
 from pdftopdfa.sanitizers.actions import (
@@ -142,6 +142,7 @@ class TestRemoveActions:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = remove_actions(pdf)
         assert result >= 1
@@ -612,6 +613,7 @@ class TestWidgetFieldActionsRule641:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = remove_actions(pdf)
         assert result >= 1
@@ -639,6 +641,7 @@ class TestWidgetFieldActionsRule641:
             )
         )
         pdf.pages[0]["/Annots"] = Array([annot])
+        register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = remove_actions(pdf)
         assert result >= 1

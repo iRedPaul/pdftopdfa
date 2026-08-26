@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pikepdf
 import pytest
-from conftest import new_pdf, open_pdf, resolve
+from conftest import new_pdf, open_pdf, register_form_widget, resolve
 from fontTools.ttLib import TTFont
 from pikepdf import Array, Dictionary, Name, Pdf
 
@@ -1140,6 +1140,7 @@ class TestNestedStructures:
             Annots=Array([annot]),
         )
         pdf.pages.append(pikepdf.Page(page_dict))
+        register_form_widget(pdf, annot)
         pdf = _roundtrip(pdf)
 
         result = sanitize_font_widths(pdf)
