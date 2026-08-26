@@ -460,7 +460,7 @@ def test_preserves_valid_structure_language() -> None:
     assert str(document["/Lang"]) == "de-DE"
 
 
-def test_rebuilds_structure_with_unstructured_popup_annotation() -> None:
+def test_preserves_structure_with_unstructured_popup_annotation() -> None:
     pdf = new_pdf()
     page = _add_page(pdf, b"BT ET")
     root, document = _install_existing_structure(pdf)
@@ -475,18 +475,10 @@ def test_rebuilds_structure_with_unstructured_popup_annotation() -> None:
 
     result = ensure_logical_structure(pdf)
 
-    assert result["structure_rebuilt"] is True
-    assert result["annotations_tagged"] == 1
-    assert pdf.Root["/StructTreeRoot"].objgen != root.objgen
+    assert result["structure_preserved"] is True
+    assert pdf.Root["/StructTreeRoot"].objgen == root.objgen
     assert resolve_indirect(root["/K"]).objgen == document.objgen
-    assert int(popup["/StructParent"]) == 1
-    generated_root, _, divs = _generated_parts(pdf)
-    annotation_element = resolve_indirect(divs[0]["/K"][1])
-    assert annotation_element["/S"] == Name.Annot
-    assert resolve_indirect(annotation_element["/K"])["/Obj"].objgen == popup.objgen
-    assert NumberTree(generated_root["/ParentTree"])[1].objgen == (
-        annotation_element.objgen
-    )
+    assert "/StructParent" not in popup
 
 
 def test_pdfua_preserves_printer_mark_as_untagged_incidental_artifact() -> None:

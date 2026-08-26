@@ -27,6 +27,12 @@ from pikepdf import (
     String,
 )
 
+from .accessibility import (
+    AccessibilityStrings,
+    accessibility_strings,
+    infer_document_language,
+    primary_language,
+)
 from .exceptions import ConversionError
 from .fonts.glyph_usage import _iter_content_streams_with_resources
 from .sanitizers.catalog import _is_valid_bcp47
@@ -1311,7 +1317,9 @@ def _missing_structure_alternatives(
             Dictionary | Stream | None,
         ],
     ],
-) -> int:
+    *,
+    fallback: AccessibilityStrings | None = None,
+) -> tuple[int, int]:
     root = resolve_indirect(pdf.Root.get("/StructTreeRoot"))
     role_map = (
         resolve_indirect(root.get("/RoleMap")) if isinstance(root, Dictionary) else None
@@ -1337,7 +1345,7 @@ def _missing_structure_alternatives(
         )
     ]
     if not candidates:
-        return 0
+        return 0, 0
     text_references, actual_text_references = _content_reference_description_evidence(
         content_references
     )
@@ -1350,6 +1358,8 @@ def _missing_structure_alternatives(
         actual_text_references,
     )
     missing = 0
+    added = 0
+    document_language = primary_language(resolve_indirect(pdf.Root.get("/Lang")))
     for element in candidates:
         element_key = _object_key(element)
         if element_key in elements_with_actual_text:
@@ -1364,7 +1374,15 @@ def _missing_structure_alternatives(
         ):
             continue
         missing += 1
-    return missing
+        if fallback is not None:
+            role = _effective_structure_role(element.get("/S"), role_map)
+            element["/Alt"] = _bounded_pdf_string(
+                fallback.formula if role == "/Formula" else fallback.figure
+            )
+            if document_language != fallback.language and "/Lang" not in element:
+                element["/Lang"] = String(fallback.language)
+            added += 1
+    return missing, added
 
 
 def _valid_table_header_association(
@@ -3328,8 +3346,9 @@ def _valid_parent_tree(
             return False
 
         for annotation in page_annotations[page_key]:
-            if pdfua and (
-                resolve_indirect(annotation.get("/Subtype")) == Name.PrinterMark
+            annotation_subtype = resolve_indirect(annotation.get("/Subtype"))
+            if annotation_subtype == Name.Popup or (
+                pdfua and annotation_subtype == Name.PrinterMark
             ):
                 continue
             annotation_key = _object_key(annotation)
@@ -9453,6 +9472,26 @@ def _semantic_node_source_text(
     return " ".join(values) or None
 
 
+def _semantic_heading_title(node: object, source_texts: dict[str, str]) -> str | None:
+    role = getattr(node, "role", None)
+    if role != "H" and not (
+        isinstance(role, str)
+        and len(role) == 2
+        and role[0] == "H"
+        and role[1] in "123456"
+    ):
+        return None
+    title = _semantic_node_source_text(node, source_texts)
+    if title is None or any(
+        0xE000 <= ord(character) <= 0xF8FF
+        or 0xF0000 <= ord(character) <= 0xFFFFD
+        or 0x100000 <= ord(character) <= 0x10FFFD
+        for character in title
+    ):
+        return None
+    return " ".join(title.split()) or None
+
+
 def _missing_plan_alternatives(
     root: object,
     source_actual_texts: dict[str, str],
@@ -9544,8 +9583,11 @@ def _make_semantic_element(
     bindings: dict[str, _SemanticBinding],
     owners: dict[tuple[_ObjectKey, int], Dictionary],
     page_elements: dict[int, Dictionary],
+    source_texts: dict[str, str],
     source_actual_texts: dict[str, str],
     source_alt_texts: dict[str, str],
+    fallback_alternatives: AccessibilityStrings | None,
+    document_language: str | None,
 ) -> Dictionary:
     role = getattr(node, "role", None)
     if not isinstance(role, str) or f"/{role}" not in _STANDARD_STRUCTURE_TYPES:
@@ -9568,6 +9610,10 @@ def _make_semantic_element(
     if role == "Div" and page_number is not None:
         page_elements[page_number] = element
 
+    heading_title = _semantic_heading_title(node, source_texts)
+    if heading_title is not None:
+        element["/T"] = _bounded_pdf_string(heading_title)
+
     actual_text = getattr(node, "actual_text", None)
     if (not isinstance(actual_text, str) or not actual_text.strip()) and (
         role in {"Figure", "Formula"} or bool(getattr(node, "content", ()))
@@ -9579,6 +9625,14 @@ def _make_semantic_element(
         alt_text = _semantic_node_source_text(node, source_alt_texts)
         if alt_text is not None:
             element["/Alt"] = _bounded_pdf_string(alt_text)
+        elif "/ActualText" not in element and fallback_alternatives is not None:
+            element["/Alt"] = _bounded_pdf_string(
+                fallback_alternatives.formula
+                if role == "Formula"
+                else fallback_alternatives.figure
+            )
+            if document_language != fallback_alternatives.language:
+                element["/Lang"] = String(fallback_alternatives.language)
     _set_semantic_attributes(element, node, pdf_pages)
 
     items: list[Dictionary] = []
@@ -9611,8 +9665,11 @@ def _make_semantic_element(
             bindings,
             owners,
             page_elements,
+            source_texts,
             source_actual_texts,
             source_alt_texts,
+            fallback_alternatives,
+            document_language,
         )
         for child in getattr(node, "children", ())
     ]
@@ -10161,6 +10218,18 @@ def _rebuild_semantic_structure(
             )
         )
 
+    document_language = primary_language(resolve_indirect(pdf.Root.get("/Lang")))
+    document_language_inferred = 0
+    if pdfua and document_language in {None, "und"}:
+        inferred_language = infer_document_language(
+            span.text for page in pages for span in page.spans if span.text.strip()
+        )
+        if inferred_language is not None:
+            pdf.Root["/Lang"] = String(inferred_language)
+            document_language = inferred_language
+            document_language_inferred = 1
+    fallback_alternatives = accessibility_strings(document_language) if pdfua else None
+
     plan = build_semantic_plan(pages)
     table_review_required = 0
     if pdfua:
@@ -10283,8 +10352,11 @@ def _rebuild_semantic_structure(
         bindings,
         owners,
         page_elements,
+        {span_id: binding.text for span_id, binding in bindings.items()},
         source_actual_texts,
         source_alt_texts,
+        fallback_alternatives,
+        document_language,
     )
     structure_root["/K"] = document
     prelinked_annotations = _link_semantic_annotations(
@@ -10331,6 +10403,7 @@ def _rebuild_semantic_structure(
         "artifacts_tagged": artifacts_tagged,
         "semantic_content_items": len(referenced_ids),
         "semantic_repairs": 0,
+        "document_language_inferred": document_language_inferred,
         "semantic_alternatives_review_required": alternatives_review_required,
         "semantic_vector_review_required": vector_review_required,
         "semantic_scanned_visual_review_required": len(scanned_visual_review_pages),
@@ -10642,11 +10715,19 @@ def _ensure_logical_structure_in_place(
             raise ConversionError(
                 "Cannot preserve logical structure after semantic repairs"
             )
-        alternatives_review_required = _missing_structure_alternatives(
-            pdf,
-            existing_elements,
-            existing_content_references,
+        alternatives_review_required, fallback_alternatives_added = (
+            _missing_structure_alternatives(
+                pdf,
+                existing_elements,
+                existing_content_references,
+                fallback=(
+                    accessibility_strings(resolve_indirect(pdf.Root.get("/Lang")))
+                    if pdfua
+                    else None
+                ),
+            )
         )
+        semantic_repairs += fallback_alternatives_added
         return {
             "structure_preserved": True,
             "structure_rebuilt": False,
@@ -10664,6 +10745,7 @@ def _ensure_logical_structure_in_place(
             "artifacts_tagged": path_artifacts_tagged,
             "semantic_content_items": 0,
             "semantic_repairs": semantic_repairs,
+            "document_language_inferred": 0,
             "semantic_alternatives_review_required": (alternatives_review_required),
             "semantic_vector_review_required": int(path_artifacts_tagged > 0),
             "semantic_scanned_visual_review_required": 0,
@@ -10763,6 +10845,7 @@ def _ensure_logical_structure_in_place(
         "artifacts_tagged": path_artifacts_tagged,
         "semantic_content_items": 0,
         "semantic_repairs": 0,
+        "document_language_inferred": 0,
         "semantic_alternatives_review_required": 0,
         "semantic_vector_review_required": 0,
         "semantic_scanned_visual_review_required": 0,

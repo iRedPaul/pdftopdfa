@@ -91,12 +91,12 @@ If the `pdftopdfa` console script is not on `PATH`, use
 ### PDF/A and PDF/UA validation
 
 Validation uses the external [veraPDF](https://verapdf.org/) application, which
-is not bundled. Install it and make its launcher available on `PATH`, or set
+is not bundled. Install version 1.30.2 or newer and make its launcher available on `PATH`, or set
 `VERAPDF_PATH` to the executable or its parent directory. `--validate` and
 `validate=True` opt ordinary PDF/A output into validation. PDF/UA output always
 attempts validation against both the selected PDF/A profile and veraPDF's `ua1`
 profile. If either check cannot run or fails, the candidate remains published
-and the failure is reported through the result and CLI exit code.
+with `success=False`; the failure is also reported through the CLI exit code.
 
 ### Optional: OCR support
 
@@ -337,7 +337,7 @@ image, table, and reusable `OCRSession` APIs.
   publications. PDF/A level A does not by itself imply PDF/UA conformance;
   request the additional PDF/UA-1 requirements with `--pdfua` or
   `pdfua=True`. PDF/UA candidates are published even when PDF/A or PDF/UA-1
-  machine validation fails; the non-conformance is reported. veraPDF cannot
+  machine validation fails, but return `success=False`; the non-conformance is reported. veraPDF cannot
   judge whether content order, descriptions, labels, language, contrast, color
   use, or media alternatives are meaningful; reported semantic uncertainties
   still require human review.

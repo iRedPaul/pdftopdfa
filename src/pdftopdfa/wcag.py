@@ -7,17 +7,18 @@
 import logging
 import re
 
-from pikepdf import Array, Dictionary, Name, Pdf, String
+import pikepdf
+from pikepdf import Array, Dictionary, Name, NumberTree, Pdf, String
 
+from .accessibility import AccessibilityStrings, accessibility_strings, primary_language
 from .utils import resolve_indirect
 
 logger = logging.getLogger(__name__)
 
 _FIELD_REQUIRED = 1 << 1
-_GENERIC_WIDGET_TOOLTIP = "Form field"
 _MAX_STRING_BYTES = 32_767
-_REQUIRED_LABEL = re.compile(r"\brequired\b", re.IGNORECASE)
-_REQUIRED_SUFFIX = " (required)"
+_GENERIC_WIDGET_TOOLTIPS = frozenset({"Form field", "Formularfeld"})
+_PAGE_LABEL_STYLES = frozenset({"/D", "/R", "/r", "/A", "/a"})
 
 
 def prepare_pdfua_document(pdf: Pdf) -> dict[str, int]:
@@ -55,9 +56,9 @@ def _field_entry(widget: Dictionary, key: str) -> tuple[Dictionary, object] | No
     return None
 
 
-def _required_tooltip(label: str) -> String:
+def _required_tooltip(label: str, suffix: str) -> String:
     """Append the required suffix without exceeding the PDF string byte limit."""
-    result = String(f"{label}{_REQUIRED_SUFFIX}")
+    result = String(f"{label}{suffix}")
     if len(bytes(result)) <= _MAX_STRING_BYTES:
         return result
 
@@ -65,12 +66,12 @@ def _required_tooltip(label: str) -> String:
     high = len(label)
     while low < high:
         middle = (low + high + 1) // 2
-        candidate = String(f"{label[:middle]}{_REQUIRED_SUFFIX}")
+        candidate = String(f"{label[:middle]}{suffix}")
         if len(bytes(candidate)) <= _MAX_STRING_BYTES:
             low = middle
         else:
             high = middle - 1
-    return String(f"{label[:low]}{_REQUIRED_SUFFIX}")
+    return String(f"{label[:low]}{suffix}")
 
 
 def _bounded_string(value: str) -> String:
@@ -89,7 +90,30 @@ def _bounded_string(value: str) -> String:
     return String(value[:low])
 
 
-def _indicate_required_control(widget: Dictionary) -> bool:
+def _localize_generic_widget_tooltip(
+    widget: Dictionary,
+    strings: AccessibilityStrings,
+) -> bool:
+    tooltip_entry = _field_entry(widget, "/TU")
+    if tooltip_entry is None:
+        return False
+    owner, value = tooltip_entry
+    if (
+        not isinstance(value, String)
+        or str(value).strip() not in _GENERIC_WIDGET_TOOLTIPS
+    ):
+        return False
+    tooltip = String(strings.form_field)
+    owner["/TU"] = tooltip
+    if "/TU" in widget:
+        widget["/TU"] = tooltip
+    return True
+
+
+def _indicate_required_control(
+    widget: Dictionary,
+    strings: AccessibilityStrings,
+) -> bool:
     """Include inherited required status in a trustworthy accessible label."""
     flags_entry = _field_entry(widget, "/Ff")
     flags = flags_entry[1] if flags_entry is not None else None
@@ -110,13 +134,16 @@ def _indicate_required_control(widget: Dictionary) -> bool:
         if not isinstance(value, String):
             continue
         label = str(value).strip()
-        if label and label != _GENERIC_WIDGET_TOOLTIP:
+        if label and label not in _GENERIC_WIDGET_TOOLTIPS:
             label_entry = owner, label
             break
     if label_entry is None:
         return False
     label_owner, label = label_entry
-    if _REQUIRED_LABEL.search(label):
+    if any(
+        re.search(rf"(?<!\w){re.escape(term)}(?!\w)", label, re.IGNORECASE)
+        for term in strings.required_terms
+    ):
         return False
     if field_name_entry is not None:
         field_owner = field_name_entry[0]
@@ -124,11 +151,181 @@ def _indicate_required_control(widget: Dictionary) -> bool:
         field_owner = flags_entry[0]
     else:
         field_owner = label_owner
-    tooltip = _required_tooltip(label)
+    tooltip = _required_tooltip(label, strings.required_suffix)
     field_owner["/TU"] = tooltip
     if "/TU" in widget:
         widget["/TU"] = tooltip
     return True
+
+
+def _valid_page_labels(pdf: Pdf) -> bool:
+    root = resolve_indirect(pdf.Root.get("/PageLabels"))
+    if not isinstance(root, Dictionary):
+        return False
+    try:
+        entries = list(NumberTree(root).items())
+    except (TypeError, ValueError, RuntimeError, pikepdf.PdfError):
+        return False
+    if not entries or entries[0][0] != 0:
+        return False
+    previous = -1
+    for page_index, raw_label in entries:
+        if (
+            isinstance(page_index, bool)
+            or not isinstance(page_index, int)
+            or page_index <= previous
+            or not 0 <= page_index < len(pdf.pages)
+        ):
+            return False
+        previous = page_index
+        label = resolve_indirect(raw_label)
+        if not isinstance(label, Dictionary):
+            return False
+        style = resolve_indirect(label.get("/S"))
+        prefix = resolve_indirect(label.get("/P"))
+        if style is not None and str(style) not in _PAGE_LABEL_STYLES:
+            return False
+        if prefix is not None and not isinstance(prefix, String):
+            return False
+        if style is None and prefix is None:
+            return False
+        start = resolve_indirect(label.get("/St"))
+        if start is not None and (
+            isinstance(start, bool) or not isinstance(start, int) or start < 1
+        ):
+            return False
+    return True
+
+
+def _object_identity(value: object) -> tuple[int, int] | int:
+    resolved = resolve_indirect(value)
+    objgen = getattr(resolved, "objgen", (0, 0))
+    return objgen if objgen != (0, 0) else id(resolved)
+
+
+def _structure_children(element: Dictionary) -> list[Dictionary]:
+    raw_children = resolve_indirect(element.get("/K"))
+    values = list(raw_children) if isinstance(raw_children, Array) else [raw_children]
+    children = []
+    for value in values:
+        child = resolve_indirect(value)
+        if isinstance(child, Dictionary) and "/S" in child:
+            children.append(child)
+    return children
+
+
+def _heading_level(role: object) -> int | None:
+    match = re.fullmatch(r"/H([1-6])", str(resolve_indirect(role)))
+    if match:
+        return int(match.group(1))
+    return 1 if str(resolve_indirect(role)) == "/H" else None
+
+
+def _bookmark_title(element: Dictionary) -> str | None:
+    for key in ("/T", "/ActualText", "/Alt"):
+        value = resolve_indirect(element.get(key))
+        if not isinstance(value, String):
+            continue
+        title = " ".join(str(value).split())
+        if title and not any(
+            0xE000 <= ord(character) <= 0xF8FF
+            or 0xF0000 <= ord(character) <= 0xFFFFD
+            or 0x100000 <= ord(character) <= 0x10FFFD
+            for character in title
+        ):
+            return title
+    return None
+
+
+def _heading_bookmarks(
+    pdf: Pdf,
+) -> list[tuple[int, str, Dictionary]]:
+    structure_root = resolve_indirect(pdf.Root.get("/StructTreeRoot"))
+    if not isinstance(structure_root, Dictionary):
+        return []
+    page_objects = {_object_identity(page.obj): page.obj for page in pdf.pages}
+    bookmarks = []
+    raw_root = resolve_indirect(structure_root.get("/K"))
+    root_elements = list(raw_root) if isinstance(raw_root, Array) else [raw_root]
+    stack: list[tuple[object, object | None]] = [
+        (element, None) for element in reversed(root_elements)
+    ]
+    visited: set[tuple[int, int] | int] = set()
+    while stack:
+        raw_element, inherited_page = stack.pop()
+        element = resolve_indirect(raw_element)
+        if not isinstance(element, Dictionary) or "/S" not in element:
+            continue
+        identity = _object_identity(element)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        page_reference = element.get("/Pg", inherited_page)
+        level = _heading_level(element.get("/S"))
+        title = _bookmark_title(element) if level is not None else None
+        page = page_objects.get(_object_identity(page_reference))
+        if level is not None and title is not None and page is not None:
+            bookmarks.append((level, title, page))
+        children = _structure_children(element)
+        stack.extend((child, page_reference) for child in reversed(children))
+    return bookmarks
+
+
+def _ensure_heading_bookmarks(pdf: Pdf) -> int:
+    existing = resolve_indirect(pdf.Root.get("/Outlines"))
+    if isinstance(existing, Dictionary) and isinstance(
+        resolve_indirect(existing.get("/First")), Dictionary
+    ):
+        return 0
+    headings = _heading_bookmarks(pdf)
+    if len(headings) < 2:
+        return 0
+
+    outline_root = pdf.make_indirect(Dictionary(Type=Name.Outlines))
+    child_groups: dict[tuple[int, int] | int, list[Dictionary]] = {}
+    hierarchy: list[tuple[int, Dictionary]] = []
+    for level, title, page in headings:
+        while hierarchy and hierarchy[-1][0] >= level:
+            hierarchy.pop()
+        parent = hierarchy[-1][1] if hierarchy else outline_root
+        item = pdf.make_indirect(
+            Dictionary(
+                Title=_bounded_string(title),
+                Parent=parent,
+                Dest=Array([page, Name.Fit]),
+            )
+        )
+        child_groups.setdefault(_object_identity(parent), []).append(item)
+        hierarchy.append((level, item))
+
+    parents = [
+        outline_root,
+        *(item for items in child_groups.values() for item in items),
+    ]
+    for parent in parents:
+        children = child_groups.get(_object_identity(parent), [])
+        if not children:
+            continue
+        parent["/First"] = children[0]
+        parent["/Last"] = children[-1]
+        for index, child in enumerate(children):
+            if index:
+                child["/Prev"] = children[index - 1]
+            if index + 1 < len(children):
+                child["/Next"] = children[index + 1]
+
+    def descendant_count(parent: Dictionary) -> int:
+        count = 0
+        for child in child_groups.get(_object_identity(parent), []):
+            descendants = descendant_count(child)
+            if descendants:
+                child["/Count"] = descendants
+            count += 1 + descendants
+        return count
+
+    outline_root["/Count"] = descendant_count(outline_root)
+    pdf.Root["/Outlines"] = outline_root
+    return len(headings)
 
 
 def apply_wcag_21(pdf: Pdf) -> dict[str, int | bool]:
@@ -144,13 +341,19 @@ def apply_wcag_21(pdf: Pdf) -> dict[str, int | bool]:
     annotation_descriptions_added = 0
     annotation_descriptions_review_required = 0
     seen_widgets: set[tuple[int, int] | int] = set()
+    language = str(resolve_indirect(pdf.Root.get("/Lang")) or "").strip().casefold()
+    strings = accessibility_strings(language)
 
     page_labels_added = 0
-    if not isinstance(resolve_indirect(pdf.Root.get("/PageLabels")), Dictionary):
+    page_labels_repaired = 0
+    if not _valid_page_labels(pdf):
+        page_labels_repaired = int("/PageLabels" in pdf.Root)
         pdf.Root["/PageLabels"] = pdf.make_indirect(
             Dictionary(Nums=Array([0, Dictionary(S=Name.D, St=1)]))
         )
-        page_labels_added = 1
+        page_labels_added = int(not page_labels_repaired)
+
+    bookmarks_added = _ensure_heading_bookmarks(pdf)
 
     for page in pdf.pages:
         if resolve_indirect(page.obj.get("/Tabs")) != Name.S:
@@ -196,9 +399,9 @@ def apply_wcag_21(pdf: Pdf) -> dict[str, int | bool]:
                             else "PDF"
                         )
                         description = (
-                            "Link"
+                            strings.link
                             if subtype == Name.Link
-                            else f"{subtype_name} annotation"
+                            else strings.annotation.format(subtype=subtype_name)
                         )
                         annotation_descriptions_review_required += 1
                     annotation["/Contents"] = _bounded_string(description)
@@ -211,10 +414,12 @@ def apply_wcag_21(pdf: Pdf) -> dict[str, int | bool]:
             if identity in seen_widgets:
                 continue
             seen_widgets.add(identity)
-            required_controls_labeled += int(_indicate_required_control(widget))
+            _localize_generic_widget_tooltip(widget, strings)
+            required_controls_labeled += int(
+                _indicate_required_control(widget, strings)
+            )
 
-    language = str(resolve_indirect(pdf.Root.get("/Lang")) or "").strip().casefold()
-    language_review_required = not language or language == "und"
+    language_review_required = primary_language(language) in {None, "und"}
     logger.info(
         "Applied WCAG 2.1 PDF requirements: %d tab order(s), %d required "
         "control label(s), %d annotation description(s)",
@@ -225,6 +430,8 @@ def apply_wcag_21(pdf: Pdf) -> dict[str, int | bool]:
     return {
         "page_tab_orders_set": tab_orders_set,
         "page_labels_added": page_labels_added,
+        "page_labels_repaired": page_labels_repaired,
+        "bookmarks_added": bookmarks_added,
         "required_controls_labeled": required_controls_labeled,
         "annotation_descriptions_added": annotation_descriptions_added,
         "annotation_descriptions_review_required": (

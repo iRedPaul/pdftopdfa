@@ -732,6 +732,35 @@ def test_digital_tj_tj_and_image_have_stable_parent_tree_after_reopen() -> None:
         assert preserved["semantic_alternatives_review_required"] == 1
 
 
+def test_pdfua_localizes_fallback_alt_and_infers_document_language() -> None:
+    pdf = pikepdf.Pdf.new()
+    font = _font(pdf)
+    image = _image(pdf)
+    _page(
+        pdf,
+        (
+            b"BT /F1 12 Tf 20 250 Td "
+            b"(Rechnung Kunde Menge Zahlungshinweis) Tj ET "
+            b"q 40 0 0 30 300 100 cm /Im0 Do Q"
+        ),
+        Dictionary(
+            Font=Dictionary(F1=font),
+            XObject=Dictionary(Im0=image),
+        ),
+        size=(400, 300),
+    )
+
+    result = ensure_logical_structure(pdf, semantic=True, pdfua=True)
+
+    figure = next(
+        item for item in _structure_objects(pdf) if item.get("/S") == Name.Figure
+    )
+    assert str(pdf.Root["/Lang"]) == "de"
+    assert str(figure["/Alt"]) == "Bild"
+    assert result["document_language_inferred"] == 1
+    assert result["semantic_alternatives_review_required"] == 1
+
+
 def test_overlaid_invisible_digital_text_is_tagged_once() -> None:
     pdf = pikepdf.Pdf.new()
     font = _font(pdf)
@@ -2068,6 +2097,39 @@ def test_existing_empty_caption_still_requires_alternative_review() -> None:
     assert first["semantic_alternatives_review_required"] == 1
     assert second["structure_preserved"] is True
     assert second["semantic_alternatives_review_required"] == 1
+
+
+def test_pdfua_preserved_figure_gets_localized_fallback_alt() -> None:
+    pdf = pikepdf.Pdf.new()
+    pdf.Root["/Lang"] = String("de")
+    page = _page(pdf, b"/Span <</MCID 0>> BDC q Q EMC")
+    page.obj["/StructParents"] = 0
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    document = pdf.make_indirect(
+        Dictionary(Type=Name.StructElem, S=Name.Document, P=root)
+    )
+    figure = pdf.make_indirect(
+        Dictionary(
+            Type=Name.StructElem,
+            S=Name.Figure,
+            P=document,
+            Pg=page.obj,
+            K=0,
+        )
+    )
+    document["/K"] = figure
+    root["/K"] = document
+    parent_tree = NumberTree.new(pdf)
+    parent_tree[0] = Array([figure])
+    root["/ParentTree"] = parent_tree.obj
+    root["/ParentTreeNextKey"] = 1
+    pdf.Root["/StructTreeRoot"] = root
+
+    result = ensure_logical_structure(pdf, semantic=True, pdfua=True)
+
+    assert result["structure_preserved"] is True
+    assert result["semantic_alternatives_review_required"] == 1
+    assert str(figure["/Alt"]) == "Bild"
 
 
 def test_existing_figure_does_not_combine_distinct_inner_actualtext_values() -> None:

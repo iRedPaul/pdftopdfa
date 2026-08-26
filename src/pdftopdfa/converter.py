@@ -62,7 +62,12 @@ from .staging import (
     staged_file_snapshot,
 )
 from .tagging import ensure_logical_structure
-from .utils import get_required_pdf_version, is_pdf_encrypted, validate_pdfa_level
+from .utils import (
+    get_required_pdf_version,
+    is_pdf_encrypted,
+    resolve_indirect,
+    validate_pdfa_level,
+)
 from .validator import detect_iso_standards, detect_pdfa_level
 from .verapdf import validate_with_verapdf
 from .wcag import apply_wcag_21, prepare_pdfua_document
@@ -258,6 +263,7 @@ _SIGNATURE_SKIP_WARNING = (
 _VALIDATION_PUBLICATION_WARNING = (
     "Output was published despite failed or incomplete validation"
 )
+_VALIDATION_FAILURE_ERROR = "Validation failed; output candidate was published"
 
 
 def _signature_invalidation_warning(count: int, *, pdfa: bool = True) -> str:
@@ -348,7 +354,7 @@ class ConversionResult:
     """Result of a PDF/A conversion.
 
     Attributes:
-        success: True if the conversion was successful.
+        success: True only if processing and every requested validation succeeded.
         input_path: Path to the input PDF.
         output_path: Requested path for the output PDF.
         level: Requested level for a converted output, detected level for a
@@ -359,7 +365,8 @@ class ConversionResult:
         error: Error message if success=False.
         validation_failed: True if veraPDF reported non-conformance or could
             not complete, or if a preserved embedded PDF could not be
-            converted. The candidate output is still published in this case.
+            converted. The candidate output is still published with
+            ``success=False`` in this case.
         skipped: True if the original PDF was copied through unchanged.
     """
 
@@ -533,12 +540,13 @@ def _copy_encrypted_input(
         warnings.append(_VALIDATION_PUBLICATION_WARNING)
     processing_time = time.perf_counter() - start_time
     return ConversionResult(
-        success=True,
+        success=not validation_failed,
         input_path=input_path,
         output_path=output_path,
         level=level if validate_candidate and not validation_failed else None,
         warnings=warnings,
         processing_time=processing_time,
+        error=_VALIDATION_FAILURE_ERROR if validation_failed else None,
         skipped=True,
         validation_failed=validation_failed,
     )
@@ -1177,7 +1185,7 @@ def convert_to_pdfa(
                 if validation_failed:
                     branch_warnings.append(_VALIDATION_PUBLICATION_WARNING)
                 return ConversionResult(
-                    success=True,
+                    success=not validation_failed,
                     input_path=input_path,
                     output_path=output_path,
                     level=(
@@ -1185,6 +1193,7 @@ def convert_to_pdfa(
                     ),
                     warnings=branch_warnings,
                     processing_time=processing_time,
+                    error=(_VALIDATION_FAILURE_ERROR if validation_failed else None),
                     skipped=True,
                     validation_failed=validation_failed,
                 )
@@ -1666,6 +1675,12 @@ def convert_to_pdfa(
                 ocr_manifest=ocr_manifest,
                 preflight=False,
             )
+            if tagging_result.get("document_language_inferred", 0):
+                warnings.append(
+                    "Document language inferred from visible text as "
+                    f"{resolve_indirect(pdf.Root.get('/Lang'))}; manual review "
+                    "is required"
+                )
             if tagging_result.get("semantic_repairs", 0):
                 repair_count = tagging_result["semantic_repairs"]
                 repair_label = "property" if repair_count == 1 else "properties"
@@ -1681,11 +1696,17 @@ def convert_to_pdfa(
                     "element" if alternative_review_count == 1 else "elements"
                 )
                 review_verb = "requires" if alternative_review_count == 1 else "require"
-                warnings.append(
+                warning = (
                     f"{alternative_review_count} Figure/Formula {element_label} "
                     f"{review_verb} manual review: no trustworthy Alt, "
                     "ActualText, or Caption is available"
                 )
+                if pdfua:
+                    warning += (
+                        "; a localized fallback was supplied for machine-level "
+                        "PDF/UA validation"
+                    )
+                warnings.append(warning)
             vector_review_count = tagging_result.get(
                 "semantic_vector_review_required",
                 0,
@@ -1891,12 +1912,13 @@ def convert_to_pdfa(
         )
 
         return ConversionResult(
-            success=True,
+            success=not validation_failed,
             input_path=input_path,
             output_path=output_path,
             level=level,
             warnings=warnings,
             processing_time=processing_time,
+            error=_VALIDATION_FAILURE_ERROR if validation_failed else None,
             validation_failed=validation_failed,
         )
 

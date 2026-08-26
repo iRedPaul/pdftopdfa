@@ -431,14 +431,20 @@ class TestCliConvert:
         mock_validate,
         sample_pdf: Path,
         tmp_dir: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """A known compliance failure returns the validation failure exit code."""
+        """Quiet PDF/UA failures report both automatic validation profiles."""
         output_path = tmp_dir / "output.pdf"
+        validation_errors = [
+            "Validation: PDF/A rule failed",
+            "PDF/UA validation: PDF/UA rule failed",
+        ]
         mock_convert_to_pdfa.return_value = ConversionResult(
             success=True,
             input_path=sample_pdf,
             output_path=output_path,
             level="2b",
+            warnings=validation_errors,
             validation_failed=True,
         )
 
@@ -449,10 +455,13 @@ class TestCliConvert:
             do_validate=True,
             force=False,
             quiet=True,
+            pdfua=True,
         )
 
         assert result == EXIT_VALIDATION_FAILED
         mock_validate.assert_not_called()
+        stderr = capsys.readouterr().err
+        assert all(error in stderr for error in validation_errors)
 
     def test_cli_convert_simple(
         self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path

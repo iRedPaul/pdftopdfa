@@ -1896,8 +1896,9 @@ class TestConvertToPdfa:
         output_path.write_bytes(sentinel)
         result = convert_to_pdfa(sample_pdf, output_path, validate=True)
 
-        assert result.success is True
+        assert result.success is False
         assert result.validation_failed is True
+        assert result.error == "Validation failed; output candidate was published"
         assert any("Validation: Rule 6.1.2 failed" in w for w in result.warnings)
         assert any("published despite" in warning for warning in result.warnings)
         validated_path = mock_verapdf.call_args.kwargs["path"]
@@ -1922,8 +1923,9 @@ class TestConvertToPdfa:
 
         result = convert_to_pdfa(sample_pdf, output_path, validate=True)
 
-        assert result.success is True
+        assert result.success is False
         assert result.validation_failed is True
+        assert result.error == "Validation failed; output candidate was published"
         assert "Validation: veraPDF could not run: veraPDF crashed" in result.warnings
         assert any("published despite" in warning for warning in result.warnings)
         validated_path = mock_verapdf.call_args.kwargs["path"]
@@ -1951,6 +1953,7 @@ class TestConvertToPdfa:
 
         result = convert_to_pdfa(password_encrypted_pdf, output_path, validate=True)
 
+        assert result.success is False
         assert result.skipped is True
         assert result.validation_failed is True
         assert "Validation: Encryption is not permitted" in result.warnings
@@ -1985,6 +1988,7 @@ class TestConvertToPdfa:
             pdfua=True,
         )
 
+        assert result.success is False
         assert result.skipped is True
         assert result.validation_failed is True
         assert result.level is None
@@ -2910,6 +2914,7 @@ class TestConvertToPdfa:
             validate=True,
         )
 
+        assert result.success is False
         assert result.skipped is True
         assert result.validation_failed is True
         assert "Validation: The output is not PDF/A-3b" in result.warnings
@@ -4370,7 +4375,7 @@ class TestConvertFiles:
 
         assert len(results) == 1
         result = results[0]
-        assert result.success is True
+        assert result.success is False
         assert result.validation_failed is True
         assert result.skipped is False
         assert result.level == "2a"
@@ -4398,7 +4403,7 @@ class TestConvertFiles:
 
         assert len(results) == 1
         result = results[0]
-        assert result.success is True
+        assert result.success is False
         assert result.validation_failed is True
         assert result.skipped is True
         assert result.level is None

@@ -49,6 +49,7 @@ VALID_FLAVOURS = frozenset(
         "ua1",
     }
 )
+MIN_VERAPDF_VERSION = "1.30.2"
 
 _DEFAULT_JAVA_STACK_OPTION = "-Xss16m"
 _JAVA_OPTION_ENV_VARS = (
@@ -109,6 +110,7 @@ class VeraPDFResult:
         failed_rules: Number of failed rules.
         errors: List of critical errors.
         warnings: List of warnings.
+        validator_version: veraPDF application version reported by the validator.
         raw_xml: The raw XML result from veraPDF.
     """
 
@@ -118,6 +120,7 @@ class VeraPDFResult:
     failed_rules: int = 0
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    validator_version: str | None = None
     raw_xml: str | None = None
 
 
@@ -215,6 +218,13 @@ def _normalize_flavour(flavour: str) -> str:
     return normalized
 
 
+def _version_tuple(value: str) -> tuple[int, int, int] | None:
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", value.strip())
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
 def _parse_verapdf_xml(xml_string: str) -> VeraPDFResult:
     """Parses the XML result from veraPDF.
 
@@ -234,6 +244,13 @@ def _parse_verapdf_xml(xml_string: str) -> VeraPDFResult:
         root = etree.fromstring(xml_string.encode("utf-8"), parser=parser)
     except etree.XMLSyntaxError as e:
         raise VeraPDFError(f"Invalid veraPDF XML report: {e}") from e
+
+    releases = {
+        element.get("id"): element.get("version")
+        for element in root.xpath(".//*[local-name()='releaseDetails']")
+        if element.get("id") and element.get("version")
+    }
+    result.validator_version = releases.get("apps") or releases.get("core")
 
     task_errors: list[str] = []
     for task_result in root.xpath(
@@ -492,6 +509,18 @@ def validate_with_verapdf(
     # Parse XML result. Incomplete reports and veraPDF execution failures raise
     # VeraPDFError instead of being misclassified as ordinary non-compliance.
     verapdf_result = _parse_verapdf_xml(xml_output)
+    installed_version = (
+        _version_tuple(verapdf_result.validator_version)
+        if verapdf_result.validator_version is not None
+        else None
+    )
+    minimum_version = _version_tuple(MIN_VERAPDF_VERSION)
+    assert minimum_version is not None
+    if installed_version is not None and installed_version < minimum_version:
+        raise VeraPDFError(
+            f"veraPDF {verapdf_result.validator_version} is too old; "
+            f"version {MIN_VERAPDF_VERSION} or newer is required"
+        )
     expected_returncode = 0 if verapdf_result.compliant else 1
     if result.returncode != expected_returncode:
         raise VeraPDFError(

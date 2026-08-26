@@ -345,6 +345,23 @@ class TestParseVerapdfXml:
         assert result.failed_rules == 0
         assert len(result.errors) == 0
 
+    def test_parses_validator_application_version(self) -> None:
+        xml = """<report>
+            <buildInformation>
+                <releaseDetails id="core" version="1.30.2" />
+                <releaseDetails id="apps" version="1.30.2" />
+            </buildInformation>
+            <jobs><job>
+                <validationReport isCompliant="true" profileName="PDF/A-2B">
+                    <details passedRules="1" failedRules="0" />
+                </validationReport>
+            </job></jobs>
+        </report>"""
+
+        result = _parse_verapdf_xml(xml)
+
+        assert result.validator_version == "1.30.2"
+
     def test_parses_non_compliant_report(self) -> None:
         """Parses a non-compliant validation report."""
         xml = """<?xml version="1.0" encoding="UTF-8"?>
@@ -600,6 +617,36 @@ class TestValidateWithVerapdf:
 
         with pytest.raises(VeraPDFError, match="not found"):
             validate_with_verapdf(pdf_path)
+
+    @patch("pdftopdfa.verapdf.subprocess.run")
+    @patch("pdftopdfa.verapdf.is_verapdf_available")
+    def test_rejects_validator_older_than_supported_minimum(
+        self,
+        mock_available: MagicMock,
+        mock_run: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        mock_available.return_value = True
+        xml_response = """<report>
+            <buildInformation>
+                <releaseDetails id="apps" version="1.28.2" />
+            </buildInformation>
+            <jobs><job>
+                <validationReport isCompliant="true" profileName="PDF/A-2B">
+                    <details passedRules="1" failedRules="0" />
+                </validationReport>
+            </job></jobs>
+        </report>"""
+        mock_run.return_value = MagicMock(
+            stdout=xml_response,
+            stderr="",
+            returncode=0,
+        )
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.touch()
+
+        with pytest.raises(VeraPDFError, match="1.30.2 or newer"):
+            validate_with_verapdf(pdf_path, flavour="2b")
 
     @patch("pdftopdfa.verapdf.subprocess.run")
     @patch("pdftopdfa.verapdf.is_verapdf_available")

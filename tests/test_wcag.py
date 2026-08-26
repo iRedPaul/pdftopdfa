@@ -4,7 +4,7 @@
 
 """Tests for WCAG 2.1 PDF accessibility requirements."""
 
-from pikepdf import Array, Dictionary, Name, String
+from pikepdf import Array, Dictionary, Name, NumberTree, String
 
 from pdftopdfa.utils import resolve_indirect
 from pdftopdfa.wcag import apply_wcag_21, prepare_pdfua_document
@@ -51,6 +51,38 @@ def test_apply_wcag_labels_an_inherited_required_form_control(sample_pdf_obj) ->
     assert result["required_controls_labeled"] == 1
     assert apply_wcag_21(sample_pdf_obj)["required_controls_labeled"] == 0
     assert str(field["/TU"]) == "Email address (required)"
+
+
+def test_apply_wcag_localizes_generated_german_accessibility_text(
+    sample_pdf_obj,
+) -> None:
+    sample_pdf_obj.Root["/Lang"] = String("de-DE")
+    page = sample_pdf_obj.pages[0]
+    widget = sample_pdf_obj.make_indirect(
+        Dictionary(
+            Type=Name.Annot,
+            Subtype=Name.Widget,
+            FT=Name.Tx,
+            Ff=2,
+            T=String("E-Mail-Adresse"),
+            TU=String("Form field"),
+            Rect=Array([0, 0, 100, 20]),
+        )
+    )
+    printer_mark = sample_pdf_obj.make_indirect(
+        Dictionary(
+            Type=Name.Annot,
+            Subtype=Name.PrinterMark,
+            Rect=Array([0, 0, 10, 10]),
+        )
+    )
+    page.obj["/Annots"] = Array([widget, printer_mark])
+
+    result = apply_wcag_21(sample_pdf_obj)
+
+    assert str(widget["/TU"]) == "E-Mail-Adresse (Pflichtfeld)"
+    assert str(printer_mark["/Contents"]) == "PrinterMark-Anmerkung"
+    assert result["required_controls_labeled"] == 1
 
 
 def test_apply_wcag_synchronizes_an_existing_widget_tooltip(sample_pdf_obj) -> None:
@@ -168,6 +200,121 @@ def test_apply_wcag_adds_decimal_page_labels_and_human_review_limit(
     assert result["page_labels_added"] == 1
     assert result["human_review_required"] is True
     assert apply_wcag_21(sample_pdf_obj)["page_labels_added"] == 0
+
+
+def test_apply_wcag_repairs_an_empty_page_label_number_tree(sample_pdf_obj) -> None:
+    sample_pdf_obj.Root["/PageLabels"] = Dictionary()
+
+    result = apply_wcag_21(sample_pdf_obj)
+
+    labels = NumberTree(resolve_indirect(sample_pdf_obj.Root["/PageLabels"]))
+    assert list(labels) == [0]
+    assert result["page_labels_added"] == 0
+    assert result["page_labels_repaired"] == 1
+
+
+def test_apply_wcag_repairs_page_labels_without_page_zero(sample_pdf_obj) -> None:
+    sample_pdf_obj.add_blank_page()
+    labels = NumberTree.new(sample_pdf_obj)
+    labels[1] = Dictionary(S=Name.D, St=1)
+    sample_pdf_obj.Root["/PageLabels"] = labels.obj
+
+    result = apply_wcag_21(sample_pdf_obj)
+
+    repaired = NumberTree(resolve_indirect(sample_pdf_obj.Root["/PageLabels"]))
+    assert list(repaired) == [0]
+    assert result["page_labels_repaired"] == 1
+
+
+def test_apply_wcag_repairs_page_labels_with_noninteger_start(
+    sample_pdf_obj,
+) -> None:
+    labels = NumberTree.new(sample_pdf_obj)
+    labels[0] = Dictionary(S=Name.D, St=1.5)
+    sample_pdf_obj.Root["/PageLabels"] = labels.obj
+
+    result = apply_wcag_21(sample_pdf_obj)
+
+    repaired = NumberTree(resolve_indirect(sample_pdf_obj.Root["/PageLabels"]))
+    assert int(resolve_indirect(repaired[0])["/St"]) == 1
+    assert result["page_labels_repaired"] == 1
+
+
+def test_apply_wcag_builds_hierarchical_bookmarks_from_heading_titles(
+    sample_pdf_obj,
+) -> None:
+    second_page = sample_pdf_obj.add_blank_page()
+    root = sample_pdf_obj.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    document = sample_pdf_obj.make_indirect(
+        Dictionary(Type=Name.StructElem, S=Name.Document, P=root)
+    )
+    heading = sample_pdf_obj.make_indirect(
+        Dictionary(
+            Type=Name.StructElem,
+            S=Name.H1,
+            P=document,
+            Pg=sample_pdf_obj.pages[0].obj,
+            T=String("Overview"),
+        )
+    )
+    subheading = sample_pdf_obj.make_indirect(
+        Dictionary(
+            Type=Name.StructElem,
+            S=Name.H2,
+            P=document,
+            Pg=second_page.obj,
+            T=String("Details"),
+        )
+    )
+    document["/K"] = Array([heading, subheading])
+    root["/K"] = document
+    sample_pdf_obj.Root["/StructTreeRoot"] = root
+
+    result = apply_wcag_21(sample_pdf_obj)
+
+    outlines = resolve_indirect(sample_pdf_obj.Root["/Outlines"])
+    first = resolve_indirect(outlines["/First"])
+    child = resolve_indirect(first["/First"])
+    assert str(first["/Title"]) == "Overview"
+    assert str(child["/Title"]) == "Details"
+    assert resolve_indirect(child["/Dest"])[0].objgen == second_page.obj.objgen
+    assert result["bookmarks_added"] == 2
+
+
+def test_apply_wcag_builds_bookmarks_from_top_level_structure_array(
+    sample_pdf_obj,
+) -> None:
+    second_page = sample_pdf_obj.add_blank_page()
+    root = sample_pdf_obj.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    first_heading = sample_pdf_obj.make_indirect(
+        Dictionary(
+            Type=Name.StructElem,
+            S=Name.H1,
+            P=root,
+            Pg=sample_pdf_obj.pages[0].obj,
+            T=String("Overview"),
+        )
+    )
+    second_heading = sample_pdf_obj.make_indirect(
+        Dictionary(
+            Type=Name.StructElem,
+            S=Name.H1,
+            P=root,
+            Pg=second_page.obj,
+            T=String("Details"),
+        )
+    )
+    root["/K"] = Array([first_heading, second_heading])
+    sample_pdf_obj.Root["/StructTreeRoot"] = root
+
+    result = apply_wcag_21(sample_pdf_obj)
+
+    outlines = resolve_indirect(sample_pdf_obj.Root["/Outlines"])
+    first = resolve_indirect(outlines["/First"])
+    second = resolve_indirect(first["/Next"])
+    assert str(first["/Title"]) == "Overview"
+    assert str(second["/Title"]) == "Details"
+    assert result["bookmarks_added"] == 2
 
 
 def test_prepare_pdfua_preserves_incidental_printer_mark_annotations(

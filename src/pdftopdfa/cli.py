@@ -101,6 +101,11 @@ def _print_result(result: ConversionResult, quiet: bool) -> None:
         result: The conversion result.
         quiet: If True, only output errors.
     """
+    if quiet and result.validation_failed:
+        for warning in result.warnings:
+            if warning.startswith(("Validation:", "PDF/UA validation:")):
+                print_error(warning)
+
     if result.success:
         if not quiet:
             if result.level is None:
