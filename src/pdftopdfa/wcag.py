@@ -364,12 +364,14 @@ def _ensure_heading_bookmarks(pdf: Pdf) -> int:
     return len(headings)
 
 
-def _annotation_structure_owner(
+def _scope_fallback_annotation_language(
+    pdf: Pdf,
     structure_root: Dictionary | None,
     annotation: Dictionary,
-) -> Dictionary | None:
+    language: str,
+) -> None:
     if structure_root is None:
-        return None
+        return
     parent_key = resolve_indirect(annotation.get("/StructParent"))
     parent_tree = resolve_indirect(structure_root.get("/ParentTree"))
     if (
@@ -377,12 +379,54 @@ def _annotation_structure_owner(
         or isinstance(parent_key, bool)
         or not isinstance(parent_tree, Dictionary)
     ):
-        return None
+        return
+    number_tree = NumberTree(parent_tree)
     try:
-        owner = resolve_indirect(NumberTree(parent_tree).get(parent_key))
+        owner = resolve_indirect(number_tree.get(parent_key))
     except (TypeError, ValueError, RuntimeError, pikepdf.PdfError):
-        return None
-    return owner if isinstance(owner, Dictionary) and "/S" in owner else None
+        return
+    if not isinstance(owner, Dictionary) or "/S" not in owner:
+        return
+    if primary_language(resolve_indirect(owner.get("/Lang"))) == language:
+        return
+
+    raw_children = resolve_indirect(owner.get("/K"))
+    children = list(raw_children) if isinstance(raw_children, Array) else [raw_children]
+    for index, value in enumerate(children):
+        object_reference = resolve_indirect(value)
+        if not isinstance(object_reference, Dictionary) or (
+            resolve_indirect(object_reference.get("/Type")) != Name.OBJR
+            or _object_identity(object_reference.get("/Obj"))
+            != _object_identity(annotation)
+        ):
+            continue
+        if len(children) == 1:
+            owner["/Lang"] = String(language)
+            return
+
+        role = (
+            Name.Link
+            if resolve_indirect(annotation.get("/Subtype")) == Name.Link
+            else Name.Annot
+        )
+        wrapper = pdf.make_indirect(
+            Dictionary(
+                Type=Name.StructElem,
+                S=role,
+                P=owner,
+                K=object_reference,
+                Lang=String(language),
+            )
+        )
+        page = resolve_indirect(
+            object_reference.get("/Pg", annotation.get("/P", owner.get("/Pg")))
+        )
+        if isinstance(page, Dictionary):
+            wrapper["/Pg"] = page
+        assert isinstance(raw_children, Array)
+        raw_children[index] = wrapper
+        number_tree[parent_key] = wrapper
+        return
 
 
 def apply_wcag_21(pdf: Pdf) -> dict[str, int | bool]:
@@ -471,9 +515,12 @@ def apply_wcag_21(pdf: Pdf) -> dict[str, int | bool]:
                         fallback_generated
                         and primary_language(language) != strings.language
                     ):
-                        owner = _annotation_structure_owner(structure_root, annotation)
-                        if owner is not None and "/Lang" not in owner:
-                            owner["/Lang"] = String(strings.language)
+                        _scope_fallback_annotation_language(
+                            pdf,
+                            structure_root,
+                            annotation,
+                            strings.language,
+                        )
                     annotation_descriptions_added += 1
             if subtype != Name.Widget:
                 continue

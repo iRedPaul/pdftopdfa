@@ -477,7 +477,13 @@ def test_apply_wcag_tags_fallback_annotation_description_language(
     )
     root = sample_pdf_obj.make_indirect(Dictionary(Type=Name.StructTreeRoot))
     owner = sample_pdf_obj.make_indirect(
-        Dictionary(Type=Name.StructElem, S=Name.Link, P=root, Pg=page.obj)
+        Dictionary(
+            Type=Name.StructElem,
+            S=Name.Link,
+            P=root,
+            Pg=page.obj,
+            Lang=String("fr"),
+        )
     )
     owner["/K"] = sample_pdf_obj.make_indirect(
         Dictionary(Type=Name.OBJR, Pg=page.obj, Obj=annotation)
@@ -493,6 +499,52 @@ def test_apply_wcag_tags_fallback_annotation_description_language(
 
     assert str(annotation["/Contents"]) == "Link"
     assert str(owner["/Lang"]) == "en"
+
+
+def test_apply_wcag_wraps_fallback_annotation_language_for_shared_owner(
+    sample_pdf_obj,
+) -> None:
+    sample_pdf_obj.Root["/Lang"] = String("fr")
+    page = sample_pdf_obj.pages[0]
+    annotation = sample_pdf_obj.make_indirect(
+        Dictionary(
+            Type=Name.Annot,
+            Subtype=Name.Link,
+            Rect=Array([0, 0, 10, 10]),
+            StructParent=0,
+        )
+    )
+    root = sample_pdf_obj.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    owner = sample_pdf_obj.make_indirect(
+        Dictionary(
+            Type=Name.StructElem,
+            S=Name.Link,
+            P=root,
+            Pg=page.obj,
+            Lang=String("fr"),
+        )
+    )
+    object_reference = sample_pdf_obj.make_indirect(
+        Dictionary(Type=Name.OBJR, Pg=page.obj, Obj=annotation)
+    )
+    marked_content = Dictionary(Type=Name.MCR, Pg=page.obj, MCID=0)
+    owner["/K"] = Array([marked_content, object_reference])
+    root["/K"] = owner
+    parent_tree = NumberTree.new(sample_pdf_obj)
+    parent_tree[0] = owner
+    root["/ParentTree"] = parent_tree.obj
+    sample_pdf_obj.Root["/StructTreeRoot"] = root
+    page.obj["/Annots"] = Array([annotation])
+
+    apply_wcag_21(sample_pdf_obj)
+
+    children = resolve_indirect(owner["/K"])
+    wrapper = resolve_indirect(children[1])
+    assert str(owner["/Lang"]) == "fr"
+    assert str(wrapper["/Lang"]) == "en"
+    assert resolve_indirect(wrapper["/K"]).objgen == object_reference.objgen
+    assert resolve_indirect(wrapper["/P"]).objgen == owner.objgen
+    assert resolve_indirect(NumberTree(root["/ParentTree"])[0]).objgen == wrapper.objgen
 
 
 def test_apply_wcag_describes_popup_and_printer_mark_annotations(

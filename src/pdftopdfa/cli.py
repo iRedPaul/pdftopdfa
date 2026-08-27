@@ -132,6 +132,11 @@ def _print_result(result: ConversionResult, quiet: bool) -> None:
                     continue
                 print_warning(warning)
     else:
+        if not quiet:
+            for warning in result.warnings:
+                if result.validation_failed and warning.startswith(validation_prefixes):
+                    continue
+                print_warning(warning)
         print_error(f"{result.input_path.name}: {result.error}")
 
 
