@@ -424,15 +424,19 @@ def _valid_table_cell_grid(
                     not isinstance(col_span, int)
                     or isinstance(col_span, bool)
                     or col_span <= 0
+                    or col_span > _MAX_ARRAY_ITEMS
                     or not isinstance(row_span, int)
                     or isinstance(row_span, bool)
                     or row_span <= 0
+                    or row_span > _MAX_ARRAY_ITEMS
                 ):
                     return False
                 while column < len(occupied) and occupied[column]:
                     column += 1
                 while True:
                     end = column + col_span
+                    if end > _MAX_ARRAY_ITEMS:
+                        return False
                     if end > len(occupied):
                         occupied.extend([False] * (end - len(occupied)))
                         next_spans.extend([0] * (end - len(next_spans)))
@@ -1379,7 +1383,10 @@ def _missing_structure_alternatives(
             element["/Alt"] = _bounded_pdf_string(
                 fallback.formula if role == "/Formula" else fallback.figure
             )
-            if document_language != fallback.language and "/Lang" not in element:
+            element_language = primary_language(
+                resolve_indirect(element.get("/Lang"))
+            )
+            if (element_language or document_language) != fallback.language:
                 element["/Lang"] = String(fallback.language)
             added += 1
     return missing, added

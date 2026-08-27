@@ -2132,6 +2132,47 @@ def test_pdfua_preserved_figure_gets_localized_fallback_alt() -> None:
     assert str(figure["/Alt"]) == "Bild"
 
 
+@pytest.mark.parametrize(
+    ("role", "fallback_alt"),
+    [(Name.Figure, "Image"), (Name.Formula, "Formula")],
+)
+def test_pdfua_preserved_fallback_alt_overrides_conflicting_language(
+    role: Name,
+    fallback_alt: str,
+) -> None:
+    pdf = pikepdf.Pdf.new()
+    pdf.Root["/Lang"] = String("fr")
+    page = _page(pdf, b"/Span <</MCID 0>> BDC q Q EMC")
+    page.obj["/StructParents"] = 0
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    document = pdf.make_indirect(
+        Dictionary(Type=Name.StructElem, S=Name.Document, P=root)
+    )
+    element = pdf.make_indirect(
+        Dictionary(
+            Type=Name.StructElem,
+            S=role,
+            P=document,
+            Pg=page.obj,
+            K=0,
+            Lang=String("fr"),
+        )
+    )
+    document["/K"] = element
+    root["/K"] = document
+    parent_tree = NumberTree.new(pdf)
+    parent_tree[0] = Array([element])
+    root["/ParentTree"] = parent_tree.obj
+    root["/ParentTreeNextKey"] = 1
+    pdf.Root["/StructTreeRoot"] = root
+
+    result = ensure_logical_structure(pdf, semantic=True, pdfua=True)
+
+    assert result["structure_preserved"] is True
+    assert str(element["/Alt"]) == fallback_alt
+    assert str(element["/Lang"]) == "en"
+
+
 def test_existing_figure_does_not_combine_distinct_inner_actualtext_values() -> None:
     pdf = pikepdf.Pdf.new()
     font = _font(pdf)

@@ -3816,6 +3816,37 @@ class TestStructureHierarchyValidation:
             pdfua=True,
         )
 
+    def test_pdfua_rejects_column_span_above_structural_limit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(tagging, "_MAX_ARRAY_ITEMS", 3)
+        pdf = new_pdf()
+        root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+        table = pdf.make_indirect(
+            Dictionary(Type=Name.StructElem, S=Name.Table, P=root)
+        )
+        row = pdf.make_indirect(
+            Dictionary(Type=Name.StructElem, S=Name.TR, P=table)
+        )
+        cell = pdf.make_indirect(
+            Dictionary(
+                Type=Name.StructElem,
+                S=Name.TD,
+                P=row,
+                A=Dictionary(O=Name.Table, ColSpan=4),
+            )
+        )
+        table["/K"] = row
+        row["/K"] = cell
+
+        assert not tagging._valid_structure_hierarchy(
+            root,
+            None,
+            [table, row, cell],
+            pdfua=True,
+        )
+
 
 class TestPreflightOptOut:
     """`preflight=False` skips the rehearsal without changing the result."""
