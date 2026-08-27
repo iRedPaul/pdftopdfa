@@ -1383,9 +1383,7 @@ def _missing_structure_alternatives(
             element["/Alt"] = _bounded_pdf_string(
                 fallback.formula if role == "/Formula" else fallback.figure
             )
-            element_language = primary_language(
-                resolve_indirect(element.get("/Lang"))
-            )
+            element_language = primary_language(resolve_indirect(element.get("/Lang")))
             if (element_language or document_language) != fallback.language:
                 element["/Lang"] = String(fallback.language)
             added += 1

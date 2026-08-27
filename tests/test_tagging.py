@@ -3826,9 +3826,7 @@ class TestStructureHierarchyValidation:
         table = pdf.make_indirect(
             Dictionary(Type=Name.StructElem, S=Name.Table, P=root)
         )
-        row = pdf.make_indirect(
-            Dictionary(Type=Name.StructElem, S=Name.TR, P=table)
-        )
+        row = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.TR, P=table))
         cell = pdf.make_indirect(
             Dictionary(
                 Type=Name.StructElem,
