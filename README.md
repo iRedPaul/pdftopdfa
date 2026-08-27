@@ -66,9 +66,10 @@ pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with 
    internal OCR engine's line and layout data. A provably inverted
    single-column block order is rebuilt; ambiguous or multi-column existing
    orders are preserved. PDF/UA output additionally applies deterministic
-   WCAG 2.1 PDF techniques for structure-based tab order, document title, and
-   required form-control labels
-8. **Save** -- writes the output with the correct PDF version header
+   WCAG 2.1 PDF techniques for structure-based tab order, document title, page
+   labels, annotation descriptions, and required form-control labels
+8. **Save and validate** -- writes the output with the correct PDF version
+   header, publishes it atomically, and reports PDF/A or PDF/UA non-conformance
 
 ## Installation
 
@@ -87,13 +88,15 @@ python -m pip install pdftopdfa
 If the `pdftopdfa` console script is not on `PATH`, use
 `python -m pdftopdfa` in the examples below.
 
-### Optional: PDF/A and PDF/UA validation
+### PDF/A and PDF/UA validation
 
 Validation uses the external [veraPDF](https://verapdf.org/) application, which
-is not bundled. Install it and make its launcher available on `PATH`, or set
-`VERAPDF_PATH` to the executable or its parent directory, before using
-`--validate` or `validate=True`. PDF/UA output is checked against both the
-selected PDF/A profile and veraPDF's `ua1` profile.
+is not bundled. Install version 1.30.2 or newer and make its launcher available on `PATH`, or set
+`VERAPDF_PATH` to the executable or its parent directory. `--validate` and
+`validate=True` opt ordinary PDF/A output into validation. PDF/UA output always
+attempts validation against both the selected PDF/A profile and veraPDF's `ua1`
+profile. If either check cannot run or fails, the candidate remains published
+with `success=False`; the failure is also reported through the CLI exit code.
 
 ### Optional: OCR support
 
@@ -194,8 +197,8 @@ pdftopdfa -l 2b document.pdf
 # Tagged PDF/A-2a output with veraPDF validation
 pdftopdfa -l 2a --validate document.pdf
 
-# PDF/A-2a and PDF/UA-1 output, validated against both profiles
-pdftopdfa -l 2a --pdfua --validate document.pdf
+# PDF/A-2a and PDF/UA-1 output (both profiles are always validated)
+pdftopdfa -l 2a --pdfua document.pdf
 
 # With validation (note: -v = --validate, not verbose; use --verbose for logs)
 pdftopdfa -v document.pdf
@@ -280,7 +283,6 @@ accessible_result = convert_to_pdfa(
     output_path=Path("accessible.pdf"),
     level="2a",
     pdfua=True,
-    validate=True,
 )
 
 ocr_result = convert_to_pdfa(
@@ -334,8 +336,11 @@ image, table, and reusable `OCRSession` APIs.
   Review automatically inferred semantics for accessibility-critical
   publications. PDF/A level A does not by itself imply PDF/UA conformance;
   request the additional PDF/UA-1 requirements with `--pdfua` or
-  `pdfua=True`. veraPDF checks machine-verifiable requirements, while reported
-  semantic uncertainties still require human review.
+  `pdfua=True`. PDF/UA candidates are published even when PDF/A or PDF/UA-1
+  machine validation fails, but return `success=False`; the non-conformance is reported. veraPDF cannot
+  judge whether content order, descriptions, labels, language, contrast, color
+  use, or media alternatives are meaningful; reported semantic uncertainties
+  still require human review.
 - **WCAG 2.1 review** -- PDF/UA mode applies the WCAG 2.1 requirements that
   can be derived safely from the PDF structure. An undetermined document
   language is reported against success criterion 3.1.1. Criteria requiring
@@ -345,7 +350,9 @@ image, table, and reusable `OCRSession` APIs.
 - **Encrypted PDFs** -- encryption is removed from PDFs that open with an empty
   user password. PDFs that require a password cannot be converted and are copied
   unchanged. With an automatically generated output name, the unchanged copy
-  still receives the `_pdfa.pdf` suffix; it is not a converted PDF/A file
+  still receives the `_pdfa.pdf` suffix; it is not a converted PDF/A file.
+  Requested validation still reports non-conformance, but does not suppress the
+  unchanged copy; PDF/UA mode attempts both mandatory profiles
 - **Digitally signed PDFs** -- signed PDFs are copied unchanged by default because conversion would invalidate their signatures; use `--allow-signature-invalidation` only when an unsigned archival copy is intentional
 - **Font replacement** -- fonts without a suitable metrically compatible replacement produce a warning; the resulting file may not be fully compliant
 - **Non-embedded CIDFonts (Identity encoding)** -- content streams reference glyph IDs of the original font; after replacement with a substitute font the same glyph IDs point to different or missing glyphs, so the affected text may render incorrectly or invisibly. Text extraction and copy/paste stay correct because the original ToUnicode mapping is preserved. A warning is emitted for each replaced CIDFont

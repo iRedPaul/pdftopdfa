@@ -1196,11 +1196,16 @@ def _subset_font_data(
         options.name_languages = ["*"]
 
         subsetter = Subsetter(options=options)
+        original_cid_metrics: list[tuple[int, int]] | None = None
 
         if is_cid:
             # For CIDFonts, codes are GIDs directly
             # Convert GIDs to glyph names for fontTools
             glyph_order = tt_font.getGlyphOrder()
+            if "glyf" in tt_font and "hmtx" in tt_font:
+                original_cid_metrics = [
+                    tt_font["hmtx"].metrics[glyph_name] for glyph_name in glyph_order
+                ]
             glyph_names = set()
             for gid in used_codes:
                 if 0 <= gid < len(glyph_order):
@@ -1208,6 +1213,11 @@ def _subset_font_data(
             # Always keep .notdef
             if glyph_order:
                 glyph_names.add(glyph_order[0])
+                if original_cid_metrics is not None:
+                    # retain_gids preserves TrueType holes only up to the
+                    # highest selected GID. Keep the final slot so the
+                    # original CID/GID address space remains intact.
+                    glyph_names.add(glyph_order[-1])
             subsetter.populate(glyphs=glyph_names)
         else:
             # For simple fonts, map character codes to glyphs through
@@ -1227,6 +1237,16 @@ def _subset_font_data(
                 subsetter.populate(unicodes=used_codes)
 
         subsetter.subset(tt_font)
+
+        if original_cid_metrics is not None and "hmtx" in tt_font:
+            subsetted_order = tt_font.getGlyphOrder()
+            if len(subsetted_order) == len(original_cid_metrics):
+                # fontTools zeroes advances for unused retained GID slots.
+                # Some PDF renderers then lose clipped Identity-CID text even
+                # though all referenced glyphs remain present.
+                tt_font["hmtx"].metrics = dict(
+                    zip(subsetted_order, original_cid_metrics, strict=True)
+                )
 
         # Write subsetted font to bytes
         output = BytesIO()

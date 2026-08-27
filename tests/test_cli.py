@@ -367,14 +367,14 @@ class TestCliConvert:
 
     @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
-    def test_cli_pdfua_validation_checks_both_profiles(
+    def test_cli_pdfua_validate_does_not_repeat_automatic_validation(
         self,
         mock_convert_to_pdfa: MagicMock,
         mock_validate: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """PDF/UA CLI validation checks the PDF/A and UA-1 profiles."""
+        """The converter owns the mandatory PDF/A and UA-1 validation."""
         output_path = tmp_dir / "output.pdf"
         mock_convert_to_pdfa.return_value = ConversionResult(
             success=True,
@@ -399,60 +399,7 @@ class TestCliConvert:
         )
 
         assert result == EXIT_SUCCESS
-        assert [call.kwargs["flavour"] for call in mock_validate.call_args_list] == [
-            "2a",
-            "ua1",
-        ]
-
-    @patch("pdftopdfa.cli.validate_with_verapdf")
-    @patch("pdftopdfa.cli.convert_to_pdfa")
-    def test_cli_pdfua_validation_checks_ua_after_pdfa_failure(
-        self,
-        mock_convert_to_pdfa: MagicMock,
-        mock_validate: MagicMock,
-        sample_pdf: Path,
-        tmp_dir: Path,
-    ) -> None:
-        """PDF/UA validation still runs when PDF/A validation fails."""
-        output_path = tmp_dir / "output.pdf"
-        mock_convert_to_pdfa.return_value = ConversionResult(
-            success=True,
-            input_path=sample_pdf,
-            output_path=output_path,
-            level="2a",
-        )
-        mock_validate.side_effect = [
-            MagicMock(
-                compliant=False,
-                passed_rules=0,
-                failed_rules=1,
-                errors=[],
-                warnings=[],
-            ),
-            MagicMock(
-                compliant=True,
-                passed_rules=1,
-                failed_rules=0,
-                errors=[],
-                warnings=[],
-            ),
-        ]
-
-        result = cli_module._convert_single_file(
-            sample_pdf,
-            str(output_path),
-            "2a",
-            do_validate=True,
-            force=False,
-            quiet=True,
-            pdfua=True,
-        )
-
-        assert result == EXIT_VALIDATION_FAILED
-        assert [call.kwargs["flavour"] for call in mock_validate.call_args_list] == [
-            "2a",
-            "ua1",
-        ]
+        mock_validate.assert_not_called()
 
     def test_pdfua_validation_success_uses_pdfua_label(
         self,
@@ -478,20 +425,30 @@ class TestCliConvert:
 
     @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
+    @pytest.mark.parametrize("quiet", [False, True])
     def test_cli_single_file_known_validation_failure_returns_exit_code(
         self,
         mock_convert_to_pdfa,
         mock_validate,
+        quiet: bool,
         sample_pdf: Path,
         tmp_dir: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """A known compliance failure returns the validation failure exit code."""
+        """PDF/UA failures report both automatic validation profiles."""
         output_path = tmp_dir / "output.pdf"
+        validation_errors = [
+            "Validation: PDF/A rule failed",
+            "PDF/UA validation: PDF/UA rule failed",
+        ]
+        review_warning = "Generated alternatives require review"
         mock_convert_to_pdfa.return_value = ConversionResult(
-            success=True,
+            success=False,
             input_path=sample_pdf,
             output_path=output_path,
             level="2b",
+            warnings=[*validation_errors, review_warning],
+            error="Validation failed; output candidate was published",
             validation_failed=True,
         )
 
@@ -501,11 +458,15 @@ class TestCliConvert:
             "2b",
             do_validate=True,
             force=False,
-            quiet=True,
+            quiet=quiet,
+            pdfua=True,
         )
 
         assert result == EXIT_VALIDATION_FAILED
         mock_validate.assert_not_called()
+        captured = capsys.readouterr()
+        assert all(error in captured.err for error in validation_errors)
+        assert (review_warning in captured.out) is not quiet
 
     def test_cli_convert_simple(
         self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
@@ -842,15 +803,18 @@ class TestCliDirectory:
 class TestCliValidation:
     """Tests for --validate option."""
 
-    @patch("pdftopdfa.verapdf.is_verapdf_available", return_value=False)
-    def test_cli_missing_validator_returns_validation_failure(
+    @patch(
+        "pdftopdfa.cli.validate_with_verapdf",
+        side_effect=VeraPDFError("veraPDF not installed"),
+    )
+    def test_cli_missing_validator_publishes_then_returns_validation_failure(
         self,
-        _mock_available: MagicMock,
+        _mock_validate: MagicMock,
         runner: CliRunner,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """A missing validator uses the documented validation exit code."""
+        """A missing validator does not suppress the converted output."""
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
@@ -859,12 +823,13 @@ class TestCliValidation:
         )
 
         assert result.exit_code == EXIT_VALIDATION_FAILED
-        assert "Validation requires veraPDF" in result.output
-        assert not output_path.exists()
+        assert "Validation failed: veraPDF could not run" in result.output
+        assert output_path.is_file()
+        assert output_path.read_bytes().startswith(b"%PDF-")
 
     @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
-    def test_cli_validation_runtime_error_fails_closed(
+    def test_cli_validation_runtime_error_returns_failure_status(
         self,
         mock_convert_to_pdfa: MagicMock,
         mock_validate: MagicMock,

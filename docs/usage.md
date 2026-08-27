@@ -157,15 +157,16 @@ except PDFToPDFAError as exc:
     print(f"Conversion failed: {exc}")
 else:
     if result.validation_failed:
-        print("Validation failed; no candidate was published")
+        print("Validation failed; review the published candidate")
     else:
         print("Done")
 ```
 
-`convert_to_pdfa()` raises on conversion failure and otherwise returns a result
-with `success=True`. If explicit validation fails, the result also has
-`validation_failed=True`, the rejected candidate is not published, and an
-existing destination remains unchanged (or a new destination remains absent).
+`convert_to_pdfa()` raises on conversion failure. If explicit validation fails,
+the candidate remains published at the requested destination and the result has
+`success=False`, `validation_failed=True`, and a validation error message.
+Validation failure therefore differs from conversion failure because it still
+produces a reviewable candidate.
 The batch APIs represent handled per-file failures with `success=False` and an
 `error` message so that later files can still be processed.
 
@@ -256,17 +257,44 @@ both evidence sources page by page.
 
 Pass `pdfua=True` or `--pdfua` with either Level A target to add PDF/UA-1
 identification, the required PDF/A extension schema, and a document-title
-fallback when the source has none. `validate=True` and `--validate` then run
-veraPDF once for the selected PDF/A profile and once for `ua1`.
+fallback when the source has none. PDF/UA mode always runs veraPDF once for the
+selected PDF/A profile and once for `ua1`, even without `validate=True` or
+`--validate`. If veraPDF is unavailable or either profile fails, the candidate
+is still published with `success=False` and the failure is reported. The program implements
+PDF/UA-1; PDF/UA-2 requires
+PDF 2.0 and is outside the PDF/A-2/3 output contract.
 
 PDF/UA mode also applies deterministic WCAG 2.1 PDF techniques: every page
 uses structure order for keyboard traversal, the fallback title is synchronized
 to both XMP and the document information dictionary, and required form controls
 include their required state in a trustworthy tooltip or field name. A missing
 or undetermined document language is reported for manual review against success
-criterion 3.1.1. Requirements that depend on authorial or visual judgement,
+criterion 3.1.1. Generated labels are localized for supported document
+languages; strong German or English visible-text evidence can supply a missing
+catalog language. Requirements that depend on authorial or visual judgement,
 such as semantic accuracy, contrast, use of color, and media alternatives,
 still need human review; `--pdfua` is not by itself a WCAG conformance claim.
+
+WCAG 2.1 conformance is evaluated against success criteria. The published PDF
+techniques are informative ways to meet those criteria, not an independent
+checklist that requires every technique in every document. The PDF/UA mode
+handles all safely machine-derivable parts of the applicable techniques as
+follows:
+
+| Area | Implemented automatically | Human verification still required |
+| --- | --- | --- |
+| Document properties | synchronized title, PDF/UA-1 metadata, valid or repaired page labels, strongly evidenced German/English language, and bookmarks generated from titled heading structure | correct document and passage language; meaningful title and bookmark labels |
+| Logical structure | headings, paragraphs, lists, table grammar and header associations, figures/formulas, artifacts, reading order, unique Note IDs | semantic accuracy, heading hierarchy, reading order, list/table interpretation |
+| Images and formulas | preserves and propagates trustworthy Alt, ActualText, and captions; supplies a localized type fallback needed for machine validation and reports it | authoritative descriptions and identification of decorative content; generated type fallbacks are not substantive alternatives |
+| Links, annotations, and forms | Link/Form/Annot ownership, structure tab order, annotation descriptions, field tooltips, required-state labels, accessible link text when it can be bound to visible content | link purpose, field-label meaning, instructions, error messages, and task behavior |
+| Scans | searchable OCR text, line-level tags, language/layout evidence, artifact separation | missed text, diagrams, photos, handwriting, and final reading order |
+| Visual and time-based content | preserves available semantic alternatives and reports uncertainty | color use, contrast, text resizing/reflow, captions, transcripts, audio description, flashing, timing, and media equivalence |
+| Conformance status | mandatory veraPDF PDF/A plus PDF/UA-1 validation without suppressing publication | assistive-technology and keyboard testing with representative users |
+
+This boundary follows the [WCAG 2.1 techniques model](https://www.w3.org/WAI/WCAG21/Understanding/understanding-techniques)
+and the [Matterhorn Protocol](https://pdfa.org/resource/the-matterhorn-protocol/):
+machine validation can reject structural failures, but it cannot decide whether
+author-provided semantics are correct or useful.
 
 Strongly evidenced paragraph, list, and table continuations are joined across
 page breaks. A structure element that genuinely spans pages has no `/Pg` entry;
@@ -419,13 +447,13 @@ the pages need OCR.
 
 | Field | Type | Description |
 |---|---|---|
-| `success` | `bool` | `True` if processing reached a handled result; inspect `validation_failed` and `skipped` to determine whether a newly validated PDF/A candidate was published |
+| `success` | `bool` | `True` only if processing and every requested validation succeeded; a failed validation still publishes its candidate with `success=False` |
 | `input_path` | `Path` | Input file path |
 | `output_path` | `Path` | Output file path |
 | `level` | `str \| None` | Requested level for converted output, detected level for a compliant skip, or `None` when no PDF/A level was produced or detected, such as a protected input copied unchanged or `pdfa=False` output |
 | `warnings` | `list[str]` | Non-fatal conversion warnings |
 | `processing_time` | `float` | Runtime in seconds |
-| `error` | `str \| None` | Error message for a handled per-file batch failure |
+| `error` | `str \| None` | Error message for a handled per-file or validation failure |
 | `validation_failed` | `bool` | `True` if validation reported non-compliance or could not complete, or if a preserved embedded PDF could not be converted |
 | `skipped` | `bool` | `True` if the original PDF was copied unchanged |
 
@@ -482,7 +510,9 @@ except ConversionError as exc:
 Encrypted PDFs are copied to the output path unchanged and returned with
 `success=True`, `skipped=True`, and a warning that conversion was skipped. The
 copy has not been converted and is not guaranteed to conform to PDF/A, even if
-its default output name ends in `_pdfa.pdf`.
+its default output name ends in `_pdfa.pdf`. When validation is requested, the
+copy is published with `success=False` if validation fails. PDF/UA mode still attempts both the
+PDF/A and PDF/UA-1 profiles and reports either failure.
 
 Digitally signed PDFs are also copied unchanged by default, because OCR,
 metadata repair, font embedding, and PDF/A rewriting would invalidate the
@@ -560,17 +590,17 @@ keeps its previous contents and a new destination stays absent.
 ## Validation
 
 `pdftopdfa` integrates with [veraPDF](https://verapdf.org/) for PDF/A validation.
-Install veraPDF separately and make its executable available on `PATH`, or set
-`VERAPDF_PATH` to the executable or its parent directory.
+Install veraPDF 1.30.2 or newer separately and make its executable available on
+`PATH`, or set `VERAPDF_PATH` to the executable or its parent directory. Older
+versions reported by veraPDF's XML output are rejected as unsupported.
 
 - CLI: `pdftopdfa -v input.pdf`
 - API: pass `validate=True`
 
-Explicit validation is fail-closed: if veraPDF is missing or cannot complete,
-the Python APIs return a result with `validation_failed=True`, do not publish
-the rejected candidate, and leave any pre-existing destination unchanged. The
-CLI checks for veraPDF before conversion and exits with the validation-failure
-code if it is unavailable.
+If veraPDF reports non-conformance or cannot complete, the Python APIs return a
+result with `success=False` and `validation_failed=True` while keeping the candidate published. The
+CLI exits with the validation-failure code; this status does not delete or
+suppress the output file. A true conversion failure still publishes nothing.
 
 ## Environment Variables
 

@@ -15,7 +15,7 @@ from io import BytesIO
 from pathlib import Path
 
 import pikepdf
-from pikepdf import Array, Dictionary, Name, Pdf, Stream
+from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
 
 from ..metadata import _format_pdf_date
 from ..utils import log_suppressed_error
@@ -1111,16 +1111,20 @@ def ensure_filespec_uf_entries(pdf: Pdf) -> int:
             f_val = resolved.get("/F")
             uf_val = resolved.get("/UF")
 
+            def usable_filename(value: object) -> bool:
+                value = _resolve_indirect(value)
+                return isinstance(value, String) and bool(str(value).strip())
+
             # Ensure both /F and /UF exist (ISO requires both)
-            if uf_val is None and f_val is not None:
+            if not usable_filename(uf_val) and usable_filename(f_val):
                 resolved["/UF"] = f_val
                 fixed_count += 1
                 logger.debug("Added /UF from /F on FileSpec")
-            elif f_val is None and uf_val is not None:
+            elif not usable_filename(f_val) and usable_filename(uf_val):
                 resolved["/F"] = uf_val
                 fixed_count += 1
                 logger.debug("Added /F from /UF on FileSpec")
-            elif f_val is None and uf_val is None:
+            elif not usable_filename(f_val) and not usable_filename(uf_val):
                 # Neither exists — derive from /EF key names or use fallback
                 resolved["/F"] = "embedded_file"
                 resolved["/UF"] = "embedded_file"

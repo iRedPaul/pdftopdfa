@@ -101,6 +101,12 @@ def _print_result(result: ConversionResult, quiet: bool) -> None:
         result: The conversion result.
         quiet: If True, only output errors.
     """
+    validation_prefixes = ("Validation:", "PDF/UA validation:")
+    if result.validation_failed:
+        for warning in result.warnings:
+            if warning.startswith(validation_prefixes):
+                print_error(warning)
+
     if result.success:
         if not quiet:
             if result.level is None:
@@ -122,8 +128,15 @@ def _print_result(result: ConversionResult, quiet: bool) -> None:
                 f"{result.output_path.name} ({details})"
             )
             for warning in result.warnings:
+                if result.validation_failed and warning.startswith(validation_prefixes):
+                    continue
                 print_warning(warning)
     else:
+        if not quiet:
+            for warning in result.warnings:
+                if result.validation_failed and warning.startswith(validation_prefixes):
+                    continue
+                print_warning(warning)
         print_error(f"{result.input_path.name}: {result.error}")
 
 
@@ -182,12 +195,18 @@ def _ocr_execution_provider_callback(
     "--validate",
     "do_validate",
     is_flag=True,
-    help="Validate after conversion (note: -v is not verbose; use --verbose)",
+    help=(
+        "Validate PDF/A after conversion (PDF/UA is always validated; "
+        "-v is not verbose, use --verbose)"
+    ),
 )
 @click.option(
     "--pdfua",
     is_flag=True,
-    help="Also produce PDF/UA-1 (requires --level 2a or 3a).",
+    help=(
+        "Also produce PDF/UA-1 (requires --level 2a or 3a; both profiles "
+        "are always submitted to veraPDF validation)."
+    ),
 )
 @click.option(
     "--no-pdfa",
@@ -360,18 +379,6 @@ def main(
         raise click.UsageError("--pdfua requires --level 2a or 3a")
     if not pdfa and do_validate:
         raise click.UsageError("--validate cannot be combined with --no-pdfa")
-
-    # Check veraPDF availability if validation is requested
-    if do_validate:
-        from .verapdf import is_verapdf_available
-
-        if not is_verapdf_available():
-            print_error(
-                "Validation requires veraPDF, but it is not installed.\n"
-                "Please install veraPDF from https://verapdf.org/ "
-                "and ensure it is in your PATH."
-            )
-            sys.exit(EXIT_VALIDATION_FAILED)
 
     if deskew and ocr_force:
         raise click.UsageError("--deskew cannot be combined with --ocr-force")
@@ -600,14 +607,12 @@ def _convert_single_file(
         return EXIT_SUCCESS
 
     # Optional: Validation
-    if do_validate:
+    if do_validate and not pdfua:
         if not quiet:
             click.echo("Validating output with veraPDF...")
 
         validation_flavour = result.level if result.skipped and result.level else level
         flavours = [validation_flavour]
-        if pdfua:
-            flavours.append("ua1")
         validation_failed = False
         for flavour in flavours:
             try:

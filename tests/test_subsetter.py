@@ -281,7 +281,7 @@ class TestSubsetFontData:
         assert len(result) < len(font_data)
 
     def test_subset_cid_mode(self):
-        """CID mode subsetting works with GID-based codes."""
+        """CID mode preserves the original GID address space."""
         font_data = _load_liberation_sans()
         # Use a few GIDs
         used_codes = {36, 37, 38}
@@ -290,6 +290,22 @@ class TestSubsetFontData:
 
         assert result is not None
         assert len(result) < len(font_data)
+        from fontTools.ttLib import TTFont
+
+        original_font = TTFont(BytesIO(font_data))
+        subsetted_font = TTFont(BytesIO(result))
+        try:
+            assert subsetted_font["maxp"].numGlyphs == original_font["maxp"].numGlyphs
+            assert [
+                subsetted_font["hmtx"].metrics[name]
+                for name in subsetted_font.getGlyphOrder()
+            ] == [
+                original_font["hmtx"].metrics[name]
+                for name in original_font.getGlyphOrder()
+            ]
+        finally:
+            original_font.close()
+            subsetted_font.close()
 
     def test_subset_empty_usage(self):
         """Subsetting with no usage still produces valid font (.notdef)."""

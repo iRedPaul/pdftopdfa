@@ -733,6 +733,35 @@ def test_digital_tj_tj_and_image_have_stable_parent_tree_after_reopen() -> None:
         assert preserved["semantic_alternatives_review_required"] == 1
 
 
+def test_pdfua_localizes_fallback_alt_and_infers_document_language() -> None:
+    pdf = pikepdf.Pdf.new()
+    font = _font(pdf)
+    image = _image(pdf)
+    _page(
+        pdf,
+        (
+            b"BT /F1 12 Tf 20 250 Td "
+            b"(Rechnung Kunde Menge Zahlungshinweis) Tj ET "
+            b"q 40 0 0 30 300 100 cm /Im0 Do Q"
+        ),
+        Dictionary(
+            Font=Dictionary(F1=font),
+            XObject=Dictionary(Im0=image),
+        ),
+        size=(400, 300),
+    )
+
+    result = ensure_logical_structure(pdf, semantic=True, pdfua=True)
+
+    figure = next(
+        item for item in _structure_objects(pdf) if item.get("/S") == Name.Figure
+    )
+    assert str(pdf.Root["/Lang"]) == "de"
+    assert str(figure["/Alt"]) == "Bild"
+    assert result["document_language_inferred"] == 1
+    assert result["semantic_alternatives_review_required"] == 1
+
+
 def test_overlaid_invisible_digital_text_is_tagged_once() -> None:
     pdf = pikepdf.Pdf.new()
     font = _font(pdf)
@@ -773,6 +802,26 @@ def test_separate_invisible_digital_text_remains_logical_content() -> None:
     assert [marker[0] for marker in _marked_content(page)] == ["/Span", "/Span"]
 
 
+def test_iccbased_text_color_has_deterministic_paint_visibility() -> None:
+    pdf = pikepdf.Pdf.new()
+    profile = pdf.make_stream(b"")
+    profile["/N"] = 1
+    page = _page(
+        pdf,
+        b"/CS0 cs 0 scn BT /F1 12 Tf 20 200 Td (Visible text) Tj ET",
+        Dictionary(
+            ColorSpace=Dictionary(CS0=Array([Name.ICCBased, profile])),
+            Font=Dictionary(F1=_font(pdf)),
+        ),
+        size=(300, 300),
+    )
+
+    result = ensure_logical_structure(pdf, semantic=True)
+
+    assert result["semantic_content_items"] == 1
+    assert _marked_content(page)[0][0] == "/Span"
+
+
 def test_semantic_link_owns_overlapping_text_and_objr_after_reopen() -> None:
     pdf = pikepdf.Pdf.new()
     font = _font(pdf)
@@ -797,6 +846,7 @@ def test_semantic_link_owns_overlapping_text_and_objr_after_reopen() -> None:
     assert result["semantic_structure_generated"] is True
     assert result["annotations_tagged"] == 1
     assert result["semantic_link_review_required"] == 0
+    assert str(annotation["/Contents"]) == "Open documentation"
     assert page.obj["/Tabs"] == Name.S
     link = next(item for item in _structure_objects(pdf) if item.get("/S") == Name.Link)
     link_kids = _k_objects(link)
@@ -826,6 +876,7 @@ def test_semantic_link_owns_overlapping_text_and_objr_after_reopen() -> None:
         root_objgen = reopened_root.objgen
         reopened_page = reopened.pages[0]
         reopened_annotation = resolve_indirect(reopened_page.obj["/Annots"][0])
+        assert str(reopened_annotation["/Contents"]) == "Open documentation"
         reopened_link = next(
             item for item in _structure_objects(reopened) if item.get("/S") == Name.Link
         )
@@ -1371,6 +1422,7 @@ def test_semantic_widget_uses_form_role_and_inherited_tooltip() -> None:
     assert result["annotations_tagged"] == 1
     assert result["semantic_form_review_required"] == 0
     assert str(widget["/TU"]) == "Customer email"
+    assert str(field["/TU"]) == "Customer email"
     form = next(item for item in _structure_objects(pdf) if item.get("/S") == Name.Form)
     object_reference = resolve_indirect(form["/K"])
     assert object_reference["/Type"] == Name.OBJR
@@ -2047,6 +2099,80 @@ def test_existing_empty_caption_still_requires_alternative_review() -> None:
     assert first["semantic_alternatives_review_required"] == 1
     assert second["structure_preserved"] is True
     assert second["semantic_alternatives_review_required"] == 1
+
+
+def test_pdfua_preserved_figure_gets_localized_fallback_alt() -> None:
+    pdf = pikepdf.Pdf.new()
+    pdf.Root["/Lang"] = String("de")
+    page = _page(pdf, b"/Span <</MCID 0>> BDC q Q EMC")
+    page.obj["/StructParents"] = 0
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    document = pdf.make_indirect(
+        Dictionary(Type=Name.StructElem, S=Name.Document, P=root)
+    )
+    figure = pdf.make_indirect(
+        Dictionary(
+            Type=Name.StructElem,
+            S=Name.Figure,
+            P=document,
+            Pg=page.obj,
+            K=0,
+        )
+    )
+    document["/K"] = figure
+    root["/K"] = document
+    parent_tree = NumberTree.new(pdf)
+    parent_tree[0] = Array([figure])
+    root["/ParentTree"] = parent_tree.obj
+    root["/ParentTreeNextKey"] = 1
+    pdf.Root["/StructTreeRoot"] = root
+
+    result = ensure_logical_structure(pdf, semantic=True, pdfua=True)
+
+    assert result["structure_preserved"] is True
+    assert result["semantic_alternatives_review_required"] == 1
+    assert str(figure["/Alt"]) == "Bild"
+
+
+@pytest.mark.parametrize(
+    ("role", "fallback_alt"),
+    [(Name.Figure, "Image"), (Name.Formula, "Formula")],
+)
+def test_pdfua_preserved_fallback_alt_overrides_conflicting_language(
+    role: Name,
+    fallback_alt: str,
+) -> None:
+    pdf = pikepdf.Pdf.new()
+    pdf.Root["/Lang"] = String("fr")
+    page = _page(pdf, b"/Span <</MCID 0>> BDC q Q EMC")
+    page.obj["/StructParents"] = 0
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    document = pdf.make_indirect(
+        Dictionary(Type=Name.StructElem, S=Name.Document, P=root)
+    )
+    element = pdf.make_indirect(
+        Dictionary(
+            Type=Name.StructElem,
+            S=role,
+            P=document,
+            Pg=page.obj,
+            K=0,
+            Lang=String("fr"),
+        )
+    )
+    document["/K"] = element
+    root["/K"] = document
+    parent_tree = NumberTree.new(pdf)
+    parent_tree[0] = Array([element])
+    root["/ParentTree"] = parent_tree.obj
+    root["/ParentTreeNextKey"] = 1
+    pdf.Root["/StructTreeRoot"] = root
+
+    result = ensure_logical_structure(pdf, semantic=True, pdfua=True)
+
+    assert result["structure_preserved"] is True
+    assert str(element["/Alt"]) == fallback_alt
+    assert str(element["/Lang"]) == "en"
 
 
 def test_existing_figure_does_not_combine_distinct_inner_actualtext_values() -> None:

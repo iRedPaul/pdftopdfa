@@ -27,6 +27,12 @@ from pikepdf import (
     String,
 )
 
+from .accessibility import (
+    AccessibilityStrings,
+    accessibility_strings,
+    infer_document_language,
+    primary_language,
+)
 from .exceptions import ConversionError
 from .fonts.glyph_usage import _iter_content_streams_with_resources
 from .sanitizers.catalog import _is_valid_bcp47
@@ -146,7 +152,11 @@ def _ensure_mark_info(pdf: pikepdf.Pdf) -> bool:
     return True
 
 
-def _resolvable_roles(role_map: Dictionary | None) -> set[str] | None:
+def _resolvable_roles(
+    role_map: Dictionary | None,
+    *,
+    pdfua: bool = False,
+) -> set[str] | None:
     roles = set(_STANDARD_STRUCTURE_TYPES)
     if role_map is None:
         return roles
@@ -158,10 +168,15 @@ def _resolvable_roles(role_map: Dictionary | None) -> set[str] | None:
         if not isinstance(mapped, Name):
             return None
         target = str(mapped)
-        if key in _STANDARD_STRUCTURE_TYPES and target not in _STANDARD_STRUCTURE_TYPES:
-            return None
-        if key == target and key in _STANDARD_STRUCTURE_TYPES:
-            continue
+        if key in _STANDARD_STRUCTURE_TYPES:
+            if pdfua:
+                # ISO 14289-1 does not permit standard structure types to be
+                # remapped, including circular identity mappings.
+                return None
+            if target not in _STANDARD_STRUCTURE_TYPES:
+                return None
+            if key == target:
+                continue
         mappings[key] = target
 
     checked: set[str] = set()
@@ -217,6 +232,8 @@ def _valid_structure_hierarchy(
     root: Dictionary,
     role_map: Dictionary | None,
     elements: list[Dictionary],
+    *,
+    pdfua: bool = False,
 ) -> bool:
     root_key = _object_key(root)
     if root_key is None:
@@ -289,6 +306,163 @@ def _valid_structure_hierarchy(
             not child_roles
             or any(child not in {"/Lbl", "/LBody"} for child in child_roles)
         ):
+            return False
+
+    if not pdfua:
+        return True
+
+    # PDF/UA-1 requires a document to use either the unnumbered /H role or
+    # numbered /H1-/H6 roles, never both.  A structure element may also not
+    # contain more than one direct /H child.
+    has_h = any(role == "/H" for role in roles.values())
+    has_numbered_h = any(
+        re.fullmatch(r"/H[1-6]", role) is not None for role in roles.values()
+    )
+    if has_h and has_numbered_h:
+        return False
+    if any(child_roles.count("/H") > 1 for child_roles in children.values()):
+        return False
+
+    for key, role in roles.items():
+        child_roles = children.get(key, [])
+        if role == "/Table":
+            if child_roles.count("/Caption") > 1 or (
+                "/Caption" in child_roles
+                and child_roles.index("/Caption") not in {0, len(child_roles) - 1}
+            ):
+                return False
+            if child_roles.count("/THead") > 1 or child_roles.count("/TFoot") > 1:
+                return False
+            if any(item in child_roles for item in {"/THead", "/TFoot"}) and (
+                "/TBody" not in child_roles
+            ):
+                return False
+            if "/TR" in child_roles and any(
+                item in child_roles for item in {"/THead", "/TBody", "/TFoot"}
+            ):
+                return False
+        elif role == "/L" and "/Caption" in child_roles:
+            if child_roles.count("/Caption") > 1 or child_roles[0] != "/Caption":
+                return False
+
+    return _valid_table_cell_grid(root, role_map, elements)
+
+
+def _table_attribute_value(
+    root: Dictionary,
+    element: Dictionary,
+    key: str,
+) -> object | None:
+    """Return a direct or class-mapped table structure attribute."""
+    candidates: list[object] = []
+    raw_attributes = resolve_indirect(element.get("/A"))
+    if isinstance(raw_attributes, Array):
+        candidates.extend(raw_attributes)
+    elif raw_attributes is not None:
+        candidates.append(raw_attributes)
+
+    class_map = resolve_indirect(root.get("/ClassMap"))
+    raw_classes = resolve_indirect(element.get("/C"))
+    classes = list(raw_classes) if isinstance(raw_classes, Array) else [raw_classes]
+    if isinstance(class_map, Dictionary):
+        for raw_class in classes:
+            class_name = resolve_indirect(raw_class)
+            if isinstance(class_name, Name):
+                mapped = resolve_indirect(class_map.get(class_name))
+                if isinstance(mapped, Array):
+                    candidates.extend(mapped)
+                elif mapped is not None:
+                    candidates.append(mapped)
+
+    for candidate in candidates:
+        attribute = resolve_indirect(candidate)
+        if not isinstance(attribute, Dictionary) or (
+            resolve_indirect(attribute.get("/O")) != Name.Table
+        ):
+            continue
+        value = resolve_indirect(attribute.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _valid_table_cell_grid(
+    root: Dictionary,
+    role_map: Dictionary | None,
+    elements: list[Dictionary],
+) -> bool:
+    """Validate rectangular table grids, including row and column spans."""
+    for table in elements:
+        if _effective_structure_role(table.get("/S"), role_map) != "/Table":
+            continue
+        rows: list[Dictionary] = []
+        for child in _structure_element_children(table):
+            child_role = _effective_structure_role(child.get("/S"), role_map)
+            if child_role == "/TR":
+                rows.append(child)
+            elif child_role in {"/THead", "/TBody", "/TFoot"}:
+                rows.extend(_structure_element_children(child))
+
+        expected_width: int | None = None
+        active_row_spans: list[int] = []
+        for row in rows:
+            occupied = [remaining > 0 for remaining in active_row_spans]
+            next_spans = [max(0, remaining - 1) for remaining in active_row_spans]
+            column = 0
+            cells = [
+                child
+                for child in _structure_element_children(row)
+                if _effective_structure_role(child.get("/S"), role_map)
+                in {"/TH", "/TD"}
+            ]
+            for cell in cells:
+                raw_col_span = _table_attribute_value(root, cell, "/ColSpan")
+                raw_row_span = _table_attribute_value(root, cell, "/RowSpan")
+                col_span = 1 if raw_col_span is None else raw_col_span
+                row_span = 1 if raw_row_span is None else raw_row_span
+                if (
+                    not isinstance(col_span, int)
+                    or isinstance(col_span, bool)
+                    or col_span <= 0
+                    or col_span > _MAX_ARRAY_ITEMS
+                    or not isinstance(row_span, int)
+                    or isinstance(row_span, bool)
+                    or row_span <= 0
+                    or row_span > _MAX_ARRAY_ITEMS
+                ):
+                    return False
+                while column < len(occupied) and occupied[column]:
+                    column += 1
+                while True:
+                    end = column + col_span
+                    if end > _MAX_ARRAY_ITEMS:
+                        return False
+                    if end > len(occupied):
+                        occupied.extend([False] * (end - len(occupied)))
+                        next_spans.extend([0] * (end - len(next_spans)))
+                    if not any(occupied[column:end]):
+                        break
+                    column += 1
+                    while column < len(occupied) and occupied[column]:
+                        column += 1
+                occupied[column:end] = [True] * col_span
+                if row_span > 1:
+                    next_spans[column:end] = [row_span - 1] * col_span
+                column = end
+
+            width = len(occupied)
+            while width and not occupied[width - 1]:
+                width -= 1
+            if not cells or not width or not all(occupied[:width]):
+                return False
+            if expected_width is None:
+                expected_width = width
+            elif width != expected_width:
+                return False
+            if len(occupied) > width and any(occupied[width:]):
+                return False
+            active_row_spans = next_spans[:width]
+        if not rows or any(active_row_spans):
             return False
     return True
 
@@ -495,6 +669,7 @@ def _walk_structure_k(
 def _existing_structure_elements(
     pdf: pikepdf.Pdf,
     *,
+    pdfua: bool = False,
     content_references_out: dict[
         tuple[_ObjectKey, int],
         tuple[
@@ -530,7 +705,14 @@ def _existing_structure_elements(
     role_map = resolve_indirect(raw_role_map)
     if raw_role_map is not None and not isinstance(role_map, Dictionary):
         return None
-    resolvable_roles = _resolvable_roles(role_map)
+    if pdfua and isinstance(role_map, Dictionary):
+        for raw_key in list(role_map):
+            mapped = resolve_indirect(role_map.get(raw_key))
+            if str(raw_key) in _STANDARD_STRUCTURE_TYPES and (
+                isinstance(mapped, Name) and str(mapped) == str(raw_key)
+            ):
+                del role_map[raw_key]
+    resolvable_roles = _resolvable_roles(role_map, pdfua=pdfua)
     if resolvable_roles is None:
         return None
 
@@ -574,7 +756,7 @@ def _existing_structure_elements(
         return None
     if not _valid_id_tree(root, elements):
         return None
-    if not _valid_structure_hierarchy(root, role_map, elements):
+    if not _valid_structure_hierarchy(root, role_map, elements, pdfua=pdfua):
         return None
     if not _valid_parent_tree(
         pdf,
@@ -582,12 +764,14 @@ def _existing_structure_elements(
         content_references,
         object_owners,
         root,
+        pdfua=pdfua,
     ) and not _repair_parent_tree(
         pdf,
         root,
         elements,
         content_references,
         object_owners,
+        pdfua=pdfua,
     ):
         return None
     if content_references_out is not None:
@@ -1137,7 +1321,9 @@ def _missing_structure_alternatives(
             Dictionary | Stream | None,
         ],
     ],
-) -> int:
+    *,
+    fallback: AccessibilityStrings | None = None,
+) -> tuple[int, int]:
     root = resolve_indirect(pdf.Root.get("/StructTreeRoot"))
     role_map = (
         resolve_indirect(root.get("/RoleMap")) if isinstance(root, Dictionary) else None
@@ -1163,7 +1349,7 @@ def _missing_structure_alternatives(
         )
     ]
     if not candidates:
-        return 0
+        return 0, 0
     text_references, actual_text_references = _content_reference_description_evidence(
         content_references
     )
@@ -1176,6 +1362,8 @@ def _missing_structure_alternatives(
         actual_text_references,
     )
     missing = 0
+    added = 0
+    document_language = primary_language(resolve_indirect(pdf.Root.get("/Lang")))
     for element in candidates:
         element_key = _object_key(element)
         if element_key in elements_with_actual_text:
@@ -1190,7 +1378,16 @@ def _missing_structure_alternatives(
         ):
             continue
         missing += 1
-    return missing
+        if fallback is not None:
+            role = _effective_structure_role(element.get("/S"), role_map)
+            element["/Alt"] = _bounded_pdf_string(
+                fallback.formula if role == "/Formula" else fallback.figure
+            )
+            element_language = primary_language(resolve_indirect(element.get("/Lang")))
+            if (element_language or document_language) != fallback.language:
+                element["/Lang"] = String(fallback.language)
+            added += 1
+    return missing, added
 
 
 def _valid_table_header_association(
@@ -1390,14 +1587,26 @@ def _widget_tooltip_evidence(
 
 def _ensure_widget_tooltip(annotation: Dictionary) -> bool:
     tooltip, is_direct, has_generic_tooltip = _widget_tooltip_evidence(annotation)
-    if is_direct:
-        return False
+    parent = resolve_indirect(annotation.get("/Parent"))
+    field_owner = parent if isinstance(parent, Dictionary) else annotation
+
     if tooltip is not None:
-        annotation["/TU"] = _bounded_pdf_string(tooltip)
-        return True
+        bounded = _bounded_pdf_string(tooltip)
+        updated = False
+        if not is_direct:
+            annotation["/TU"] = bounded
+            updated = True
+        owner_tooltip = resolve_indirect(field_owner.get("/TU"))
+        if not isinstance(owner_tooltip, String) or not str(owner_tooltip).strip():
+            field_owner["/TU"] = bounded
+            updated = True
+        return updated
     if has_generic_tooltip:
         return False
-    annotation["/TU"] = _bounded_pdf_string(_GENERIC_WIDGET_TOOLTIP)
+    generic = _bounded_pdf_string(_GENERIC_WIDGET_TOOLTIP)
+    annotation["/TU"] = generic
+    if not _same_object(field_owner, annotation):
+        field_owner["/TU"] = generic
     return True
 
 
@@ -1497,9 +1706,12 @@ def _table_header_scope(
 def _repair_existing_semantics(
     pdf: pikepdf.Pdf,
     elements: list[Dictionary],
+    *,
+    pdfua: bool = False,
 ) -> int:
     """Repair local role requirements without replacing author structure."""
-    repaired = _repair_numbered_heading_sequence(elements)
+    repaired = _repair_note_identifiers(pdf, elements) if pdfua else 0
+    repaired += _repair_numbered_heading_sequence(elements)
     root = resolve_indirect(pdf.Root.get("/StructTreeRoot"))
     role_map = (
         resolve_indirect(root.get("/RoleMap")) if isinstance(root, Dictionary) else None
@@ -1543,19 +1755,18 @@ def _repair_existing_semantics(
                 if subtype == Name.Widget
                 else Name.Link
                 if subtype == Name.Link
-                else None
+                else Name.Annot
             )
-            if expected_role is not None:
-                wrapper = _repair_annotation_structure_role(
-                    pdf,
-                    element,
-                    candidate,
-                    annotation,
-                    expected_role,
-                )
-                if wrapper is not None:
-                    elements.append(wrapper)
-                    repaired += 1
+            wrapper = _repair_annotation_structure_role(
+                pdf,
+                element,
+                candidate,
+                annotation,
+                expected_role,
+            )
+            if wrapper is not None:
+                elements.append(wrapper)
+                repaired += 1
             if subtype != Name.Widget:
                 continue
             repaired += int(_ensure_widget_tooltip(annotation))
@@ -2582,6 +2793,57 @@ def _valid_id_tree(structure_root: Dictionary, elements: list[Dictionary]) -> bo
     return True
 
 
+def _repair_note_identifiers(
+    pdf: pikepdf.Pdf,
+    elements: list[Dictionary],
+) -> int:
+    """Assign unique IDs to Note elements and register them in the IDTree."""
+    structure_root = resolve_indirect(pdf.Root.get("/StructTreeRoot"))
+    if not isinstance(structure_root, Dictionary):
+        return 0
+    role_map = resolve_indirect(structure_root.get("/RoleMap"))
+    if not isinstance(role_map, Dictionary):
+        role_map = None
+    missing = [
+        element
+        for element in elements
+        if _effective_structure_role(element.get("/S"), role_map) == "/Note"
+        and not _valid_structure_text(resolve_indirect(element.get("/ID")))
+    ]
+    if not missing:
+        return 0
+
+    existing_ids = {
+        bytes(identifier)
+        for element in elements
+        if isinstance((identifier := resolve_indirect(element.get("/ID"))), String)
+    }
+    raw_id_tree = structure_root.get("/IDTree")
+    id_tree_object = resolve_indirect(raw_id_tree)
+    if isinstance(id_tree_object, Dictionary):
+        id_tree = NameTree(id_tree_object)
+    else:
+        id_tree = NameTree.new(pdf)
+        structure_root["/IDTree"] = id_tree.obj
+
+    next_identifier = 1
+    for note in missing:
+        old_identifier = resolve_indirect(note.get("/ID"))
+        if isinstance(old_identifier, String):
+            del id_tree[str(old_identifier)]
+            existing_ids.discard(bytes(old_identifier))
+        while True:
+            candidate = f"note-{next_identifier}"
+            next_identifier += 1
+            identifier = String(candidate)
+            if bytes(identifier) not in existing_ids:
+                break
+        note["/ID"] = identifier
+        id_tree[candidate] = note
+        existing_ids.add(bytes(identifier))
+    return len(missing)
+
+
 def _number_tree_keys(root: Dictionary) -> list[int] | None:
     seen: set[_ObjectKey] = set()
     keys_by_node: dict[_ObjectKey, list[int]] = {}
@@ -2698,6 +2960,8 @@ def _valid_parent_tree(
         tuple[Dictionary | Stream, _ObjectKey, Dictionary],
     ],
     structure_root: Dictionary,
+    *,
+    pdfua: bool = False,
 ) -> bool:
     number_tree = None
     number_tree_keys: set[int] = set()
@@ -3087,7 +3351,10 @@ def _valid_parent_tree(
             return False
 
         for annotation in page_annotations[page_key]:
-            if resolve_indirect(annotation.get("/Subtype")) == Name.Popup:
+            annotation_subtype = resolve_indirect(annotation.get("/Subtype"))
+            if annotation_subtype == Name.Popup or (
+                pdfua and annotation_subtype == Name.PrinterMark
+            ):
                 continue
             annotation_key = _object_key(annotation)
             if (
@@ -3111,6 +3378,10 @@ def _valid_parent_tree(
         expected_owner,
         _,
     ) in object_owners.items():
+        if pdfua and (
+            resolve_indirect(referenced_object.get("/Subtype")) == Name.PrinterMark
+        ):
+            return False
         existing = object_parent_owners.get(object_key)
         if existing is not None and existing[1] != expected_owner:
             return False
@@ -3185,6 +3456,8 @@ def _repair_parent_tree(
         tuple[_ObjectKey, _ObjectKey],
         tuple[Dictionary | Stream, _ObjectKey, Dictionary],
     ],
+    *,
+    pdfua: bool = False,
 ) -> bool:
     """Replace only a malformed parent tree whose reachable mappings are valid."""
     entries: dict[int, pikepdf.Object] = {}
@@ -3262,6 +3535,7 @@ def _repair_parent_tree(
             content_references,
             object_owners,
             structure_root,
+            pdfua=pdfua,
         ):
             return True
     except Exception:
@@ -3678,6 +3952,8 @@ def _make_annotation_elements(
     seen_annotations: set[_ObjectKey],
     prelinked_annotations: dict[_ObjectKey, Dictionary] | None = None,
     optional_content: _DefaultOCVisibility | None = None,
+    *,
+    pdfua: bool = False,
 ) -> tuple[list[Dictionary], int]:
     annots = resolve_indirect(page.obj.get("/Annots"))
     if annots is None:
@@ -3697,6 +3973,11 @@ def _make_annotation_elements(
                 f"Cannot create logical structure: page {page_number} has a "
                 "malformed annotation"
             )
+        if pdfua and (resolve_indirect(annotation.get("/Subtype")) == Name.PrinterMark):
+            for key in ("/StructParent", "/StructParents"):
+                if key in annotation:
+                    del annotation[key]
+            continue
         if "/OC" in annotation and not _optional_content_is_visible(
             optional_content,
             annotation.get("/OC"),
@@ -3840,6 +4121,7 @@ class _SemanticBinding:
     source_index: int
     bbox: tuple[float, float, float, float]
     mcid: int | None = None
+    text: str = ""
 
 
 @dataclass(slots=True)
@@ -4371,6 +4653,7 @@ def _ocr_semantic_inputs(
                 mcid,
                 binding_bbox,
                 mcid,
+                span_text,
             )
         if actual_mcids != declared_mcids:
             details = []
@@ -5494,7 +5777,18 @@ def _direct_artifact_items(
             if isinstance(color_spaces, Dictionary)
             else None
         )
-        return resolved not in simple_names
+        if isinstance(resolved, Name):
+            return resolved not in simple_names
+        if isinstance(resolved, Array) and resolved:
+            family = resolve_indirect(resolved[0])
+            return family not in {
+                Name.CalGray,
+                Name.CalRGB,
+                Name.Lab,
+                Name.ICCBased,
+                Name.Indexed,
+            }
+        return True
 
     def text_show_has_codes(operator_name: str, operands: list[object]) -> bool:
         value = resolve_indirect(operands[-1])
@@ -6969,6 +7263,7 @@ def _digital_semantic_inputs(
                 source,
                 source_index,
                 (box.left, box.top, box.right, box.bottom),
+                text=text,
             )
             if generated_artifact:
                 optional_artifacts[span_id] = ArtifactReference(
@@ -7026,6 +7321,7 @@ def _digital_semantic_inputs(
                 source,
                 scope.marked_content_index,
                 (box.left, box.top, box.right, box.bottom),
+                text=scope.actual_text or scope.alt_text or "",
             )
             if scope.actual_text is not None:
                 source_actual_texts[span_id] = scope.actual_text
@@ -9181,6 +9477,26 @@ def _semantic_node_source_text(
     return " ".join(values) or None
 
 
+def _semantic_heading_title(node: object, source_texts: dict[str, str]) -> str | None:
+    role = getattr(node, "role", None)
+    if role != "H" and not (
+        isinstance(role, str)
+        and len(role) == 2
+        and role[0] == "H"
+        and role[1] in "123456"
+    ):
+        return None
+    title = _semantic_node_source_text(node, source_texts)
+    if title is None or any(
+        0xE000 <= ord(character) <= 0xF8FF
+        or 0xF0000 <= ord(character) <= 0xFFFFD
+        or 0x100000 <= ord(character) <= 0x10FFFD
+        for character in title
+    ):
+        return None
+    return " ".join(title.split()) or None
+
+
 def _missing_plan_alternatives(
     root: object,
     source_actual_texts: dict[str, str],
@@ -9212,6 +9528,58 @@ def _missing_plan_alternatives(
     return missing
 
 
+def _normalize_pdfua_plan_tables(node: object) -> tuple[object, int]:
+    """Demote inferred non-rectangular tables to conservative reading structure."""
+    normalized_children = []
+    review_required = 0
+    for child in getattr(node, "children", ()):
+        normalized, child_review = _normalize_pdfua_plan_tables(child)
+        normalized_children.append(normalized)
+        review_required += child_review
+    normalized_node = replace(node, children=tuple(normalized_children))
+    if getattr(normalized_node, "role", None) != "Table":
+        return normalized_node, review_required
+
+    rows = normalized_node.children
+    widths = tuple(len(getattr(row, "children", ())) for row in rows)
+    rectangular = (
+        bool(rows)
+        and len(set(widths)) == 1
+        and widths[0] > 0
+        and all(
+            getattr(row, "role", None) == "TR"
+            and all(
+                getattr(cell, "role", None) in {"TH", "TD"} for cell in row.children
+            )
+            for row in rows
+        )
+    )
+    if rectangular:
+        return normalized_node, review_required
+
+    role_map = {
+        "Table": "Div",
+        "THead": "Div",
+        "TBody": "Div",
+        "TFoot": "Div",
+        "TR": "Div",
+        "TH": "P",
+        "TD": "P",
+    }
+
+    def demote(candidate: object) -> object:
+        role = getattr(candidate, "role", None)
+        children = tuple(demote(child) for child in getattr(candidate, "children", ()))
+        return replace(
+            candidate,
+            role=role_map.get(role, role),
+            children=children,
+            attributes=() if role in role_map else candidate.attributes,
+        )
+
+    return demote(normalized_node), review_required + 1
+
+
 def _make_semantic_element(
     pdf: pikepdf.Pdf,
     node: object,
@@ -9220,8 +9588,11 @@ def _make_semantic_element(
     bindings: dict[str, _SemanticBinding],
     owners: dict[tuple[_ObjectKey, int], Dictionary],
     page_elements: dict[int, Dictionary],
+    source_texts: dict[str, str],
     source_actual_texts: dict[str, str],
     source_alt_texts: dict[str, str],
+    fallback_alternatives: AccessibilityStrings | None,
+    document_language: str | None,
 ) -> Dictionary:
     role = getattr(node, "role", None)
     if not isinstance(role, str) or f"/{role}" not in _STANDARD_STRUCTURE_TYPES:
@@ -9244,6 +9615,10 @@ def _make_semantic_element(
     if role == "Div" and page_number is not None:
         page_elements[page_number] = element
 
+    heading_title = _semantic_heading_title(node, source_texts)
+    if heading_title is not None:
+        element["/T"] = _bounded_pdf_string(heading_title)
+
     actual_text = getattr(node, "actual_text", None)
     if (not isinstance(actual_text, str) or not actual_text.strip()) and (
         role in {"Figure", "Formula"} or bool(getattr(node, "content", ()))
@@ -9255,6 +9630,14 @@ def _make_semantic_element(
         alt_text = _semantic_node_source_text(node, source_alt_texts)
         if alt_text is not None:
             element["/Alt"] = _bounded_pdf_string(alt_text)
+        elif "/ActualText" not in element and fallback_alternatives is not None:
+            element["/Alt"] = _bounded_pdf_string(
+                fallback_alternatives.formula
+                if role == "Formula"
+                else fallback_alternatives.figure
+            )
+            if document_language != fallback_alternatives.language:
+                element["/Lang"] = String(fallback_alternatives.language)
     _set_semantic_attributes(element, node, pdf_pages)
 
     items: list[Dictionary] = []
@@ -9287,8 +9670,11 @@ def _make_semantic_element(
             bindings,
             owners,
             page_elements,
+            source_texts,
             source_actual_texts,
             source_alt_texts,
+            fallback_alternatives,
+            document_language,
         )
         for child in getattr(node, "children", ())
     ]
@@ -9503,6 +9889,28 @@ def _link_semantic_annotations(
             if len(selected) != len(matched):
                 continue
 
+            if not _valid_structure_text(resolve_indirect(annotation.get("/Contents"))):
+                matched_bindings = {
+                    (_object_key(binding.container), binding.mcid): binding
+                    for _span_id, binding, _owner in matched
+                }
+                description_parts: list[str] = []
+                for marked_reference in selected:
+                    stream = resolve_indirect(marked_reference.get("/Stm"))
+                    container = stream if isinstance(stream, Stream) else page.obj
+                    binding = matched_bindings.get(
+                        (_object_key(container), marked_reference.get("/MCID"))
+                    )
+                    text = binding.text.strip() if binding is not None else ""
+                    if text and (
+                        not description_parts or text != description_parts[-1]
+                    ):
+                        description_parts.append(text)
+                if description_parts:
+                    annotation["/Contents"] = _bounded_pdf_string(
+                        " ".join(description_parts)
+                    )
+
             object_reference = pdf.make_indirect(
                 Dictionary(Type=Name.OBJR, Obj=annotation, Pg=page.obj)
             )
@@ -9657,6 +10065,8 @@ def _append_semantic_annotations(
     next_key: int,
     prelinked_annotations: dict[_ObjectKey, Dictionary],
     optional_content: _DefaultOCVisibility,
+    *,
+    pdfua: bool = False,
 ) -> tuple[int, int, int]:
     tagged = 0
     link_review_required = 0
@@ -9677,6 +10087,7 @@ def _append_semantic_annotations(
             seen_annotations,
             prelinked_annotations,
             optional_content,
+            pdfua=pdfua,
         )
         if not elements:
             continue
@@ -9713,6 +10124,8 @@ def _rebuild_semantic_structure(
     pdf: pikepdf.Pdf,
     ocr_manifest: dict[str, object] | None,
     optional_content: _DefaultOCVisibility,
+    *,
+    pdfua: bool = False,
 ) -> dict[str, int | bool]:
     from collections import Counter
 
@@ -9810,7 +10223,23 @@ def _rebuild_semantic_structure(
             )
         )
 
+    document_language = primary_language(resolve_indirect(pdf.Root.get("/Lang")))
+    document_language_inferred = 0
+    if pdfua and document_language in {None, "und"}:
+        inferred_language = infer_document_language(
+            span.text for page in pages for span in page.spans if span.text.strip()
+        )
+        if inferred_language is not None:
+            pdf.Root["/Lang"] = String(inferred_language)
+            document_language = inferred_language
+            document_language_inferred = 1
+    fallback_alternatives = accessibility_strings(document_language) if pdfua else None
+
     plan = build_semantic_plan(pages)
+    table_review_required = 0
+    if pdfua:
+        normalized_root, table_review_required = _normalize_pdfua_plan_tables(plan.root)
+        plan = replace(plan, root=normalized_root)
     scanned_visual_review_pages = {
         artifact.page_number
         for artifact in plan.artifacts
@@ -9928,8 +10357,11 @@ def _rebuild_semantic_structure(
         bindings,
         owners,
         page_elements,
+        {span_id: binding.text for span_id, binding in bindings.items()},
         source_actual_texts,
         source_alt_texts,
+        fallback_alternatives,
+        document_language,
     )
     structure_root["/K"] = document
     prelinked_annotations = _link_semantic_annotations(
@@ -9952,6 +10384,7 @@ def _rebuild_semantic_structure(
         next_key,
         prelinked_annotations,
         optional_content,
+        pdfua=pdfua,
     )
     structure_root["/ParentTreeNextKey"] = next_key
     pdf.Root["/StructTreeRoot"] = structure_root
@@ -9975,6 +10408,7 @@ def _rebuild_semantic_structure(
         "artifacts_tagged": artifacts_tagged,
         "semantic_content_items": len(referenced_ids),
         "semantic_repairs": 0,
+        "document_language_inferred": document_language_inferred,
         "semantic_alternatives_review_required": alternatives_review_required,
         "semantic_vector_review_required": vector_review_required,
         "semantic_scanned_visual_review_required": len(scanned_visual_review_pages),
@@ -9983,6 +10417,7 @@ def _rebuild_semantic_structure(
             pdf,
             optional_content,
         ),
+        "semantic_table_review_required": table_review_required,
     }
 
 
@@ -9994,6 +10429,8 @@ def _tag_page(
     page_key: int,
     next_key: int,
     seen_annotations: set[_ObjectKey],
+    *,
+    pdfua: bool = False,
 ) -> tuple[Dictionary, int, int, int]:
     page_number = page_key + 1
     streams = _content_streams(page, page_number)
@@ -10040,6 +10477,7 @@ def _tag_page(
         next_key,
         page_number,
         seen_annotations,
+        pdfua=pdfua,
     )
     annotation_count = len(annotation_elements)
     annotation_elements = _bounded_structure_children(
@@ -10116,6 +10554,7 @@ def _ensure_logical_structure_in_place(
     *,
     rebuild: bool = False,
     semantic: bool = False,
+    pdfua: bool = False,
     ocr_manifest: dict[str, object] | None = None,
     _content_preflight_complete: bool = False,
 ) -> dict[str, int | bool]:
@@ -10181,6 +10620,7 @@ def _ensure_logical_structure_in_place(
         if rebuild
         else _existing_structure_elements(
             pdf,
+            pdfua=pdfua,
             content_references_out=existing_content_references,
             object_owners_out=existing_object_owners,
         )
@@ -10198,6 +10638,7 @@ def _ensure_logical_structure_in_place(
             existing_object_owners.clear()
             existing_elements = _existing_structure_elements(
                 pdf,
+                pdfua=pdfua,
                 content_references_out=existing_content_references,
                 object_owners_out=existing_object_owners,
             )
@@ -10266,20 +10707,32 @@ def _ensure_logical_structure_in_place(
         or (not existing_content_references and not hidden_optional_content_references)
     ):
         languages_normalized = _normalize_structure_languages(existing_elements)
-        semantic_repairs = _repair_existing_semantics(pdf, existing_elements)
+        semantic_repairs = _repair_existing_semantics(
+            pdf,
+            existing_elements,
+            pdfua=pdfua,
+        )
         semantic_repairs += _propagate_existing_marked_text_evidence(
             pdf,
             existing_content_references,
         )
-        if semantic_repairs and _existing_structure_elements(pdf) is None:
+        if semantic_repairs and _existing_structure_elements(pdf, pdfua=pdfua) is None:
             raise ConversionError(
                 "Cannot preserve logical structure after semantic repairs"
             )
-        alternatives_review_required = _missing_structure_alternatives(
-            pdf,
-            existing_elements,
-            existing_content_references,
+        alternatives_review_required, fallback_alternatives_added = (
+            _missing_structure_alternatives(
+                pdf,
+                existing_elements,
+                existing_content_references,
+                fallback=(
+                    accessibility_strings(resolve_indirect(pdf.Root.get("/Lang")))
+                    if pdfua
+                    else None
+                ),
+            )
         )
+        semantic_repairs += fallback_alternatives_added
         return {
             "structure_preserved": True,
             "structure_rebuilt": False,
@@ -10297,6 +10750,7 @@ def _ensure_logical_structure_in_place(
             "artifacts_tagged": path_artifacts_tagged,
             "semantic_content_items": 0,
             "semantic_repairs": semantic_repairs,
+            "document_language_inferred": 0,
             "semantic_alternatives_review_required": (alternatives_review_required),
             "semantic_vector_review_required": int(path_artifacts_tagged > 0),
             "semantic_scanned_visual_review_required": 0,
@@ -10305,6 +10759,7 @@ def _ensure_logical_structure_in_place(
                 pdf,
                 optional_content,
             ),
+            "semantic_table_review_required": 0,
         }
 
     if semantic_requested:
@@ -10315,6 +10770,7 @@ def _ensure_logical_structure_in_place(
                 pdf,
                 ocr_manifest,
                 optional_content,
+                pdfua=pdfua,
             )
         except (ConversionError, TypeError, ValueError) as exc:
             semantic_error = exc
@@ -10366,6 +10822,7 @@ def _ensure_logical_structure_in_place(
             page_key,
             next_key,
             seen_annotations,
+            pdfua=pdfua,
         )
         page_elements.append(element)
         annotations_tagged += annotation_count
@@ -10393,11 +10850,13 @@ def _ensure_logical_structure_in_place(
         "artifacts_tagged": path_artifacts_tagged,
         "semantic_content_items": 0,
         "semantic_repairs": 0,
+        "document_language_inferred": 0,
         "semantic_alternatives_review_required": 0,
         "semantic_vector_review_required": 0,
         "semantic_scanned_visual_review_required": 0,
         "semantic_link_review_required": 0,
         "semantic_form_review_required": _widgets_requiring_name_review(pdf),
+        "semantic_table_review_required": 0,
     }
 
 
@@ -10406,6 +10865,7 @@ def ensure_logical_structure(
     *,
     rebuild: bool = False,
     semantic: bool = False,
+    pdfua: bool = False,
     ocr_manifest: dict[str, object] | None = None,
     preflight: bool = True,
 ) -> dict[str, int | bool]:
@@ -10425,6 +10885,7 @@ def ensure_logical_structure(
         pdf: Opened pikepdf PDF object to modify.
         rebuild: Replace even a plausible existing logical structure.
         semantic: Infer a semantic structure for digital page content.
+        pdfua: Apply the stricter PDF/UA-1 structure constraints.
         ocr_manifest: Validated OCR document metadata for line-level binding.
         preflight: Rehearse the operation on an isolated copy first.
 
@@ -10469,6 +10930,7 @@ def ensure_logical_structure(
                         preflight_pdf,
                         rebuild=rebuild,
                         semantic=semantic,
+                        pdfua=pdfua,
                         ocr_manifest=ocr_manifest,
                         _content_preflight_complete=True,
                     )
@@ -10482,6 +10944,7 @@ def ensure_logical_structure(
         pdf,
         rebuild=rebuild,
         semantic=semantic,
+        pdfua=pdfua,
         ocr_manifest=ocr_manifest,
         _content_preflight_complete=True,
     )
