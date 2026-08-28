@@ -603,7 +603,7 @@ def _convert_single_file(
     if result.validation_failed:
         return EXIT_VALIDATION_FAILED
 
-    if result.skipped and not do_validate:
+    if result.skipped and (not do_validate or result.level is None):
         return EXIT_SUCCESS
 
     # Optional: Validation

@@ -473,45 +473,15 @@ def _copy_input_to_output(
         )
 
 
-def _validate_input_snapshot_and_publish(
-    input_path: Path,
-    output_path: Path,
-    level: str,
-    warnings: list[str],
-    *,
-    pdfua: bool = False,
-    allow_overwrite: bool = True,
-) -> bool:
-    """Validate and publish the exact snapshot of an unchanged input."""
-    with _staged_input_copy(input_path, output_path) as staged_input:
-        snapshot = staged_file_snapshot(staged_input)
-        validation_failed = _validate_pdfa_output(staged_input, level, warnings)
-        if pdfua:
-            validation_failed = (
-                _validate_pdfua_output(staged_input, warnings) or validation_failed
-            )
-        publish_staged_file(
-            staged_input,
-            output_path,
-            snapshot,
-            backup=staged_input.with_name(f"backup{output_path.suffix}"),
-            require_absent=not allow_overwrite,
-        )
-    return validation_failed
-
-
 def _copy_encrypted_input(
     input_path: Path,
     output_path: Path,
     *,
     pdfa: bool,
-    validate: bool,
-    level: str,
-    pdfua: bool,
     start_time: float,
     allow_overwrite: bool = True,
 ) -> ConversionResult:
-    """Copy an encrypted input unchanged and validate it when requested."""
+    """Copy an encrypted input unchanged without validating it."""
     warning = (
         "Conversion skipped: PDF is encrypted and cannot be converted"
         if pdfa
@@ -519,36 +489,20 @@ def _copy_encrypted_input(
     )
     logger.warning("%s: %s", warning, input_path)
     warnings = [warning]
-    validation_failed = False
-    validate_candidate = validate or pdfua
-    if validate_candidate:
-        validation_failed = _validate_input_snapshot_and_publish(
-            input_path,
-            output_path,
-            level,
-            warnings,
-            pdfua=pdfua,
-            allow_overwrite=allow_overwrite,
-        )
-    else:
-        _copy_input_to_output(
-            input_path,
-            output_path,
-            allow_overwrite=allow_overwrite,
-        )
-    if validation_failed:
-        warnings.append(_VALIDATION_PUBLICATION_WARNING)
+    _copy_input_to_output(
+        input_path,
+        output_path,
+        allow_overwrite=allow_overwrite,
+    )
     processing_time = time.perf_counter() - start_time
     return ConversionResult(
-        success=not validation_failed,
+        success=True,
         input_path=input_path,
         output_path=output_path,
-        level=level if validate_candidate and not validation_failed else None,
+        level=None,
         warnings=warnings,
         processing_time=processing_time,
-        error=_VALIDATION_FAILURE_ERROR if validation_failed else None,
         skipped=True,
-        validation_failed=validation_failed,
     )
 
 
@@ -1121,9 +1075,6 @@ def convert_to_pdfa(
                         input_path,
                         output_path,
                         pdfa=False,
-                        validate=validate,
-                        level=level,
-                        pdfua=pdfua,
                         start_time=start_time,
                         allow_overwrite=_allow_output_overwrite,
                     )
@@ -1154,7 +1105,6 @@ def convert_to_pdfa(
             source_xmp_tree = _extract_existing_xmp(check_pdf) if pdfa else None
             signature_count = count_digital_signatures(check_pdf)
             if signature_count > 0 and not allow_signature_invalidation:
-                processing_time = time.perf_counter() - start_time
                 signature_skip_warning = (
                     _SIGNATURE_SKIP_WARNING
                     if pdfa
@@ -1164,38 +1114,21 @@ def convert_to_pdfa(
                     )
                 )
                 logger.warning("%s: %s", signature_skip_warning, input_path)
-                branch_warnings = [signature_skip_warning]
-                validation_failed = False
                 check_pdf.close()
-                if validate or pdfua:
-                    validation_failed = _validate_input_snapshot_and_publish(
-                        input_path,
-                        output_path,
-                        level,
-                        branch_warnings,
-                        pdfua=pdfua,
-                        allow_overwrite=_allow_output_overwrite,
-                    )
-                else:
-                    _copy_input_to_output(
-                        input_path,
-                        output_path,
-                        allow_overwrite=_allow_output_overwrite,
-                    )
-                if validation_failed:
-                    branch_warnings.append(_VALIDATION_PUBLICATION_WARNING)
+                _copy_input_to_output(
+                    input_path,
+                    output_path,
+                    allow_overwrite=_allow_output_overwrite,
+                )
+                processing_time = time.perf_counter() - start_time
                 return ConversionResult(
-                    success=not validation_failed,
+                    success=True,
                     input_path=input_path,
                     output_path=output_path,
-                    level=(
-                        level if (validate or pdfua) and not validation_failed else None
-                    ),
-                    warnings=branch_warnings,
+                    level=None,
+                    warnings=[signature_skip_warning],
                     processing_time=processing_time,
-                    error=(_VALIDATION_FAILURE_ERROR if validation_failed else None),
                     skipped=True,
-                    validation_failed=validation_failed,
                 )
             if signature_count > 0:
                 warnings.append(
@@ -1927,9 +1860,6 @@ def convert_to_pdfa(
             input_path,
             output_path,
             pdfa=pdfa,
-            validate=validate,
-            level=level,
-            pdfua=pdfua,
             start_time=start_time,
             allow_overwrite=_allow_output_overwrite,
         )

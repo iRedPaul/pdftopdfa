@@ -327,7 +327,7 @@ class TestCliConvert:
 
     @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
-    def test_cli_single_file_skipped_result_is_still_validated(
+    def test_cli_single_file_compliant_skip_is_still_validated(
         self,
         mock_convert_to_pdfa,
         mock_validate,
@@ -364,6 +364,37 @@ class TestCliConvert:
             flavour="2b",
             timeout=300,
         )
+
+    @patch("pdftopdfa.cli.validate_with_verapdf")
+    @patch("pdftopdfa.cli.convert_to_pdfa")
+    def test_cli_single_file_protected_skip_is_not_validated(
+        self,
+        mock_convert_to_pdfa: MagicMock,
+        mock_validate: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """The CLI does not validate when no PDF/A output was created."""
+        output_path = tmp_dir / "output.pdf"
+        mock_convert_to_pdfa.return_value = ConversionResult(
+            success=True,
+            input_path=sample_pdf,
+            output_path=output_path,
+            level=None,
+            skipped=True,
+        )
+
+        result = cli_module._convert_single_file(
+            sample_pdf,
+            str(output_path),
+            "3a",
+            do_validate=True,
+            force=False,
+            quiet=True,
+        )
+
+        assert result == EXIT_SUCCESS
+        mock_validate.assert_not_called()
 
     @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")

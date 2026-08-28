@@ -24,7 +24,6 @@ from pdftopdfa.converter import (
     _compare_pdfa_levels,
     _ensure_binary_comment,
     _truncate_trailing_data,
-    _validate_input_snapshot_and_publish,
     _verify_file_structure,
     convert_directory,
     convert_files,
@@ -399,7 +398,7 @@ class TestConvertToPdfa:
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """Early copy and validation callbacks run after releasing the input PDF."""
+        """Early copy callbacks run after releasing the input PDF."""
         closed = False
 
         def detect_encryption(check_pdf: pikepdf.Pdf) -> bool:
@@ -415,14 +414,8 @@ class TestConvertToPdfa:
 
         def early_callback(*_args: object, **_kwargs: object):
             assert closed
-            if branch == "signed":
-                return False
             return None
 
-        helper = {
-            "signed": "_validate_input_snapshot_and_publish",
-            "no-processing": "_copy_input_to_output",
-        }[branch]
         with (
             patch(
                 "pdftopdfa.converter.is_pdf_encrypted",
@@ -433,7 +426,7 @@ class TestConvertToPdfa:
                 return_value=1 if branch == "signed" else 0,
             ),
             patch(
-                f"pdftopdfa.converter.{helper}",
+                "pdftopdfa.converter._copy_input_to_output",
                 side_effect=early_callback,
             ) as mock_callback,
         ):
@@ -466,67 +459,6 @@ class TestConvertToPdfa:
 
         assert output_path.read_bytes() == sentinel
         assert not list(tmp_dir.glob(".processed_copy_*"))
-
-    def test_validated_input_snapshot_cannot_be_swapped_before_publish(
-        self,
-        sample_pdf: Path,
-        tmp_dir: Path,
-    ) -> None:
-        output_path = tmp_dir / "processed.pdf"
-        sentinel = b"existing output"
-        output_path.write_bytes(sentinel)
-
-        def swap_validated_path(staged_path: Path, *_args: object) -> bool:
-            replacement = Path(staged_path).with_name("replacement.pdf")
-            replacement.write_bytes(b"different bytes")
-            os.replace(replacement, staged_path)
-            return False
-
-        with (
-            patch(
-                "pdftopdfa.converter._validate_pdfa_output",
-                side_effect=swap_validated_path,
-            ),
-            pytest.raises(ConversionError, match="changed after validation"),
-        ):
-            _validate_input_snapshot_and_publish(
-                sample_pdf,
-                output_path,
-                "2a",
-                [],
-            )
-
-        assert output_path.read_bytes() == sentinel
-        assert not list(tmp_dir.glob(".processed_copy_*"))
-
-    def test_validated_in_place_publishes_exact_snapshot(
-        self,
-        sample_pdf: Path,
-    ) -> None:
-        expected = sample_pdf.read_bytes()
-
-        def mutate_input_after_validation(
-            staged_path: Path,
-            *_args: object,
-        ) -> bool:
-            assert staged_path.read_bytes() == expected
-            sample_pdf.write_bytes(b"unvalidated replacement")
-            return False
-
-        with patch(
-            "pdftopdfa.converter._validate_pdfa_output",
-            side_effect=mutate_input_after_validation,
-        ):
-            validation_failed = _validate_input_snapshot_and_publish(
-                sample_pdf,
-                sample_pdf,
-                "2a",
-                [],
-            )
-
-        assert validation_failed is False
-        assert sample_pdf.read_bytes() == expected
-        assert not list(sample_pdf.parent.glob(f".{sample_pdf.stem}_copy_*"))
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Windows ACL regression")
     @pytest.mark.parametrize("existing_output", [False, True])
@@ -1946,51 +1878,35 @@ class TestConvertToPdfa:
         assert not validated_path.exists()
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_encrypted_skip_is_still_validated_when_requested(
+    def test_encrypted_skip_is_not_validated_when_requested(
         self,
         mock_verapdf: MagicMock,
         password_encrypted_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """Explicit validation does not silently bypass encrypted skip output."""
-        mock_verapdf.return_value = VeraPDFResult(
-            compliant=False,
-            flavour="3b",
-            errors=["Encryption is not permitted"],
-        )
+        """Explicit validation is skipped when no PDF/A output was created."""
         output_path = tmp_dir / "output.pdf"
         sentinel = b"existing output"
         output_path.write_bytes(sentinel)
 
         result = convert_to_pdfa(password_encrypted_pdf, output_path, validate=True)
 
-        assert result.success is False
+        assert result.success is True
         assert result.skipped is True
-        assert result.validation_failed is True
-        assert "Validation: Encryption is not permitted" in result.warnings
-        assert any("published despite" in warning for warning in result.warnings)
+        assert result.validation_failed is False
+        assert result.level is None
         assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
-        validated_path = mock_verapdf.call_args.kwargs["path"]
-        assert validated_path != password_encrypted_pdf
-        assert validated_path.parent.parent == output_path.parent
-        assert not validated_path.exists()
+        mock_verapdf.assert_not_called()
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_pdfua_encrypted_skip_always_validates_both_profiles(
+    def test_pdfua_encrypted_skip_is_not_validated(
         self,
         mock_verapdf: MagicMock,
         password_encrypted_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """PDF/UA validation does not suppress an unchanged encrypted copy."""
-        mock_verapdf.side_effect = lambda *, path, flavour: VeraPDFResult(
-            compliant=flavour == "2a",
-            flavour=flavour,
-            errors=[] if flavour == "2a" else ["Encryption is not permitted"],
-        )
+        """Mandatory PDF/UA validation is skipped for an unchanged input."""
         output_path = tmp_dir / "output.pdf"
-        sentinel = b"existing output"
-        output_path.write_bytes(sentinel)
 
         result = convert_to_pdfa(
             password_encrypted_pdf,
@@ -1999,63 +1915,12 @@ class TestConvertToPdfa:
             pdfua=True,
         )
 
-        assert result.success is False
+        assert result.success is True
         assert result.skipped is True
-        assert result.validation_failed is True
+        assert result.validation_failed is False
         assert result.level is None
         assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
-        assert any("published despite" in warning for warning in result.warnings)
-        assert [call.kwargs["flavour"] for call in mock_verapdf.call_args_list] == [
-            "2a",
-            "ua1",
-        ]
-
-    @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_encrypted_skip_publishes_after_successful_validation(
-        self,
-        mock_verapdf: MagicMock,
-        password_encrypted_pdf: Path,
-        tmp_dir: Path,
-    ) -> None:
-        """A validated unchanged encrypted input is published atomically."""
-        mock_verapdf.return_value = VeraPDFResult(compliant=True, flavour="3b")
-        output_path = tmp_dir / "output.pdf"
-        output_path.write_bytes(b"existing output")
-
-        result = convert_to_pdfa(password_encrypted_pdf, output_path, validate=True)
-
-        assert result.validation_failed is False
-        assert result.level == "3b"
-        assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
-        validated_path = mock_verapdf.call_args.kwargs["path"]
-        assert validated_path != password_encrypted_pdf
-        assert validated_path.parent.parent == output_path.parent
-        assert not validated_path.exists()
-
-    @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_encrypted_skip_publishes_exact_validated_snapshot(
-        self,
-        mock_verapdf: MagicMock,
-        password_encrypted_pdf: Path,
-        tmp_dir: Path,
-    ) -> None:
-        """A source change during validation cannot change published bytes."""
-        expected = password_encrypted_pdf.read_bytes()
-
-        def validate_snapshot(*, path: Path, flavour: str) -> VeraPDFResult:
-            assert flavour == "3b"
-            assert path.read_bytes() == expected
-            password_encrypted_pdf.write_bytes(b"changed after snapshot")
-            return VeraPDFResult(compliant=True, flavour=flavour)
-
-        mock_verapdf.side_effect = validate_snapshot
-        output_path = tmp_dir / "output.pdf"
-        output_path.write_bytes(b"existing output")
-
-        result = convert_to_pdfa(password_encrypted_pdf, output_path, validate=True)
-
-        assert result.validation_failed is False
-        assert output_path.read_bytes() == expected
+        mock_verapdf.assert_not_called()
 
     @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_with_ocr_language_fails_when_unavailable(
@@ -2902,20 +2767,15 @@ class TestConvertToPdfa:
         mock_apply_ocr.assert_not_called()
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_signed_skip_is_still_validated_when_requested(
+    def test_signed_skip_is_not_validated_when_requested(
         self,
         mock_verapdf: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """Explicit validation does not silently bypass signed skip output."""
+        """Explicit validation is skipped when a signature prevents conversion."""
         signed_input = tmp_dir / "signed_input.pdf"
         _write_signed_pdf(sample_pdf, signed_input)
-        mock_verapdf.return_value = VeraPDFResult(
-            compliant=False,
-            flavour="3b",
-            errors=["The output is not PDF/A-3b"],
-        )
         output_path = tmp_dir / "output.pdf"
 
         result = convert_to_pdfa(
@@ -2925,75 +2785,12 @@ class TestConvertToPdfa:
             validate=True,
         )
 
-        assert result.success is False
+        assert result.success is True
         assert result.skipped is True
-        assert result.validation_failed is True
-        assert "Validation: The output is not PDF/A-3b" in result.warnings
-        assert any("published despite" in warning for warning in result.warnings)
+        assert result.validation_failed is False
+        assert result.level is None
         assert output_path.read_bytes() == signed_input.read_bytes()
-        validated_path = mock_verapdf.call_args.kwargs["path"]
-        assert validated_path != signed_input
-        assert validated_path.parent.parent == output_path.parent
-        assert not validated_path.exists()
-
-    @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_signed_skip_publishes_exact_validated_snapshot(
-        self,
-        mock_verapdf: MagicMock,
-        sample_pdf: Path,
-        tmp_dir: Path,
-    ) -> None:
-        """Signed copy-through publishes the bytes seen by the validator."""
-        signed_input = tmp_dir / "signed_input.pdf"
-        _write_signed_pdf(sample_pdf, signed_input)
-        expected = signed_input.read_bytes()
-
-        def validate_snapshot(*, path: Path, flavour: str) -> VeraPDFResult:
-            assert flavour == "3b"
-            assert path.read_bytes() == expected
-            signed_input.write_bytes(b"changed after snapshot")
-            return VeraPDFResult(compliant=True, flavour=flavour)
-
-        mock_verapdf.side_effect = validate_snapshot
-        output_path = tmp_dir / "output.pdf"
-        output_path.write_bytes(b"existing output")
-
-        result = convert_to_pdfa(
-            signed_input,
-            output_path,
-            level="3b",
-            validate=True,
-        )
-
-        assert result.validation_failed is False
-        assert output_path.read_bytes() == expected
-
-    @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_signed_validated_in_place_skip_preserves_input(
-        self,
-        mock_verapdf: MagicMock,
-        sample_pdf: Path,
-        tmp_dir: Path,
-    ) -> None:
-        """Validated signed in-place skips do not replace an open input."""
-        signed_input = tmp_dir / "signed_input.pdf"
-        _write_signed_pdf(sample_pdf, signed_input)
-        expected = signed_input.read_bytes()
-        mock_verapdf.return_value = VeraPDFResult(compliant=True, flavour="3b")
-
-        result = convert_to_pdfa(
-            signed_input,
-            signed_input,
-            level="3b",
-            validate=True,
-        )
-
-        assert result.skipped is True
-        assert result.validation_failed is False
-        assert signed_input.read_bytes() == expected
-        validated_path = mock_verapdf.call_args.kwargs["path"]
-        assert validated_path != signed_input
-        assert not validated_path.exists()
+        mock_verapdf.assert_not_called()
 
     def test_signed_pdf_can_be_converted_with_explicit_invalidation(
         self,
@@ -4396,14 +4193,13 @@ class TestConvertFiles:
         assert output_path.read_bytes().startswith(b"%PDF-")
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_convert_files_preserves_encrypted_skip_on_validator_failure(
+    def test_convert_files_does_not_validate_encrypted_skip(
         self,
         mock_verapdf: MagicMock,
         password_encrypted_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """An unavailable validator does not erase encrypted-skip context."""
-        mock_verapdf.side_effect = VeraPDFError("validator crashed")
+        """Batch validation ignores an unchanged encrypted copy."""
         output_path = tmp_dir / "output.pdf"
 
         results = convert_files(
@@ -4414,14 +4210,13 @@ class TestConvertFiles:
 
         assert len(results) == 1
         result = results[0]
-        assert result.success is False
-        assert result.validation_failed is True
+        assert result.success is True
+        assert result.validation_failed is False
         assert result.skipped is True
         assert result.level is None
         assert any("PDF is encrypted" in warning for warning in result.warnings)
-        assert "Validation: veraPDF could not run: validator crashed" in result.warnings
-        assert any("published despite" in warning for warning in result.warnings)
         assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
+        mock_verapdf.assert_not_called()
 
     def test_convert_files_copies_password_encrypted_input(
         self,
