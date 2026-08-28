@@ -24,5 +24,5 @@ def test_infers_english_only_from_strong_document_evidence() -> None:
 
 
 def test_localizes_supported_language_and_tags_english_fallback() -> None:
-    assert accessibility_strings("de-DE").form_field == "Formularfeld"
+    assert accessibility_strings("de-DE").figure == "Bild"
     assert accessibility_strings("fr").language == "en"

@@ -1364,11 +1364,9 @@ class TestConvertToPdfa:
             assert str(pdf.Root.Lang)
             assert pdf.Root.StructTreeRoot.Type == Name.StructTreeRoot
             assert pdf.pages[0].obj.Tabs == Name.S
-            assert str(pdf.docinfo.Title) == sample_pdf.stem
             metadata = bytes(pdf.Root.Metadata.read_bytes())
             assert b"pdfaExtension:schemas" in metadata
             assert sample_pdf.stem.encode() in metadata
-        assert any("WCAG 2.1 3.1.1" in warning for warning in result.warnings)
 
     @pytest.mark.parametrize("level", ["2a", "3a"])
     def test_convert_level_a_preserves_tagged_structure(

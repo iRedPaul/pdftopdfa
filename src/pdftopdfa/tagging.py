@@ -9477,26 +9477,6 @@ def _semantic_node_source_text(
     return " ".join(values) or None
 
 
-def _semantic_heading_title(node: object, source_texts: dict[str, str]) -> str | None:
-    role = getattr(node, "role", None)
-    if role != "H" and not (
-        isinstance(role, str)
-        and len(role) == 2
-        and role[0] == "H"
-        and role[1] in "123456"
-    ):
-        return None
-    title = _semantic_node_source_text(node, source_texts)
-    if title is None or any(
-        0xE000 <= ord(character) <= 0xF8FF
-        or 0xF0000 <= ord(character) <= 0xFFFFD
-        or 0x100000 <= ord(character) <= 0x10FFFD
-        for character in title
-    ):
-        return None
-    return " ".join(title.split()) or None
-
-
 def _missing_plan_alternatives(
     root: object,
     source_actual_texts: dict[str, str],
@@ -9588,7 +9568,6 @@ def _make_semantic_element(
     bindings: dict[str, _SemanticBinding],
     owners: dict[tuple[_ObjectKey, int], Dictionary],
     page_elements: dict[int, Dictionary],
-    source_texts: dict[str, str],
     source_actual_texts: dict[str, str],
     source_alt_texts: dict[str, str],
     fallback_alternatives: AccessibilityStrings | None,
@@ -9614,10 +9593,6 @@ def _make_semantic_element(
     element = pdf.make_indirect(properties)
     if role == "Div" and page_number is not None:
         page_elements[page_number] = element
-
-    heading_title = _semantic_heading_title(node, source_texts)
-    if heading_title is not None:
-        element["/T"] = _bounded_pdf_string(heading_title)
 
     actual_text = getattr(node, "actual_text", None)
     if (not isinstance(actual_text, str) or not actual_text.strip()) and (
@@ -9670,7 +9645,6 @@ def _make_semantic_element(
             bindings,
             owners,
             page_elements,
-            source_texts,
             source_actual_texts,
             source_alt_texts,
             fallback_alternatives,
@@ -10357,7 +10331,6 @@ def _rebuild_semantic_structure(
         bindings,
         owners,
         page_elements,
-        {span_id: binding.text for span_id, binding in bindings.items()},
         source_actual_texts,
         source_alt_texts,
         fallback_alternatives,

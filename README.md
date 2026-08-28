@@ -20,7 +20,6 @@ preserving the original content, fonts, and layout where possible.
   (ISO 19005-2 and ISO 19005-3), including Tagged PDF output for scanned
   documents
 - **PDF/UA-1** -- optional dual-conformance output with PDF/A-2a or PDF/A-3a
-- **WCAG 2.1 PDF techniques** -- applied when PDF/UA output is requested
 - **Automatic font embedding** -- uses policy-approved Windows system fonts or bundled replacements
 - **Font subsetting** -- reduces file size by removing unused glyphs
 - **CJK support** -- embeds Noto Sans CJK for Chinese, Japanese, and Korean text
@@ -65,9 +64,7 @@ pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with 
    links, forms, and reading order from final digital-PDF provenance or the
    internal OCR engine's line and layout data. A provably inverted
    single-column block order is rebuilt; ambiguous or multi-column existing
-   orders are preserved. PDF/UA output additionally applies deterministic
-   WCAG 2.1 PDF techniques for structure-based tab order, document title, page
-   labels, annotation descriptions, and required form-control labels
+   orders are preserved
 8. **Save and validate** -- writes the output with the correct PDF version
    header, publishes it atomically, and reports PDF/A or PDF/UA non-conformance
 
@@ -341,12 +338,6 @@ image, table, and reusable `OCRSession` APIs.
   judge whether content order, descriptions, labels, language, contrast, color
   use, or media alternatives are meaningful; reported semantic uncertainties
   still require human review.
-- **WCAG 2.1 review** -- PDF/UA mode applies the WCAG 2.1 requirements that
-  can be derived safely from the PDF structure. An undetermined document
-  language is reported against success criterion 3.1.1. Criteria requiring
-  authorial or visual judgement, including semantic accuracy, use of color,
-  contrast, and media alternatives, still require manual review; the PDF/UA
-  flag is not by itself a WCAG conformance claim.
 - **Encrypted PDFs** -- encryption is removed from PDFs that open with an empty
   user password. PDFs that require a password cannot be converted and are copied
   unchanged. With an automatically generated output name, the unchanged copy

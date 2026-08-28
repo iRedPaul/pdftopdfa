@@ -264,38 +264,6 @@ is still published with `success=False` and the failure is reported. The program
 PDF/UA-1; PDF/UA-2 requires
 PDF 2.0 and is outside the PDF/A-2/3 output contract.
 
-PDF/UA mode also applies deterministic WCAG 2.1 PDF techniques: every page
-uses structure order for keyboard traversal, the fallback title is synchronized
-to both XMP and the document information dictionary, and required form controls
-include their required state in a trustworthy tooltip or field name. A missing
-or undetermined document language is reported for manual review against success
-criterion 3.1.1. Generated labels are localized for supported document
-languages; strong German or English visible-text evidence can supply a missing
-catalog language. Requirements that depend on authorial or visual judgement,
-such as semantic accuracy, contrast, use of color, and media alternatives,
-still need human review; `--pdfua` is not by itself a WCAG conformance claim.
-
-WCAG 2.1 conformance is evaluated against success criteria. The published PDF
-techniques are informative ways to meet those criteria, not an independent
-checklist that requires every technique in every document. The PDF/UA mode
-handles all safely machine-derivable parts of the applicable techniques as
-follows:
-
-| Area | Implemented automatically | Human verification still required |
-| --- | --- | --- |
-| Document properties | synchronized title, PDF/UA-1 metadata, valid or repaired page labels, strongly evidenced German/English language, and bookmarks generated from titled heading structure | correct document and passage language; meaningful title and bookmark labels |
-| Logical structure | headings, paragraphs, lists, table grammar and header associations, figures/formulas, artifacts, reading order, unique Note IDs | semantic accuracy, heading hierarchy, reading order, list/table interpretation |
-| Images and formulas | preserves and propagates trustworthy Alt, ActualText, and captions; supplies a localized type fallback needed for machine validation and reports it | authoritative descriptions and identification of decorative content; generated type fallbacks are not substantive alternatives |
-| Links, annotations, and forms | Link/Form/Annot ownership, structure tab order, annotation descriptions, field tooltips, required-state labels, accessible link text when it can be bound to visible content | link purpose, field-label meaning, instructions, error messages, and task behavior |
-| Scans | searchable OCR text, line-level tags, language/layout evidence, artifact separation | missed text, diagrams, photos, handwriting, and final reading order |
-| Visual and time-based content | preserves available semantic alternatives and reports uncertainty | color use, contrast, text resizing/reflow, captions, transcripts, audio description, flashing, timing, and media equivalence |
-| Conformance status | mandatory veraPDF PDF/A plus PDF/UA-1 validation without suppressing publication | assistive-technology and keyboard testing with representative users |
-
-This boundary follows the [WCAG 2.1 techniques model](https://www.w3.org/WAI/WCAG21/Understanding/understanding-techniques)
-and the [Matterhorn Protocol](https://pdfa.org/resource/the-matterhorn-protocol/):
-machine validation can reject structural failures, but it cannot decide whether
-author-provided semantics are correct or useful.
-
 Strongly evidenced paragraph, list, and table continuations are joined across
 page breaks. A structure element that genuinely spans pages has no `/Pg` entry;
 its marked-content references and page-local descendants retain their exact

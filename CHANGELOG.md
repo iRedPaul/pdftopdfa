@@ -5,23 +5,20 @@
 ### Features
 
 - Add localized accessibility labels and infer German or English document languages
-- Generate heading bookmarks and repair PDF/UA structures
+- Repair PDF/UA structures
 
 ### Changes
 
 - Report validation failures through `success=False` while retaining published candidates
 - Require veraPDF 1.30.2 or newer and reject unknown validator versions
-- Improve WCAG page labels, role-mapped headings, annotation languages, and CLI warnings
 
 ### Bug Fixes
 
 - Enforce PDF/UA array limits and safely handle oversized table spans
-- Preserve structure-owner languages when adding localized annotation fallbacks
-- Filter duplicate validation warnings when scoping annotation fallback languages
 
 ### Documentation
 
-- Update PDF/UA, WCAG 2.1, and validation behavior documentation
+- Update PDF/UA and validation behavior documentation
 
 ### CI / Build
 
@@ -32,7 +29,6 @@
 ### Features
 
 - Add opt-in PDF/UA-1 output for PDF/A-2a and PDF/A-3a
-- Apply deterministic WCAG 2.1 PDF techniques to PDF/UA output
 
 ### Bug Fixes
 
@@ -41,7 +37,7 @@
 
 ### Documentation
 
-- Document PDF/UA-1 output and WCAG 2.1 implementation
+- Document PDF/UA-1 output
 
 ## [0.9.5] - 2026-08-25
 

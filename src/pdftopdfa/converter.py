@@ -70,7 +70,6 @@ from .utils import (
 )
 from .validator import detect_iso_standards, detect_pdfa_level
 from .verapdf import validate_with_verapdf
-from .wcag import apply_wcag_21, prepare_pdfua_document
 
 logger = logging.getLogger(__name__)
 
@@ -1576,17 +1575,6 @@ def convert_to_pdfa(
         if count > 0:
             warnings.append(f"{count} .notdef usage operator(s) fixed")
 
-        if pdfua:
-            pdfua_prepare_result = prepare_pdfua_document(pdf)
-            printer_marks_preserved = pdfua_prepare_result.get(
-                "printer_mark_annotations_preserved", 0
-            )
-            if printer_marks_preserved:
-                warnings.append(
-                    f"{printer_marks_preserved} PrinterMark annotation(s) "
-                    "preserved as untagged incidental artifacts for PDF/UA-1"
-                )
-
         if level.endswith("a"):
             ocr_manifest = None
             if ocr_manifest_temp_file is not None and ocr_manifest_temp_file.exists():
@@ -1748,27 +1736,6 @@ def convert_to_pdfa(
                         "PDF/UA identification removed from XMP metadata "
                         "(logical structure rebuilt)"
                     )
-
-            if pdfua:
-                wcag_result = apply_wcag_21(pdf)
-                if wcag_result["language_review_required"]:
-                    warnings.append(
-                        "WCAG 2.1 3.1.1 requires manual review: the document "
-                        "language is undetermined"
-                    )
-                annotation_review_count = wcag_result.get(
-                    "annotation_descriptions_review_required", 0
-                )
-                if annotation_review_count:
-                    warnings.append(
-                        f"{annotation_review_count} generated annotation "
-                        "description(s) require human review"
-                    )
-                warnings.append(
-                    "PDF/UA-1 and WCAG 2.1 conformance requires human review "
-                    "of semantic accuracy, reading order, alternatives, "
-                    "language, color and contrast, forms, and media"
-                )
 
         # 7. Create output directory if needed
         output_path.parent.mkdir(parents=True, exist_ok=True)

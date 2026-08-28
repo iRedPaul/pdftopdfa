@@ -16,32 +16,17 @@ class AccessibilityStrings:
     """Accessibility labels for one supported document language."""
 
     language: str
-    form_field: str
-    required_suffix: str
-    required_terms: tuple[str, ...]
-    link: str
-    annotation: str
     figure: str
     formula: str
 
 
 _ENGLISH = AccessibilityStrings(
     language="en",
-    form_field="Form field",
-    required_suffix=" (required)",
-    required_terms=("required", "erforderlich", "pflichtfeld"),
-    link="Link",
-    annotation="{subtype} annotation",
     figure="Image",
     formula="Formula",
 )
 _GERMAN = AccessibilityStrings(
     language="de",
-    form_field="Formularfeld",
-    required_suffix=" (Pflichtfeld)",
-    required_terms=("required", "erforderlich", "pflichtfeld"),
-    link="Link",
-    annotation="{subtype}-Anmerkung",
     figure="Bild",
     formula="Formel",
 )
