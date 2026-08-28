@@ -332,7 +332,7 @@ def test_real_mixed_ocr_keeps_native_and_scan_semantics_once(
         annotation = resolve_indirect(page.obj["/Annots"][0])
         assert annotation.get("/Subtype") == Name.Link
         assert "/StructParent" in annotation
-        assert page.obj.get("/Tabs") == Name.S
+        assert "/Tabs" not in page.obj
         assert {"/Document", "/Div", "/P", "/Link"} <= _roles(pdf)
         original_root = root.objgen
         preserved = ensure_logical_structure(pdf, semantic=True)

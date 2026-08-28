@@ -709,16 +709,16 @@ class TestEnsureDisplayDocTitle:
         assert "/ViewerPreferences" not in pdf.Root
 
     @pytest.mark.parametrize("level", ["2a", "3a"])
-    def test_integration_via_sanitize_for_pdfa(self, level):
+    def test_pdfa_sanitizer_does_not_enable_pdfua_preference(self, level):
         pdf = new_pdf()
         pdf.Root["/ViewerPreferences"] = pikepdf.Dictionary(HideMenubar=True)
 
         result = sanitize_for_pdfa(pdf, level=level)
 
-        assert result["display_doc_title_set"] is True
+        assert "display_doc_title_set" not in result
         viewer_preferences = pdf.Root["/ViewerPreferences"]
         assert viewer_preferences["/HideMenubar"] is True
-        assert viewer_preferences["/DisplayDocTitle"] is True
+        assert "/DisplayDocTitle" not in viewer_preferences
 
 
 class TestEnsureMarkInfo:

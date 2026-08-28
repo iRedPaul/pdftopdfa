@@ -281,9 +281,9 @@ reported when the available OCR layout evidence cannot rule out an unrecognized
 photo or diagram. Link annotations that cannot be associated safely with
 content owned by one logical structure element are likewise retained and
 reported instead of reassigning heading or paragraph content speculatively.
-Form fields without a trustworthy tooltip or field name receive a generic
-structural tooltip and are reported for author review rather than receiving an
-invented accessible name.
+Form fields without a trustworthy tooltip or field name are left without an
+invented accessible name and reported for author review. In PDF/UA mode this
+also causes machine validation to report the missing description.
 
 ### `convert_directory()`
 

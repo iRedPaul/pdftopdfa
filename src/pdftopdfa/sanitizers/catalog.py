@@ -29,8 +29,8 @@ Rule 6.10 forbids /PresSteps entries in Page dictionaries.
 ISO 19005-2, clause 6.7.4 defines the /Lang key in the Document
 Catalog for accessibility and structural compliance.
 
-Level A output also enables /ViewerPreferences /DisplayDocTitle so PDF
-viewers present the document title instead of only the file name.
+PDF/UA output also enables /ViewerPreferences /DisplayDocTitle so PDF viewers
+present the document title instead of only the file name.
 """
 
 import logging
@@ -194,7 +194,7 @@ def remove_forbidden_viewer_preferences(pdf: Pdf) -> int:
 
 
 def ensure_display_doc_title(pdf: Pdf, level: str = "3b") -> bool:
-    """Enable document-title display for semantic Level A output.
+    """Enable document-title display for PDF/UA-compatible Level A output.
 
     Existing valid ViewerPreferences entries are preserved. A malformed
     dictionary, or a malformed/false /DisplayDocTitle value, is repaired only
@@ -220,7 +220,7 @@ def ensure_display_doc_title(pdf: Pdf, level: str = "3b") -> bool:
         return False
 
     viewer_preferences["/DisplayDocTitle"] = True
-    logger.info("Enabled /ViewerPreferences /DisplayDocTitle for Level A output")
+    logger.info("Enabled /ViewerPreferences /DisplayDocTitle for PDF/UA output")
     return True
 
 

@@ -733,7 +733,7 @@ def test_digital_tj_tj_and_image_have_stable_parent_tree_after_reopen() -> None:
         assert preserved["semantic_alternatives_review_required"] == 1
 
 
-def test_pdfua_localizes_fallback_alt_and_infers_document_language() -> None:
+def test_pdfua_does_not_invent_fallback_alt_or_document_language() -> None:
     pdf = pikepdf.Pdf.new()
     font = _font(pdf)
     image = _image(pdf)
@@ -756,9 +756,8 @@ def test_pdfua_localizes_fallback_alt_and_infers_document_language() -> None:
     figure = next(
         item for item in _structure_objects(pdf) if item.get("/S") == Name.Figure
     )
-    assert str(pdf.Root["/Lang"]) == "de"
-    assert str(figure["/Alt"]) == "Bild"
-    assert result["document_language_inferred"] == 1
+    assert "/Lang" not in pdf.Root
+    assert "/Alt" not in figure
     assert result["semantic_alternatives_review_required"] == 1
 
 
@@ -847,7 +846,7 @@ def test_semantic_link_owns_overlapping_text_and_objr_after_reopen() -> None:
     assert result["annotations_tagged"] == 1
     assert result["semantic_link_review_required"] == 0
     assert str(annotation["/Contents"]) == "Open documentation"
-    assert page.obj["/Tabs"] == Name.S
+    assert "/Tabs" not in page.obj
     link = next(item for item in _structure_objects(pdf) if item.get("/S") == Name.Link)
     link_kids = _k_objects(link)
     assert [item.get("/Type") for item in link_kids] == [Name.MCR, Name.OBJR]
@@ -1487,7 +1486,7 @@ def test_unlabeled_widget_requires_review_after_reopen() -> None:
     result = ensure_logical_structure(pdf, semantic=True)
 
     assert result["semantic_form_review_required"] == 1
-    assert str(widget["/TU"]) == "Form field"
+    assert "/TU" not in widget
     form = next(item for item in _structure_objects(pdf) if item.get("/S") == Name.Form)
     parent_tree = NumberTree(pdf.Root["/StructTreeRoot"]["/ParentTree"])
     assert (
@@ -1512,7 +1511,7 @@ def test_unlabeled_widget_requires_review_after_reopen() -> None:
             reopened_tree[int(reopened_widget["/StructParent"])]
         )
         assert reopened_owner.get("/S") == Name.Form
-        assert str(reopened_widget["/TU"]) == "Form field"
+        assert "/TU" not in reopened_widget
 
 
 def test_semantic_widgets_follow_spatial_reading_order_after_reopen() -> None:
@@ -2101,7 +2100,7 @@ def test_existing_empty_caption_still_requires_alternative_review() -> None:
     assert second["semantic_alternatives_review_required"] == 1
 
 
-def test_pdfua_preserved_figure_gets_localized_fallback_alt() -> None:
+def test_pdfua_preserved_figure_does_not_get_fallback_alt() -> None:
     pdf = pikepdf.Pdf.new()
     pdf.Root["/Lang"] = String("de")
     page = _page(pdf, b"/Span <</MCID 0>> BDC q Q EMC")
@@ -2131,16 +2130,15 @@ def test_pdfua_preserved_figure_gets_localized_fallback_alt() -> None:
 
     assert result["structure_preserved"] is True
     assert result["semantic_alternatives_review_required"] == 1
-    assert str(figure["/Alt"]) == "Bild"
+    assert "/Alt" not in figure
 
 
 @pytest.mark.parametrize(
-    ("role", "fallback_alt"),
-    [(Name.Figure, "Image"), (Name.Formula, "Formula")],
+    "role",
+    [Name.Figure, Name.Formula],
 )
-def test_pdfua_preserved_fallback_alt_overrides_conflicting_language(
+def test_pdfua_preserved_element_keeps_language_without_fallback_alt(
     role: Name,
-    fallback_alt: str,
 ) -> None:
     pdf = pikepdf.Pdf.new()
     pdf.Root["/Lang"] = String("fr")
@@ -2171,8 +2169,9 @@ def test_pdfua_preserved_fallback_alt_overrides_conflicting_language(
     result = ensure_logical_structure(pdf, semantic=True, pdfua=True)
 
     assert result["structure_preserved"] is True
-    assert str(element["/Alt"]) == fallback_alt
-    assert str(element["/Lang"]) == "en"
+    assert result["semantic_alternatives_review_required"] == 1
+    assert "/Alt" not in element
+    assert str(element["/Lang"]) == "fr"
 
 
 def test_existing_figure_does_not_combine_distinct_inner_actualtext_values() -> None:
@@ -2711,7 +2710,7 @@ def test_repeated_page_content_and_paths_become_typed_artifacts() -> None:
     assert artifact_types.count(("/Pagination", "/Header")) == 3
     assert artifact_types.count(("/Pagination", "/Footer")) == 6
     assert artifact_types.count(("/Layout", None)) == 3
-    assert all(page.obj["/Tabs"] == Name.S for page in pdf.pages)
+    assert all("/Tabs" not in page.obj for page in pdf.pages)
 
 
 def test_generated_path_artifact_marker_starts_before_path_object() -> None:
@@ -2749,7 +2748,7 @@ def test_ocr_form_mcid_is_referenced_by_mcr_and_preserves_unicode() -> None:
         assert isinstance(form, pikepdf.Stream)
         assert "/StructParents" in form
         assert "/StructParents" not in page.obj
-        assert page.obj["/Tabs"] == Name.S
+        assert "/Tabs" not in page.obj
         assert str(reopened.Root["/Lang"]) == "de-DE"
 
         mcr = next(

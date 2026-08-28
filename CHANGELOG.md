@@ -4,7 +4,6 @@
 
 ### Features
 
-- Add localized accessibility labels and infer German or English document languages
 - Repair PDF/UA structures
 
 ### Changes

@@ -224,9 +224,6 @@ def sanitize_for_pdfa(
     # Remove forbidden ViewerPreferences entries (ISO 19005-2, 6.1.2)
     result["viewer_prefs_entries_removed"] = remove_forbidden_viewer_preferences(pdf)
 
-    # Present the document title for semantic Level A output.
-    result["display_doc_title_set"] = ensure_display_doc_title(pdf, level)
-
     # Ensure /Lang key in catalog (ISO 19005-2, 6.7.4)
     result["catalog_lang_set"] = ensure_catalog_lang(pdf)
 

@@ -49,6 +49,7 @@ from .metadata import (
 from .ocr import validate_ocr_languages
 from .sanitizers import (
     count_digital_signatures,
+    ensure_display_doc_title,
     sanitize_for_pdfa,
     sanitize_notdef_usage,
     sanitize_signatures,
@@ -65,7 +66,6 @@ from .tagging import ensure_logical_structure
 from .utils import (
     get_required_pdf_version,
     is_pdf_encrypted,
-    resolve_indirect,
     validate_pdfa_level,
 )
 from .validator import detect_iso_standards, detect_pdfa_level
@@ -1498,6 +1498,8 @@ def convert_to_pdfa(
         # 4. Sanitize PDF for PDF/A
         logger.debug("Sanitizing PDF for PDF/A-%s", level)
         sanitize_result = sanitize_for_pdfa(pdf, level, preserve_stamps=preserve_stamps)
+        if pdfua:
+            ensure_display_doc_title(pdf, level)
 
         # Collect warnings from sanitization
         for key, message in _SANITIZE_WARNINGS:
@@ -1596,12 +1598,6 @@ def convert_to_pdfa(
                 ocr_manifest=ocr_manifest,
                 preflight=False,
             )
-            if tagging_result.get("document_language_inferred", 0):
-                warnings.append(
-                    "Document language inferred from visible text as "
-                    f"{resolve_indirect(pdf.Root.get('/Lang'))}; manual review "
-                    "is required"
-                )
             if tagging_result.get("semantic_repairs", 0):
                 repair_count = tagging_result["semantic_repairs"]
                 repair_label = "property" if repair_count == 1 else "properties"
@@ -1617,17 +1613,11 @@ def convert_to_pdfa(
                     "element" if alternative_review_count == 1 else "elements"
                 )
                 review_verb = "requires" if alternative_review_count == 1 else "require"
-                warning = (
+                warnings.append(
                     f"{alternative_review_count} Figure/Formula {element_label} "
                     f"{review_verb} manual review: no trustworthy Alt, "
                     "ActualText, or Caption is available"
                 )
-                if pdfua:
-                    warning += (
-                        "; a localized fallback was supplied for machine-level "
-                        "PDF/UA validation"
-                    )
-                warnings.append(warning)
             vector_review_count = tagging_result.get(
                 "semantic_vector_review_required",
                 0,

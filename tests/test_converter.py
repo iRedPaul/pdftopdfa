@@ -1363,7 +1363,7 @@ class TestConvertToPdfa:
             assert bool(pdf.Root.ViewerPreferences.DisplayDocTitle) is True
             assert str(pdf.Root.Lang)
             assert pdf.Root.StructTreeRoot.Type == Name.StructTreeRoot
-            assert pdf.pages[0].obj.Tabs == Name.S
+            assert "/Tabs" not in pdf.pages[0].obj
             metadata = bytes(pdf.Root.Metadata.read_bytes())
             assert b"pdfaExtension:schemas" in metadata
             assert sample_pdf.stem.encode() in metadata
@@ -1381,7 +1381,7 @@ class TestConvertToPdfa:
         assert result.level == level
         with Pdf.open(output_path) as pdf:
             assert bool(pdf.Root.MarkInfo.Marked) is True
-            assert bool(pdf.Root.ViewerPreferences.DisplayDocTitle) is True
+            assert "/ViewerPreferences" not in pdf.Root
             assert pdf.Root.StructTreeRoot.Type == Name.StructTreeRoot
             assert len(pdf.Root.StructTreeRoot.K) == 1
 

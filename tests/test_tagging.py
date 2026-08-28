@@ -2600,7 +2600,8 @@ def test_explicit_rebuild_replaces_existing_structure_and_page_key() -> None:
     assert len(_content_streams(page)) == 3
 
 
-def test_tags_annotation_roles_with_objr_and_parent_tree_entries() -> None:
+@pytest.mark.parametrize("pdfua", [False, True])
+def test_tags_annotation_roles_with_objr_and_parent_tree_entries(pdfua: bool) -> None:
     pdf = new_pdf()
     page = _add_page(pdf, b"q Q")
     page.obj["/StructParent"] = 98
@@ -2627,10 +2628,10 @@ def test_tags_annotation_roles_with_objr_and_parent_tree_entries() -> None:
     )
     page.obj["/Annots"] = Array([first, second, third])
 
-    result = ensure_logical_structure(pdf)
+    result = ensure_logical_structure(pdf, pdfua=pdfua)
 
     assert result["annotations_tagged"] == 3
-    assert page.obj["/Tabs"] == Name.S
+    assert (page.obj.get("/Tabs") == Name.S) is pdfua
     annotations = [resolve_indirect(item) for item in page.obj["/Annots"]]
     assert [int(item["/StructParent"]) for item in annotations] == [1, 2, 3]
     assert "/StructParent" not in page.obj
