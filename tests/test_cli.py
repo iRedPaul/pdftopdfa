@@ -771,6 +771,48 @@ class TestCliForceOverwrite:
         assert result.exit_code == EXIT_GENERAL_ERROR
         assert "already exists" in result.output
 
+    @patch("pdftopdfa.cli.convert_to_pdfa")
+    def test_cli_refused_overwrite_replaces_stale_audit_report(
+        self,
+        mock_convert_to_pdfa: MagicMock,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """A no-overwrite refusal replaces evidence from an earlier run."""
+        output_path = tmp_dir / "output.pdf"
+        output_path.write_text("existing content")
+        report_path = tmp_dir / "audit.json"
+        report_path.write_text('{"stale": true}', encoding="utf-8")
+
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--audit-report",
+                str(report_path),
+            ],
+        )
+
+        assert result.exit_code == EXIT_GENERAL_ERROR
+        mock_convert_to_pdfa.assert_not_called()
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        assert report == {
+            "schema_version": 1,
+            "results": [],
+            "fatal_error": {
+                "error_type": "FileExistsError",
+                "exit_code": EXIT_GENERAL_ERROR,
+                "input_path": str(sample_pdf),
+                "message": (
+                    f"Output file already exists: {output_path}. "
+                    "Use --force to overwrite."
+                ),
+                "output_path": str(output_path),
+            },
+        }
+
     def test_cli_allows_overwrite_with_force(
         self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
     ) -> None:

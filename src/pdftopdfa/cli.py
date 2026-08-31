@@ -657,9 +657,22 @@ def _convert_single_file(
 
     # Check if output exists
     if output_path.exists() and not force:
-        print_error(
+        message = (
             f"Output file already exists: {output_path}. Use --force to overwrite."
         )
+        print_error(message)
+        if audit_report is not None:
+            _write_audit_report(
+                audit_report,
+                [],
+                fatal_error={
+                    "error_type": "FileExistsError",
+                    "message": message,
+                    "exit_code": EXIT_GENERAL_ERROR,
+                    "input_path": str(input_path),
+                    "output_path": str(output_path),
+                },
+            )
         return EXIT_GENERAL_ERROR
 
     if not quiet:
