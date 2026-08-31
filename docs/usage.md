@@ -548,8 +548,10 @@ except ConversionError as exc:
 Encrypted PDFs are ordinarily copied to the output path unchanged and returned with
 `success=True`, `skipped=True`, and a warning that conversion was skipped. The
 copy has not been converted and is not guaranteed to conform to PDF/A, even if
-its default output name ends in `_pdfa.pdf`. If PDF/UA was requested, fail-closed
-publication preserves an existing destination and returns `success=False`,
+its default output name ends in `_pdfa.pdf`. If PDF/A validation was requested,
+the unchanged input is not published by default and the result records an
+incomplete validation. If PDF/UA was requested, fail-closed publication
+preserves an existing destination and returns `success=False`,
 `published=False`, `target_produced=False`, and
 `pdfua_status="not_produced"`. `publication_policy="always"` or
 `--publish-noncompliant` explicitly enables unchanged copy-through.
@@ -558,8 +560,9 @@ Digitally signed PDFs are also copied unchanged by default, because OCR,
 metadata repair, font embedding, and PDF/A rewriting would invalidate the
 cryptographic signature. The result has `success=True`, `skipped=True`, and a
 warning, but the unchanged copy is not guaranteed to conform to the requested
-PDF/A level. If PDF/UA was requested, the protected input is not published by
-default and likewise returns `success=False`, `published=False`,
+PDF/A level. Requested PDF/A validation withholds the unchanged input by default
+and records an incomplete validation. If PDF/UA was requested, the protected
+input is not published by default and likewise returns `success=False`, `published=False`,
 `target_produced=False`, and `pdfua_status="not_produced"`.
 Use `--allow-signature-invalidation` or
 `allow_signature_invalidation=True` only when you intentionally want an

@@ -15,6 +15,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from typing import NoReturn
 
 # Third Party
 import click
@@ -414,20 +415,6 @@ def main(
 
     input_path_obj = Path(input_path)
 
-    if pdfua and not pdfa:
-        raise click.UsageError("--pdfua cannot be combined with --no-pdfa")
-    if pdfua and level not in {"2a", "3a"}:
-        raise click.UsageError("--pdfua requires --level 2a or 3a")
-    if not pdfa and do_validate:
-        raise click.UsageError("--validate cannot be combined with --no-pdfa")
-    if not pdfa and (document_title is not None or document_language is not None):
-        raise click.UsageError(
-            "Document metadata options cannot be combined with --no-pdfa"
-        )
-    if publish_noncompliant and not (do_validate or pdfua):
-        raise click.UsageError("--publish-noncompliant requires --validate or --pdfua")
-    if input_path_obj.is_dir() and document_title is not None:
-        raise click.UsageError("--document-title is only valid for a single PDF")
     if audit_report is not None and audit_report.suffix.lower() != ".json":
         raise click.UsageError("--audit-report must use a .json filename")
     if audit_report is not None:
@@ -443,14 +430,45 @@ def main(
                 "Audit report path must differ from input and output"
             )
 
+    def raise_usage_error(message: str) -> NoReturn:
+        error = click.UsageError(message)
+        if audit_report is not None:
+            failure: dict[str, object] = {
+                "error_type": type(error).__name__,
+                "message": message,
+                "exit_code": error.exit_code,
+                "input_path": str(input_path_obj),
+            }
+            if output is not None:
+                failure["output_path"] = output
+            try:
+                _write_audit_report(audit_report, [], fatal_error=failure)
+            except Exception as audit_error:
+                logger.exception("Could not write failure audit report")
+                print_error(f"Could not write audit report: {audit_error}")
+        raise error
+
+    if pdfua and not pdfa:
+        raise_usage_error("--pdfua cannot be combined with --no-pdfa")
+    if pdfua and level not in {"2a", "3a"}:
+        raise_usage_error("--pdfua requires --level 2a or 3a")
+    if not pdfa and do_validate:
+        raise_usage_error("--validate cannot be combined with --no-pdfa")
+    if not pdfa and (document_title is not None or document_language is not None):
+        raise_usage_error("Document metadata options cannot be combined with --no-pdfa")
+    if publish_noncompliant and not (do_validate or pdfua):
+        raise_usage_error("--publish-noncompliant requires --validate or --pdfua")
+    if input_path_obj.is_dir() and document_title is not None:
+        raise_usage_error("--document-title is only valid for a single PDF")
+
     if deskew and ocr_force:
-        raise click.UsageError("--deskew cannot be combined with --ocr-force")
+        raise_usage_error("--deskew cannot be combined with --ocr-force")
 
     model_pair_complete = (
         ocr_detection_model_dir is not None and ocr_recognition_model_dir is not None
     )
     if (ocr_detection_model_dir is None) != (ocr_recognition_model_dir is None):
-        raise click.UsageError(
+        raise_usage_error(
             "--ocr-detection-model-dir and --ocr-recognition-model-dir "
             "must be provided together"
         )
@@ -463,7 +481,7 @@ def main(
         or ocr_layout
     ):
         if not model_pair_complete:
-            raise click.UsageError(
+            raise_usage_error(
                 "OCR requires --ocr-detection-model-dir and --ocr-recognition-model-dir"
             )
     if model_pair_complete:
@@ -475,7 +493,7 @@ def main(
         try:
             validate_ocr_languages(ocr_languages)
         except ValueError as exc:
-            raise click.UsageError(str(exc)) from exc
+            raise_usage_error(str(exc))
 
     fatal_error: Exception | None = None
     try:

@@ -394,6 +394,39 @@ class TestCliConvert:
             "output_path": str(output_path),
         }
 
+    def test_cli_replaces_stale_audit_report_after_usage_error(
+        self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """A rejected option combination cannot leave stale audit evidence."""
+        output_path = tmp_dir / "output.pdf"
+        report_path = tmp_dir / "audit.json"
+        report_path.write_text('{"stale": true}', encoding="utf-8")
+
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--audit-report",
+                str(report_path),
+                "--publish-noncompliant",
+            ],
+        )
+
+        assert result.exit_code == 2
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        assert report == {
+            "fatal_error": {
+                "error_type": "UsageError",
+                "exit_code": 2,
+                "input_path": str(sample_pdf),
+                "message": "--publish-noncompliant requires --validate or --pdfua",
+                "output_path": str(output_path),
+            },
+            "results": [],
+            "schema_version": 1,
+        }
+
     def test_cli_rejects_non_json_audit_report(
         self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
     ) -> None:
@@ -1019,6 +1052,27 @@ class TestCliValidation:
         assert result.exit_code == EXIT_VALIDATION_FAILED
         assert "Validation: veraPDF could not run" in result.output
         assert not output_path.exists()
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_cli_encrypted_validation_failure_withholds_output(
+        self,
+        mock_validate: MagicMock,
+        runner: CliRunner,
+        password_encrypted_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Protected input still returns the validation failure exit code."""
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [str(password_encrypted_pdf), str(output_path), "--validate"],
+        )
+
+        assert result.exit_code == EXIT_VALIDATION_FAILED
+        assert "validation could not run" in result.output
+        assert not output_path.exists()
+        mock_validate.assert_not_called()
 
     @patch("pdftopdfa.cli.convert_to_pdfa")
     def test_cli_validation_runtime_error_returns_failure_status(

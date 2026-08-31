@@ -667,6 +667,7 @@ def _copy_encrypted_input(
     pdfa: bool,
     pdfua: bool = False,
     publish_unconverted: bool = False,
+    validation_profile: str | None = None,
     start_time: float,
     allow_overwrite: bool = True,
 ) -> ConversionResult:
@@ -677,22 +678,37 @@ def _copy_encrypted_input(
         else "Processing skipped: PDF is encrypted and cannot be processed"
     )
     logger.warning("%s: %s", warning, input_path)
-    published = not pdfua or publish_unconverted
     warnings = [warning]
+    validation_error = None
+    if validation_profile is not None:
+        validation_error = (
+            f"PDF/A-{validation_profile} validation could not run because the "
+            "encrypted input could not be converted"
+        )
+        warnings.append(f"Validation: {validation_error}")
+
+    publication_requires_opt_in = pdfua or validation_error is not None
+    published = not publication_requires_opt_in or publish_unconverted
     if published:
         _copy_input_to_output(
             input_path,
             output_path,
             allow_overwrite=allow_overwrite,
         )
-    else:
+    elif pdfua:
         warnings.append(
             "Encrypted input was not published because the PDF/UA target "
             "could not be produced"
         )
+    if validation_error is not None:
+        warnings.append(
+            _VALIDATION_PUBLICATION_WARNING
+            if published
+            else _VALIDATION_WITHHELD_WARNING
+        )
     processing_time = time.perf_counter() - start_time
     return ConversionResult(
-        success=not pdfua,
+        success=not publication_requires_opt_in,
         input_path=input_path,
         output_path=output_path,
         level=None,
@@ -701,12 +717,27 @@ def _copy_encrypted_input(
         error=(
             "PDF/UA target was not produced because the input is encrypted"
             if pdfua
+            else (
+                _VALIDATION_FAILURE_ERROR if published else _VALIDATION_WITHHELD_ERROR
+            )
+            if validation_error is not None
             else None
         ),
+        validation_failed=validation_error is not None,
         skipped=True,
         published=published,
         target_produced=not pdfa,
         pdfua_status=(PDFUAStatus.NOT_PRODUCED if pdfua else PDFUAStatus.NOT_REQUESTED),
+        validation_results=(
+            (
+                ProfileValidationResult(
+                    profile=validation_profile,
+                    error=validation_error,
+                ),
+            )
+            if validation_profile is not None
+            else ()
+        ),
     )
 
 
@@ -1390,24 +1421,39 @@ def convert_to_pdfa(
                 )
                 logger.warning("%s: %s", signature_skip_warning, input_path)
                 check_pdf.close()
-                published = not pdfua or (
+                validation_error = None
+                if validate and not pdfua:
+                    validation_error = (
+                        f"PDF/A-{level} validation could not run because conversion "
+                        "would invalidate a digital signature"
+                    )
+                publication_requires_opt_in = pdfua or validation_error is not None
+                published = not publication_requires_opt_in or (
                     effective_publication_policy is PublicationPolicy.ALWAYS
                 )
                 signature_warnings = [signature_skip_warning]
+                if validation_error is not None:
+                    signature_warnings.append(f"Validation: {validation_error}")
                 if published:
                     _copy_input_to_output(
                         input_path,
                         output_path,
                         allow_overwrite=_allow_output_overwrite,
                     )
-                else:
+                elif pdfua:
                     signature_warnings.append(
                         "Signed input was not published because the PDF/UA target "
                         "could not be produced"
                     )
+                if validation_error is not None:
+                    signature_warnings.append(
+                        _VALIDATION_PUBLICATION_WARNING
+                        if published
+                        else _VALIDATION_WITHHELD_WARNING
+                    )
                 processing_time = time.perf_counter() - start_time
                 return ConversionResult(
-                    success=not pdfua,
+                    success=not publication_requires_opt_in,
                     input_path=input_path,
                     output_path=output_path,
                     level=None,
@@ -1417,13 +1463,30 @@ def convert_to_pdfa(
                         "PDF/UA target was not produced because conversion would "
                         "invalidate a digital signature"
                         if pdfua
+                        else (
+                            _VALIDATION_FAILURE_ERROR
+                            if published
+                            else _VALIDATION_WITHHELD_ERROR
+                        )
+                        if validation_error is not None
                         else None
                     ),
+                    validation_failed=validation_error is not None,
                     skipped=True,
                     published=published,
                     target_produced=not pdfa,
                     pdfua_status=(
                         PDFUAStatus.NOT_PRODUCED if pdfua else PDFUAStatus.NOT_REQUESTED
+                    ),
+                    validation_results=(
+                        (
+                            ProfileValidationResult(
+                                profile=level,
+                                error=validation_error,
+                            ),
+                        )
+                        if validation_error is not None
+                        else ()
                     ),
                 )
             if signature_count > 0:
@@ -2318,6 +2381,7 @@ def convert_to_pdfa(
             publish_unconverted=(
                 effective_publication_policy is PublicationPolicy.ALWAYS
             ),
+            validation_profile=level if validate and not pdfua else None,
             start_time=start_time,
             allow_overwrite=_allow_output_overwrite,
         )

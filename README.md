@@ -362,11 +362,13 @@ image, table, and reusable `OCRSession` APIs.
   user password. PDFs that require a password cannot be converted and are
   ordinarily copied unchanged. With an automatically generated output name, the unchanged copy
   still receives the `_pdfa.pdf` suffix; it is not a converted PDF/A file.
+  When PDF/A validation is requested, the unchanged input is not published by
+  default because the requested target could not be produced or validated.
   A requested PDF/UA target returns `success=False` and
   `pdfua_status="not_produced"` and preserves the destination without
   publishing the protected input. `--publish-noncompliant` explicitly enables
   unchanged copy-through.
-- **Digitally signed PDFs** -- signed PDFs are ordinarily copied unchanged because conversion would invalidate their signatures. A requested PDF/UA target returns `success=False` and `pdfua_status="not_produced"` without publishing by default; use `--allow-signature-invalidation` only when an unsigned archival copy is intentional
+- **Digitally signed PDFs** -- signed PDFs are ordinarily copied unchanged because conversion would invalidate their signatures. Requested PDF/A validation withholds the unchanged input by default. A requested PDF/UA target returns `success=False` and `pdfua_status="not_produced"` without publishing by default; use `--allow-signature-invalidation` only when an unsigned archival copy is intentional
 - **Font replacement** -- fonts without a suitable metrically compatible replacement produce a warning; the resulting file may not be fully compliant
 - **Non-embedded CIDFonts (Identity encoding)** -- content streams reference glyph IDs of the original font; after replacement with a substitute font the same glyph IDs point to different or missing glyphs, so the affected text may render incorrectly or invisibly. Text extraction and copy/paste stay correct because the original ToUnicode mapping is preserved. A warning is emitted for each replaced CIDFont
 
