@@ -41,7 +41,6 @@ from pdftopdfa._ocr_runtime import (
 )
 from pdftopdfa.exceptions import OCRError
 from pdftopdfa.ocr import (
-    _OCR_MAX_DOCUMENT_RASTER_PIXELS,
     _OCR_MAX_PAGE_RASTER_PIXELS,
     _cleanup_ocr_resources,
     _finalize_ocr_output,
@@ -1253,79 +1252,24 @@ class TestOcrResourcePreflight:
             ]
         )
 
-        with (
-            patch("ocrmypdf.pdfinfo.PdfInfo", return_value=pdfinfo_value),
-            patch(
-                "pdftopdfa.ocr._OCR_MAX_DOCUMENT_RASTER_PIXELS",
-                17_363_889,
-            ),
-        ):
+        with patch("ocrmypdf.pdfinfo.PdfInfo", return_value=pdfinfo_value):
             assert _preflight_ocr_input(path) == 300
 
         assert "preferred 600 dpi oversampling (effective 800 dpi)" in caplog.text
         assert "using 300 dpi" in caplog.text
         assert "17,363,889 pixels expected" in caplog.text
 
-    @pytest.mark.parametrize("document_limit", [77_714_648, 77_714_647])
-    def test_document_budget_uses_planned_fallback_dpi(
+    def test_allows_large_document_with_safe_individual_pages(
         self,
         tmp_dir: Path,
-        document_limit: int,
     ) -> None:
-        path = tmp_dir / f"fallback-budget-{document_limit}.pdf"
+        path = tmp_dir / "large-raster-document.pdf"
         with Pdf.new() as pdf:
-            pdf.add_blank_page(page_size=(1700, 2338))
-            pdf.add_blank_page(page_size=(595, 842))
-            pdf.save(path)
-        pdfinfo_value = SimpleNamespace(
-            pages=[
-                SimpleNamespace(
-                    has_text=False,
-                    images=[],
-                    dpi=SimpleNamespace(x=72.0, y=72.0),
-                ),
-                SimpleNamespace(
-                    has_text=False,
-                    images=[],
-                    dpi=SimpleNamespace(x=0.0, y=0.0),
-                ),
-            ]
-        )
-
-        with (
-            patch("ocrmypdf.pdfinfo.PdfInfo", return_value=pdfinfo_value),
-            patch(
-                "pdftopdfa.ocr._OCR_MAX_DOCUMENT_RASTER_PIXELS",
-                document_limit,
-            ),
-        ):
-            if document_limit == 77_714_648:
-                assert _preflight_ocr_input(path) == 300
-            else:
-                with pytest.raises(OCRError, match="document raster work"):
-                    _preflight_ocr_input(path)
-
-    @pytest.mark.parametrize(("page_count", "exceeds_limit"), [(28, False), (29, True)])
-    def test_enforces_document_raster_work_limit(
-        self,
-        tmp_dir: Path,
-        page_count: int,
-        exceeds_limit: bool,
-    ) -> None:
-        path = tmp_dir / f"raster-document-{page_count}.pdf"
-        with Pdf.new() as pdf:
-            for _ in range(page_count):
+            for _ in range(29):
                 pdf.add_blank_page(page_size=(595, 842))
             pdf.save(path)
 
-        if exceeds_limit:
-            with pytest.raises(
-                OCRError,
-                match=f"more than {_OCR_MAX_DOCUMENT_RASTER_PIXELS:,} pixels",
-            ):
-                _preflight_ocr_input(path)
-        else:
-            _preflight_ocr_input(path)
+        assert _preflight_ocr_input(path) == 600
 
     def test_enforces_document_page_count_before_pdfinfo_analysis(
         self,

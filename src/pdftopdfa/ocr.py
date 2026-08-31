@@ -80,8 +80,6 @@ _OCR_RASTER_DPI = 600
 _OCR_FALLBACK_RASTER_DPI = 300
 # Keeps one grayscale raster near 100 MB while still admitting A3 at 600 dpi.
 _OCR_MAX_PAGE_RASTER_PIXELS = 100_000_000
-# Bound aggregate raster work from small PDFs with arbitrarily many pages.
-_OCR_MAX_DOCUMENT_RASTER_PIXELS = 1_000_000_000
 # Bound non-raster page inspection and planning work as well.
 _OCR_MAX_DOCUMENT_PAGES = 10_000
 _OCR_MANIFEST_GEOMETRY_TOLERANCE = 1e-6
@@ -2690,7 +2688,6 @@ def _preflight_ocr_input(
         pdfinfo = PdfInfo(pdf_path, max_workers=1)
         if len(pdfinfo.pages) != len(page_dimensions):
             raise OCRError("Page count changed during OCR resource preflight")
-        document_raster_pixels = 0
         raster_pages = []
         for page_number, (page_info, dimensions, has_text, scan_like) in enumerate(
             zip(
@@ -2721,12 +2718,6 @@ def _preflight_ocr_input(
                         f"Paddle orientation page {page_number} would require "
                         f"{orientation_pixels:,} pixels at {orientation_dpi:g} dpi; "
                         f"the safety limit is {_OCR_MAX_PAGE_RASTER_PIXELS:,} pixels"
-                    )
-                document_raster_pixels += orientation_pixels
-                if document_raster_pixels > _OCR_MAX_DOCUMENT_RASTER_PIXELS:
-                    raise OCRError(
-                        "OCR document raster work would require more than "
-                        f"{_OCR_MAX_DOCUMENT_RASTER_PIXELS:,} pixels"
                     )
             renderable_image = any(image.renderable for image in page_info.images)
             will_rasterize = (
@@ -2776,12 +2767,6 @@ def _preflight_ocr_input(
                     )
                 raster_dpi = float(planned_oversample)
                 pixel_count = capped_pixel_count
-            document_raster_pixels += pixel_count
-            if document_raster_pixels > _OCR_MAX_DOCUMENT_RASTER_PIXELS:
-                raise OCRError(
-                    "OCR document raster work would require more than "
-                    f"{_OCR_MAX_DOCUMENT_RASTER_PIXELS:,} pixels"
-                )
             planned_pages.append((page_number, raster_dpi, pixel_count))
         for page_number, raster_dpi, pixel_count in planned_pages:
             if page_number not in oversized_pages:

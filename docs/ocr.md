@@ -49,9 +49,7 @@ cleanup is always attempted independently; a cleanup failure aborts an
 otherwise successful call, but is only logged when another OCR error is already
 propagating so that the primary failure remains visible.
 
-Aggregate orientation and OCR raster work is limited to one billion pixels per
-document, and OCR input is limited to 10,000 pages so that arbitrarily many tiny
-pages cannot bypass the raster budget. PDF and semantic-manifest candidates are
+OCR input is limited to 10,000 pages. PDF and semantic-manifest candidates are
 created in private same-filesystem staging directories, then checked for
 pathname identity and byte-for-byte stability immediately before atomic
 publication.
