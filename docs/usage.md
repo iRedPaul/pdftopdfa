@@ -31,7 +31,12 @@ pdftopdfa -l 2b input.pdf
 pdftopdfa -v input.pdf
 
 # Create dual-conformance PDF/A-2a and PDF/UA-1 output
-pdftopdfa --level 2a --pdfua --validate input.pdf
+pdftopdfa --level 2a --pdfua \
+  --document-title "Annual report" --document-language en-GB \
+  --audit-report input-audit.json input.pdf
+
+# Explicitly publish a candidate even if validation fails
+pdftopdfa --level 2a --pdfua --publish-noncompliant input.pdf
 
 # Overwrite an existing output
 pdftopdfa -f input.pdf output.pdf
@@ -101,7 +106,11 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 |---|---|
 | `-l, --level [2a\|2b\|2u\|3a\|3b\|3u]` | Target PDF/A level (default: `3b`) |
 | `-v, --validate` | Validate output with veraPDF. Note: unlike the common CLI convention, `-v` does **not** mean verbose — use `--verbose` for detailed logs |
-| `--pdfua` | Also produce PDF/UA-1; requires PDF/A level `2a` or `3a`. With `--validate`, both conformance profiles are checked |
+| `--pdfua` | Also produce PDF/UA-1; requires PDF/A level `2a` or `3a`. The selected PDF/A profile and `ua1` are always checked |
+| `--publish-noncompliant` | Publish a candidate even when requested validation fails; requires `--validate` or `--pdfua` |
+| `--document-title TITLE` | Set an authoritative document title; single-file conversion only |
+| `--document-language TAG` | Set an authoritative BCP 47 document language, for example `de` or `en-GB`; directory mode applies it to every document |
+| `--audit-report FILE.json` | Atomically write machine-readable conversion and full validator evidence |
 | `--no-pdfa` | Apply requested OCR processing without running the PDF/A conversion pipeline |
 | `-r, --recursive` | Process directories recursively |
 | `-f, --force` | Overwrite existing output files |
@@ -136,6 +145,7 @@ omitted. Providing only one model directory is an error.
 | `3` | Conversion failed |
 | `4` | Validation failed |
 | `5` | Permission error |
+| `6` | PDF/UA machine validation passed, but author review is required |
 
 ## Python API
 
@@ -143,7 +153,7 @@ omitted. Providing only one model directory is an error.
 
 ```python
 from pathlib import Path
-from pdftopdfa import PDFToPDFAError, convert_to_pdfa
+from pdftopdfa import PDFToPDFAError, PDFUAStatus, convert_to_pdfa
 
 try:
     result = convert_to_pdfa(
@@ -151,22 +161,26 @@ try:
         output_path=Path("output.pdf"),
         level="2a",
         pdfua=True,
-        validate=True,
+        document_title="Annual report",
+        document_language="en-GB",
     )
 except PDFToPDFAError as exc:
     print(f"Conversion failed: {exc}")
 else:
     if result.validation_failed:
-        print("Validation failed; review the published candidate")
+        print("Validation failed; no candidate was published")
+    elif result.pdfua_status is PDFUAStatus.REVIEW_REQUIRED:
+        print("Machine checks passed; author review is still required")
     else:
         print("Done")
 ```
 
 `convert_to_pdfa()` raises on conversion failure. If explicit validation fails,
-the candidate remains published at the requested destination and the result has
-`success=False`, `validation_failed=True`, and a validation error message.
-Validation failure therefore differs from conversion failure because it still
-produces a reviewable candidate.
+the default `publication_policy="validated"` leaves the staged candidate
+unpublished, preserves an existing destination, and returns `success=False`,
+`validation_failed=True`, `published=False`, and a validation error message.
+Set `publication_policy="always"` only to retain a known non-conforming review
+candidate; it remains `success=False` and `target_produced=False`.
 The batch APIs represent handled per-file failures with `success=False` and an
 `error` message so that later files can still be processed.
 
@@ -181,6 +195,9 @@ def convert_to_pdfa(
     pdfa: bool = True,
     pdfua: bool = False,
     validate: bool = False,
+    publication_policy: PublicationPolicy | Literal["always", "validated"] | None = None,
+    document_title: str | None = None,
+    document_language: str | None = None,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_detection_model_dir: Path | None = None,
@@ -259,10 +276,23 @@ Pass `pdfua=True` or `--pdfua` with either Level A target to add PDF/UA-1
 identification, the required PDF/A extension schema, and a document-title
 fallback when the source has none. PDF/UA mode always runs veraPDF once for the
 selected PDF/A profile and once for `ua1`, even without `validate=True` or
-`--validate`. If veraPDF is unavailable or either profile fails, the candidate
-is still published with `success=False` and the failure is reported. The program implements
-PDF/UA-1; PDF/UA-2 requires
-PDF 2.0 and is outside the PDF/A-2/3 output contract.
+`--validate`. If veraPDF is unavailable or either profile fails, fail-closed
+publication withholds the candidate and reports `validation_failed`. Provide
+`document_title` and `document_language` when source metadata is not
+authoritative; otherwise a filename-derived title or undetermined language is
+reported for author review. A converted PDF/A output has inherited PDF/UA
+identification removed unless `pdfua=True` was explicitly requested.
+
+The implementation produces PDF/UA-1. PDF/UA-2 requires PDF 2.0 and a separate
+PDF/A-4 output track, so `pdfua=True` is not a PDF/UA-2 switch. The low-level
+validation API can nevertheless inspect an existing PDF/UA-2 candidate:
+
+```python
+from pathlib import Path
+from pdftopdfa.verapdf import validate_with_verapdf
+
+result = validate_with_verapdf(Path("existing-pdf-2.0.pdf"), flavour="ua2")
+```
 
 Strongly evidenced paragraph, list, and table continuations are joined across
 page breaks. A structure element that genuinely spans pages has no `/Pg` entry;
@@ -284,6 +314,15 @@ reported instead of reassigning heading or paragraph content speculatively.
 Form fields without a trustworthy tooltip or field name are left without an
 invented accessible name and reported for author review. In PDF/UA mode this
 also causes machine validation to report the missing description.
+
+`PDFUAStatus.REVIEW_REQUIRED` means the PDF/A and PDF/UA-1 machine profiles
+passed but `review_findings` contains unresolved author decisions. The CLI
+returns exit code `6`. Neither that state nor
+`PDFUAStatus.MACHINE_VALIDATED` is a human accessibility certification.
+Every newly converted PDF/UA candidate includes a `human_accessibility_review`
+finding because reading order, meaning, alternatives, contrast, and usability
+cannot be established by veraPDF. `machine_validated` is therefore reserved for
+an unchanged, already conforming input that passed both machine profiles.
 
 ### `convert_directory()`
 
@@ -314,6 +353,8 @@ def convert_directory(
     pdfua: bool = False,
     recursive: bool = False,
     validate: bool = False,
+    publication_policy: PublicationPolicy | Literal["always", "validated"] | None = None,
+    document_language: str | None = None,
     skip_any_pdfa: bool = False,
     show_progress: bool = True,
     ocr_languages: list[str] | None = None,
@@ -355,6 +396,8 @@ def convert_files(
     pdfa: bool = True,
     pdfua: bool = False,
     validate: bool = False,
+    publication_policy: PublicationPolicy | Literal["always", "validated"] | None = None,
+    document_language: str | None = None,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_detection_model_dir: Path | None = None,
@@ -415,7 +458,7 @@ the pages need OCR.
 
 | Field | Type | Description |
 |---|---|---|
-| `success` | `bool` | `True` only if processing and every requested validation succeeded; a failed validation still publishes its candidate with `success=False` |
+| `success` | `bool` | `True` only if processing and every requested validation succeeded; author review may still be required |
 | `input_path` | `Path` | Input file path |
 | `output_path` | `Path` | Output file path |
 | `level` | `str \| None` | Requested level for converted output, detected level for a compliant skip, or `None` when no PDF/A level was produced or detected, such as a protected input copied unchanged or `pdfa=False` output |
@@ -424,6 +467,33 @@ the pages need OCR.
 | `error` | `str \| None` | Error message for a handled per-file or validation failure |
 | `validation_failed` | `bool` | `True` if validation reported non-compliance or could not complete, or if a preserved embedded PDF could not be converted |
 | `skipped` | `bool` | `True` if the original PDF was copied unchanged |
+| `published` | `bool` | Whether this call wrote the requested output path |
+| `target_produced` | `bool` | Whether the requested conformance target was produced; a published non-conforming candidate is `False` |
+| `pdfua_status` | `PDFUAStatus` | Machine-verifiable PDF/UA workflow state; never a human certification |
+| `review_findings` | `tuple[PDFUAReviewFinding, ...]` | Stable codes, messages, and counts for unresolved author decisions |
+| `validation_results` | `tuple[ProfileValidationResult, ...]` | Per-profile veraPDF result or execution error, including rule findings and validator version |
+| `sanitization_stats` | `dict[str, Any]` | Structured sanitizer counters |
+| `tagging_stats` | `dict[str, Any]` | Structured logical-structure counters |
+| `metadata_sources` | `dict[str, str]` | Provenance of the document title and language (`user`, source metadata, or fallback) |
+| `candidate_sha256` | `str \| None` | SHA-256 of the exact staged candidate, published or withheld |
+| `candidate_size` | `int \| None` | Size of that staged candidate |
+
+PDF/UA status values are:
+
+| Value | Meaning |
+|---|---|
+| `not_requested` | PDF/UA output was not requested |
+| `not_produced` | PDF/UA was requested, but no target was produced, for example because a protected input was copied unchanged |
+| `validation_failed` | A candidate was built, but a required profile failed or the validator could not complete |
+| `review_required` | Both profiles passed, but structured findings require an author decision |
+| `machine_validated` | Both profiles passed and the converter emitted no review finding; this is still not human certification |
+
+`ConversionResult.to_dict()` returns a deterministic JSON-serializable record.
+Pass `include_raw_validation=True` to include available veraPDF XML. The CLI's
+`--audit-report` enables raw XML and atomically writes a schema-versioned list
+of results with structured rule contexts, review findings, sanitizer and tagger
+statistics, and the candidate hash when a staged candidate exists. A fatal CLI
+error atomically replaces stale evidence with a top-level `fatal_error` record.
 
 ## Exceptions
 
@@ -475,18 +545,23 @@ except ConversionError as exc:
     print(f"Conversion failed: {exc}")
 ```
 
-Encrypted PDFs are copied to the output path unchanged and returned with
+Encrypted PDFs are ordinarily copied to the output path unchanged and returned with
 `success=True`, `skipped=True`, and a warning that conversion was skipped. The
 copy has not been converted and is not guaranteed to conform to PDF/A, even if
-its default output name ends in `_pdfa.pdf`. When validation is requested, the
-copy is published with `success=False` if validation fails. PDF/UA mode still attempts both the
-PDF/A and PDF/UA-1 profiles and reports either failure.
+its default output name ends in `_pdfa.pdf`. If PDF/UA was requested, fail-closed
+publication preserves an existing destination and returns `success=False`,
+`published=False`, `target_produced=False`, and
+`pdfua_status="not_produced"`. `publication_policy="always"` or
+`--publish-noncompliant` explicitly enables unchanged copy-through.
 
 Digitally signed PDFs are also copied unchanged by default, because OCR,
 metadata repair, font embedding, and PDF/A rewriting would invalidate the
 cryptographic signature. The result has `success=True`, `skipped=True`, and a
 warning, but the unchanged copy is not guaranteed to conform to the requested
-PDF/A level. Use `--allow-signature-invalidation` or
+PDF/A level. If PDF/UA was requested, the protected input is not published by
+default and likewise returns `success=False`, `published=False`,
+`target_produced=False`, and `pdfua_status="not_produced"`.
+Use `--allow-signature-invalidation` or
 `allow_signature_invalidation=True` only when you intentionally want an
 unsigned converted copy. For signed archives, the recommended workflow is to
 convert to PDF/A first and sign the PDF/A output afterwards.
@@ -566,9 +641,12 @@ versions reported by veraPDF's XML output are rejected as unsupported.
 - API: pass `validate=True`
 
 If veraPDF reports non-conformance or cannot complete, the Python APIs return a
-result with `success=False` and `validation_failed=True` while keeping the candidate published. The
-CLI exits with the validation-failure code; this status does not delete or
-suppress the output file. A true conversion failure still publishes nothing.
+result with `success=False` and `validation_failed=True`. For `validate=True`
+and all PDF/UA conversions, the default is fail-closed: the candidate remains
+unpublished and an existing destination is unchanged. The CLI exits with code
+`4`. Use `publication_policy="always"` or `--publish-noncompliant` to publish
+the failed candidate explicitly; the failure status is unchanged. A true
+conversion failure also publishes nothing.
 
 ## Environment Variables
 

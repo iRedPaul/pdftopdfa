@@ -8,6 +8,10 @@ from importlib.metadata import PackageNotFoundError, version
 
 from .converter import (
     ConversionResult,
+    PDFUAReviewFinding,
+    PDFUAStatus,
+    ProfileValidationResult,
+    PublicationPolicy,
     convert_directory,
     convert_files,
     convert_to_pdfa,
@@ -44,6 +48,10 @@ __all__ = [
     "recognize_image",
     "recognize_table",
     "ConversionResult",
+    "PDFUAReviewFinding",
+    "PDFUAStatus",
+    "ProfileValidationResult",
+    "PublicationPolicy",
     "TableType",
     "TableBoundingBox",
     "TableCell",

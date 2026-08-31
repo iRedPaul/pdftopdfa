@@ -9,8 +9,11 @@ converting PDF files to the PDF/A format.
 """
 
 # Standard Library
+import json
 import logging
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 # Third Party
@@ -22,6 +25,8 @@ from . import __version__
 from ._ocr_runtime import validate_ocr_execution_provider
 from .converter import (
     ConversionResult,
+    PDFUAStatus,
+    PublicationPolicy,
     convert_directory,
     convert_to_pdfa,
     generate_output_path,
@@ -34,7 +39,6 @@ from .exceptions import (
     VeraPDFError,
 )
 from .utils import setup_logging
-from .verapdf import VeraPDFResult, validate_with_verapdf
 
 # Exit codes
 EXIT_SUCCESS = 0
@@ -43,8 +47,41 @@ EXIT_FILE_NOT_FOUND = 2
 EXIT_CONVERSION_FAILED = 3
 EXIT_VALIDATION_FAILED = 4
 EXIT_PERMISSION_ERROR = 5
+EXIT_REVIEW_REQUIRED = 6
 
 logger = logging.getLogger(__name__)
+_VALIDATION_PREFIXES = ("Validation:", "PDF/UA validation:")
+
+
+def _write_audit_report(
+    path: Path,
+    results: list[ConversionResult],
+    *,
+    fatal_error: dict[str, object] | None = None,
+) -> None:
+    """Atomically persist full conversion and validation evidence as JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "results": [result.to_dict(include_raw_validation=True) for result in results],
+    }
+    if fatal_error is not None:
+        payload["fatal_error"] = fatal_error
+    fd, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _encode_for_console(text: str, *, err: bool = False) -> str:
@@ -101,10 +138,9 @@ def _print_result(result: ConversionResult, quiet: bool) -> None:
         result: The conversion result.
         quiet: If True, only output errors.
     """
-    validation_prefixes = ("Validation:", "PDF/UA validation:")
     if result.validation_failed:
         for warning in result.warnings:
-            if warning.startswith(validation_prefixes):
+            if warning.startswith(_VALIDATION_PREFIXES):
                 print_error(warning)
 
     if result.success:
@@ -128,44 +164,24 @@ def _print_result(result: ConversionResult, quiet: bool) -> None:
                 f"{result.output_path.name} ({details})"
             )
             for warning in result.warnings:
-                if result.validation_failed and warning.startswith(validation_prefixes):
+                if result.validation_failed and warning.startswith(
+                    _VALIDATION_PREFIXES
+                ):
                     continue
                 print_warning(warning)
+            if result.review_required:
+                print_warning(
+                    "PDF/UA machine validation passed, but author review is required"
+                )
     else:
         if not quiet:
             for warning in result.warnings:
-                if result.validation_failed and warning.startswith(validation_prefixes):
+                if result.validation_failed and warning.startswith(
+                    _VALIDATION_PREFIXES
+                ):
                     continue
                 print_warning(warning)
         print_error(f"{result.input_path.name}: {result.error}")
-
-
-def _print_validation_result(
-    result: VeraPDFResult,
-    file_path: Path,
-    quiet: bool,
-) -> None:
-    """Prints the validation result in a formatted way.
-
-    Args:
-        result: The veraPDF validation result.
-        file_path: Path to the validated file.
-        quiet: If True, only output errors.
-    """
-    if result.compliant:
-        if not quiet:
-            standard = (
-                "PDF/UA-1" if result.flavour == "ua1" else f"PDF/A-{result.flavour}"
-            )
-            print_success(f"Validation successful: {standard}")
-    else:
-        print_error(f"Validation failed for {file_path.name}")
-        for error in result.errors:
-            click.echo(_encode_for_console(f"  - {error}", err=True), err=True)
-
-    if not quiet:
-        for warning in result.warnings:
-            print_warning(warning)
 
 
 def _ocr_execution_provider_callback(
@@ -207,6 +223,27 @@ def _ocr_execution_provider_callback(
         "Also produce PDF/UA-1 (requires --level 2a or 3a; both profiles "
         "are always submitted to veraPDF validation)."
     ),
+)
+@click.option(
+    "--publish-noncompliant",
+    is_flag=True,
+    help=(
+        "Publish the candidate even if requested validation fails. By default, "
+        "validated conversions are fail-closed."
+    ),
+)
+@click.option(
+    "--document-title",
+    help="Authoritative document title (single-file conversion only).",
+)
+@click.option(
+    "--document-language",
+    help="Authoritative BCP 47 document language, for example de or en-GB.",
+)
+@click.option(
+    "--audit-report",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Write machine-readable conversion and veraPDF evidence as JSON.",
 )
 @click.option(
     "--no-pdfa",
@@ -337,6 +374,10 @@ def main(
     level: str,
     do_validate: bool,
     pdfua: bool,
+    publish_noncompliant: bool,
+    document_title: str | None,
+    document_language: str | None,
+    audit_report: Path | None,
     pdfa: bool,
     recursive: bool,
     force: bool,
@@ -379,6 +420,28 @@ def main(
         raise click.UsageError("--pdfua requires --level 2a or 3a")
     if not pdfa and do_validate:
         raise click.UsageError("--validate cannot be combined with --no-pdfa")
+    if not pdfa and (document_title is not None or document_language is not None):
+        raise click.UsageError(
+            "Document metadata options cannot be combined with --no-pdfa"
+        )
+    if publish_noncompliant and not (do_validate or pdfua):
+        raise click.UsageError("--publish-noncompliant requires --validate or --pdfua")
+    if input_path_obj.is_dir() and document_title is not None:
+        raise click.UsageError("--document-title is only valid for a single PDF")
+    if audit_report is not None and audit_report.suffix.lower() != ".json":
+        raise click.UsageError("--audit-report must use a .json filename")
+    if audit_report is not None:
+        protected_paths = {input_path_obj.resolve()}
+        if output is not None:
+            protected_paths.add(Path(output).resolve())
+        elif input_path_obj.is_file():
+            protected_paths.add(
+                generate_output_path(input_path_obj, pdfa=pdfa).resolve()
+            )
+        if audit_report.resolve() in protected_paths:
+            raise click.UsageError(
+                "Audit report path must differ from input and output"
+            )
 
     if deskew and ocr_force:
         raise click.UsageError("--deskew cannot be combined with --ocr-force")
@@ -414,6 +477,7 @@ def main(
         except ValueError as exc:
             raise click.UsageError(str(exc)) from exc
 
+    fatal_error: Exception | None = None
     try:
         if input_path_obj.is_file():
             # Convert single file
@@ -426,6 +490,12 @@ def main(
                 quiet,
                 pdfa=pdfa,
                 pdfua=pdfua,
+                publication_policy=(
+                    PublicationPolicy.ALWAYS if publish_noncompliant else None
+                ),
+                document_title=document_title,
+                document_language=document_language,
+                audit_report=audit_report,
                 ocr_languages=ocr_languages,
                 ocr_detection_model_dir=ocr_detection_model_dir,
                 ocr_recognition_model_dir=ocr_recognition_model_dir,
@@ -451,6 +521,11 @@ def main(
                 quiet,
                 pdfa=pdfa,
                 pdfua=pdfua,
+                publication_policy=(
+                    PublicationPolicy.ALWAYS if publish_noncompliant else None
+                ),
+                document_language=document_language,
+                audit_report=audit_report,
                 ocr_languages=ocr_languages,
                 ocr_detection_model_dir=ocr_detection_model_dir,
                 ocr_recognition_model_dir=ocr_recognition_model_dir,
@@ -467,13 +542,16 @@ def main(
         else:
             print_error(f"Invalid path: {input_path}")
             exit_code = EXIT_FILE_NOT_FOUND
+            fatal_error = FileNotFoundError(f"Invalid path: {input_path}")
 
     except FileNotFoundError as e:
         print_error(str(e))
         exit_code = EXIT_FILE_NOT_FOUND
+        fatal_error = e
     except PermissionError as e:
         print_error(f"Access denied: {e}")
         exit_code = EXIT_PERMISSION_ERROR
+        fatal_error = e
     except (
         ConversionError,
         UnsupportedPDFError,
@@ -483,10 +561,27 @@ def main(
     ) as e:
         print_error(str(e))
         exit_code = EXIT_CONVERSION_FAILED
+        fatal_error = e
     except Exception as e:
         logger.exception("Unexpected error")
         print_error(f"Unexpected error: {e}")
         exit_code = EXIT_GENERAL_ERROR
+        fatal_error = e
+
+    if audit_report is not None and fatal_error is not None:
+        failure = {
+            "error_type": type(fatal_error).__name__,
+            "message": str(fatal_error),
+            "exit_code": exit_code,
+            "input_path": str(input_path_obj),
+        }
+        if output is not None:
+            failure["output_path"] = output
+        try:
+            _write_audit_report(audit_report, [], fatal_error=failure)
+        except Exception as audit_error:
+            logger.exception("Could not write failure audit report")
+            print_error(f"Could not write audit report: {audit_error}")
 
     sys.exit(exit_code)
 
@@ -501,6 +596,10 @@ def _convert_single_file(
     *,
     pdfa: bool = True,
     pdfua: bool = False,
+    publication_policy: PublicationPolicy | None = None,
+    document_title: str | None = None,
+    document_language: str | None = None,
+    audit_report: Path | None = None,
     ocr_languages: list[str] | None = None,
     ocr_detection_model_dir: Path | None = None,
     ocr_recognition_model_dir: Path | None = None,
@@ -525,6 +624,10 @@ def _convert_single_file(
         quiet: Whether to only output errors.
         pdfa: Whether to perform PDF/A conversion after OCR processing.
         pdfua: Whether to also produce PDF/UA-1 output.
+        publication_policy: Controls publication after failed validation.
+        document_title: Authoritative document title.
+        document_language: Authoritative BCP 47 document language.
+        audit_report: Optional path for a machine-readable JSON audit record.
         ocr_languages: Optional list of PaddleOCR language codes
             (e.g., ``["de", "en"]``).
         ocr_detection_model_dir: PP-OCRv6 Medium detection model directory.
@@ -581,7 +684,10 @@ def _convert_single_file(
         level=level,
         pdfa=pdfa,
         pdfua=pdfua,
-        validate=False,  # Validate manually later
+        validate=do_validate,
+        publication_policy=publication_policy,
+        document_title=document_title,
+        document_language=document_language,
         skip_any_pdfa=skip_any_pdfa,
         ocr_languages=ocr_languages,
         ocr_detection_model_dir=ocr_detection_model_dir,
@@ -597,57 +703,23 @@ def _convert_single_file(
     )
 
     _print_result(result, quiet)
+    if audit_report is not None:
+        _write_audit_report(audit_report, [result])
 
-    # Note: convert_to_pdfa() raises on failure instead of returning
-    # success=False, so no failure branch is needed here.
     if result.validation_failed:
         return EXIT_VALIDATION_FAILED
-
-    if result.skipped and (not do_validate or result.level is None):
-        return EXIT_SUCCESS
-
-    # Optional: Validation
-    if do_validate and not pdfua:
-        if not quiet:
-            click.echo("Validating output with veraPDF...")
-
-        validation_flavour = result.level if result.skipped and result.level else level
-        flavours = [validation_flavour]
-        validation_failed = False
-        for flavour in flavours:
-            try:
-                verapdf_result = validate_with_verapdf(
-                    path=output_path,
-                    flavour=flavour,
-                    timeout=300,
-                )
-            except VeraPDFError as e:
-                click.echo(
-                    _encode_for_console(
-                        f"Validation failed: veraPDF could not run ({e})",
-                        err=True,
-                    ),
+    if not result.success:
+        return EXIT_CONVERSION_FAILED
+    if result.pdfua_status is PDFUAStatus.REVIEW_REQUIRED:
+        if quiet:
+            click.echo(
+                _encode_for_console(
+                    "Review required: PDF/UA author review is outstanding",
                     err=True,
-                )
-                validation_failed = True
-                continue
-
-            _print_validation_result(verapdf_result, output_path, quiet)
-
-            if not quiet:
-                click.echo(
-                    _encode_for_console(
-                        f"  veraPDF ({flavour}): "
-                        f"{verapdf_result.passed_rules} rules passed, "
-                        f"{verapdf_result.failed_rules} failed"
-                    )
-                )
-
-            if not verapdf_result.compliant:
-                validation_failed = True
-
-        if validation_failed:
-            return EXIT_VALIDATION_FAILED
+                ),
+                err=True,
+            )
+        return EXIT_REVIEW_REQUIRED
 
     return EXIT_SUCCESS
 
@@ -663,6 +735,9 @@ def _convert_directory(
     *,
     pdfa: bool = True,
     pdfua: bool = False,
+    publication_policy: PublicationPolicy | None = None,
+    document_language: str | None = None,
+    audit_report: Path | None = None,
     ocr_languages: list[str] | None = None,
     ocr_detection_model_dir: Path | None = None,
     ocr_recognition_model_dir: Path | None = None,
@@ -688,6 +763,9 @@ def _convert_directory(
         quiet: Whether to only output errors.
         pdfa: Whether to perform PDF/A conversion after OCR processing.
         pdfua: Whether to also produce PDF/UA-1 output.
+        publication_policy: Controls publication after failed validation.
+        document_language: Authoritative BCP 47 document language.
+        audit_report: Optional path for a machine-readable JSON audit record.
         ocr_languages: Optional list of PaddleOCR language codes
             (e.g., ``["de", "en"]``).
         ocr_detection_model_dir: PP-OCRv6 Medium detection model directory.
@@ -738,6 +816,8 @@ def _convert_directory(
         pdfua=pdfua,
         recursive=recursive,
         validate=do_validate,
+        publication_policy=publication_policy,
+        document_language=document_language,
         skip_any_pdfa=skip_any_pdfa,
         show_progress=not quiet,
         ocr_languages=ocr_languages,
@@ -753,16 +833,26 @@ def _convert_directory(
         preserve_stamps=preserve_stamps,
         allow_signature_invalidation=allow_signature_invalidation,
     )
+    if audit_report is not None:
+        _write_audit_report(audit_report, results)
 
     # Output summary
     successful = [
-        r for r in results if r.success and not r.skipped and not r.validation_failed
+        r
+        for r in results
+        if r.success
+        and not r.skipped
+        and not r.validation_failed
+        and not r.review_required
     ]
     skipped = [
         r for r in results if r.success and r.skipped and not r.validation_failed
     ]
     failed = [r for r in results if not r.success and not r.validation_failed]
     validation_failures = [r for r in results if r.validation_failed]
+    review_required = [
+        r for r in results if r.review_required and not r.validation_failed
+    ]
 
     if not quiet:
         click.echo()
@@ -786,20 +876,32 @@ def _convert_directory(
                     ),
                     err=True,
                 )
-        if validation_failures:
-            print_error(f"{len(validation_failures)} file(s) failed validation")
-            for result in validation_failures:
-                val_warnings = [
-                    w for w in result.warnings if w.startswith("Validation:")
-                ]
-                for w in val_warnings:
-                    click.echo(
-                        _encode_for_console(
-                            f"  - {result.input_path.name}: {w}",
-                            err=True,
-                        ),
+        if review_required:
+            print_warning(
+                f"{len(review_required)} file(s) require PDF/UA author review"
+            )
+    if validation_failures:
+        print_error(f"{len(validation_failures)} file(s) failed validation")
+        for result in validation_failures:
+            val_warnings = [
+                w for w in result.warnings if w.startswith(_VALIDATION_PREFIXES)
+            ]
+            for w in val_warnings:
+                click.echo(
+                    _encode_for_console(
+                        f"  - {result.input_path.name}: {w}",
                         err=True,
-                    )
+                    ),
+                    err=True,
+                )
+    if quiet and review_required:
+        click.echo(
+            _encode_for_console(
+                f"Review required: {len(review_required)} PDF/UA file(s)",
+                err=True,
+            ),
+            err=True,
+        )
 
     if failed:
         if all(result.error == "Output file already exists" for result in failed):
@@ -808,6 +910,9 @@ def _convert_directory(
 
     if validation_failures:
         return EXIT_VALIDATION_FAILED
+
+    if review_required:
+        return EXIT_REVIEW_REQUIRED
 
     return EXIT_SUCCESS
 

@@ -4,6 +4,7 @@
 
 """Unit tests for cli.py."""
 
+import json
 import os
 import subprocess
 import sys
@@ -22,12 +23,13 @@ from pdftopdfa.cli import (
     EXIT_FILE_NOT_FOUND,
     EXIT_GENERAL_ERROR,
     EXIT_PERMISSION_ERROR,
+    EXIT_REVIEW_REQUIRED,
     EXIT_SUCCESS,
     EXIT_VALIDATION_FAILED,
     main,
 )
-from pdftopdfa.converter import ConversionResult
-from pdftopdfa.exceptions import OCRError, VeraPDFError
+from pdftopdfa.converter import ConversionResult, PDFUAStatus, PublicationPolicy
+from pdftopdfa.exceptions import ConversionError, OCRError, VeraPDFError
 from pdftopdfa.verapdf import is_verapdf_available
 
 OCR_MODEL_ARGS = [
@@ -283,6 +285,143 @@ class TestCliConvert:
         assert result.exit_code == EXIT_SUCCESS
         assert mock_convert_single.call_args.kwargs["pdfua"] is True
 
+    @patch("pdftopdfa.cli._convert_single_file", return_value=EXIT_SUCCESS)
+    def test_cli_forwards_pdfua_enterprise_options(
+        self,
+        mock_convert_single: MagicMock,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Metadata authority and unsafe publication are explicit CLI inputs."""
+        output_path = tmp_dir / "output.pdf"
+
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                str(output_path),
+                "--level",
+                "2a",
+                "--pdfua",
+                "--publish-noncompliant",
+                "--document-title",
+                "Annual report",
+                "--document-language",
+                "en-GB",
+            ],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        kwargs = mock_convert_single.call_args.kwargs
+        assert kwargs["publication_policy"] is PublicationPolicy.ALWAYS
+        assert kwargs["document_title"] == "Annual report"
+        assert kwargs["document_language"] == "en-GB"
+
+    @patch("pdftopdfa.cli.convert_to_pdfa")
+    def test_cli_writes_machine_readable_audit_report(
+        self,
+        mock_convert_to_pdfa: MagicMock,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """The CLI persists a stable JSON envelope for enterprise ingestion."""
+        output_path = tmp_dir / "output.pdf"
+        report_path = tmp_dir / "audit.json"
+        mock_convert_to_pdfa.return_value = ConversionResult(
+            success=True,
+            input_path=sample_pdf,
+            output_path=output_path,
+            level="2a",
+            pdfua_status=PDFUAStatus.MACHINE_VALIDATED,
+            candidate_sha256="abc123",
+            candidate_size=42,
+        )
+
+        result = runner.invoke(
+            main,
+            [str(sample_pdf), str(output_path), "--audit-report", str(report_path)],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        assert report["schema_version"] == 1
+        assert report["results"][0]["pdfua_status"] == "machine_validated"
+        assert report["results"][0]["candidate_sha256"] == "abc123"
+
+    @pytest.mark.parametrize(
+        ("error", "expected_exit"),
+        [
+            (ConversionError("conversion stopped"), EXIT_CONVERSION_FAILED),
+            (PermissionError("destination locked"), EXIT_PERMISSION_ERROR),
+            (RuntimeError("unexpected failure"), EXIT_GENERAL_ERROR),
+        ],
+    )
+    def test_cli_replaces_stale_audit_report_after_fatal_error(
+        self,
+        error: Exception,
+        expected_exit: int,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Fatal invocations atomically replace evidence from an earlier run."""
+        output_path = tmp_dir / "output.pdf"
+        report_path = tmp_dir / "audit.json"
+        report_path.write_text('{"stale": true}', encoding="utf-8")
+
+        with patch("pdftopdfa.cli.convert_to_pdfa", side_effect=error):
+            result = runner.invoke(
+                main,
+                [
+                    str(sample_pdf),
+                    str(output_path),
+                    "--audit-report",
+                    str(report_path),
+                ],
+            )
+
+        assert result.exit_code == expected_exit
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        assert report["schema_version"] == 1
+        assert report["results"] == []
+        assert report["fatal_error"] == {
+            "error_type": type(error).__name__,
+            "exit_code": expected_exit,
+            "input_path": str(sample_pdf),
+            "message": str(error),
+            "output_path": str(output_path),
+        }
+
+    def test_cli_rejects_non_json_audit_report(
+        self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """Audit output cannot accidentally overwrite a PDF path."""
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                "--audit-report",
+                str(tmp_dir / "report.pdf"),
+            ],
+        )
+
+        assert result.exit_code != EXIT_SUCCESS
+        assert "must use a .json filename" in result.output
+
+    def test_cli_rejects_document_title_for_directory(
+        self, runner: CliRunner, tmp_dir: Path
+    ) -> None:
+        """One title cannot be silently applied to every file in a batch."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+
+        result = runner.invoke(main, [str(input_dir), "--document-title", "Title"])
+
+        assert result.exit_code != EXIT_SUCCESS
+        assert "only valid for a single PDF" in result.output
+
     @patch("pdftopdfa.cli._convert_single_file")
     def test_cli_convert_passes_skip_any_pdfa(
         self,
@@ -325,12 +464,10 @@ class TestCliConvert:
             mock_convert_single.call_args.kwargs["allow_signature_invalidation"] is True
         )
 
-    @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
     def test_cli_single_file_compliant_skip_is_still_validated(
         self,
         mock_convert_to_pdfa,
-        mock_validate,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
@@ -343,12 +480,6 @@ class TestCliConvert:
             level="2b",
             skipped=True,
         )
-        mock_validate.return_value = MagicMock(
-            compliant=True,
-            passed_rules=1,
-            failed_rules=0,
-        )
-
         result = cli_module._convert_single_file(
             sample_pdf,
             str(output_path),
@@ -359,18 +490,12 @@ class TestCliConvert:
         )
 
         assert result == EXIT_SUCCESS
-        mock_validate.assert_called_once_with(
-            path=output_path,
-            flavour="2b",
-            timeout=300,
-        )
+        assert mock_convert_to_pdfa.call_args.kwargs["validate"] is True
 
-    @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
     def test_cli_single_file_protected_skip_is_not_validated(
         self,
         mock_convert_to_pdfa: MagicMock,
-        mock_validate: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
@@ -394,14 +519,12 @@ class TestCliConvert:
         )
 
         assert result == EXIT_SUCCESS
-        mock_validate.assert_not_called()
+        assert mock_convert_to_pdfa.call_args.kwargs["validate"] is True
 
-    @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
     def test_cli_pdfua_validate_does_not_repeat_automatic_validation(
         self,
         mock_convert_to_pdfa: MagicMock,
-        mock_validate: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
@@ -413,12 +536,6 @@ class TestCliConvert:
             output_path=output_path,
             level="2a",
         )
-        mock_validate.return_value = MagicMock(
-            compliant=True,
-            passed_rules=1,
-            failed_rules=0,
-        )
-
         result = cli_module._convert_single_file(
             sample_pdf,
             str(output_path),
@@ -430,37 +547,13 @@ class TestCliConvert:
         )
 
         assert result == EXIT_SUCCESS
-        mock_validate.assert_not_called()
+        assert mock_convert_to_pdfa.call_args.kwargs["validate"] is True
 
-    def test_pdfua_validation_success_uses_pdfua_label(
-        self,
-        capsys: pytest.CaptureFixture[str],
-        tmp_dir: Path,
-    ) -> None:
-        """PDF/UA validation output names the correct standard."""
-        result = MagicMock(
-            compliant=True,
-            flavour="ua1",
-            warnings=[],
-        )
-
-        cli_module._print_validation_result(
-            result,
-            tmp_dir / "output.pdf",
-            quiet=False,
-        )
-
-        output = capsys.readouterr().out
-        assert "PDF/UA-1" in output
-        assert "PDF/A-ua1" not in output
-
-    @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
     @pytest.mark.parametrize("quiet", [False, True])
     def test_cli_single_file_known_validation_failure_returns_exit_code(
         self,
         mock_convert_to_pdfa,
-        mock_validate,
         quiet: bool,
         sample_pdf: Path,
         tmp_dir: Path,
@@ -494,10 +587,38 @@ class TestCliConvert:
         )
 
         assert result == EXIT_VALIDATION_FAILED
-        mock_validate.assert_not_called()
         captured = capsys.readouterr()
         assert all(error in captured.err for error in validation_errors)
         assert (review_warning in captured.out) is not quiet
+
+    @patch("pdftopdfa.cli.convert_to_pdfa")
+    def test_cli_returns_distinct_author_review_status(
+        self,
+        mock_convert_to_pdfa: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Machine-valid output requiring author review is not a silent success."""
+        output_path = tmp_dir / "output.pdf"
+        mock_convert_to_pdfa.return_value = ConversionResult(
+            success=True,
+            input_path=sample_pdf,
+            output_path=output_path,
+            level="2a",
+            pdfua_status=PDFUAStatus.REVIEW_REQUIRED,
+        )
+
+        result = cli_module._convert_single_file(
+            sample_pdf,
+            str(output_path),
+            "2a",
+            do_validate=False,
+            force=False,
+            quiet=True,
+            pdfua=True,
+        )
+
+        assert result == EXIT_REVIEW_REQUIRED
 
     def test_cli_convert_simple(
         self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
@@ -835,17 +956,17 @@ class TestCliValidation:
     """Tests for --validate option."""
 
     @patch(
-        "pdftopdfa.cli.validate_with_verapdf",
+        "pdftopdfa.converter.validate_with_verapdf",
         side_effect=VeraPDFError("veraPDF not installed"),
     )
-    def test_cli_missing_validator_publishes_then_returns_validation_failure(
+    def test_cli_missing_validator_withholds_output_and_returns_failure(
         self,
         _mock_validate: MagicMock,
         runner: CliRunner,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """A missing validator does not suppress the converted output."""
+        """A missing validator suppresses publication of the staged output."""
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
@@ -854,16 +975,13 @@ class TestCliValidation:
         )
 
         assert result.exit_code == EXIT_VALIDATION_FAILED
-        assert "Validation failed: veraPDF could not run" in result.output
-        assert output_path.is_file()
-        assert output_path.read_bytes().startswith(b"%PDF-")
+        assert "Validation: veraPDF could not run" in result.output
+        assert not output_path.exists()
 
-    @patch("pdftopdfa.cli.validate_with_verapdf")
     @patch("pdftopdfa.cli.convert_to_pdfa")
     def test_cli_validation_runtime_error_returns_failure_status(
         self,
         mock_convert_to_pdfa: MagicMock,
-        mock_validate: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
         capsys: pytest.CaptureFixture[str],
@@ -871,12 +989,15 @@ class TestCliValidation:
         """A missing or crashed validator returns the validation failure code."""
         output_path = tmp_dir / "output.pdf"
         mock_convert_to_pdfa.return_value = ConversionResult(
-            success=True,
+            success=False,
             input_path=sample_pdf,
             output_path=output_path,
             level="3b",
+            warnings=["Validation: veraPDF could not run: veraPDF crashed"],
+            error="Validation failed; output was not published",
+            validation_failed=True,
+            published=False,
         )
-        mock_validate.side_effect = VeraPDFError("veraPDF crashed")
 
         result = cli_module._convert_single_file(
             sample_pdf,
@@ -889,7 +1010,7 @@ class TestCliValidation:
 
         assert result == EXIT_VALIDATION_FAILED
         assert (
-            "Validation failed: veraPDF could not run (veraPDF crashed)"
+            "Validation: veraPDF could not run: veraPDF crashed"
             in capsys.readouterr().err
         )
 
@@ -1660,6 +1781,47 @@ class TestDirectoryValidationFailures:
 
         assert "1 file(s) failed validation" in result.output
 
+    @pytest.mark.parametrize("quiet", [False, True])
+    @patch("pdftopdfa.cli.convert_directory")
+    def test_pdfua_validation_details_are_errors_in_directory_mode(
+        self,
+        mock_convert_dir: MagicMock,
+        runner: CliRunner,
+        tmp_dir: Path,
+        quiet: bool,
+    ) -> None:
+        """Directory mode reports both mandatory validation profiles."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        input_path = input_dir / "test.pdf"
+        input_path.write_bytes(b"%PDF-1.4 dummy")
+        validation_errors = [
+            "Validation: PDF/A rule failed",
+            "PDF/UA validation: PDF/UA rule failed",
+        ]
+        mock_convert_dir.return_value = [
+            ConversionResult(
+                success=False,
+                input_path=input_path,
+                output_path=tmp_dir / "test_pdfa.pdf",
+                level="2a",
+                warnings=validation_errors,
+                error="Validation failed; output candidate was published",
+                validation_failed=True,
+            )
+        ]
+        arguments = [str(input_dir), "--level", "2a", "--pdfua"]
+        if quiet:
+            arguments.append("--quiet")
+
+        result = runner.invoke(main, arguments)
+
+        assert result.exit_code == EXIT_VALIDATION_FAILED
+        assert "1 file(s) failed validation" in result.stderr
+        assert all(error in result.stderr for error in validation_errors)
+        if quiet:
+            assert "Summary:" not in result.output
+
     @patch("pdftopdfa.cli.convert_directory")
     def test_no_validation_failure_returns_success(
         self, mock_convert_dir, runner: CliRunner, tmp_dir: Path
@@ -1681,3 +1843,35 @@ class TestDirectoryValidationFailures:
         result = runner.invoke(main, [str(input_dir)])
 
         assert result.exit_code == EXIT_SUCCESS
+
+    @pytest.mark.parametrize("quiet", [True, False])
+    @patch("pdftopdfa.cli.convert_directory")
+    def test_review_required_returns_distinct_exit_code(
+        self,
+        mock_convert_dir: MagicMock,
+        runner: CliRunner,
+        tmp_dir: Path,
+        quiet: bool,
+    ) -> None:
+        """Batch automation can gate machine-valid files needing review."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        input_path = input_dir / "test.pdf"
+        input_path.write_bytes(b"%PDF-1.4 dummy")
+        mock_convert_dir.return_value = [
+            ConversionResult(
+                success=True,
+                input_path=input_path,
+                output_path=tmp_dir / "test_pdfa.pdf",
+                level="2a",
+                pdfua_status=PDFUAStatus.REVIEW_REQUIRED,
+            )
+        ]
+        arguments = [str(input_dir), "--level", "2a", "--pdfua"]
+        if quiet:
+            arguments.append("--quiet")
+
+        result = runner.invoke(main, arguments)
+
+        assert result.exit_code == EXIT_REVIEW_REQUIRED
+        assert "review" in result.output.lower()

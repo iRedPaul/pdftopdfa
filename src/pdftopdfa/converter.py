@@ -14,8 +14,9 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
+from typing import Any, Literal
 
 # Third Party
 import pikepdf
@@ -38,7 +39,10 @@ from .exceptions import (
 from .extensions import add_extensions_if_needed
 from .fonts import check_font_compliance
 from .metadata import (
+    NAMESPACES,
+    _clean_metadata_text,
     _extract_existing_xmp,
+    _extract_lang_alt_xmp_property,
     extract_pdf_info,
     remove_pdfe_identification,
     remove_pdfua_identification,
@@ -56,6 +60,7 @@ from .sanitizers import (
     sanitize_structure_limits,
     sanitize_truetype_encoding,
 )
+from .sanitizers.catalog import _is_valid_bcp47
 from .staging import (
     copy_to_private_stage,
     private_staging_directory,
@@ -69,7 +74,7 @@ from .utils import (
     validate_pdfa_level,
 )
 from .validator import detect_iso_standards, detect_pdfa_level
-from .verapdf import validate_with_verapdf
+from .verapdf import VeraPDFResult, validate_with_verapdf
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +268,113 @@ _VALIDATION_PUBLICATION_WARNING = (
     "Output was published despite failed or incomplete validation"
 )
 _VALIDATION_FAILURE_ERROR = "Validation failed; output candidate was published"
+_VALIDATION_WITHHELD_WARNING = (
+    "Output was not published because validation failed or could not complete"
+)
+_VALIDATION_WITHHELD_ERROR = "Validation failed; output was not published"
+
+
+class PublicationPolicy(StrEnum):
+    """Controls whether a staged output may replace the requested target."""
+
+    ALWAYS = "always"
+    VALIDATED = "validated"
+
+
+class PDFUAStatus(StrEnum):
+    """Truthful PDF/UA outcome without implying human certification."""
+
+    NOT_REQUESTED = "not_requested"
+    NOT_PRODUCED = "not_produced"
+    VALIDATION_FAILED = "validation_failed"
+    REVIEW_REQUIRED = "review_required"
+    MACHINE_VALIDATED = "machine_validated"
+
+
+@dataclass(frozen=True, slots=True)
+class PDFUAReviewFinding:
+    """One structured reason why a PDF/UA output needs author review."""
+
+    code: str
+    message: str
+    count: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileValidationResult:
+    """Evidence from one requested veraPDF profile validation."""
+
+    profile: str
+    result: VeraPDFResult | None = None
+    error: str | None = None
+
+    @property
+    def completed(self) -> bool:
+        """Whether veraPDF returned a parseable validation report."""
+        return self.result is not None
+
+    @property
+    def compliant(self) -> bool:
+        """Whether validation completed and reported conformance."""
+        return self.result is not None and self.result.compliant
+
+    def to_dict(self, *, include_raw_xml: bool = False) -> dict[str, Any]:
+        """Return JSON-serializable validation evidence."""
+        if self.result is None:
+            return {
+                "profile": self.profile,
+                "completed": False,
+                "compliant": False,
+                "error": self.error,
+            }
+
+        result = self.result
+        data: dict[str, Any] = {
+            "profile": self.profile,
+            "completed": True,
+            "compliant": result.compliant,
+            "detected_flavour": result.flavour,
+            "passed_rules": result.passed_rules,
+            "failed_rules": result.failed_rules,
+            "errors": list(result.errors),
+            "warnings": list(result.warnings),
+            "validator_version": result.validator_version,
+            "rule_findings": [
+                {
+                    "specification": finding.specification,
+                    "clause": finding.clause,
+                    "test_number": finding.test_number,
+                    "description": finding.description,
+                    "passed_checks": finding.passed_checks,
+                    "failed_checks": finding.failed_checks,
+                    "contexts": list(finding.contexts),
+                }
+                for finding in result.rule_findings
+            ],
+        }
+        if include_raw_xml:
+            data["raw_xml"] = result.raw_xml
+        return data
+
+
+def _publication_policy(
+    value: PublicationPolicy | Literal["always", "validated"] | None,
+    *,
+    validation_required: bool,
+) -> PublicationPolicy:
+    """Resolve the publication policy, defaulting validation to fail-closed."""
+    if value is None:
+        return (
+            PublicationPolicy.VALIDATED
+            if validation_required
+            else PublicationPolicy.ALWAYS
+        )
+    try:
+        return PublicationPolicy(value)
+    except ValueError as exc:
+        raise ConversionError(
+            "publication_policy must be 'validated' or 'always'"
+        ) from exc
 
 
 def _signature_invalidation_warning(count: int, *, pdfa: bool = True) -> str:
@@ -312,26 +424,39 @@ def _validate_pdfa_output(
     output_path: Path,
     level: str,
     warnings: list[str],
+    evidence: list[ProfileValidationResult] | None = None,
 ) -> bool:
     """Validate an output and append all reported compliance errors."""
     try:
         result = validate_with_verapdf(path=output_path, flavour=level)
     except VeraPDFError as exc:
+        if evidence is not None:
+            evidence.append(ProfileValidationResult(profile=level, error=str(exc)))
         warnings.append(f"Validation: veraPDF could not run: {exc}")
         return True
+    if evidence is not None:
+        evidence.append(ProfileValidationResult(profile=level, result=result))
     if result.compliant:
         return False
     warnings.extend(f"Validation: {error}" for error in result.errors)
     return True
 
 
-def _validate_pdfua_output(output_path: Path, warnings: list[str]) -> bool:
+def _validate_pdfua_output(
+    output_path: Path,
+    warnings: list[str],
+    evidence: list[ProfileValidationResult] | None = None,
+) -> bool:
     """Validate PDF/UA-1 conformance and append all reported errors."""
     try:
         result = validate_with_verapdf(path=output_path, flavour="ua1")
     except VeraPDFError as exc:
+        if evidence is not None:
+            evidence.append(ProfileValidationResult(profile="ua1", error=str(exc)))
         warnings.append(f"PDF/UA validation: veraPDF could not run: {exc}")
         return True
+    if evidence is not None:
+        evidence.append(ProfileValidationResult(profile="ua1", result=result))
     if result.compliant:
         return False
     warnings.extend(f"PDF/UA validation: {error}" for error in result.errors)
@@ -364,9 +489,21 @@ class ConversionResult:
         error: Error message if success=False.
         validation_failed: True if veraPDF reported non-conformance or could
             not complete, or if a preserved embedded PDF could not be
-            converted. The candidate output is still published with
-            ``success=False`` in this case.
+            converted.
         skipped: True if the original PDF was copied through unchanged.
+        published: True if this call wrote the requested output path.
+        target_produced: True if the requested conformance target was produced.
+        pdfua_status: Machine-verifiable PDF/UA outcome. This never represents
+            a human accessibility certification.
+        review_findings: Structured accessibility findings requiring author
+            review.
+        validation_results: Full per-profile veraPDF evidence.
+        sanitization_stats: Structured counters from PDF/A sanitization.
+        tagging_stats: Structured counters from logical-structure processing.
+        metadata_sources: Provenance for accessibility-critical metadata.
+        candidate_sha256: SHA-256 of the exact staged bytes submitted to
+            validation, whether or not they were published.
+        candidate_size: Size of that staged candidate in bytes.
     """
 
     success: bool
@@ -378,6 +515,57 @@ class ConversionResult:
     error: str | None = None
     validation_failed: bool = False
     skipped: bool = False
+    published: bool = True
+    target_produced: bool = True
+    pdfua_status: PDFUAStatus = PDFUAStatus.NOT_REQUESTED
+    review_findings: tuple[PDFUAReviewFinding, ...] = ()
+    validation_results: tuple[ProfileValidationResult, ...] = ()
+    sanitization_stats: dict[str, Any] = field(default_factory=dict)
+    tagging_stats: dict[str, Any] = field(default_factory=dict)
+    metadata_sources: dict[str, str] = field(default_factory=dict)
+    candidate_sha256: str | None = None
+    candidate_size: int | None = None
+
+    @property
+    def review_required(self) -> bool:
+        """Whether author review is required before claiming accessibility."""
+        return self.pdfua_status is PDFUAStatus.REVIEW_REQUIRED
+
+    def to_dict(self, *, include_raw_validation: bool = False) -> dict[str, Any]:
+        """Return a deterministic, JSON-serializable conversion audit record."""
+        return {
+            "schema_version": 1,
+            "success": self.success,
+            "input_path": str(self.input_path),
+            "output_path": str(self.output_path),
+            "level": self.level,
+            "warnings": list(self.warnings),
+            "processing_time": self.processing_time,
+            "error": self.error,
+            "validation_failed": self.validation_failed,
+            "skipped": self.skipped,
+            "published": self.published,
+            "target_produced": self.target_produced,
+            "pdfua_status": self.pdfua_status.value,
+            "review_required": self.review_required,
+            "review_findings": [
+                {
+                    "code": finding.code,
+                    "message": finding.message,
+                    "count": finding.count,
+                }
+                for finding in self.review_findings
+            ],
+            "validation_results": [
+                evidence.to_dict(include_raw_xml=include_raw_validation)
+                for evidence in self.validation_results
+            ],
+            "sanitization_stats": dict(sorted(self.sanitization_stats.items())),
+            "tagging_stats": dict(sorted(self.tagging_stats.items())),
+            "metadata_sources": dict(sorted(self.metadata_sources.items())),
+            "candidate_sha256": self.candidate_sha256,
+            "candidate_size": self.candidate_size,
+        }
 
 
 def generate_output_path(
@@ -477,31 +665,48 @@ def _copy_encrypted_input(
     output_path: Path,
     *,
     pdfa: bool,
+    pdfua: bool = False,
+    publish_unconverted: bool = False,
     start_time: float,
     allow_overwrite: bool = True,
 ) -> ConversionResult:
-    """Copy an encrypted input unchanged without validating it."""
+    """Handle an encrypted input without treating it as converted output."""
     warning = (
         "Conversion skipped: PDF is encrypted and cannot be converted"
         if pdfa
         else "Processing skipped: PDF is encrypted and cannot be processed"
     )
     logger.warning("%s: %s", warning, input_path)
+    published = not pdfua or publish_unconverted
     warnings = [warning]
-    _copy_input_to_output(
-        input_path,
-        output_path,
-        allow_overwrite=allow_overwrite,
-    )
+    if published:
+        _copy_input_to_output(
+            input_path,
+            output_path,
+            allow_overwrite=allow_overwrite,
+        )
+    else:
+        warnings.append(
+            "Encrypted input was not published because the PDF/UA target "
+            "could not be produced"
+        )
     processing_time = time.perf_counter() - start_time
     return ConversionResult(
-        success=True,
+        success=not pdfua,
         input_path=input_path,
         output_path=output_path,
         level=None,
         warnings=warnings,
         processing_time=processing_time,
+        error=(
+            "PDF/UA target was not produced because the input is encrypted"
+            if pdfua
+            else None
+        ),
         skipped=True,
+        published=published,
+        target_produced=not pdfa,
+        pdfua_status=(PDFUAStatus.NOT_PRODUCED if pdfua else PDFUAStatus.NOT_REQUESTED),
     )
 
 
@@ -959,6 +1164,11 @@ def convert_to_pdfa(
     pdfa: bool = True,
     pdfua: bool = False,
     validate: bool = False,
+    publication_policy: PublicationPolicy
+    | Literal["always", "validated"]
+    | None = None,
+    document_title: str | None = None,
+    document_language: str | None = None,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_detection_model_dir: Path | None = None,
@@ -986,8 +1196,16 @@ def convert_to_pdfa(
         pdfua: If True, also produce PDF/UA-1 output. This requires PDF/A-2a
             or PDF/A-3a.
         validate: If True, the result is validated. PDF/UA-1 output is always
-            submitted to both requested validation profiles; the candidate is
-            published regardless of the validation result.
+            submitted to both requested validation profiles.
+        publication_policy: ``"validated"`` publishes only when every
+            requested validator completed successfully and reported
+            conformance. ``"always"`` also publishes non-conforming
+            candidates. Validation defaults to fail-closed.
+        document_title: Authoritative document title for PDF/UA output. When
+            omitted, source metadata is preserved and a filename fallback is
+            reported for author review.
+        document_language: Authoritative BCP 47 language tag for the document
+            catalog (for example ``"de"`` or ``"en-GB"``).
         skip_any_pdfa: If True, skip conversion for any input that veraPDF
             validates as compliant PDF/A, regardless of target level.
         ocr_languages: Optional list of PaddleOCR language codes
@@ -1036,8 +1254,33 @@ def convert_to_pdfa(
     _validate_pdfua_options(pdfa=pdfa, level=level, pdfua=pdfua)
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
+    if not pdfa and (document_title is not None or document_language is not None):
+        raise ConversionError(
+            "Document metadata overrides cannot be used when pdfa=False"
+        )
+    effective_publication_policy = _publication_policy(
+        publication_policy,
+        validation_required=validate or pdfua,
+    )
+    cleaned_document_title = None
+    if document_title is not None:
+        cleaned_document_title = _clean_metadata_text(document_title)
+        if cleaned_document_title is None:
+            raise ConversionError("document_title must contain visible text")
+    cleaned_document_language = None
+    if document_language is not None:
+        cleaned_document_language = document_language.strip()
+        if not _is_valid_bcp47(cleaned_document_language):
+            raise ConversionError("document_language must be a valid BCP 47 tag")
     start_time = time.perf_counter()
     warnings: list[str] = []
+    validation_results: list[ProfileValidationResult] = []
+    review_findings: list[PDFUAReviewFinding] = []
+    sanitize_result: dict[str, Any] = {}
+    tagging_result: dict[str, Any] = {}
+    title_source = "not_applicable"
+    language_source = "not_applicable"
+    unrequested_pdfua_claim = False
     ocr_temp_file: Path | None = None
     ocr_signature_temp_file: Path | None = None
     ocr_clean_temp_file: Path | None = None
@@ -1052,6 +1295,9 @@ def convert_to_pdfa(
     if ocr_force and ocr_deskew:
         raise OCRError("Deskew cannot be combined with forced OCR")
     explicit_ocr_processing_requested = ocr_requested
+    explicit_metadata_update_requested = (
+        cleaned_document_title is not None or cleaned_document_language is not None
+    )
 
     if pdfa:
         logger.info(
@@ -1074,6 +1320,8 @@ def convert_to_pdfa(
                         input_path,
                         output_path,
                         pdfa=False,
+                        pdfua=False,
+                        publish_unconverted=True,
                         start_time=start_time,
                         allow_overwrite=_allow_output_overwrite,
                     )
@@ -1102,6 +1350,34 @@ def convert_to_pdfa(
                 )
             source_info = extract_pdf_info(check_pdf) if pdfa else None
             source_xmp_tree = _extract_existing_xmp(check_pdf) if pdfa else None
+            if pdfa and source_info is not None:
+                source_title = _clean_metadata_text(source_info.get("title"))
+                title_source = (
+                    "source_docinfo" if source_title is not None else "missing"
+                )
+                if source_title is None:
+                    source_title = _extract_lang_alt_xmp_property(
+                        source_xmp_tree,
+                        NAMESPACES["dc"],
+                        "title",
+                    )
+                    if source_title is not None:
+                        title_source = "source_xmp"
+                if cleaned_document_title is not None:
+                    source_info["title"] = cleaned_document_title
+                    title_source = "user"
+                elif source_title is None and pdfua:
+                    title_source = "fallback"
+
+                try:
+                    source_catalog_language = str(check_pdf.Root.get("/Lang", ""))
+                except (TypeError, ValueError):
+                    source_catalog_language = ""
+                source_catalog_language = source_catalog_language.strip()
+                if cleaned_document_language is not None:
+                    language_source = "user"
+                elif _is_valid_bcp47(source_catalog_language):
+                    language_source = "source_catalog"
             signature_count = count_digital_signatures(check_pdf)
             if signature_count > 0 and not allow_signature_invalidation:
                 signature_skip_warning = (
@@ -1114,34 +1390,72 @@ def convert_to_pdfa(
                 )
                 logger.warning("%s: %s", signature_skip_warning, input_path)
                 check_pdf.close()
-                _copy_input_to_output(
-                    input_path,
-                    output_path,
-                    allow_overwrite=_allow_output_overwrite,
+                published = not pdfua or (
+                    effective_publication_policy is PublicationPolicy.ALWAYS
                 )
+                signature_warnings = [signature_skip_warning]
+                if published:
+                    _copy_input_to_output(
+                        input_path,
+                        output_path,
+                        allow_overwrite=_allow_output_overwrite,
+                    )
+                else:
+                    signature_warnings.append(
+                        "Signed input was not published because the PDF/UA target "
+                        "could not be produced"
+                    )
                 processing_time = time.perf_counter() - start_time
                 return ConversionResult(
-                    success=True,
+                    success=not pdfua,
                     input_path=input_path,
                     output_path=output_path,
                     level=None,
-                    warnings=[signature_skip_warning],
+                    warnings=signature_warnings,
                     processing_time=processing_time,
+                    error=(
+                        "PDF/UA target was not produced because conversion would "
+                        "invalidate a digital signature"
+                        if pdfua
+                        else None
+                    ),
                     skipped=True,
+                    published=published,
+                    target_produced=not pdfa,
+                    pdfua_status=(
+                        PDFUAStatus.NOT_PRODUCED if pdfua else PDFUAStatus.NOT_REQUESTED
+                    ),
                 )
             if signature_count > 0:
                 warnings.append(
                     _signature_invalidation_warning(signature_count, pdfa=pdfa)
                 )
             detected_level = detect_pdfa_level(check_pdf) if pdfa else None
+            if pdfa and not pdfua:
+                unrequested_pdfua_claim = any(
+                    standard.standard == "PDF/UA"
+                    for standard in detect_iso_standards(check_pdf)
+                )
 
-        if detected_level is not None and explicit_ocr_processing_requested:
+        if detected_level is not None and (
+            explicit_ocr_processing_requested
+            or explicit_metadata_update_requested
+            or unrequested_pdfua_claim
+        ):
             logger.debug(
-                "Bypassing PDF/A pre-check skip because explicit OCR processing "
-                "was requested"
+                "Bypassing PDF/A pre-check skip because %s",
+                (
+                    "an unrequested PDF/UA claim must be removed"
+                    if unrequested_pdfua_claim
+                    else "explicit processing was requested"
+                ),
             )
 
-        if detected_level is not None and not explicit_ocr_processing_requested:
+        if detected_level is not None and not (
+            explicit_ocr_processing_requested
+            or explicit_metadata_update_requested
+            or unrequested_pdfua_claim
+        ):
             should_validate_for_skip = skip_any_pdfa
             if not should_validate_for_skip and not level.endswith("a"):
                 level_cmp = _compare_pdfa_levels(detected_level, level)
@@ -1214,6 +1528,28 @@ def convert_to_pdfa(
                             ],
                             processing_time=processing_time,
                             skipped=True,
+                            pdfua_status=(
+                                PDFUAStatus.MACHINE_VALIDATED
+                                if pdfua
+                                else PDFUAStatus.NOT_REQUESTED
+                            ),
+                            validation_results=tuple(
+                                ProfileValidationResult(
+                                    profile=profile,
+                                    result=result,
+                                )
+                                for profile, result in (
+                                    (detected_level, verapdf_result),
+                                    ("ua1", pdfua_result),
+                                )
+                                if result is not None
+                            ),
+                            metadata_sources={
+                                "title": title_source,
+                                "language": language_source,
+                            },
+                            candidate_sha256=staged_snapshot.sha256,
+                            candidate_size=staged_snapshot.size,
                         )
                     if verapdf_result is not None:
                         logger.info(
@@ -1498,6 +1834,8 @@ def convert_to_pdfa(
         # 4. Sanitize PDF for PDF/A
         logger.debug("Sanitizing PDF for PDF/A-%s", level)
         sanitize_result = sanitize_for_pdfa(pdf, level, preserve_stamps=preserve_stamps)
+        if cleaned_document_language is not None:
+            pdf.Root["/Lang"] = pikepdf.String(cleaned_document_language)
         if pdfua:
             ensure_display_doc_title(pdf, level)
 
@@ -1527,6 +1865,15 @@ def convert_to_pdfa(
             pdfua=pdfua,
             fallback_title=input_path.stem,
         )
+
+        # A PDF/UA claim is valid only for the explicitly requested and
+        # subsequently validated output. Never carry an inherited claim into
+        # a different processing contract.
+        if not pdfua and remove_pdfua_identification(pdf):
+            warnings.append(
+                "PDF/UA identification removed from XMP metadata "
+                "(PDF/UA output was not requested)"
+            )
 
         # 5.5. Add Extensions dictionary for PDF/A-3
         add_extensions_if_needed(pdf, level)
@@ -1609,6 +1956,16 @@ def convert_to_pdfa(
                 0,
             )
             if alternative_review_count:
+                review_findings.append(
+                    PDFUAReviewFinding(
+                        code="missing_alternative_text",
+                        message=(
+                            "Figure or Formula has no trustworthy Alt, ActualText, "
+                            "or Caption"
+                        ),
+                        count=alternative_review_count,
+                    )
+                )
                 element_label = (
                     "element" if alternative_review_count == 1 else "elements"
                 )
@@ -1623,6 +1980,15 @@ def convert_to_pdfa(
                 0,
             )
             if vector_review_count:
+                review_findings.append(
+                    PDFUAReviewFinding(
+                        code="unclassified_vector_content",
+                        message=(
+                            "Direct vector painting was retained as a Layout artifact"
+                        ),
+                        count=vector_review_count,
+                    )
+                )
                 page_label = "page" if vector_review_count == 1 else "pages"
                 warnings.append(
                     f"{vector_review_count} {page_label} require manual review: "
@@ -1634,6 +2000,16 @@ def convert_to_pdfa(
                 0,
             )
             if table_review_count:
+                review_findings.append(
+                    PDFUAReviewFinding(
+                        code="non_rectangular_table",
+                        message=(
+                            "Inferred non-rectangular table was retained as "
+                            "conservative reading structure"
+                        ),
+                        count=table_review_count,
+                    )
+                )
                 table_label = "table" if table_review_count == 1 else "tables"
                 review_verb = "requires" if table_review_count == 1 else "require"
                 retain_verb = "was" if table_review_count == 1 else "were"
@@ -1647,6 +2023,15 @@ def convert_to_pdfa(
                 0,
             )
             if scanned_visual_review_count:
+                review_findings.append(
+                    PDFUAReviewFinding(
+                        code="unrepresented_scan_visuals",
+                        message=(
+                            "Full-page scan may contain meaningful non-text visuals"
+                        ),
+                        count=scanned_visual_review_count,
+                    )
+                )
                 page_label = (
                     "OCR page" if scanned_visual_review_count == 1 else "OCR pages"
                 )
@@ -1668,6 +2053,16 @@ def convert_to_pdfa(
                 0,
             )
             if link_review_count:
+                review_findings.append(
+                    PDFUAReviewFinding(
+                        code="unassociated_link",
+                        message=(
+                            "Link could not be safely associated with one logical "
+                            "structure element"
+                        ),
+                        count=link_review_count,
+                    )
+                )
                 link_label = (
                     "Link annotation" if link_review_count == 1 else "Link annotations"
                 )
@@ -1682,6 +2077,13 @@ def convert_to_pdfa(
                 0,
             )
             if form_review_count:
+                review_findings.append(
+                    PDFUAReviewFinding(
+                        code="unnamed_form_field",
+                        message="Form field has no trustworthy tooltip or field name",
+                        count=form_review_count,
+                    )
+                )
                 field_label = "Form field" if form_review_count == 1 else "Form fields"
                 review_verb = "requires" if form_review_count == 1 else "require"
                 warnings.append(
@@ -1690,6 +2092,15 @@ def convert_to_pdfa(
                 )
             if tagging_result["structure_rebuilt"]:
                 if tagging_result.get("semantic_structure_generated"):
+                    review_findings.append(
+                        PDFUAReviewFinding(
+                            code="generated_semantic_structure",
+                            message=(
+                                "Logical reading order and semantics were generated "
+                                "automatically"
+                            ),
+                        )
+                    )
                     if ocr_manifest is not None:
                         semantic_generation_warning = (
                             "Semantic Tagged PDF structure generated from final "
@@ -1721,11 +2132,39 @@ def convert_to_pdfa(
                     warnings.append(
                         "Tagged PDF structure generated from page content order"
                     )
-                if not pdfua and remove_pdfua_identification(pdf):
-                    warnings.append(
-                        "PDF/UA identification removed from XMP metadata "
-                        "(logical structure rebuilt)"
+
+        if pdfua:
+            if title_source == "fallback":
+                review_findings.append(
+                    PDFUAReviewFinding(
+                        code="fallback_document_title",
+                        message="Document title was derived from the input filename",
                     )
+                )
+            catalog_language = str(pdf.Root.get("/Lang", "")).strip()
+            if language_source == "not_applicable":
+                language_source = (
+                    "fallback" if catalog_language == "und" else "source_xmp"
+                )
+            if catalog_language == "und":
+                review_findings.append(
+                    PDFUAReviewFinding(
+                        code="undetermined_document_language",
+                        message=(
+                            "Document language is undetermined; supply an "
+                            "authoritative BCP 47 language tag"
+                        ),
+                    )
+                )
+            review_findings.append(
+                PDFUAReviewFinding(
+                    code="human_accessibility_review",
+                    message=(
+                        "Reading order, semantic meaning, alternatives, visual "
+                        "contrast, and usability require human verification"
+                    ),
+                )
+            )
 
         # 7. Create output directory if needed
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1765,41 +2204,82 @@ def convert_to_pdfa(
         pdf.close()
         pdf = None
 
-        processing_time = time.perf_counter() - start_time
-
         # 9. Validate requested profiles before atomically publishing the same
-        # candidate. Non-conformance is reported but does not suppress output.
+        # candidate. Validation is fail-closed unless the caller explicitly
+        # requests publication of a non-conforming candidate.
         validation_failed = (
             sanitize_result.get("embedded_pdf_conversions_failed", 0) > 0
         )
         if validate or pdfua:
             logger.debug("Validating output with veraPDF")
             validation_failed = (
-                _validate_pdfa_output(final_output_temp_file, level, warnings)
+                _validate_pdfa_output(
+                    final_output_temp_file,
+                    level,
+                    warnings,
+                    validation_results,
+                )
                 or validation_failed
             )
         if pdfua:
             validation_failed = (
-                _validate_pdfua_output(final_output_temp_file, warnings)
+                _validate_pdfua_output(
+                    final_output_temp_file,
+                    warnings,
+                    validation_results,
+                )
                 or validation_failed
             )
 
-        if validation_failed:
-            warnings.append(_VALIDATION_PUBLICATION_WARNING)
-        publish_staged_file(
-            final_output_temp_file,
-            output_path,
-            final_output_snapshot,
-            backup=final_output_temp_file.with_name(f"backup{output_path.suffix}"),
-            require_absent=not _allow_output_overwrite,
-        )
-        final_output_temp_file = None
+        if pdfua:
+            if validation_failed:
+                pdfua_status = PDFUAStatus.VALIDATION_FAILED
+            elif review_findings:
+                pdfua_status = PDFUAStatus.REVIEW_REQUIRED
+            else:
+                pdfua_status = PDFUAStatus.MACHINE_VALIDATED
+        else:
+            pdfua_status = PDFUAStatus.NOT_REQUESTED
 
-        logger.info(
-            "Conversion successful: %s (%.2f seconds)",
-            output_path,
-            processing_time,
+        published = not (
+            validation_failed
+            and effective_publication_policy is PublicationPolicy.VALIDATED
         )
+        if published:
+            if validation_failed:
+                warnings.append(_VALIDATION_PUBLICATION_WARNING)
+            publish_staged_file(
+                final_output_temp_file,
+                output_path,
+                final_output_snapshot,
+                backup=final_output_temp_file.with_name(f"backup{output_path.suffix}"),
+                require_absent=not _allow_output_overwrite,
+            )
+            final_output_temp_file = None
+        else:
+            warnings.append(_VALIDATION_WITHHELD_WARNING)
+
+        processing_time = time.perf_counter() - start_time
+        if validation_failed:
+            logger.error(
+                "Conversion validation failed%s: %s (%.2f seconds)",
+                " after publication" if published else "",
+                output_path,
+                processing_time,
+            )
+        elif pdfua_status is PDFUAStatus.REVIEW_REQUIRED:
+            logger.warning(
+                "Conversion machine validation passed; author review required: "
+                "%s (%.2f seconds)",
+                output_path,
+                processing_time,
+            )
+        else:
+            logger.info(
+                "Conversion successful: %s (%.2f seconds)",
+                output_path,
+                processing_time,
+            )
 
         return ConversionResult(
             success=not validation_failed,
@@ -1808,8 +2288,25 @@ def convert_to_pdfa(
             level=level,
             warnings=warnings,
             processing_time=processing_time,
-            error=_VALIDATION_FAILURE_ERROR if validation_failed else None,
+            error=(
+                (_VALIDATION_FAILURE_ERROR if published else _VALIDATION_WITHHELD_ERROR)
+                if validation_failed
+                else None
+            ),
             validation_failed=validation_failed,
+            published=published,
+            target_produced=not validation_failed,
+            pdfua_status=pdfua_status,
+            review_findings=tuple(review_findings),
+            validation_results=tuple(validation_results),
+            sanitization_stats=dict(sanitize_result),
+            tagging_stats=dict(tagging_result),
+            metadata_sources={
+                "title": title_source,
+                "language": language_source,
+            },
+            candidate_sha256=final_output_snapshot.sha256,
+            candidate_size=final_output_snapshot.size,
         )
 
     except pikepdf.PasswordError:
@@ -1817,6 +2314,10 @@ def convert_to_pdfa(
             input_path,
             output_path,
             pdfa=pdfa,
+            pdfua=pdfua,
+            publish_unconverted=(
+                effective_publication_policy is PublicationPolicy.ALWAYS
+            ),
             start_time=start_time,
             allow_overwrite=_allow_output_overwrite,
         )
@@ -1903,6 +2404,10 @@ def convert_files(
     pdfa: bool = True,
     pdfua: bool = False,
     validate: bool = False,
+    publication_policy: PublicationPolicy
+    | Literal["always", "validated"]
+    | None = None,
+    document_language: str | None = None,
     skip_any_pdfa: bool = False,
     ocr_languages: list[str] | None = None,
     ocr_detection_model_dir: Path | None = None,
@@ -1930,6 +2435,10 @@ def convert_files(
         pdfua: If True, also produce PDF/UA-1 output. This requires PDF/A-2a
             or PDF/A-3a.
         validate: If True, results are validated.
+        publication_policy: Controls whether validation failures may be
+            published. Validation defaults to fail-closed.
+        document_language: Authoritative BCP 47 language tag applied to every
+            document in the batch.
         skip_any_pdfa: If True, skip conversion for any input that veraPDF
             validates as compliant PDF/A, regardless of target level.
         ocr_languages: Optional list of PaddleOCR language codes
@@ -2013,6 +2522,11 @@ def convert_files(
                     output_path=output_path,
                     level=level if pdfa else None,
                     error="Output file already exists",
+                    published=False,
+                    target_produced=False,
+                    pdfua_status=(
+                        PDFUAStatus.NOT_PRODUCED if pdfua else PDFUAStatus.NOT_REQUESTED
+                    ),
                 )
             )
             continue
@@ -2025,6 +2539,8 @@ def convert_files(
                 pdfa=pdfa,
                 pdfua=pdfua,
                 validate=validate,
+                publication_policy=publication_policy,
+                document_language=document_language,
                 skip_any_pdfa=skip_any_pdfa,
                 ocr_languages=ocr_languages,
                 ocr_detection_model_dir=ocr_detection_model_dir,
@@ -2046,6 +2562,7 @@ def convert_files(
             UnsupportedPDFError,
             FontEmbeddingError,
             OCRError,
+            PermissionError,
         ) as e:
             logger.error("Error for %s: %s", input_path.name, e)
             results.append(
@@ -2056,6 +2573,11 @@ def convert_files(
                     level=level if pdfa else None,
                     error=str(e),
                     processing_time=0.0,
+                    published=False,
+                    target_produced=False,
+                    pdfua_status=(
+                        PDFUAStatus.NOT_PRODUCED if pdfua else PDFUAStatus.NOT_REQUESTED
+                    ),
                 )
             )
 
@@ -2071,6 +2593,10 @@ def convert_directory(
     pdfua: bool = False,
     recursive: bool = False,
     validate: bool = False,
+    publication_policy: PublicationPolicy
+    | Literal["always", "validated"]
+    | None = None,
+    document_language: str | None = None,
     skip_any_pdfa: bool = False,
     show_progress: bool = True,
     ocr_languages: list[str] | None = None,
@@ -2098,6 +2624,10 @@ def convert_directory(
             or PDF/A-3a.
         recursive: If True, subdirectories are included.
         validate: If True, results are validated.
+        publication_policy: Controls whether validation failures may be
+            published. Validation defaults to fail-closed.
+        document_language: Authoritative BCP 47 language tag applied to every
+            document in the directory.
         skip_any_pdfa: If True, skip conversion for any input that veraPDF
             validates as compliant PDF/A, regardless of target level.
         show_progress: If True, a progress bar is shown.
@@ -2238,6 +2768,8 @@ def convert_directory(
         pdfa=pdfa,
         pdfua=pdfua,
         validate=validate,
+        publication_policy=publication_policy,
+        document_language=document_language,
         skip_any_pdfa=skip_any_pdfa,
         ocr_languages=ocr_languages,
         ocr_detection_model_dir=ocr_detection_model_dir,

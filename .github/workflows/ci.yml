@@ -58,3 +58,64 @@ jobs:
 
       - name: Tests with coverage
         run: python -m pytest --cov=pdftopdfa --cov-report=term-missing
+
+  pdfua-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Install pinned veraPDF
+        env:
+          VERAPDF_SHA256: 6cc6341cb1af644044054b81f00a6590a7918abb18f762243de115258bcad838
+        run: |
+          curl --fail --location --retry 3 \
+            --output verapdf-installer.zip \
+            https://software.verapdf.org/rel/1.30/verapdf-greenfield-1.30.2-installer.zip
+          echo "$VERAPDF_SHA256  verapdf-installer.zip" | sha256sum --check
+          unzip -q verapdf-installer.zip -d verapdf-installer
+          cat > auto-install.xml <<'EOF'
+          <?xml version="1.0" encoding="UTF-8" standalone="no"?>
+          <AutomatedInstallation langpack="eng">
+            <com.izforge.izpack.panels.htmlhello.HTMLHelloPanel id="welcome"/>
+            <com.izforge.izpack.panels.target.TargetPanel id="install_dir">
+              <installpath>${{ runner.temp }}/verapdf</installpath>
+            </com.izforge.izpack.panels.target.TargetPanel>
+            <com.izforge.izpack.panels.packs.PacksPanel id="sdk_pack_select">
+              <pack index="0" name="veraPDF GUI" selected="false"/>
+              <pack index="1" name="veraPDF CLI" selected="true"/>
+              <pack index="2" name="veraPDF Documentation" selected="false"/>
+              <pack index="3" name="veraPDF Sample Plugins" selected="false"/>
+            </com.izforge.izpack.panels.packs.PacksPanel>
+            <com.izforge.izpack.panels.install.InstallPanel id="install"/>
+            <com.izforge.izpack.panels.finish.FinishPanel id="finish"/>
+          </AutomatedInstallation>
+          EOF
+          java -jar \
+            verapdf-installer/verapdf-greenfield-1.30.2/verapdf-izpack-installer-1.30.2.jar \
+            auto-install.xml
+          "${{ runner.temp }}/verapdf/verapdf" --version
+
+      - name: PDF/UA-1 conversion gate
+        env:
+          VERAPDF_PATH: ${{ runner.temp }}/verapdf/verapdf
+        run: >-
+          python -m pytest tests/test_converter.py
+          -k "convert_pdfua_passes_both_verapdf_profiles"
+          --no-cov

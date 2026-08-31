@@ -20,6 +20,8 @@ preserving the original content, fonts, and layout where possible.
   (ISO 19005-2 and ISO 19005-3), including Tagged PDF output for scanned
   documents
 - **PDF/UA-1** -- optional dual-conformance output with PDF/A-2a or PDF/A-3a
+- **Auditable PDF/UA workflow** -- fail-closed publication, explicit machine and
+  author-review states, and atomic JSON evidence reports
 - **Automatic font embedding** -- uses policy-approved Windows system fonts or bundled replacements
 - **Font subsetting** -- reduces file size by removing unused glyphs
 - **CJK support** -- embeds Noto Sans CJK for Chinese, Japanese, and Korean text
@@ -65,8 +67,9 @@ pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with 
    internal OCR engine's line and layout data. A provably inverted
    single-column block order is rebuilt; ambiguous or multi-column existing
    orders are preserved
-8. **Save and validate** -- writes the output with the correct PDF version
-   header, publishes it atomically, and reports PDF/A or PDF/UA non-conformance
+8. **Save and validate** -- stages the output with the correct PDF version
+   header, validates requested profiles, and by default atomically publishes
+   only an accepted candidate
 
 ## Installation
 
@@ -92,8 +95,17 @@ is not bundled. Install version 1.30.2 or newer and make its launcher available 
 `VERAPDF_PATH` to the executable or its parent directory. `--validate` and
 `validate=True` opt ordinary PDF/A output into validation. PDF/UA output always
 attempts validation against both the selected PDF/A profile and veraPDF's `ua1`
-profile. If either check cannot run or fails, the candidate remains published
-with `success=False`; the failure is also reported through the CLI exit code.
+profile. Validation is fail-closed: if a requested check cannot run or fails,
+the staged candidate is not published and an existing destination is preserved.
+Use `--publish-noncompliant` or `publication_policy="always"` only when an
+explicitly non-conforming review candidate is required.
+
+Passing `--audit-report report.json` writes an atomic, machine-readable record
+containing the exact staged-candidate hash when available, sanitizer and tagger
+counters, structured veraPDF rule findings, and raw XML for completed validator
+runs. A fatal invocation replaces stale evidence with a structured
+`fatal_error` record. The report distinguishes machine validation from author
+review; it is evidence, not an accessibility certification.
 
 ### Optional: OCR support
 
@@ -195,7 +207,11 @@ pdftopdfa -l 2b document.pdf
 pdftopdfa -l 2a --validate document.pdf
 
 # PDF/A-2a and PDF/UA-1 output (both profiles are always validated)
-pdftopdfa -l 2a --pdfua document.pdf
+pdftopdfa -l 2a --pdfua --document-title "Annual report" \
+  --document-language en-GB --audit-report document-audit.json document.pdf
+
+# Explicitly retain a failed validation candidate (not conforming output)
+pdftopdfa -l 2a --pdfua --publish-noncompliant document.pdf
 
 # With validation (note: -v = --validate, not verbose; use --verbose for logs)
 pdftopdfa -v document.pdf
@@ -280,6 +296,8 @@ accessible_result = convert_to_pdfa(
     output_path=Path("accessible.pdf"),
     level="2a",
     pdfua=True,
+    document_title="Annual report",
+    document_language="en-GB",
 )
 
 ocr_result = convert_to_pdfa(
@@ -333,18 +351,22 @@ image, table, and reusable `OCRSession` APIs.
   Review automatically inferred semantics for accessibility-critical
   publications. PDF/A level A does not by itself imply PDF/UA conformance;
   request the additional PDF/UA-1 requirements with `--pdfua` or
-  `pdfua=True`. PDF/UA candidates are published even when PDF/A or PDF/UA-1
-  machine validation fails, but return `success=False`; the non-conformance is reported. veraPDF cannot
-  judge whether content order, descriptions, labels, language, contrast, color
-  use, or media alternatives are meaningful; reported semantic uncertainties
-  still require human review.
+  `pdfua=True`. A `review_required` result means both machine profiles passed
+  but one or more semantics still require an author decision; it is not a
+  certification. veraPDF cannot judge whether content order, descriptions,
+  labels, language, contrast, color use, or media alternatives are meaningful.
+  PDF/UA-2 generation is not implemented: it requires a separate PDF 2.0 and
+  PDF/A-4 output track. The low-level validator API can inspect an existing
+  file with the `ua2` profile.
 - **Encrypted PDFs** -- encryption is removed from PDFs that open with an empty
-  user password. PDFs that require a password cannot be converted and are copied
-  unchanged. With an automatically generated output name, the unchanged copy
+  user password. PDFs that require a password cannot be converted and are
+  ordinarily copied unchanged. With an automatically generated output name, the unchanged copy
   still receives the `_pdfa.pdf` suffix; it is not a converted PDF/A file.
-  Requested validation still reports non-conformance, but does not suppress the
-  unchanged copy; PDF/UA mode attempts both mandatory profiles
-- **Digitally signed PDFs** -- signed PDFs are copied unchanged by default because conversion would invalidate their signatures; use `--allow-signature-invalidation` only when an unsigned archival copy is intentional
+  A requested PDF/UA target returns `success=False` and
+  `pdfua_status="not_produced"` and preserves the destination without
+  publishing the protected input. `--publish-noncompliant` explicitly enables
+  unchanged copy-through.
+- **Digitally signed PDFs** -- signed PDFs are ordinarily copied unchanged because conversion would invalidate their signatures. A requested PDF/UA target returns `success=False` and `pdfua_status="not_produced"` without publishing by default; use `--allow-signature-invalidation` only when an unsigned archival copy is intentional
 - **Font replacement** -- fonts without a suitable metrically compatible replacement produce a warning; the resulting file may not be fully compliant
 - **Non-embedded CIDFonts (Identity encoding)** -- content streams reference glyph IDs of the original font; after replacement with a substitute font the same glyph IDs point to different or missing glyphs, so the affected text may render incorrectly or invisibly. Text extraction and copy/paste stay correct because the original ToUnicode mapping is preserved. A warning is emitted for each replaced CIDFont
 
@@ -370,6 +392,10 @@ python -m pytest
 
 The test suite covers fonts, color profiles, metadata, sanitization, OCR, and
 end-to-end conversion.
+
+CI additionally installs the checksum-pinned veraPDF 1.30.2 distribution and
+runs a real dual PDF/A/PDF/UA-1 conversion gate rather than mocking the
+validator boundary.
 
 The real-model semantic OCR tests are opt-in and never modify the configured
 model directories. Set `PDFTOPDFA_TEST_OCR_DETECTION_MODEL_DIR` and
@@ -433,8 +459,8 @@ Contributions are welcome! Please open an [issue](https://github.com/iredpaul/pd
 - [PaddleX](https://github.com/PaddlePaddle/PaddleX) -- local-model OCR and
   table-recognition pipelines
 - [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) -- PDF page rasterizer for OCR
-- [veraPDF](https://verapdf.org/) -- external application for ISO-compliant
-  PDF/A validation
+- [veraPDF](https://verapdf.org/) -- external application for PDF/A and PDF/UA
+  machine validation
 
 ## Acknowledgments
 

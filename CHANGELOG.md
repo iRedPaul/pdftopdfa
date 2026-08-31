@@ -1,5 +1,37 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+- Add enterprise PDF/UA outcomes with structured author-review findings,
+  per-profile veraPDF evidence, sanitizer/tagger statistics, and candidate
+  SHA-256 data
+- Add atomic CLI JSON audit reports with complete veraPDF XML and structured
+  failed-rule contexts
+- Add authoritative PDF/UA document-title and BCP 47 language inputs
+
+### Changes
+
+- Make requested validation fail-closed by default; non-conforming candidates
+  are published only with `--publish-noncompliant` or
+  `publication_policy="always"`
+- Return `not_produced` and `success=False` without publishing protected inputs
+  when they prevent a requested PDF/UA conversion
+- Remove inherited PDF/UA identification when PDF/UA output was not requested
+- Accept `ua2` in the low-level veraPDF API for validation only; PDF/UA-2
+  generation remains outside the PDF/A-2/3 pipeline
+
+### Bug Fixes
+
+- Continue batch processing after per-file permission errors and report both
+  PDF/A and PDF/UA validation failures in quiet directory mode
+
+### CI / Build
+
+- Add a real dual-profile PDF/UA conversion gate using checksum-pinned
+  veraPDF 1.30.2
+
 ## [0.9.7] - 2026-08-27
 
 ### Features
