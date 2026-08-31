@@ -36,20 +36,21 @@ Within one PDF conversion, the initialized Paddle session is reused across
 pages and released when conversion ends, including after an error. OCRmyPDF runs
 one page job at a time and Paddle predictions are serialized, avoiding
 concurrent access to the PaddleX session. The detector limits its inference
-image to 1,600 pixels on the longest side. OCR uses a minimum rasterization
+image to 1,600 pixels on the longest side. OCR normally uses a rasterization
 resolution of 600 DPI. Before rasterization, every selected page is checked at
-the effective OCR resolution and rejected if it would exceed 100 million
-pixels. This admits A3 at 600 DPI while bounding a grayscale page raster to
-about 100 MB before decoder and renderer overhead. Page boxes that would later
-be normalized or clipped for PDF/A are rejected before OCR so text-layer and
-semantic coordinates cannot diverge. When page orientation is enabled, every
-page is also checked at the orientation model's actual 108 DPI render size,
+the effective OCR resolution and rejected if it would exceed 250 million
+pixels. Pages exceeding the limit at 600 DPI are retried at 300 DPI. This
+admits A2 at 600 DPI and A0 at 300 DPI while bounding a grayscale page raster
+to about 250 MB before decoder and renderer overhead. Page boxes that would
+later be normalized or clipped for PDF/A are rejected before OCR so text-layer
+and semantic coordinates cannot diverge. When page orientation is enabled,
+every page is also checked at the orientation model's actual 108 DPI render size,
 including text pages that OCRmyPDF itself skips. Model and temporary-resource
 cleanup is always attempted independently; a cleanup failure aborts an
 otherwise successful call, but is only logged when another OCR error is already
 propagating so that the primary failure remains visible.
 
-OCR input is limited to 10,000 pages. PDF and semantic-manifest candidates are
+OCR input is limited to 100,000 pages. PDF and semantic-manifest candidates are
 created in private same-filesystem staging directories, then checked for
 pathname identity and byte-for-byte stability immediately before atomic
 publication.

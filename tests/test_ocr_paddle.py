@@ -2867,7 +2867,7 @@ def test_plugin_blocks_tesseract_and_registers_compatibility_only() -> None:
 
 @pytest.mark.parametrize(
     ("requested_dpi", "oversample", "expected_dpi"),
-    [(700.0, 600, 700.0), (800.0, 300, 300.0)],
+    [(700.0, 600, 700.0), (1200.0, 300, 300.0)],
 )
 def test_pypdfium_rasterizer_caps_only_unsafe_native_dpi(
     tmp_path: Path,

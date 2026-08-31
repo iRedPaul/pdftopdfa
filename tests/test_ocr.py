@@ -756,11 +756,16 @@ class TestOcrDetection:
 
             def many_operators(_owner: object):
                 nonlocal consumed
-                for _ in range(200_000):
+                for _ in range(200):
                     consumed += 1
                     yield SimpleNamespace(operator=pikepdf.Operator("q"), operands=())
 
             monkeypatch.setattr(pikepdf, "parse_content_stream", many_operators)
+            monkeypatch.setattr(
+                digital_layout,
+                "_MAX_DIGITAL_OPERATORS_PER_PAGE",
+                100,
+            )
             with (
                 patch("pdftopdfa.ocr._page_has_images") as page_has_images,
                 patch("pdftopdfa.ocr._page_has_text") as page_has_text,
@@ -1196,8 +1201,8 @@ class TestOcrResourcePreflight:
     @pytest.mark.parametrize(
         ("page_size", "expected_oversample"),
         [
-            (479.0, 600),
-            (481.0, 300),
+            (758.0, 600),
+            (760.0, 300),
         ],
     )
     def test_plans_safe_dpi_with_rotation_and_user_unit(
@@ -1221,7 +1226,7 @@ class TestOcrResourcePreflight:
     ) -> None:
         path = tmp_dir / "too-large-at-300.pdf"
         with Pdf.new() as pdf:
-            pdf.add_blank_page(page_size=(2401, 2401))
+            pdf.add_blank_page(page_size=(3800, 3800))
             pdf.save(path)
 
         with pytest.raises(
@@ -1233,6 +1238,14 @@ class TestOcrResourcePreflight:
         ):
             _preflight_ocr_input(path)
 
+    def test_allows_a0_page_at_fallback_dpi(self, tmp_dir: Path) -> None:
+        path = tmp_dir / "a0.pdf"
+        with Pdf.new() as pdf:
+            pdf.add_blank_page(page_size=(2384, 3370))
+            pdf.save(path)
+
+        assert _preflight_ocr_input(path) == 300
+
     def test_native_dpi_is_capped_at_planned_fallback(
         self,
         tmp_dir: Path,
@@ -1240,7 +1253,7 @@ class TestOcrResourcePreflight:
     ) -> None:
         path = tmp_dir / "high-native-dpi.pdf"
         with Pdf.new() as pdf:
-            pdf.add_blank_page(page_size=(1000, 1000))
+            pdf.add_blank_page(page_size=(1500, 1500))
             pdf.save(path)
         pdfinfo_value = SimpleNamespace(
             pages=[
@@ -1257,7 +1270,7 @@ class TestOcrResourcePreflight:
 
         assert "preferred 600 dpi oversampling (effective 800 dpi)" in caplog.text
         assert "using 300 dpi" in caplog.text
-        assert "17,363,889 pixels expected" in caplog.text
+        assert "39,062,500 pixels expected" in caplog.text
 
     def test_allows_large_document_with_safe_individual_pages(
         self,
@@ -1305,11 +1318,16 @@ class TestOcrResourcePreflight:
 
         def many_operators(_owner: object):
             nonlocal consumed
-            for _ in range(200_000):
+            for _ in range(200):
                 consumed += 1
                 yield SimpleNamespace(operator=pikepdf.Operator("q"), operands=())
 
         monkeypatch.setattr(pikepdf, "parse_content_stream", many_operators)
+        monkeypatch.setattr(
+            digital_layout,
+            "_MAX_DIGITAL_OPERATORS_PER_PAGE",
+            100,
+        )
         with (
             patch("pdftopdfa.ocr._page_has_text") as page_has_text,
             patch("pdftopdfa.ocr._page_paint_analysis") as paint_analysis,
@@ -1319,7 +1337,7 @@ class TestOcrResourcePreflight:
             _preflight_ocr_input(path)
 
         assert consumed == digital_layout._MAX_DIGITAL_OPERATORS_PER_PAGE + 1
-        assert consumed < 200_000
+        assert consumed < 200
         page_has_text.assert_not_called()
         paint_analysis.assert_not_called()
         pdfinfo.assert_not_called()
@@ -1679,9 +1697,9 @@ class TestOcrResourcePreflight:
     @pytest.mark.parametrize(
         ("page_size", "rotate_pages", "exceeds_limit"),
         [
-            (2666.0, True, False),
-            (2667.0, True, True),
-            (2667.0, False, False),
+            (4216.0, True, False),
+            (4217.0, True, True),
+            (4217.0, False, False),
         ],
     )
     def test_enforces_orientation_render_pixel_limit_on_text_pages(
@@ -3972,7 +3990,7 @@ class TestApplyOcr:
 
         kwargs = mock_ocr.call_args.kwargs
         assert kwargs["oversample"] == 300
-        assert kwargs["max_image_mpixels"] == 100.0
+        assert kwargs["max_image_mpixels"] == _OCR_MAX_PAGE_RASTER_PIXELS / 1_000_000
         assert "OCR page 1" in caplog.text
         assert "preferred 600 dpi" in caplog.text
         assert "using 300 dpi" in caplog.text
@@ -4042,7 +4060,7 @@ class TestApplyOcr:
             "rasterizer": "pypdfium",
             "output_type": "pdf",
             "oversample": 600,
-            "max_image_mpixels": 100.0,
+            "max_image_mpixels": _OCR_MAX_PAGE_RASTER_PIXELS / 1_000_000,
             "optimize": 0,
             "jobs": 1,
             "skip_text": True,

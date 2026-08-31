@@ -1124,7 +1124,9 @@ def test_page_filter_rejects_invalid_physical_index() -> None:
         extract_digital_layout(pdf, page_indices=frozenset({1}))
 
 
-def test_rejects_exponential_form_invocation_expansion() -> None:
+def test_rejects_exponential_form_invocation_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     pdf = pikepdf.Pdf.new()
     leaf = _form(pdf, b"q Q", Dictionary())
     current = leaf
@@ -1135,6 +1137,11 @@ def test_rejects_exponential_form_invocation_expansion() -> None:
             Dictionary(XObject=Dictionary(N=current)),
         )
     _page(pdf, b"/Root Do", Dictionary(XObject=Dictionary(Root=current)))
+    monkeypatch.setattr(
+        digital_layout,
+        "_MAX_FORM_INVOCATIONS_PER_RESOURCE_PER_PAGE",
+        1_024,
+    )
 
     with pytest.raises(ConversionError, match="invocation budget exceeded"):
         extract_digital_layout(pdf)

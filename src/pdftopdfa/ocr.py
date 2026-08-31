@@ -78,10 +78,10 @@ _OCR_PAGE_MANIFEST_TYPE = "pdftopdfa-ocr-page"
 _OCR_DOCUMENT_MANIFEST_TYPE = "pdftopdfa-ocr-document"
 _OCR_RASTER_DPI = 600
 _OCR_FALLBACK_RASTER_DPI = 300
-# Keeps one grayscale raster near 100 MB while still admitting A3 at 600 dpi.
-_OCR_MAX_PAGE_RASTER_PIXELS = 100_000_000
+# Keeps one grayscale raster near 250 MB while admitting A0 at fallback DPI.
+_OCR_MAX_PAGE_RASTER_PIXELS = 250_000_000
 # Bound non-raster page inspection and planning work as well.
-_OCR_MAX_DOCUMENT_PAGES = 10_000
+_OCR_MAX_DOCUMENT_PAGES = 100_000
 _OCR_MANIFEST_GEOMETRY_TOLERANCE = 1e-6
 _MAX_PDF_USER_UNIT = 75_000.0
 _ObjectKey = tuple[int, int] | tuple[str, bytes]
