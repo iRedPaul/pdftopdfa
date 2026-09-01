@@ -47,6 +47,7 @@ VALID_FLAVOURS = frozenset(
         "4e",
         "4f",
         "ua1",
+        "ua2",
     }
 )
 MIN_VERAPDF_VERSION = "1.30.2"
@@ -99,6 +100,19 @@ def _get_verapdf_cmd() -> str:
     return shutil.which(cmd) or cmd
 
 
+@dataclass(frozen=True, slots=True)
+class VeraPDFRuleFinding:
+    """Structured details for one failed veraPDF validation rule."""
+
+    specification: str = ""
+    clause: str = ""
+    test_number: str = ""
+    description: str = ""
+    passed_checks: int | None = None
+    failed_checks: int | None = None
+    contexts: tuple[str, ...] = ()
+
+
 @dataclass
 class VeraPDFResult:
     """Result of veraPDF validation.
@@ -112,6 +126,7 @@ class VeraPDFResult:
         warnings: List of warnings.
         validator_version: veraPDF application version reported by the validator.
         raw_xml: The raw XML result from veraPDF.
+        rule_findings: Structured details for failed validation rules.
     """
 
     compliant: bool
@@ -122,6 +137,7 @@ class VeraPDFResult:
     warnings: list[str] = field(default_factory=list)
     validator_version: str | None = None
     raw_xml: str | None = None
+    rule_findings: tuple[VeraPDFRuleFinding, ...] = ()
 
 
 def is_verapdf_available() -> bool:
@@ -356,11 +372,14 @@ def _parse_verapdf_xml(xml_string: str) -> VeraPDFResult:
             f"isCompliant={compliance_status}, failedRules={result.failed_rules}"
         )
 
-    # Extract error messages from failed rules
+    # Extract error messages and structured details from failed rules.
+    rule_findings: list[VeraPDFRuleFinding] = []
     for rule in details.xpath(".//*[local-name()='rule']"):
         if rule.get("status", "").lower() != "failed":
             continue
         clause = rule.get("clause", "")
+        specification = rule.get("specification", "")
+        test_number = rule.get("testNumber", "")
         description_elements = rule.xpath("./*[local-name()='description']")
         description = (
             " ".join(description_elements[0].itertext()).strip()
@@ -368,9 +387,50 @@ def _parse_verapdf_xml(xml_string: str) -> VeraPDFResult:
             else ""
         )
 
+        check_counts: dict[str, int | None] = {}
+        for attribute in ("passedChecks", "failedChecks"):
+            value = rule.get(attribute)
+            if value is None:
+                check_counts[attribute] = None
+                continue
+            try:
+                count = int(value)
+            except ValueError as e:
+                raise VeraPDFError(
+                    f"Invalid veraPDF rule counter {attribute}={value!r}"
+                ) from e
+            if count < 0:
+                raise VeraPDFError(
+                    f"Invalid veraPDF rule counter {attribute}={value!r}"
+                )
+            check_counts[attribute] = count
+
+        contexts: list[str] = []
+        for check in rule.xpath(".//*[local-name()='check']"):
+            if check.get("status", "").strip().lower() not in {"", "failed"}:
+                continue
+            for context_element in check.xpath(".//*[local-name()='context']"):
+                context = " ".join(context_element.itertext()).strip()
+                if context:
+                    contexts.append(context)
+
+        rule_findings.append(
+            VeraPDFRuleFinding(
+                specification=specification,
+                clause=clause,
+                test_number=test_number,
+                description=description,
+                passed_checks=check_counts["passedChecks"],
+                failed_checks=check_counts["failedChecks"],
+                contexts=tuple(contexts),
+            )
+        )
+
         error_msg = f"Rule {clause}: {description}" if clause else description
         if error_msg:
             result.errors.append(error_msg)
+
+    result.rule_findings = tuple(rule_findings)
 
     return result
 
@@ -402,7 +462,7 @@ def _extract_flavour_from_profile(profile_name: str) -> str | None:
             "PDF/UA-1 validation profile".
 
     Returns:
-        Flavour like "2b", "ua1", or None.
+        Flavour like "2b", "ua1", "ua2", or None.
     """
     # Typical formats: "PDF/A-2B validation profile", "PDF/A-1A", "PDF/A-4"
     match = re.search(r"PDF/A-(\d)([ABUEFabuef])?", profile_name, re.IGNORECASE)
@@ -413,7 +473,7 @@ def _extract_flavour_from_profile(profile_name: str) -> str | None:
             return f"{part}{conformance.lower()}"
         return part
 
-    match = re.search(r"PDF/UA-(\d)", profile_name, re.IGNORECASE)
+    match = re.search(r"PDF/UA-(\d+)", profile_name, re.IGNORECASE)
     if match:
         return f"ua{match.group(1)}"
 
@@ -430,8 +490,8 @@ def validate_with_verapdf(
 
     Args:
         path: Path to the PDF file to validate.
-        flavour: Optional PDF/A or PDF/UA flavour for validation (e.g. "2b"
-            or "ua1").
+        flavour: Optional PDF/A or PDF/UA flavour for validation (e.g. "2b",
+            "ua1", or "ua2").
             If not specified, veraPDF detects automatically.
         timeout: Timeout in seconds (default: 300).
         non_compliant_log_level: Log level used when veraPDF reports a
@@ -455,7 +515,13 @@ def validate_with_verapdf(
         raise VeraPDFError(f"File not found: {path}")
 
     # Build command
-    cmd = [_get_verapdf_cmd(), "--format", "xml"]
+    cmd = [
+        _get_verapdf_cmd(),
+        "--format",
+        "xml",
+        "--maxfailuresdisplayed",
+        "-1",
+    ]
 
     normalized_flavour = _normalize_flavour(flavour) if flavour else None
     if normalized_flavour:

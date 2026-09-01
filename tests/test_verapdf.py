@@ -6,6 +6,7 @@
 
 import logging
 import os
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +16,7 @@ from pdftopdfa.exceptions import VeraPDFError
 from pdftopdfa.verapdf import (
     VALID_FLAVOURS,
     VeraPDFResult,
+    VeraPDFRuleFinding,
     _extract_flavour_from_profile,
     _get_verapdf_candidates,
     _get_verapdf_cmd,
@@ -273,8 +275,11 @@ class TestNormalizeFlavour:
             ("PDF/A-4E", "4e"),
             ("PDF/A-4F", "4f"),
             ("ua1", "ua1"),
+            ("ua2", "ua2"),
             ("PDF/UA-1", "ua1"),
+            ("PDF/UA-2", "ua2"),
             ("PDFUA-1", "ua1"),
+            ("PDFUA-2", "ua2"),
         ],
     )
     def test_normalizes_valid_flavours(self, input_flavour: str, expected: str) -> None:
@@ -308,6 +313,7 @@ class TestExtractFlavourFromProfile:
             ("PDF/A-4E validation profile", "4e"),
             ("PDF/A-4F validation profile", "4f"),
             ("PDF/UA-1 validation profile", "ua1"),
+            ("PDF/UA-2 + Tagged PDF validation profile", "ua2"),
         ],
     )
     def test_extracts_flavour(self, profile_name: str, expected: str) -> None:
@@ -391,6 +397,67 @@ class TestParseVerapdfXml:
         assert result.failed_rules == 5
         assert len(result.errors) > 0
         assert "6.2.3" in result.errors[0]
+
+    def test_parses_structured_failed_rule_findings(self) -> None:
+        """Preserves rule identity, counts, and every failed check context."""
+        xml = """
+        <v:report xmlns:v="urn:verapdf:report">
+            <v:validationReport isCompliant="false"
+                profileName="PDF/UA-2 + Tagged PDF validation profile">
+                <v:details passedRules="100" failedRules="1">
+                    <v:rule status="failed" specification="ISO 14289-2:2024"
+                        clause="8.2.5.20"
+                        testNumber="2" passedChecks="1" failedChecks="2">
+                        <v:description>Invalid structure relationship</v:description>
+                        <v:check status="failed">
+                            <v:context>root/document[0]/StructTreeRoot[0]</v:context>
+                        </v:check>
+                        <v:check status="passed">
+                            <v:context>ignored passed check</v:context>
+                        </v:check>
+                        <v:check status="failed">
+                            <v:context>root/document[0]/StructTreeRoot[1]</v:context>
+                        </v:check>
+                    </v:rule>
+                </v:details>
+            </v:validationReport>
+        </v:report>
+        """
+
+        result = _parse_verapdf_xml(xml)
+
+        assert result.flavour == "ua2"
+        assert result.errors == ["Rule 8.2.5.20: Invalid structure relationship"]
+        assert result.rule_findings == (
+            VeraPDFRuleFinding(
+                specification="ISO 14289-2:2024",
+                clause="8.2.5.20",
+                test_number="2",
+                description="Invalid structure relationship",
+                passed_checks=1,
+                failed_checks=2,
+                contexts=(
+                    "root/document[0]/StructTreeRoot[0]",
+                    "root/document[0]/StructTreeRoot[1]",
+                ),
+            ),
+        )
+
+    @pytest.mark.parametrize("value", ["invalid", "-1"])
+    def test_rejects_invalid_rule_check_counters(self, value: str) -> None:
+        """Rejects corrupt optional per-rule counters when they are present."""
+        xml = f"""
+        <report>
+            <validationReport isCompliant="false">
+                <details passedRules="0" failedRules="1">
+                    <rule status="failed" failedChecks="{value}" />
+                </details>
+            </validationReport>
+        </report>
+        """
+
+        with pytest.raises(VeraPDFError, match="failedChecks"):
+            _parse_verapdf_xml(xml)
 
     def test_rejects_invalid_xml(self) -> None:
         """Rejects truncated or otherwise invalid XML."""
@@ -743,6 +810,8 @@ class TestValidateWithVerapdf:
         assert "xml" in cmd
         assert "--flavour" in cmd
         assert "2b" in cmd
+        max_failures_index = cmd.index("--maxfailuresdisplayed")
+        assert cmd[max_failures_index + 1] == "-1"
         assert str(pdf_path) in cmd
         assert call_args.kwargs["encoding"] == "utf-8"
         assert call_args.kwargs["errors"] == "replace"
@@ -1202,6 +1271,7 @@ class TestVerapdfResult:
         assert result.errors == []
         assert result.warnings == []
         assert result.raw_xml is None
+        assert result.rule_findings == ()
 
     def test_custom_values(self) -> None:
         """Checks custom values."""
@@ -1213,6 +1283,16 @@ class TestVerapdfResult:
             errors=["error1"],
             warnings=["warning1"],
             raw_xml="<xml/>",
+            rule_findings=(
+                VeraPDFRuleFinding(
+                    clause="6.2.3",
+                    test_number="1",
+                    description="error1",
+                    passed_checks=0,
+                    failed_checks=1,
+                    contexts=("root/document[0]",),
+                ),
+            ),
         )
 
         assert result.compliant is True
@@ -1222,6 +1302,14 @@ class TestVerapdfResult:
         assert result.errors == ["error1"]
         assert result.warnings == ["warning1"]
         assert result.raw_xml == "<xml/>"
+        assert result.rule_findings[0].clause == "6.2.3"
+
+    def test_rule_findings_are_immutable(self) -> None:
+        """Structured findings cannot be changed after parsing."""
+        finding = VeraPDFRuleFinding(clause="6.2.3")
+
+        with pytest.raises(FrozenInstanceError):
+            setattr(finding, "clause", "changed")
 
 
 class TestValidFlavours:
@@ -1242,6 +1330,7 @@ class TestValidFlavours:
             "4e",
             "4f",
             "ua1",
+            "ua2",
         }
 
         assert VALID_FLAVOURS == expected

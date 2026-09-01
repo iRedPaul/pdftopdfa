@@ -21,6 +21,9 @@ from pikepdf import Array, Dictionary, Name, Pdf
 
 from pdftopdfa.converter import (
     ConversionResult,
+    PDFUAReviewFinding,
+    PDFUAStatus,
+    ProfileValidationResult,
     _compare_pdfa_levels,
     _ensure_binary_comment,
     _truncate_trailing_data,
@@ -246,6 +249,49 @@ class TestConversionResult:
         )
         assert result.validation_failed is True
 
+    def test_audit_record_preserves_structured_evidence(self, tmp_dir: Path) -> None:
+        """The result can be persisted without parsing human-readable warnings."""
+        result = ConversionResult(
+            success=True,
+            input_path=tmp_dir / "input.pdf",
+            output_path=tmp_dir / "output.pdf",
+            level="2a",
+            pdfua_status=PDFUAStatus.REVIEW_REQUIRED,
+            review_findings=(
+                PDFUAReviewFinding(
+                    code="generated_semantic_structure",
+                    message="Generated automatically",
+                ),
+            ),
+            validation_results=(
+                ProfileValidationResult(
+                    profile="ua1",
+                    result=VeraPDFResult(
+                        compliant=True,
+                        flavour="ua1",
+                        validator_version="1.30.2",
+                        raw_xml="<report />",
+                    ),
+                ),
+            ),
+            sanitization_stats={"actions_removed": 1},
+            tagging_stats={"structure_rebuilt": True},
+        )
+
+        audit = result.to_dict()
+
+        assert audit["schema_version"] == 1
+        assert audit["pdfua_status"] == "review_required"
+        assert audit["review_findings"][0]["code"] == ("generated_semantic_structure")
+        assert audit["validation_results"][0]["validator_version"] == "1.30.2"
+        assert "raw_xml" not in audit["validation_results"][0]
+        assert (
+            result.to_dict(include_raw_validation=True)["validation_results"][0][
+                "raw_xml"
+            ]
+            == "<report />"
+        )
+
 
 class TestGenerateOutputPath:
     """Tests for generate_output_path."""
@@ -387,14 +433,17 @@ class TestConvertToPdfa:
     @pytest.mark.parametrize(
         ("branch", "options"),
         [
-            ("signed", {"validate": True}),
+            (
+                "signed",
+                {"validate": True, "publication_policy": "always"},
+            ),
             ("no-processing", {"pdfa": False}),
         ],
     )
     def test_early_copy_paths_close_check_pdf_before_callback(
         self,
         branch: str,
-        options: dict[str, bool],
+        options: dict[str, object],
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
@@ -1353,6 +1402,18 @@ class TestConvertToPdfa:
         )
 
         assert result.success is True
+        assert result.pdfua_status is PDFUAStatus.REVIEW_REQUIRED
+        assert result.review_required is True
+        assert [item.profile for item in result.validation_results] == [level, "ua1"]
+        finding_codes = {finding.code for finding in result.review_findings}
+        assert "generated_semantic_structure" in finding_codes
+        assert "fallback_document_title" in finding_codes
+        assert "undetermined_document_language" in finding_codes
+        assert "human_accessibility_review" in finding_codes
+        assert result.metadata_sources == {
+            "title": "fallback",
+            "language": "fallback",
+        }
         with Pdf.open(output_path) as pdf:
             standards = {
                 (standard.standard, standard.version)
@@ -1367,6 +1428,48 @@ class TestConvertToPdfa:
             metadata = bytes(pdf.Root.Metadata.read_bytes())
             assert b"pdfaExtension:schemas" in metadata
             assert sample_pdf.stem.encode() in metadata
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_pdfua_authoritative_title_and_language_are_applied(
+        self, mock_verapdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """Author-supplied accessibility metadata replaces technical fallbacks."""
+        mock_verapdf.side_effect = lambda *, path, flavour: VeraPDFResult(
+            compliant=True,
+            flavour=flavour,
+        )
+        output_path = tmp_dir / "output.pdf"
+
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            level="2a",
+            pdfua=True,
+            document_title="Annual report",
+            document_language="en-GB",
+        )
+
+        finding_codes = {finding.code for finding in result.review_findings}
+        assert "fallback_document_title" not in finding_codes
+        assert "undetermined_document_language" not in finding_codes
+        assert result.metadata_sources == {"title": "user", "language": "user"}
+        with Pdf.open(output_path) as pdf:
+            assert str(pdf.Root.Lang) == "en-GB"
+            assert str(pdf.docinfo.Title) == "Annual report"
+
+    @pytest.mark.parametrize("language", ["", "en_uk", "not a tag"])
+    def test_rejects_invalid_document_language(
+        self, sample_pdf: Path, tmp_dir: Path, language: str
+    ) -> None:
+        """Catalog language overrides must be valid BCP 47 tags."""
+        with pytest.raises(ConversionError, match="BCP 47"):
+            convert_to_pdfa(
+                sample_pdf,
+                tmp_dir / "output.pdf",
+                level="2a",
+                pdfua=True,
+                document_language=language,
+            )
 
     @pytest.mark.parametrize("level", ["2a", "3a"])
     def test_convert_level_a_preserves_tagged_structure(
@@ -1440,6 +1543,108 @@ class TestConvertToPdfa:
             assert all(
                 standard.standard != "PDF/UA" for standard in detect_iso_standards(pdf)
             )
+
+    def test_convert_removes_unrequested_pdfua_claim_without_tag_rebuild(
+        self, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """A stale PDF/UA claim never survives a non-PDF/UA conversion."""
+        input_path = tmp_dir / "claimed_pdfua.pdf"
+        output_path = tmp_dir / "output.pdf"
+        xmp = f"""\
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}"
+           xmlns:pdfuaid="{NAMESPACES["pdfuaid"]}">
+    <rdf:Description rdf:about="">
+      <pdfuaid:part>1</pdfuaid:part>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>""".encode()
+        with Pdf.open(sample_pdf) as pdf:
+            embed_xmp_metadata(pdf, xmp)
+            pdf.save(input_path)
+
+        result = convert_to_pdfa(input_path, output_path, level="3b")
+
+        assert any(
+            "PDF/UA identification removed" in warning for warning in result.warnings
+        )
+        with Pdf.open(output_path) as pdf:
+            assert all(
+                standard.standard != "PDF/UA" for standard in detect_iso_standards(pdf)
+            )
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_unrequested_pdfua_claim_cannot_bypass_removal_via_pdfa_skip(
+        self, mock_verapdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """A claimed PDF/A input is rewritten when its UA claim was not requested."""
+        input_path = tmp_dir / "claimed_pdfa_and_pdfua.pdf"
+        output_path = tmp_dir / "output.pdf"
+        xmp = f"""\
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}"
+           xmlns:pdfaid="{NAMESPACES["pdfaid"]}"
+           xmlns:pdfuaid="{NAMESPACES["pdfuaid"]}">
+    <rdf:Description rdf:about="">
+      <pdfaid:part>3</pdfaid:part>
+      <pdfaid:conformance>B</pdfaid:conformance>
+      <pdfuaid:part>1</pdfuaid:part>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>""".encode()
+        with Pdf.open(sample_pdf) as pdf:
+            embed_xmp_metadata(pdf, xmp)
+            pdf.save(input_path)
+
+        result = convert_to_pdfa(input_path, output_path, level="3b")
+
+        assert result.skipped is False
+        mock_verapdf.assert_not_called()
+        with Pdf.open(output_path) as pdf:
+            assert all(
+                standard.standard != "PDF/UA" for standard in detect_iso_standards(pdf)
+            )
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_unchanged_valid_pdfua_has_machine_validated_status(
+        self, mock_verapdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """An exact already-conforming copy is distinct from newly authored tags."""
+        input_path = tmp_dir / "claimed_pdfa_and_pdfua.pdf"
+        output_path = tmp_dir / "output.pdf"
+        xmp = f"""\
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}"
+           xmlns:pdfaid="{NAMESPACES["pdfaid"]}"
+           xmlns:pdfuaid="{NAMESPACES["pdfuaid"]}">
+    <rdf:Description rdf:about="">
+      <pdfaid:part>3</pdfaid:part>
+      <pdfaid:conformance>A</pdfaid:conformance>
+      <pdfuaid:part>1</pdfuaid:part>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>""".encode()
+        with Pdf.open(sample_pdf) as pdf:
+            embed_xmp_metadata(pdf, xmp)
+            pdf.save(input_path)
+        mock_verapdf.side_effect = lambda path, *, flavour, **kwargs: VeraPDFResult(
+            compliant=True,
+            flavour=flavour,
+        )
+
+        result = convert_to_pdfa(
+            input_path,
+            output_path,
+            level="3a",
+            pdfua=True,
+            skip_any_pdfa=True,
+        )
+
+        assert result.skipped is True
+        assert result.pdfua_status is PDFUAStatus.MACHINE_VALIDATED
+        assert result.review_required is False
+        assert result.candidate_sha256 is not None
+        assert output_path.read_bytes() == input_path.read_bytes()
 
     @pytest.mark.parametrize("level", ["2a", "3a"])
     def test_convert_level_a_removes_pdfvt_claim_with_pdfx(
@@ -1824,10 +2029,43 @@ class TestConvertToPdfa:
         ]
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_pdfua_failure_is_structured_and_not_published(
+        self, mock_verapdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """A failed UA profile cannot replace the canonical enterprise output."""
+        mock_verapdf.side_effect = [
+            VeraPDFResult(compliant=True, flavour="2a"),
+            VeraPDFResult(
+                compliant=False,
+                flavour="ua1",
+                errors=["Rule 7.1 failed"],
+            ),
+        ]
+        output_path = tmp_dir / "output.pdf"
+        output_path.write_bytes(b"approved output")
+
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            level="2a",
+            pdfua=True,
+        )
+
+        assert result.pdfua_status is PDFUAStatus.VALIDATION_FAILED
+        assert result.published is False
+        assert [evidence.profile for evidence in result.validation_results] == [
+            "2a",
+            "ua1",
+        ]
+        assert result.validation_results[0].compliant is True
+        assert result.validation_results[1].compliant is False
+        assert output_path.read_bytes() == b"approved output"
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
     def test_convert_with_failing_validation_sets_flag(
         self, mock_verapdf: MagicMock, sample_pdf: Path, tmp_dir: Path
     ) -> None:
-        """Non-compliance is reported without suppressing the output."""
+        """Non-compliance leaves the existing canonical output untouched."""
         mock_verapdf.return_value = MagicMock(
             compliant=False,
             errors=["Rule 6.1.2 failed"],
@@ -1839,24 +2077,25 @@ class TestConvertToPdfa:
 
         assert result.success is False
         assert result.validation_failed is True
-        assert result.error == "Validation failed; output candidate was published"
+        assert result.error == "Validation failed; output was not published"
+        assert result.published is False
+        assert result.target_produced is False
         assert any("Validation: Rule 6.1.2 failed" in w for w in result.warnings)
-        assert any("published despite" in warning for warning in result.warnings)
+        assert any("not published" in warning for warning in result.warnings)
         validated_path = mock_verapdf.call_args.kwargs["path"]
         assert validated_path != output_path
         assert validated_path.parent.parent == output_path.parent
-        assert output_path.read_bytes() != sentinel
-        assert output_path.read_bytes().startswith(b"%PDF-")
+        assert output_path.read_bytes() == sentinel
         assert not validated_path.exists()
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_convert_with_unavailable_validation_publishes_output(
+    def test_convert_with_unavailable_validation_withholds_output(
         self,
         mock_verapdf: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """A validator error is reported without suppressing the output."""
+        """A validator infrastructure error also fails closed."""
         mock_verapdf.side_effect = VeraPDFError("veraPDF crashed")
         output_path = tmp_dir / "output.pdf"
         sentinel = b"existing output"
@@ -1866,33 +2105,96 @@ class TestConvertToPdfa:
 
         assert result.success is False
         assert result.validation_failed is True
-        assert result.error == "Validation failed; output candidate was published"
+        assert result.error == "Validation failed; output was not published"
+        assert result.published is False
         assert "Validation: veraPDF could not run: veraPDF crashed" in result.warnings
-        assert any("published despite" in warning for warning in result.warnings)
+        assert result.validation_results == (
+            ProfileValidationResult(profile="3b", error="veraPDF crashed"),
+        )
+        assert any("not published" in warning for warning in result.warnings)
         validated_path = mock_verapdf.call_args.kwargs["path"]
         assert validated_path != output_path
-        assert output_path.read_bytes() != sentinel
-        assert output_path.read_bytes().startswith(b"%PDF-")
+        assert output_path.read_bytes() == sentinel
         assert not validated_path.exists()
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_encrypted_skip_is_not_validated_when_requested(
+    def test_convert_can_explicitly_publish_noncompliant_candidate(
+        self, mock_verapdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """The unsafe publication behavior requires an explicit policy."""
+        mock_verapdf.return_value = VeraPDFResult(
+            compliant=False,
+            flavour="3b",
+            errors=["Rule 6.1.2 failed"],
+        )
+        output_path = tmp_dir / "output.pdf"
+
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            validate=True,
+            publication_policy="always",
+        )
+
+        assert result.success is False
+        assert result.published is True
+        assert any("published despite" in warning for warning in result.warnings)
+        assert output_path.read_bytes().startswith(b"%PDF-")
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_encrypted_validation_failure_preserves_destination(
         self,
         mock_verapdf: MagicMock,
         password_encrypted_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """Explicit validation is skipped when no PDF/A output was created."""
+        """An encrypted input cannot bypass fail-closed PDF/A validation."""
         output_path = tmp_dir / "output.pdf"
         sentinel = b"existing output"
         output_path.write_bytes(sentinel)
 
         result = convert_to_pdfa(password_encrypted_pdf, output_path, validate=True)
 
-        assert result.success is True
+        assert result.success is False
         assert result.skipped is True
-        assert result.validation_failed is False
+        assert result.validation_failed is True
         assert result.level is None
+        assert result.target_produced is False
+        assert result.published is False
+        assert result.pdfua_status is PDFUAStatus.NOT_REQUESTED
+        assert result.validation_results == (
+            ProfileValidationResult(
+                profile="3b",
+                error=(
+                    "PDF/A-3b validation could not run because the encrypted input "
+                    "could not be converted"
+                ),
+            ),
+        )
+        assert output_path.read_bytes() == sentinel
+        mock_verapdf.assert_not_called()
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_encrypted_validation_failure_can_be_explicitly_published(
+        self,
+        mock_verapdf: MagicMock,
+        password_encrypted_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Best-effort publication retains failure state for encrypted input."""
+        output_path = tmp_dir / "output.pdf"
+
+        result = convert_to_pdfa(
+            password_encrypted_pdf,
+            output_path,
+            validate=True,
+            publication_policy="always",
+        )
+
+        assert result.success is False
+        assert result.validation_failed is True
+        assert result.published is True
+        assert any("published despite" in warning for warning in result.warnings)
         assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
         mock_verapdf.assert_not_called()
 
@@ -1905,6 +2207,7 @@ class TestConvertToPdfa:
     ) -> None:
         """Mandatory PDF/UA validation is skipped for an unchanged input."""
         output_path = tmp_dir / "output.pdf"
+        output_path.write_bytes(b"approved output")
 
         result = convert_to_pdfa(
             password_encrypted_pdf,
@@ -1913,12 +2216,34 @@ class TestConvertToPdfa:
             pdfua=True,
         )
 
-        assert result.success is True
+        assert result.success is False
         assert result.skipped is True
         assert result.validation_failed is False
         assert result.level is None
-        assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
+        assert result.target_produced is False
+        assert result.published is False
+        assert result.pdfua_status is PDFUAStatus.NOT_PRODUCED
+        assert output_path.read_bytes() == b"approved output"
         mock_verapdf.assert_not_called()
+
+    def test_pdfua_encrypted_copy_requires_explicit_publication_policy(
+        self, password_encrypted_pdf: Path, tmp_dir: Path
+    ) -> None:
+        """Unsafe protected copy-through remains available only by opt-in."""
+        output_path = tmp_dir / "output.pdf"
+
+        result = convert_to_pdfa(
+            password_encrypted_pdf,
+            output_path,
+            level="2a",
+            pdfua=True,
+            publication_policy="always",
+        )
+
+        assert result.success is False
+        assert result.published is True
+        assert result.pdfua_status is PDFUAStatus.NOT_PRODUCED
+        assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
 
     @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_with_ocr_language_fails_when_unavailable(
@@ -2765,13 +3090,51 @@ class TestConvertToPdfa:
         mock_apply_ocr.assert_not_called()
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_signed_skip_is_not_validated_when_requested(
+    def test_signed_validation_failure_preserves_destination(
         self,
         mock_verapdf: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """Explicit validation is skipped when a signature prevents conversion."""
+        """A signed input cannot bypass fail-closed PDF/A validation."""
+        signed_input = tmp_dir / "signed_input.pdf"
+        _write_signed_pdf(sample_pdf, signed_input)
+        output_path = tmp_dir / "output.pdf"
+        sentinel = b"existing output"
+        output_path.write_bytes(sentinel)
+
+        result = convert_to_pdfa(
+            signed_input,
+            output_path,
+            level="3b",
+            validate=True,
+        )
+
+        assert result.success is False
+        assert result.skipped is True
+        assert result.validation_failed is True
+        assert result.level is None
+        assert result.published is False
+        assert result.validation_results == (
+            ProfileValidationResult(
+                profile="3b",
+                error=(
+                    "PDF/A-3b validation could not run because conversion would "
+                    "invalidate a digital signature"
+                ),
+            ),
+        )
+        assert output_path.read_bytes() == sentinel
+        mock_verapdf.assert_not_called()
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_signed_validation_failure_can_be_explicitly_published(
+        self,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Best-effort publication retains failure state for signed input."""
         signed_input = tmp_dir / "signed_input.pdf"
         _write_signed_pdf(sample_pdf, signed_input)
         output_path = tmp_dir / "output.pdf"
@@ -2781,13 +3144,42 @@ class TestConvertToPdfa:
             output_path,
             level="3b",
             validate=True,
+            publication_policy="always",
         )
 
-        assert result.success is True
-        assert result.skipped is True
-        assert result.validation_failed is False
-        assert result.level is None
+        assert result.success is False
+        assert result.validation_failed is True
+        assert result.published is True
+        assert any("published despite" in warning for warning in result.warnings)
         assert output_path.read_bytes() == signed_input.read_bytes()
+        mock_verapdf.assert_not_called()
+
+    @patch("pdftopdfa.converter.validate_with_verapdf")
+    def test_pdfua_signed_skip_preserves_existing_destination(
+        self,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """A protected signed input cannot replace a canonical PDF/UA target."""
+        signed_input = tmp_dir / "signed_input.pdf"
+        _write_signed_pdf(sample_pdf, signed_input)
+        output_path = tmp_dir / "output.pdf"
+        output_path.write_bytes(b"approved output")
+
+        result = convert_to_pdfa(
+            signed_input,
+            output_path,
+            level="2a",
+            pdfua=True,
+        )
+
+        assert result.success is False
+        assert result.skipped is True
+        assert result.published is False
+        assert result.target_produced is False
+        assert result.pdfua_status is PDFUAStatus.NOT_PRODUCED
+        assert output_path.read_bytes() == b"approved output"
         mock_verapdf.assert_not_called()
 
     def test_signed_pdf_can_be_converted_with_explicit_invalidation(
@@ -4186,18 +4578,18 @@ class TestConvertFiles:
         assert result.skipped is False
         assert result.level == "2a"
         assert "Validation: veraPDF could not run: validator crashed" in result.warnings
-        assert any("published despite" in warning for warning in result.warnings)
-        assert output_path.is_file()
-        assert output_path.read_bytes().startswith(b"%PDF-")
+        assert any("not published" in warning for warning in result.warnings)
+        assert result.published is False
+        assert not output_path.exists()
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_convert_files_does_not_validate_encrypted_skip(
+    def test_convert_files_fails_closed_for_encrypted_validation(
         self,
         mock_verapdf: MagicMock,
         password_encrypted_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """Batch validation ignores an unchanged encrypted copy."""
+        """Batch validation does not publish an unchanged encrypted input."""
         output_path = tmp_dir / "output.pdf"
 
         results = convert_files(
@@ -4208,12 +4600,13 @@ class TestConvertFiles:
 
         assert len(results) == 1
         result = results[0]
-        assert result.success is True
-        assert result.validation_failed is False
+        assert result.success is False
+        assert result.validation_failed is True
         assert result.skipped is True
         assert result.level is None
+        assert result.published is False
         assert any("PDF is encrypted" in warning for warning in result.warnings)
-        assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
+        assert not output_path.exists()
         mock_verapdf.assert_not_called()
 
     def test_convert_files_copies_password_encrypted_input(
@@ -4666,6 +5059,35 @@ class TestConvertFiles:
         assert results[1].success is False
         assert results[1].error is not None
         assert results[2].success is True
+
+    @patch("pdftopdfa.converter.convert_to_pdfa")
+    def test_convert_files_permission_error_continues(
+        self, mock_convert_to_pdfa: MagicMock, tmp_dir: Path
+    ) -> None:
+        """A permission failure on one file does not abort the batch."""
+        first_input = tmp_dir / "first.pdf"
+        first_output = tmp_dir / "first_pdfa.pdf"
+        second_input = tmp_dir / "second.pdf"
+        second_output = tmp_dir / "second_pdfa.pdf"
+        mock_convert_to_pdfa.side_effect = [
+            PermissionError("Access denied"),
+            ConversionResult(
+                success=True,
+                input_path=second_input,
+                output_path=second_output,
+                level="3b",
+            ),
+        ]
+
+        results = convert_files(
+            [(first_input, first_output), (second_input, second_output)]
+        )
+
+        assert len(results) == 2
+        assert results[0].success is False
+        assert results[0].error == "Access denied"
+        assert results[1].success is True
+        assert mock_convert_to_pdfa.call_count == 2
 
     def test_convert_files_empty_list(self) -> None:
         """Empty file list returns empty results."""
