@@ -99,7 +99,7 @@ class _AnnotationRestoreResult:
 
 # Conformance level ranking: a > u > b
 _CONFORMANCE_RANK = {"b": 0, "u": 1, "a": 2}
-_FIGURE_OCR_MAX_PIXELS = 16_777_216
+_FIGURE_OCR_MAX_PIXELS = 100_000_000
 _FIGURE_OCR_MIN_CONFIDENCE = 0.90
 
 
