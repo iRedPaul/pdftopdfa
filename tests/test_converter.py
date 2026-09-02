@@ -142,6 +142,7 @@ def test_figure_text_recognizer_crops_each_image_invocation(
     source.save(source_path)
     mock_pdf_image.return_value.extract_to.return_value = source_path
     seen_pixels = []
+    crop_paths = []
     converted_sizes = []
     original_convert = Image.Image.convert
 
@@ -154,6 +155,7 @@ def test_figure_text_recognizer_crops_each_image_invocation(
     monkeypatch.setattr(Image.Image, "convert", tracked_convert)
 
     def inspect_crop(path: Path, **_kwargs: object) -> list[tuple[str, float]]:
+        crop_paths.append(path)
         with Image.open(path) as cropped:
             seen_pixels.append((cropped.size, cropped.getpixel((25, 10))))
         return [("Visible", 0.99)]
@@ -176,10 +178,12 @@ def test_figure_text_recognizer_crops_each_image_invocation(
         ) as recognize:
             assert recognize is not None
             assert recognize(image, left) == "Visible"
+            assert not crop_paths[-1].exists()
             assert recognize(image, left) == "Visible"
             assert recognize(image, right) == "Visible"
+            assert not crop_paths[-1].exists()
 
-    assert mock_pdf_image.call_count == 2
+    assert mock_pdf_image.call_count == 1
     assert seen_pixels == [((50, 20), (255, 0, 0)), ((50, 20), (0, 0, 255))]
     assert converted_sizes == [(50, 20), (50, 20)]
 

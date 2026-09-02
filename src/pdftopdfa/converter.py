@@ -183,6 +183,7 @@ def _figure_text_recognizer(
     from .ocr import OCRSession
 
     cache: dict[tuple[object, ...], str | None] = {}
+    extracted_image_paths: dict[tuple[object, ...], Path | None] = {}
     with (
         tempfile.TemporaryDirectory(prefix="pdftopdfa-figure-ocr-") as directory,
         OCRSession(
@@ -221,18 +222,28 @@ def _figure_text_recognizer(
             ):
                 cache[key] = None
                 return None
+            crop_path = None
             try:
                 from PIL import Image, ImageDraw
 
-                extracted = pikepdf.PdfImage(image).extract_to(
-                    fileprefix=str(output_dir / f"image-{len(cache)}")
-                )
-                input_path = Path(extracted)
-                with Image.open(input_path) as source:
-                    if source.size != (width, height):
-                        cache[key] = None
-                        return None
-                    if crop_polygon is not None:
+                if image_key not in extracted_image_paths:
+                    extracted = pikepdf.PdfImage(image).extract_to(
+                        fileprefix=str(
+                            output_dir / f"image-{len(extracted_image_paths)}"
+                        )
+                    )
+                    source_path = Path(extracted)
+                    with Image.open(source_path) as source:
+                        if source.size != (width, height):
+                            extracted_image_paths[image_key] = None
+                        else:
+                            extracted_image_paths[image_key] = source_path
+                input_path = extracted_image_paths[image_key]
+                if input_path is None:
+                    cache[key] = None
+                    return None
+                if crop_polygon is not None:
+                    with Image.open(input_path) as source:
                         width, height = source.size
                         points = [
                             (
@@ -258,8 +269,8 @@ def _figure_text_recognizer(
                         )
                         visible = Image.new("RGB", cropped.size, "white")
                         visible.paste(cropped, mask=mask)
-                        input_path = output_dir / f"image-{len(cache)}-crop.png"
-                        visible.save(input_path)
+                        crop_path = output_dir / f"image-{len(cache)}-crop.png"
+                        visible.save(crop_path)
             except (
                 Image.DecompressionBombError,
                 OSError,
@@ -267,16 +278,24 @@ def _figure_text_recognizer(
                 pikepdf.PdfError,
                 pikepdf.UnsupportedImageTypeError,
             ) as exc:
+                if image_key not in extracted_image_paths:
+                    extracted_image_paths[image_key] = None
+                if crop_path is not None:
+                    crop_path.unlink(missing_ok=True)
                 logger.warning("Could not extract Figure image for OCR: %s", exc)
                 cache[key] = None
                 return None
-            text = _accepted_figure_ocr_text(
-                session.recognize_image(
-                    input_path,
-                    layout="auto",
-                    languages=ocr_languages,
+            try:
+                text = _accepted_figure_ocr_text(
+                    session.recognize_image(
+                        crop_path or input_path,
+                        layout="auto",
+                        languages=ocr_languages,
+                    )
                 )
-            )
+            finally:
+                if crop_path is not None:
+                    crop_path.unlink(missing_ok=True)
             cache[key] = text
             return text
 
