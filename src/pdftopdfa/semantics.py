@@ -1417,6 +1417,11 @@ def _page_blocks(
         node = StructureNode(
             role,
             (_whole_reference(span),),
+            attributes=(
+                (StructureAttribute("Layout", "Placement", "Block"),)
+                if role == "Figure"
+                else ()
+            ),
             bbox=span.bbox,
             page_number=page.number,
         )

@@ -733,6 +733,92 @@ def test_digital_tj_tj_and_image_have_stable_parent_tree_after_reopen() -> None:
         assert preserved["semantic_alternatives_review_required"] == 1
 
 
+@pytest.mark.parametrize(
+    ("recognized", "expected_actual_text", "missing_alternative", "ocr_review"),
+    [
+        (
+            "INFO Professionelle Lösungen für erfolgreiche Arbeit",
+            "INFO Professionelle Lösungen für erfolgreiche Arbeit",
+            0,
+            1,
+        ),
+        (None, None, 1, 0),
+    ],
+)
+def test_direct_image_figure_uses_review_required_ocr_actualtext(
+    recognized: str | None,
+    expected_actual_text: str | None,
+    missing_alternative: int,
+    ocr_review: int,
+) -> None:
+    pdf = pikepdf.Pdf.new()
+    image = _image(pdf)
+    _page(
+        pdf,
+        b"q 100 0 0 80 50 100 cm /Im Do Q",
+        Dictionary(XObject=Dictionary(Im=image)),
+        size=(400, 300),
+    )
+    seen: list[tuple[int, int]] = []
+
+    def recognize(candidate: pikepdf.Stream) -> str | None:
+        seen.append(candidate.objgen)
+        return recognized
+
+    result = ensure_logical_structure(
+        pdf,
+        semantic=True,
+        preflight=False,
+        _figure_text_recognizer=recognize,
+    )
+
+    figure = next(
+        item for item in _structure_objects(pdf) if item.get("/S") == Name.Figure
+    )
+    assert seen == [image.objgen]
+    if expected_actual_text is None:
+        assert "/ActualText" not in figure
+    else:
+        assert str(figure["/ActualText"]) == expected_actual_text
+    assert "/Alt" not in figure
+    layout = resolve_indirect(figure["/A"])
+    assert layout["/O"] == Name.Layout
+    assert layout["/Placement"] == Name.Block
+    assert result["semantic_alternatives_review_required"] == missing_alternative
+    assert result["semantic_ocr_figure_text_review_required"] == ocr_review
+
+
+def test_existing_image_actualtext_skips_figure_ocr() -> None:
+    pdf = pikepdf.Pdf.new()
+    image = _image(pdf)
+    _page(
+        pdf,
+        (
+            b"/Figure <</ActualText (Existing replacement)>> BDC "
+            b"q 100 0 0 80 50 100 cm /Im Do Q EMC"
+        ),
+        Dictionary(XObject=Dictionary(Im=image)),
+        size=(400, 300),
+    )
+
+    def recognize(_candidate: pikepdf.Stream) -> str | None:
+        raise AssertionError("OCR must not replace existing ActualText")
+
+    result = ensure_logical_structure(
+        pdf,
+        semantic=True,
+        preflight=False,
+        _figure_text_recognizer=recognize,
+    )
+
+    figure = next(
+        item for item in _structure_objects(pdf) if item.get("/S") == Name.Figure
+    )
+    assert str(figure["/ActualText"]) == "Existing replacement"
+    assert result["semantic_alternatives_review_required"] == 0
+    assert result["semantic_ocr_figure_text_review_required"] == 0
+
+
 def test_pdfua_does_not_invent_fallback_alt_or_document_language() -> None:
     pdf = pikepdf.Pdf.new()
     font = _font(pdf)

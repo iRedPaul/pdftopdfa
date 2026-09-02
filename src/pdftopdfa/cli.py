@@ -320,6 +320,14 @@ def _ocr_execution_provider_callback(
     help="Order OCR lines by detected page columns.",
 )
 @click.option(
+    "--ocr-figure-text",
+    is_flag=True,
+    help=(
+        "Use sufficiently confident OCR text as review-required ActualText for "
+        "otherwise undescribed image Figures; requires PDF/A-2a or PDF/A-3a."
+    ),
+)
+@click.option(
     "--ocr-force",
     "ocr_force",
     is_flag=True,
@@ -393,6 +401,7 @@ def main(
     ocr_recognition_model_dir: Path | None,
     ocr_execution_provider: str,
     ocr_layout: bool,
+    ocr_figure_text: bool,
     convert_calibrated: bool,
     preserve_stamps: bool,
     skip_any_pdfa: bool,
@@ -456,6 +465,8 @@ def main(
         raise_usage_error("--validate cannot be combined with --no-pdfa")
     if not pdfa and (document_title is not None or document_language is not None):
         raise_usage_error("Document metadata options cannot be combined with --no-pdfa")
+    if ocr_figure_text and (not pdfa or level not in {"2a", "3a"}):
+        raise_usage_error("--ocr-figure-text requires --level 2a or 3a")
     if publish_noncompliant and not (do_validate or pdfua):
         raise_usage_error("--publish-noncompliant requires --validate or --pdfua")
     if input_path_obj.is_dir() and document_title is not None:
@@ -479,6 +490,7 @@ def main(
         or rotate_pages
         or ocr_execution_provider != "cpu"
         or ocr_layout
+        or ocr_figure_text
     ):
         if not model_pair_complete:
             raise_usage_error(
@@ -522,6 +534,7 @@ def main(
                 ocr_rotate_pages=rotate_pages,
                 ocr_execution_provider=ocr_execution_provider,
                 ocr_layout=ocr_layout,
+                ocr_figure_text=ocr_figure_text,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 skip_any_pdfa=skip_any_pdfa,
@@ -552,6 +565,7 @@ def main(
                 ocr_rotate_pages=rotate_pages,
                 ocr_execution_provider=ocr_execution_provider,
                 ocr_layout=ocr_layout,
+                ocr_figure_text=ocr_figure_text,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 skip_any_pdfa=skip_any_pdfa,
@@ -626,6 +640,7 @@ def _convert_single_file(
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
     ocr_layout: bool = False,
+    ocr_figure_text: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     skip_any_pdfa: bool = False,
@@ -656,6 +671,8 @@ def _convert_single_file(
         ocr_execution_provider: ONNX Runtime provider for Paddle models;
             ``"directml:<index>"`` selects a specific adapter.
         ocr_layout: If True, order OCR lines by detected page columns.
+        ocr_figure_text: If True, generate review-required Figure ActualText
+            from sufficiently confident OCR.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations
             to standard PDF Stamp annotations instead of flattening them.
@@ -728,6 +745,7 @@ def _convert_single_file(
         ocr_rotate_pages=ocr_rotate_pages,
         ocr_execution_provider=ocr_execution_provider,
         ocr_layout=ocr_layout,
+        ocr_figure_text=ocr_figure_text,
         convert_calibrated=convert_calibrated,
         preserve_stamps=preserve_stamps,
         allow_signature_invalidation=allow_signature_invalidation,
@@ -777,6 +795,7 @@ def _convert_directory(
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
     ocr_layout: bool = False,
+    ocr_figure_text: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     skip_any_pdfa: bool = False,
@@ -807,6 +826,8 @@ def _convert_directory(
         ocr_execution_provider: ONNX Runtime provider for Paddle models;
             ``"directml:<index>"`` selects a specific adapter.
         ocr_layout: If True, order OCR lines by detected page columns.
+        ocr_figure_text: If True, generate review-required Figure ActualText
+            from sufficiently confident OCR.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, convert known proprietary stamp annotations
             to standard PDF Stamp annotations instead of flattening them.
@@ -859,6 +880,7 @@ def _convert_directory(
         ocr_rotate_pages=ocr_rotate_pages,
         ocr_execution_provider=ocr_execution_provider,
         ocr_layout=ocr_layout,
+        ocr_figure_text=ocr_figure_text,
         force_overwrite=force,
         convert_calibrated=convert_calibrated,
         preserve_stamps=preserve_stamps,

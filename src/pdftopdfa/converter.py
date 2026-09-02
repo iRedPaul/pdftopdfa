@@ -98,6 +98,7 @@ class _AnnotationRestoreResult:
 
 # Conformance level ranking: a > u > b
 _CONFORMANCE_RANK = {"b": 0, "u": 1, "a": 2}
+_FIGURE_OCR_MIN_CONFIDENCE = 0.90
 
 
 def _validate_ocr_configuration(
@@ -110,6 +111,7 @@ def _validate_ocr_configuration(
     ocr_rotate_pages: bool,
     ocr_execution_provider: str,
     ocr_layout: bool,
+    ocr_figure_text: bool,
 ) -> tuple[bool, list[str]]:
     """Validate OCR activation and return its effective language list."""
     ocr_execution_provider = validate_ocr_execution_provider(ocr_execution_provider)
@@ -126,6 +128,7 @@ def _validate_ocr_configuration(
         or ocr_rotate_pages
         or ocr_execution_provider != "cpu"
         or ocr_layout
+        or ocr_figure_text
     )
     if ocr_requested and ocr_detection_model_dir is None:
         raise ValueError(
@@ -137,6 +140,82 @@ def _validate_ocr_configuration(
         validate_ocr_languages(effective_languages)
         onnxruntime_engine_config(ocr_execution_provider)
     return ocr_requested, effective_languages
+
+
+def _validate_ocr_figure_text_options(
+    *, pdfa: bool, level: str, ocr_figure_text: bool
+) -> None:
+    if ocr_figure_text and (not pdfa or level not in {"2a", "3a"}):
+        raise ConversionError("Figure text OCR requires PDF/A-2a or PDF/A-3a output")
+
+
+def _accepted_figure_ocr_text(results: list[tuple[str, float]]) -> str | None:
+    lines = []
+    for text, confidence in results:
+        normalized = " ".join(text.split())
+        if not normalized:
+            continue
+        if confidence < _FIGURE_OCR_MIN_CONFIDENCE:
+            return None
+        lines.append(normalized)
+    return " ".join(lines) or None
+
+
+@contextmanager
+def _figure_text_recognizer(
+    *,
+    enabled: bool,
+    detection_model_dir: Path | None,
+    recognition_model_dir: Path | None,
+    ocr_execution_provider: str,
+) -> Iterator[Callable[[pikepdf.Stream], str | None] | None]:
+    if not enabled:
+        yield None
+        return
+
+    assert detection_model_dir is not None
+    assert recognition_model_dir is not None
+    from .ocr import OCRSession
+
+    cache: dict[tuple[object, ...], str | None] = {}
+    with (
+        tempfile.TemporaryDirectory(prefix="pdftopdfa-figure-ocr-") as directory,
+        OCRSession(
+            detection_model_dir=detection_model_dir,
+            recognition_model_dir=recognition_model_dir,
+            ocr_execution_provider=ocr_execution_provider,
+        ) as session,
+    ):
+        output_dir = Path(directory)
+
+        def recognize(image: pikepdf.Stream) -> str | None:
+            objgen = image.objgen
+            key = ("indirect", *objgen) if objgen != (0, 0) else ("direct", id(image))
+            if key in cache:
+                return cache[key]
+            if image.get("/ImageMask") is True:
+                cache[key] = None
+                return None
+            try:
+                extracted = pikepdf.PdfImage(image).extract_to(
+                    fileprefix=str(output_dir / f"image-{len(cache)}")
+                )
+            except (
+                OSError,
+                ValueError,
+                pikepdf.PdfError,
+                pikepdf.UnsupportedImageTypeError,
+            ) as exc:
+                logger.warning("Could not extract Figure image for OCR: %s", exc)
+                cache[key] = None
+                return None
+            text = _accepted_figure_ocr_text(
+                session.recognize_image(Path(extracted), layout="auto")
+            )
+            cache[key] = text
+            return text
+
+        yield recognize
 
 
 # Sanitization result key -> warning message mappings for convert_to_pdfa().
@@ -1209,6 +1288,7 @@ def convert_to_pdfa(
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
     ocr_layout: bool = False,
+    ocr_figure_text: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
@@ -1255,6 +1335,8 @@ def convert_to_pdfa(
             ``"cpu"`` (default), ``"directml"`` or ``"directml:<index>"``
             to select a specific adapter.
         ocr_layout: If True, order OCR lines by detected page columns.
+        ocr_figure_text: If True, recognize otherwise undescribed direct image
+            Figures and use sufficiently confident text as ``ActualText``.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
@@ -1279,10 +1361,16 @@ def convert_to_pdfa(
         ocr_rotate_pages=ocr_rotate_pages,
         ocr_execution_provider=ocr_execution_provider,
         ocr_layout=ocr_layout,
+        ocr_figure_text=ocr_figure_text,
     )
     if pdfa:
         level = validate_pdfa_level(level)
     _validate_pdfua_options(pdfa=pdfa, level=level, pdfua=pdfua)
+    _validate_ocr_figure_text_options(
+        pdfa=pdfa,
+        level=level,
+        ocr_figure_text=ocr_figure_text,
+    )
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
     if not pdfa and (document_title is not None or document_language is not None):
@@ -2001,13 +2089,20 @@ def convert_to_pdfa(
             # No preflight rehearsal: any failure below propagates out of this
             # try block, which closes `pdf` unsaved and unlinks the staged
             # output, so a partially built structure tree never reaches disk.
-            tagging_result = ensure_logical_structure(
-                pdf,
-                semantic=True,
-                pdfua=pdfua,
-                ocr_manifest=ocr_manifest,
-                preflight=False,
-            )
+            with _figure_text_recognizer(
+                enabled=ocr_figure_text,
+                detection_model_dir=ocr_detection_model_dir,
+                recognition_model_dir=ocr_recognition_model_dir,
+                ocr_execution_provider=ocr_execution_provider,
+            ) as figure_text_recognizer:
+                tagging_result = ensure_logical_structure(
+                    pdf,
+                    semantic=True,
+                    pdfua=pdfua,
+                    ocr_manifest=ocr_manifest,
+                    preflight=False,
+                    _figure_text_recognizer=figure_text_recognizer,
+                )
             if tagging_result.get("semantic_repairs", 0):
                 repair_count = tagging_result["semantic_repairs"]
                 repair_label = "property" if repair_count == 1 else "properties"
@@ -2037,6 +2132,28 @@ def convert_to_pdfa(
                     f"{alternative_review_count} Figure/Formula {element_label} "
                     f"{review_verb} manual review: no trustworthy Alt, "
                     "ActualText, or Caption is available"
+                )
+            ocr_figure_text_review_count = tagging_result.get(
+                "semantic_ocr_figure_text_review_required",
+                0,
+            )
+            if ocr_figure_text_review_count:
+                review_findings.append(
+                    PDFUAReviewFinding(
+                        code="ocr_generated_figure_text",
+                        message="Figure ActualText was generated by OCR",
+                        count=ocr_figure_text_review_count,
+                    )
+                )
+                figure_label = (
+                    "Figure" if ocr_figure_text_review_count == 1 else "Figures"
+                )
+                review_verb = (
+                    "requires" if ocr_figure_text_review_count == 1 else "require"
+                )
+                warnings.append(
+                    f"{ocr_figure_text_review_count} {figure_label} {review_verb} "
+                    "manual review: ActualText was generated by OCR"
                 )
             vector_review_count = tagging_result.get(
                 "semantic_vector_review_required",
@@ -2176,6 +2293,7 @@ def convert_to_pdfa(
                         if any(
                             (
                                 alternative_review_count,
+                                ocr_figure_text_review_count,
                                 vector_review_count,
                                 table_review_count,
                                 scanned_visual_review_count,
@@ -2481,6 +2599,7 @@ def convert_files(
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
     ocr_layout: bool = False,
+    ocr_figure_text: bool = False,
     force_overwrite: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -2520,6 +2639,8 @@ def convert_files(
             ``"cpu"`` (default), ``"directml"`` or ``"directml:<index>"``
             to select a specific adapter.
         ocr_layout: If True, order OCR lines by detected page columns.
+        ocr_figure_text: If True, generate review-required ``ActualText`` from
+            sufficiently confident OCR of otherwise undescribed image Figures.
         force_overwrite: If True, existing output files are overwritten.
             If False, existing outputs are skipped with an error result.
         preserve_stamps: If True, known proprietary stamp annotations are
@@ -2543,10 +2664,16 @@ def convert_files(
         ocr_rotate_pages=ocr_rotate_pages,
         ocr_execution_provider=ocr_execution_provider,
         ocr_layout=ocr_layout,
+        ocr_figure_text=ocr_figure_text,
     )
     if pdfa:
         level = validate_pdfa_level(level)
     _validate_pdfua_options(pdfa=pdfa, level=level, pdfua=pdfua)
+    _validate_ocr_figure_text_options(
+        pdfa=pdfa,
+        level=level,
+        ocr_figure_text=ocr_figure_text,
+    )
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
 
@@ -2614,6 +2741,7 @@ def convert_files(
                 ocr_rotate_pages=ocr_rotate_pages,
                 ocr_execution_provider=ocr_execution_provider,
                 ocr_layout=ocr_layout,
+                ocr_figure_text=ocr_figure_text,
                 convert_calibrated=convert_calibrated,
                 preserve_stamps=preserve_stamps,
                 allow_signature_invalidation=allow_signature_invalidation,
@@ -2671,6 +2799,7 @@ def convert_directory(
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
     ocr_layout: bool = False,
+    ocr_figure_text: bool = False,
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
@@ -2710,6 +2839,8 @@ def convert_directory(
             ``"cpu"`` (default), ``"directml"`` or ``"directml:<index>"``
             to select a specific adapter.
         ocr_layout: If True, order OCR lines by detected page columns.
+        ocr_figure_text: If True, generate review-required ``ActualText`` from
+            sufficiently confident OCR of otherwise undescribed image Figures.
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
             flattened into page content.
@@ -2732,10 +2863,16 @@ def convert_directory(
         ocr_rotate_pages=ocr_rotate_pages,
         ocr_execution_provider=ocr_execution_provider,
         ocr_layout=ocr_layout,
+        ocr_figure_text=ocr_figure_text,
     )
     if pdfa:
         level = validate_pdfa_level(level)
     _validate_pdfua_options(pdfa=pdfa, level=level, pdfua=pdfua)
+    _validate_ocr_figure_text_options(
+        pdfa=pdfa,
+        level=level,
+        ocr_figure_text=ocr_figure_text,
+    )
     if not pdfa and validate:
         raise ConversionError("PDF/A validation cannot be used when pdfa=False")
 
@@ -2843,6 +2980,7 @@ def convert_directory(
         ocr_rotate_pages=ocr_rotate_pages,
         ocr_execution_provider=ocr_execution_provider,
         ocr_layout=ocr_layout,
+        ocr_figure_text=ocr_figure_text,
         force_overwrite=force_overwrite,
         on_progress=_on_progress if show_progress else None,
         convert_calibrated=convert_calibrated,

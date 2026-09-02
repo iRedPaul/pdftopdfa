@@ -10,6 +10,7 @@ import math
 import re
 import unicodedata
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from tempfile import SpooledTemporaryFile
@@ -6644,6 +6645,7 @@ def _digital_semantic_inputs(
     frozenset[int],
     frozenset[int],
     dict[str, object],
+    dict[str, Stream],
 ]:
     import statistics
 
@@ -6679,6 +6681,7 @@ def _digital_semantic_inputs(
     optional_artifacts: dict[str, object] = {}
     source_actual_texts: dict[str, str] = {}
     source_alt_texts: dict[str, str] = {}
+    source_images: dict[str, Stream] = {}
     form_invocations: dict[int, tuple[_SemanticFormInvocation, ...]] = {}
     vector_review_pages: set[int] = set()
     native_reading_pages: set[int] = set()
@@ -6845,6 +6848,29 @@ def _digital_semantic_inputs(
                     f"resource {resource_name} cannot be resolved safely"
                 )
             return form
+
+        def resolve_image_child(
+            span: DirectXObjectSpan,
+            effective_resources: Dictionary | None,
+        ) -> Stream | None:
+            if (
+                span.kind != "image"
+                or span.resource_name is None
+                or effective_resources is None
+            ):
+                return None
+            xobjects = resolve_indirect(effective_resources.get("/XObject"))
+            image = (
+                resolve_indirect(xobjects.get(Name(f"/{span.resource_name}")))
+                if isinstance(xobjects, Dictionary)
+                else None
+            )
+            if (
+                isinstance(image, Stream)
+                and resolve_indirect(image.get("/Subtype")) == Name.Image
+            ):
+                return image
+            return None
 
         def marked_form_content(
             span: DirectXObjectSpan,
@@ -7153,6 +7179,7 @@ def _digital_semantic_inputs(
             generated_artifact: bool = False,
             source_actual_text: str | None,
             source_alt_text: str | None = None,
+            source_image: Stream | None = None,
             source_bbox: tuple[float, float, float, float] | None = None,
             text_override: str | None = None,
             kind_override=None,
@@ -7248,6 +7275,16 @@ def _digital_semantic_inputs(
                 source_actual_texts[span_id] = source_actual_text
             if source_alt_text is not None:
                 source_alt_texts[span_id] = source_alt_text
+            if (
+                source_image is not None
+                and isinstance(span, DirectXObjectSpan)
+                and not span.intrinsic_visibility_uncertain
+                and not (
+                    style_override is not None
+                    and style_override.image_visibility_uncertain
+                )
+            ):
+                source_images[span_id] = source_image
             page_spans.append(
                 SemanticSpan(
                     span_id,
@@ -7477,6 +7514,11 @@ def _digital_semantic_inputs(
                     generated_artifact=child_hidden,
                     source_actual_text=(child_actual_text or fallback_actual_text),
                     source_alt_text=(child_alt_text or fallback_alt_text),
+                    source_image=(
+                        resolve_image_child(child, effective_resources)
+                        if isinstance(child, DirectXObjectSpan)
+                        else None
+                    ),
                 ):
                     invocation_span_ids.add(child_span_id)
 
@@ -7573,6 +7615,11 @@ def _digital_semantic_inputs(
                     generated_artifact=source_hidden,
                     source_actual_text=page_actual_texts.get((source, source_index)),
                     source_alt_text=page_alt_texts.get((source, source_index)),
+                    source_image=(
+                        resolve_image_child(span, resources)
+                        if isinstance(span, DirectXObjectSpan)
+                        else None
+                    ),
                 )
                 if len(page_spans) > spans_before and (
                     isinstance(span, DirectTextSpan)
@@ -7703,6 +7750,7 @@ def _digital_semantic_inputs(
         frozenset(vector_review_pages),
         frozenset(native_reading_pages),
         optional_artifacts,
+        source_images,
     )
 
 
@@ -9474,6 +9522,66 @@ def _missing_plan_alternatives(
     return missing
 
 
+def _add_ocr_figure_actualtext(
+    root: object,
+    source_images: dict[str, Stream],
+    source_actual_texts: dict[str, str],
+    source_alt_texts: dict[str, str],
+    recognizer: Callable[[Stream], str | None] | None,
+) -> int:
+    if recognizer is None:
+        return 0
+    walk = getattr(root, "walk", None)
+    if not callable(walk):
+        return 0
+
+    generated = 0
+    for node in walk():
+        if getattr(node, "role", None) != "Figure":
+            continue
+        actual_text = getattr(node, "actual_text", None)
+        if isinstance(actual_text, str) and actual_text.strip():
+            continue
+        if _semantic_node_source_text(node, source_actual_texts) is not None:
+            continue
+        if _semantic_node_source_text(node, source_alt_texts) is not None:
+            continue
+        if any(
+            getattr(child, "role", None) == "Caption"
+            and _semantic_node_has_content(child)
+            for child in getattr(node, "children", ())
+        ):
+            continue
+
+        references = tuple(getattr(node, "content", ()))
+        if not references or any(
+            reference.span_id not in source_images for reference in references
+        ):
+            continue
+        if any(
+            reference.span_id in source_actual_texts
+            or reference.span_id in source_alt_texts
+            for reference in references
+        ):
+            continue
+        recognized = [
+            recognizer(source_images[reference.span_id]) for reference in references
+        ]
+        if any(text is None for text in recognized):
+            continue
+        values = [
+            text.strip() for text in recognized if text is not None and text.strip()
+        ]
+        if len(values) != len(references):
+            continue
+        source_actual_texts.update(
+            (reference.span_id, value)
+            for reference, value in zip(references, values, strict=True)
+        )
+        generated += 1
+    return generated
+
+
 def _normalize_pdfua_plan_tables(node: object) -> tuple[object, int]:
     """Demote inferred non-rectangular tables to conservative reading structure."""
     normalized_children = []
@@ -10054,6 +10162,7 @@ def _rebuild_semantic_structure(
     optional_content: _DefaultOCVisibility,
     *,
     pdfua: bool = False,
+    figure_text_recognizer: Callable[[Stream], str | None] | None = None,
 ) -> dict[str, int | bool]:
     from collections import Counter
 
@@ -10086,6 +10195,7 @@ def _rebuild_semantic_structure(
     form_vector_review_pages: frozenset[int] = frozenset()
     native_reading_pages: frozenset[int] = frozenset()
     optional_artifacts: dict[str, object] = {}
+    source_images: dict[str, Stream] = {}
     digital_form_invocations: dict[
         int,
         tuple[_SemanticFormInvocation, ...],
@@ -10101,6 +10211,7 @@ def _rebuild_semantic_structure(
         form_vector_review_pages,
         native_reading_pages,
         optional_artifacts,
+        source_images,
     ) = _digital_semantic_inputs(pdf, form_targets, optional_content)
     if forced_artifacts.keys() & optional_artifacts.keys():
         raise ConversionError(
@@ -10152,6 +10263,13 @@ def _rebuild_semantic_structure(
         )
 
     plan = build_semantic_plan(pages)
+    ocr_figure_text_review_required = _add_ocr_figure_actualtext(
+        plan.root,
+        source_images,
+        source_actual_texts,
+        source_alt_texts,
+        figure_text_recognizer,
+    )
     table_review_required = 0
     if pdfua:
         normalized_root, table_review_required = _normalize_pdfua_plan_tables(plan.root)
@@ -10322,6 +10440,7 @@ def _rebuild_semantic_structure(
         "semantic_content_items": len(referenced_ids),
         "semantic_repairs": 0,
         "semantic_alternatives_review_required": alternatives_review_required,
+        "semantic_ocr_figure_text_review_required": (ocr_figure_text_review_required),
         "semantic_vector_review_required": vector_review_required,
         "semantic_scanned_visual_review_required": len(scanned_visual_review_pages),
         "semantic_link_review_required": link_review_required,
@@ -10467,6 +10586,7 @@ def _ensure_logical_structure_in_place(
     semantic: bool = False,
     pdfua: bool = False,
     ocr_manifest: dict[str, object] | None = None,
+    figure_text_recognizer: Callable[[Stream], str | None] | None = None,
     _content_preflight_complete: bool = False,
 ) -> dict[str, int | bool]:
     """Preserve, repair, or create a deterministic logical structure tree.
@@ -10654,6 +10774,7 @@ def _ensure_logical_structure_in_place(
             "semantic_content_items": 0,
             "semantic_repairs": semantic_repairs,
             "semantic_alternatives_review_required": (alternatives_review_required),
+            "semantic_ocr_figure_text_review_required": 0,
             "semantic_vector_review_required": int(path_artifacts_tagged > 0),
             "semantic_scanned_visual_review_required": 0,
             "semantic_link_review_required": 0,
@@ -10673,6 +10794,7 @@ def _ensure_logical_structure_in_place(
                 ocr_manifest,
                 optional_content,
                 pdfua=pdfua,
+                figure_text_recognizer=figure_text_recognizer,
             )
         except (ConversionError, TypeError, ValueError) as exc:
             semantic_error = exc
@@ -10753,6 +10875,7 @@ def _ensure_logical_structure_in_place(
         "semantic_content_items": 0,
         "semantic_repairs": 0,
         "semantic_alternatives_review_required": 0,
+        "semantic_ocr_figure_text_review_required": 0,
         "semantic_vector_review_required": 0,
         "semantic_scanned_visual_review_required": 0,
         "semantic_link_review_required": 0,
@@ -10777,6 +10900,7 @@ def ensure_logical_structure(
     pdfua: bool = False,
     ocr_manifest: dict[str, object] | None = None,
     preflight: bool = True,
+    _figure_text_recognizer: Callable[[Stream], str | None] | None = None,
 ) -> dict[str, int | bool]:
     """Preserve, repair, or create a deterministic logical structure tree.
 
@@ -10841,6 +10965,7 @@ def ensure_logical_structure(
                         semantic=semantic,
                         pdfua=pdfua,
                         ocr_manifest=ocr_manifest,
+                        figure_text_recognizer=_figure_text_recognizer,
                         _content_preflight_complete=True,
                     )
         except ConversionError:
@@ -10855,6 +10980,7 @@ def ensure_logical_structure(
         semantic=semantic,
         pdfua=pdfua,
         ocr_manifest=ocr_manifest,
+        figure_text_recognizer=_figure_text_recognizer,
         _content_preflight_complete=True,
     )
     if pdfua:

@@ -176,8 +176,9 @@ deployment-managed, read-only directories. Both
 `--ocr-detection-model-dir` and `--ocr-recognition-model-dir` are required
 together; supplying the pair enables OCR without an additional `--ocr` flag.
 Conversely, `--ocr`, `--ocr-force`, `--deskew`, `--rotate-pages`,
-`--ocr-layout`, and a non-CPU `--ocr-execution-provider` value (`directml` or
-`directml:INDEX`) are rejected unless both model options are present.
+`--ocr-layout`, `--ocr-figure-text`, and a non-CPU `--ocr-execution-provider`
+value (`directml` or `directml:INDEX`) are rejected unless both model options
+are present.
 
 `--ocr-lang` defaults to `en`. Use `de` for German and `de+en` for mixed
 German/English recognition. Latin-script languages restrict decoding to Latin
@@ -237,6 +238,12 @@ pdftopdfa -l 2a --validate --ocr-lang de+en \
 
 # Order OCR lines by detected columns for a cleaner reading order
 pdftopdfa --ocr-layout \
+  --ocr-detection-model-dir "$DET_MODEL" \
+  --ocr-recognition-model-dir "$REC_MODEL" \
+  document.pdf
+
+# Add review-required ActualText to undescribed text-based image Figures
+pdftopdfa -l 3a --pdfua --ocr-figure-text \
   --ocr-detection-model-dir "$DET_MODEL" \
   --ocr-recognition-model-dir "$REC_MODEL" \
   document.pdf
@@ -314,8 +321,9 @@ ocr_result = convert_to_pdfa(
 Supplying both model directories enables OCR in `convert_to_pdfa()`,
 `convert_files()`, and `convert_directory()`. Supplying only one directory, or
 requesting OCR through `ocr_languages`, `ocr_force`, `ocr_deskew`,
-`ocr_rotate_pages`, `ocr_layout=True`, or a non-CPU execution provider without
-both directories, raises `ValueError` before processing starts. Set
+`ocr_rotate_pages`, `ocr_layout=True`, `ocr_figure_text=True`, or a non-CPU
+execution provider without both directories, raises `ValueError` before
+processing starts. Set
 `ocr_execution_provider="directml"` to use the supported DirectML configuration
 on Windows 11, or `ocr_execution_provider="directml:1"` to pass a specific raw
 DXGI adapter index.
@@ -338,10 +346,12 @@ image, table, and reusable `OCRSession` APIs.
   order from text styles, geometry, direct painting provenance, and, for scans,
   the internal OCR engine's line and layout data. Ambiguous content falls back
   to conservative paragraph or division structure. Trustworthy existing Alt,
-  marked-content ActualText, and textual Captions are retained or propagated;
-  software cannot invent an authoritative description for an otherwise
-  undescribed image. Such Figure/Formula elements are reported for manual
-  review instead of receiving invented descriptions. Pages with unclassified
+  marked-content ActualText, and textual Captions are retained or propagated.
+  With explicit `--ocr-figure-text` opt-in, sufficiently confident text from
+  otherwise undescribed direct image Figures is written as review-required
+  ActualText; this is replacement text, not an authoritative visual
+  description. Unrecognized or uncertain images and undescribed Formula
+  elements remain reported for manual review. Pages with unclassified
   vector painting are likewise reported because decorative rules and
   meaningful vector diagrams cannot always be distinguished automatically.
   Full-page OCR scans that may contain unrecognized non-text visuals, Link
