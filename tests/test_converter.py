@@ -84,8 +84,13 @@ def test_accepted_figure_ocr_text_requires_confident_nonempty_lines(
 def test_figure_text_recognizer_reuses_one_session_and_cached_image_result(
     mock_pdf_image: MagicMock,
     mock_session_class: MagicMock,
+    tmp_path: Path,
 ) -> None:
-    mock_pdf_image.return_value.extract_to.side_effect = ["first.png", "second.png"]
+    first_path = tmp_path / "first.png"
+    second_path = tmp_path / "second.png"
+    Image.new("RGB", (10, 10), "white").save(first_path)
+    Image.new("RGB", (10, 10), "white").save(second_path)
+    mock_pdf_image.return_value.extract_to.side_effect = [first_path, second_path]
     session = mock_session_class.return_value.__enter__.return_value
     session.recognize_image.side_effect = [
         [("First", 0.95), ("logo", 0.94)],
@@ -95,6 +100,9 @@ def test_figure_text_recognizer_reuses_one_session_and_cached_image_result(
     with Pdf.new() as pdf:
         first = pdf.make_stream(b"first")
         second = pdf.make_stream(b"second")
+        for image in (first, second):
+            image["/Width"] = 10
+            image["/Height"] = 10
         with _figure_text_recognizer(
             enabled=True,
             detection_model_dir=_DETECTION_MODEL_DIR,
@@ -126,6 +134,7 @@ def test_figure_text_recognizer_crops_each_image_invocation(
     mock_pdf_image: MagicMock,
     mock_session_class: MagicMock,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_path = tmp_path / "source.png"
     source = Image.new("RGB", (100, 20), "blue")
@@ -133,6 +142,16 @@ def test_figure_text_recognizer_crops_each_image_invocation(
     source.save(source_path)
     mock_pdf_image.return_value.extract_to.return_value = source_path
     seen_pixels = []
+    converted_sizes = []
+    original_convert = Image.Image.convert
+
+    def tracked_convert(
+        image: Image.Image, *args: object, **kwargs: object
+    ) -> Image.Image:
+        converted_sizes.append(image.size)
+        return original_convert(image, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "convert", tracked_convert)
 
     def inspect_crop(path: Path, **_kwargs: object) -> list[tuple[str, float]]:
         with Image.open(path) as cropped:
@@ -146,6 +165,8 @@ def test_figure_text_recognizer_crops_each_image_invocation(
 
     with Pdf.new() as pdf:
         image = pdf.make_stream(b"image")
+        image["/Width"] = 100
+        image["/Height"] = 20
         with _figure_text_recognizer(
             enabled=True,
             detection_model_dir=_DETECTION_MODEL_DIR,
@@ -160,6 +181,42 @@ def test_figure_text_recognizer_crops_each_image_invocation(
 
     assert mock_pdf_image.call_count == 2
     assert seen_pixels == [((50, 20), (255, 0, 0)), ((50, 20), (0, 0, 255))]
+    assert converted_sizes == [(50, 20), (50, 20)]
+
+
+@patch("pdftopdfa.converter._OCR_MAX_PAGE_RASTER_PIXELS", 99)
+@patch("pdftopdfa.ocr.OCRSession")
+@patch("pdftopdfa.converter.pikepdf.PdfImage")
+def test_figure_text_recognizer_skips_masked_and_oversized_images(
+    mock_pdf_image: MagicMock,
+    _mock_session_class: MagicMock,
+) -> None:
+    with Pdf.new() as pdf:
+        masked = pdf.make_stream(b"masked")
+        soft_masked = pdf.make_stream(b"soft-masked")
+        alpha = pdf.make_stream(b"alpha")
+        oversized = pdf.make_stream(b"oversized")
+        for image in (masked, soft_masked, alpha, oversized):
+            image["/Width"] = 10
+            image["/Height"] = 10
+        masked["/Mask"] = Array([0, 0])
+        soft_masked["/SMask"] = pdf.make_stream(b"mask")
+        alpha["/SMaskInData"] = 1
+
+        with _figure_text_recognizer(
+            enabled=True,
+            detection_model_dir=_DETECTION_MODEL_DIR,
+            recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            ocr_execution_provider="cpu",
+            ocr_languages=["en"],
+        ) as recognize:
+            assert recognize is not None
+            assert recognize(masked) is None
+            assert recognize(soft_masked) is None
+            assert recognize(alpha) is None
+            assert recognize(oversized) is None
+
+    mock_pdf_image.assert_not_called()
 
 
 def _windows_dacl_sddl(path: Path) -> str:

@@ -51,7 +51,7 @@ from .metadata import (
     remove_pdfx_identification,
     sync_metadata,
 )
-from .ocr import validate_ocr_languages
+from .ocr import _OCR_MAX_PAGE_RASTER_PIXELS, validate_ocr_languages
 from .sanitizers import (
     count_digital_signatures,
     ensure_display_doc_title,
@@ -204,18 +204,35 @@ def _figure_text_recognizer(
             key = (*image_key, crop_polygon)
             if key in cache:
                 return cache[key]
-            if image.get("/ImageMask") is True:
+            width = image.get("/Width")
+            height = image.get("/Height")
+            if (
+                bool(image.get("/ImageMask", False))
+                or image.get("/Mask") is not None
+                or image.get("/SMask") is not None
+                or bool(image.get("/SMaskInData", False))
+                or not isinstance(width, int)
+                or isinstance(width, bool)
+                or width <= 0
+                or not isinstance(height, int)
+                or isinstance(height, bool)
+                or height <= 0
+                or width * height > _OCR_MAX_PAGE_RASTER_PIXELS
+            ):
                 cache[key] = None
                 return None
             try:
+                from PIL import Image, ImageDraw
+
                 extracted = pikepdf.PdfImage(image).extract_to(
                     fileprefix=str(output_dir / f"image-{len(cache)}")
                 )
                 input_path = Path(extracted)
-                if crop_polygon is not None:
-                    from PIL import Image, ImageDraw
-
-                    with Image.open(input_path) as source:
+                with Image.open(input_path) as source:
+                    if source.size != (width, height):
+                        cache[key] = None
+                        return None
+                    if crop_polygon is not None:
                         width, height = source.size
                         points = [
                             (
@@ -231,19 +248,20 @@ def _figure_text_recognizer(
                         if left >= right or upper >= lower:
                             cache[key] = None
                             return None
-                        cropped = source.convert("RGB").crop(
-                            (left, upper, right, lower)
+                        cropped = source.crop((left, upper, right, lower)).convert(
+                            "RGB"
                         )
-                    mask = Image.new("L", cropped.size, 0)
-                    ImageDraw.Draw(mask).polygon(
-                        [(x - left, y - upper) for x, y in points],
-                        fill=255,
-                    )
-                    visible = Image.new("RGB", cropped.size, "white")
-                    visible.paste(cropped, mask=mask)
-                    input_path = output_dir / f"image-{len(cache)}-crop.png"
-                    visible.save(input_path)
+                        mask = Image.new("L", cropped.size, 0)
+                        ImageDraw.Draw(mask).polygon(
+                            [(x - left, y - upper) for x, y in points],
+                            fill=255,
+                        )
+                        visible = Image.new("RGB", cropped.size, "white")
+                        visible.paste(cropped, mask=mask)
+                        input_path = output_dir / f"image-{len(cache)}-crop.png"
+                        visible.save(input_path)
             except (
+                Image.DecompressionBombError,
                 OSError,
                 ValueError,
                 pikepdf.PdfError,
