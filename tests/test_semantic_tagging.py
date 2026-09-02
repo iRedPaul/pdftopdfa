@@ -755,14 +755,19 @@ def test_direct_image_figure_uses_review_required_ocr_actualtext(
     image = _image(pdf)
     _page(
         pdf,
-        b"q 100 0 0 80 50 100 cm /Im Do Q",
+        b"q 50 100 50 80 re W n 100 0 0 80 50 100 cm /Im Do Q",
         Dictionary(XObject=Dictionary(Im=image)),
         size=(400, 300),
     )
     seen: list[tuple[int, int]] = []
+    seen_crops: list[tuple[tuple[float, float], ...]] = []
 
-    def recognize(candidate: pikepdf.Stream) -> str | None:
+    def recognize(
+        candidate: pikepdf.Stream,
+        crop_polygon: tuple[tuple[float, float], ...],
+    ) -> str | None:
         seen.append(candidate.objgen)
+        seen_crops.append(crop_polygon)
         return recognized
 
     result = ensure_logical_structure(
@@ -776,6 +781,10 @@ def test_direct_image_figure_uses_review_required_ocr_actualtext(
         item for item in _structure_objects(pdf) if item.get("/S") == Name.Figure
     )
     assert seen == [image.objgen]
+    assert min(x for x, _y in seen_crops[0]) == pytest.approx(0.0)
+    assert max(x for x, _y in seen_crops[0]) == pytest.approx(0.5)
+    assert min(y for _x, y in seen_crops[0]) == pytest.approx(0.0)
+    assert max(y for _x, y in seen_crops[0]) == pytest.approx(1.0)
     if expected_actual_text is None:
         assert "/ActualText" not in figure
     else:
@@ -786,6 +795,55 @@ def test_direct_image_figure_uses_review_required_ocr_actualtext(
     assert layout["/Placement"] == Name.Block
     assert result["semantic_alternatives_review_required"] == missing_alternative
     assert result["semantic_ocr_figure_text_review_required"] == ocr_review
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_preserved_direct_image_figure_uses_ocr_actualtext(nested: bool) -> None:
+    pdf = pikepdf.Pdf.new()
+    image = _image(pdf)
+    if nested:
+        form = _form(
+            pdf,
+            b"q 100 0 0 80 50 100 cm /Im Do Q",
+            Dictionary(XObject=Dictionary(Im=image)),
+        )
+        content = b"/Figure <</MCID 0>> BDC /Fm Do EMC"
+        resources = Dictionary(XObject=Dictionary(Fm=form))
+    else:
+        content = b"/Figure <</MCID 0>> BDC q 100 0 0 80 50 100 cm /Im Do Q EMC"
+        resources = Dictionary(XObject=Dictionary(Im=image))
+    page = _page(
+        pdf,
+        content,
+        resources,
+        size=(400, 300),
+    )
+    root = _install_figure_structure(pdf, page)
+    seen: list[tuple[int, int]] = []
+
+    def recognize(
+        candidate: pikepdf.Stream,
+        _crop_polygon: tuple[tuple[float, float], ...],
+    ) -> str | None:
+        seen.append(candidate.objgen)
+        return "Existing Figure text"
+
+    result = ensure_logical_structure(
+        pdf,
+        semantic=True,
+        preflight=False,
+        _figure_text_recognizer=recognize,
+    )
+
+    figure = next(
+        item for item in _structure_objects(pdf) if item.get("/S") == Name.Figure
+    )
+    assert result["structure_preserved"] is True
+    assert pdf.Root["/StructTreeRoot"].objgen == root.objgen
+    assert seen == [image.objgen]
+    assert str(figure["/ActualText"]) == "Existing Figure text"
+    assert result["semantic_alternatives_review_required"] == 0
+    assert result["semantic_ocr_figure_text_review_required"] == 1
 
 
 def test_existing_image_actualtext_skips_figure_ocr() -> None:
@@ -801,7 +859,10 @@ def test_existing_image_actualtext_skips_figure_ocr() -> None:
         size=(400, 300),
     )
 
-    def recognize(_candidate: pikepdf.Stream) -> str | None:
+    def recognize(
+        _candidate: pikepdf.Stream,
+        _crop_polygon: tuple[tuple[float, float], ...],
+    ) -> str | None:
         raise AssertionError("OCR must not replace existing ActualText")
 
     result = ensure_logical_structure(

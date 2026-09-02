@@ -7,6 +7,7 @@
 # Standard Library
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -168,7 +169,11 @@ def _figure_text_recognizer(
     detection_model_dir: Path | None,
     recognition_model_dir: Path | None,
     ocr_execution_provider: str,
-) -> Iterator[Callable[[pikepdf.Stream], str | None] | None]:
+    ocr_languages: list[str],
+) -> Iterator[
+    Callable[[pikepdf.Stream, tuple[tuple[float, float], ...] | None], str | None]
+    | None
+]:
     if not enabled:
         yield None
         return
@@ -188,9 +193,15 @@ def _figure_text_recognizer(
     ):
         output_dir = Path(directory)
 
-        def recognize(image: pikepdf.Stream) -> str | None:
+        def recognize(
+            image: pikepdf.Stream,
+            crop_polygon: tuple[tuple[float, float], ...] | None = None,
+        ) -> str | None:
             objgen = image.objgen
-            key = ("indirect", *objgen) if objgen != (0, 0) else ("direct", id(image))
+            image_key = (
+                ("indirect", *objgen) if objgen != (0, 0) else ("direct", id(image))
+            )
+            key = (*image_key, crop_polygon)
             if key in cache:
                 return cache[key]
             if image.get("/ImageMask") is True:
@@ -200,6 +211,38 @@ def _figure_text_recognizer(
                 extracted = pikepdf.PdfImage(image).extract_to(
                     fileprefix=str(output_dir / f"image-{len(cache)}")
                 )
+                input_path = Path(extracted)
+                if crop_polygon is not None:
+                    from PIL import Image, ImageDraw
+
+                    with Image.open(input_path) as source:
+                        width, height = source.size
+                        points = [
+                            (
+                                min(max(x, 0.0), 1.0) * width,
+                                (1.0 - min(max(y, 0.0), 1.0)) * height,
+                            )
+                            for x, y in crop_polygon
+                        ]
+                        left = max(0, math.floor(min(x for x, _y in points)))
+                        upper = max(0, math.floor(min(y for _x, y in points)))
+                        right = min(width, math.ceil(max(x for x, _y in points)))
+                        lower = min(height, math.ceil(max(y for _x, y in points)))
+                        if left >= right or upper >= lower:
+                            cache[key] = None
+                            return None
+                        cropped = source.convert("RGB").crop(
+                            (left, upper, right, lower)
+                        )
+                    mask = Image.new("L", cropped.size, 0)
+                    ImageDraw.Draw(mask).polygon(
+                        [(x - left, y - upper) for x, y in points],
+                        fill=255,
+                    )
+                    visible = Image.new("RGB", cropped.size, "white")
+                    visible.paste(cropped, mask=mask)
+                    input_path = output_dir / f"image-{len(cache)}-crop.png"
+                    visible.save(input_path)
             except (
                 OSError,
                 ValueError,
@@ -210,7 +253,11 @@ def _figure_text_recognizer(
                 cache[key] = None
                 return None
             text = _accepted_figure_ocr_text(
-                session.recognize_image(Path(extracted), layout="auto")
+                session.recognize_image(
+                    input_path,
+                    layout="auto",
+                    languages=ocr_languages,
+                )
             )
             cache[key] = text
             return text
@@ -2094,6 +2141,7 @@ def convert_to_pdfa(
                 detection_model_dir=ocr_detection_model_dir,
                 recognition_model_dir=ocr_recognition_model_dir,
                 ocr_execution_provider=ocr_execution_provider,
+                ocr_languages=effective_ocr_languages,
             ) as figure_text_recognizer:
                 tagging_result = ensure_logical_structure(
                     pdf,

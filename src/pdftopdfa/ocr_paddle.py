@@ -47,6 +47,7 @@ from .ocr import (
     _OCR_MAX_PAGE_RASTER_PIXELS,
     _OCR_PAGE_MANIFEST_TYPE,
     PADDLE_OCR_LANGUAGES,
+    _latin_only_ocr_languages,
     _ocr_raster_pixel_count,
     _validate_ocr_page_manifest,
     _write_json_atomic,
@@ -64,7 +65,6 @@ _MIN_DESKEW_ANGLE = 0.05
 _MAX_DESKEW_ANGLE = 10.0
 _TEXT_DETECTION_LIMIT_SIDE_LEN = 1600
 _SPANNING_LINE_WIDTH_RATIO = 0.7
-_NON_LATIN_OCR_LANGUAGES = frozenset({"ch", "chinese_cht", "japan"})
 
 
 @dataclass(frozen=True)
@@ -349,7 +349,7 @@ def _has_only_latin_letters(character: str) -> bool:
 
 
 def _latin_only(options: OcrOptions) -> bool:
-    return not _NON_LATIN_OCR_LANGUAGES.intersection(options.languages)
+    return _latin_only_ocr_languages(list(options.languages))
 
 
 @contextmanager
@@ -535,6 +535,7 @@ class _ImageOCRSession:
         *,
         layout: str = "auto",
         allowed_characters: str | None = None,
+        latin_only: bool = False,
     ) -> list[tuple[str, float]]:
         with self._lock:
             if self._closed:
@@ -552,6 +553,7 @@ class _ImageOCRSession:
                 ocr_execution_provider=self._execution_provider,
                 layout=layout,
                 allowed_characters=allowed_characters,
+                _latin_only=latin_only,
                 _model=self._model,
             )
 
@@ -577,6 +579,7 @@ def recognize_image(
     ocr_execution_provider: str = "cpu",
     layout: str = "auto",
     allowed_characters: str | None = None,
+    _latin_only: bool = False,
     _model: Any | None = None,
 ) -> list[tuple[str, float]]:
     """Recognize text and confidence values in one image with PP-OCRv6."""
@@ -596,6 +599,7 @@ def recognize_image(
             input_file,
             options,
             allowed_characters=allowed_characters,
+            latin_only=_latin_only,
             model=_model,
         )
         return _text_confidence_results(
@@ -607,7 +611,11 @@ def recognize_image(
         with _prediction_lock:
             model = _model if _model is not None else _get_model(options)
             text_rec_model = model.paddlex_pipeline.text_rec_model
-            with _allowed_character_decoder(text_rec_model, allowed_characters):
+            with _allowed_character_decoder(
+                text_rec_model,
+                allowed_characters,
+                latin_only=_latin_only,
+            ):
                 results = list(
                     text_rec_model(
                         str(input_file),

@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pikepdf
 import pytest
 from pikepdf import Array, Dictionary, Name, Pdf
+from PIL import Image
 
 from pdftopdfa.converter import (
     ConversionResult,
@@ -99,6 +100,7 @@ def test_figure_text_recognizer_reuses_one_session_and_cached_image_result(
             detection_model_dir=_DETECTION_MODEL_DIR,
             recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_execution_provider="cpu",
+            ocr_languages=["de"],
         ) as recognize:
             assert recognize is not None
             assert recognize(first) == "First logo"
@@ -112,6 +114,52 @@ def test_figure_text_recognizer_reuses_one_session_and_cached_image_result(
     )
     assert mock_pdf_image.call_count == 2
     assert session.recognize_image.call_count == 2
+    assert all(
+        call.kwargs["languages"] == ["de"]
+        for call in session.recognize_image.call_args_list
+    )
+
+
+@patch("pdftopdfa.ocr.OCRSession")
+@patch("pdftopdfa.converter.pikepdf.PdfImage")
+def test_figure_text_recognizer_crops_each_image_invocation(
+    mock_pdf_image: MagicMock,
+    mock_session_class: MagicMock,
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.png"
+    source = Image.new("RGB", (100, 20), "blue")
+    source.paste("red", (0, 0, 50, 20))
+    source.save(source_path)
+    mock_pdf_image.return_value.extract_to.return_value = source_path
+    seen_pixels = []
+
+    def inspect_crop(path: Path, **_kwargs: object) -> list[tuple[str, float]]:
+        with Image.open(path) as cropped:
+            seen_pixels.append((cropped.size, cropped.getpixel((25, 10))))
+        return [("Visible", 0.99)]
+
+    session = mock_session_class.return_value.__enter__.return_value
+    session.recognize_image.side_effect = inspect_crop
+    left = ((0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0))
+    right = ((0.5, 0.0), (1.0, 0.0), (1.0, 1.0), (0.5, 1.0))
+
+    with Pdf.new() as pdf:
+        image = pdf.make_stream(b"image")
+        with _figure_text_recognizer(
+            enabled=True,
+            detection_model_dir=_DETECTION_MODEL_DIR,
+            recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            ocr_execution_provider="cpu",
+            ocr_languages=["en"],
+        ) as recognize:
+            assert recognize is not None
+            assert recognize(image, left) == "Visible"
+            assert recognize(image, left) == "Visible"
+            assert recognize(image, right) == "Visible"
+
+    assert mock_pdf_image.call_count == 2
+    assert seen_pixels == [((50, 20), (255, 0, 0)), ((50, 20), (0, 0, 255))]
 
 
 def _windows_dacl_sddl(path: Path) -> str:
