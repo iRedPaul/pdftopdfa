@@ -188,7 +188,7 @@ def test_figure_text_recognizer_crops_each_image_invocation(
     assert converted_sizes == [(50, 20), (50, 20)]
 
 
-@patch("pdftopdfa.converter._OCR_MAX_PAGE_RASTER_PIXELS", 99)
+@patch("pdftopdfa.converter._FIGURE_OCR_MAX_PIXELS", 99)
 @patch("pdftopdfa.ocr.OCRSession")
 @patch("pdftopdfa.converter.pikepdf.PdfImage")
 def test_figure_text_recognizer_skips_masked_and_oversized_images(

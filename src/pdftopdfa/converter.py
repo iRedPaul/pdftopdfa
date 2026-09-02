@@ -51,7 +51,7 @@ from .metadata import (
     remove_pdfx_identification,
     sync_metadata,
 )
-from .ocr import _OCR_MAX_PAGE_RASTER_PIXELS, validate_ocr_languages
+from .ocr import validate_ocr_languages
 from .sanitizers import (
     count_digital_signatures,
     ensure_display_doc_title,
@@ -99,6 +99,7 @@ class _AnnotationRestoreResult:
 
 # Conformance level ranking: a > u > b
 _CONFORMANCE_RANK = {"b": 0, "u": 1, "a": 2}
+_FIGURE_OCR_MAX_PIXELS = 16_777_216
 _FIGURE_OCR_MIN_CONFIDENCE = 0.90
 
 
@@ -218,7 +219,7 @@ def _figure_text_recognizer(
                 or not isinstance(height, int)
                 or isinstance(height, bool)
                 or height <= 0
-                or width * height > _OCR_MAX_PAGE_RASTER_PIXELS
+                or width * height > _FIGURE_OCR_MAX_PIXELS
             ):
                 cache[key] = None
                 return None
