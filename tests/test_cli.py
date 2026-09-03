@@ -90,6 +90,7 @@ class TestCliHelp:
         assert "--ocr" in result.output
         assert "--ocr-execution-provider [cpu|directml|directml:INDEX]" in result.output
         assert "--ocr-layout" in result.output
+        assert "--ocr-figure-text" in result.output
         assert "--deskew" in result.output
         assert "--rotate-pages" in result.output
 
@@ -474,6 +475,29 @@ class TestCliConvert:
 
         assert result.exit_code == EXIT_SUCCESS
         assert mock_convert_single.call_args.kwargs["skip_any_pdfa"] is True
+
+    @patch("pdftopdfa.cli._convert_single_file", return_value=EXIT_SUCCESS)
+    def test_cli_convert_passes_figure_text_ocr(
+        self,
+        mock_convert_single: MagicMock,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                str(tmp_dir / "output.pdf"),
+                "--level",
+                "3a",
+                "--ocr-figure-text",
+                *OCR_MODEL_ARGS,
+            ],
+        )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert mock_convert_single.call_args.kwargs["ocr_figure_text"] is True
 
     @patch("pdftopdfa.cli._convert_single_file")
     def test_cli_convert_passes_allow_signature_invalidation(
@@ -1208,6 +1232,47 @@ class TestCliOcr:
                 str(sample_pdf),
                 str(tmp_dir / "layout.pdf"),
                 "--ocr-layout",
+            ],
+        )
+
+        assert result.exit_code == 2
+        assert "OCR requires --ocr-detection-model-dir" in result.output
+
+    def test_cli_figure_text_requires_level_a(
+        self,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                str(tmp_dir / "figure-text.pdf"),
+                "--level",
+                "3b",
+                "--ocr-figure-text",
+                *OCR_MODEL_ARGS,
+            ],
+        )
+
+        assert result.exit_code == 2
+        assert "--ocr-figure-text requires --level 2a or 3a" in result.output
+
+    def test_cli_figure_text_requires_text_models(
+        self,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        result = runner.invoke(
+            main,
+            [
+                str(sample_pdf),
+                str(tmp_dir / "figure-text.pdf"),
+                "--level",
+                "3a",
+                "--ocr-figure-text",
             ],
         )
 

@@ -18,14 +18,17 @@ from unittest.mock import MagicMock, patch
 import pikepdf
 import pytest
 from pikepdf import Array, Dictionary, Name, Pdf
+from PIL import Image
 
 from pdftopdfa.converter import (
     ConversionResult,
     PDFUAReviewFinding,
     PDFUAStatus,
     ProfileValidationResult,
+    _accepted_figure_ocr_text,
     _compare_pdfa_levels,
     _ensure_binary_comment,
+    _figure_text_recognizer,
     _truncate_trailing_data,
     _verify_file_structure,
     convert_directory,
@@ -55,6 +58,169 @@ from pdftopdfa.verapdf import (
 
 _DETECTION_MODEL_DIR = Path("paddle-detection")
 _RECOGNITION_MODEL_DIR = Path("paddle-recognition")
+
+
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        (
+            [(" First\nline ", 0.95), ("Second", 0.90)],
+            "First line Second",
+        ),
+        ([("", 0.10), ("Visible", 0.90)], "Visible"),
+        ([("Trusted", 0.99), ("Uncertain", 0.89)], None),
+        ([], None),
+    ],
+)
+def test_accepted_figure_ocr_text_requires_confident_nonempty_lines(
+    results: list[tuple[str, float]],
+    expected: str | None,
+) -> None:
+    assert _accepted_figure_ocr_text(results) == expected
+
+
+@patch("pdftopdfa.ocr.OCRSession")
+@patch("pdftopdfa.converter.pikepdf.PdfImage")
+def test_figure_text_recognizer_reuses_one_session_and_cached_image_result(
+    mock_pdf_image: MagicMock,
+    mock_session_class: MagicMock,
+    tmp_path: Path,
+) -> None:
+    first_path = tmp_path / "first.png"
+    second_path = tmp_path / "second.png"
+    Image.new("RGB", (10, 10), "white").save(first_path)
+    Image.new("RGB", (10, 10), "white").save(second_path)
+    mock_pdf_image.return_value.extract_to.side_effect = [first_path, second_path]
+    session = mock_session_class.return_value.__enter__.return_value
+    session.recognize_image.side_effect = [
+        [("First", 0.95), ("logo", 0.94)],
+        [("35 Jahre", 0.98)],
+    ]
+
+    with Pdf.new() as pdf:
+        first = pdf.make_stream(b"first")
+        second = pdf.make_stream(b"second")
+        for image in (first, second):
+            image["/Width"] = 10
+            image["/Height"] = 10
+        with _figure_text_recognizer(
+            enabled=True,
+            detection_model_dir=_DETECTION_MODEL_DIR,
+            recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            ocr_execution_provider="cpu",
+            ocr_languages=["de"],
+        ) as recognize:
+            assert recognize is not None
+            assert recognize(first) == "First logo"
+            assert recognize(first) == "First logo"
+            assert recognize(second) == "35 Jahre"
+
+    mock_session_class.assert_called_once_with(
+        detection_model_dir=_DETECTION_MODEL_DIR,
+        recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        ocr_execution_provider="cpu",
+    )
+    assert mock_pdf_image.call_count == 2
+    assert session.recognize_image.call_count == 2
+    assert all(
+        call.kwargs["languages"] == ["de"]
+        for call in session.recognize_image.call_args_list
+    )
+
+
+@patch("pdftopdfa.ocr.OCRSession")
+@patch("pdftopdfa.converter.pikepdf.PdfImage")
+def test_figure_text_recognizer_crops_each_image_invocation(
+    mock_pdf_image: MagicMock,
+    mock_session_class: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "source.png"
+    source = Image.new("RGB", (100, 20), "blue")
+    source.paste("red", (0, 0, 50, 20))
+    source.save(source_path)
+    mock_pdf_image.return_value.extract_to.return_value = source_path
+    seen_pixels = []
+    crop_paths = []
+    converted_sizes = []
+    original_convert = Image.Image.convert
+
+    def tracked_convert(
+        image: Image.Image, *args: object, **kwargs: object
+    ) -> Image.Image:
+        converted_sizes.append(image.size)
+        return original_convert(image, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "convert", tracked_convert)
+
+    def inspect_crop(path: Path, **_kwargs: object) -> list[tuple[str, float]]:
+        crop_paths.append(path)
+        with Image.open(path) as cropped:
+            seen_pixels.append((cropped.size, cropped.getpixel((25, 10))))
+        return [("Visible", 0.99)]
+
+    session = mock_session_class.return_value.__enter__.return_value
+    session.recognize_image.side_effect = inspect_crop
+    left = ((0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0))
+    right = ((0.5, 0.0), (1.0, 0.0), (1.0, 1.0), (0.5, 1.0))
+
+    with Pdf.new() as pdf:
+        image = pdf.make_stream(b"image")
+        image["/Width"] = 100
+        image["/Height"] = 20
+        with _figure_text_recognizer(
+            enabled=True,
+            detection_model_dir=_DETECTION_MODEL_DIR,
+            recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            ocr_execution_provider="cpu",
+            ocr_languages=["en"],
+        ) as recognize:
+            assert recognize is not None
+            assert recognize(image, left) == "Visible"
+            assert not crop_paths[-1].exists()
+            assert recognize(image, left) == "Visible"
+            assert recognize(image, right) == "Visible"
+            assert not crop_paths[-1].exists()
+
+    assert mock_pdf_image.call_count == 1
+    assert seen_pixels == [((50, 20), (255, 0, 0)), ((50, 20), (0, 0, 255))]
+    assert converted_sizes == [(50, 20), (50, 20)]
+
+
+@patch("pdftopdfa.converter._FIGURE_OCR_MAX_PIXELS", 99)
+@patch("pdftopdfa.ocr.OCRSession")
+@patch("pdftopdfa.converter.pikepdf.PdfImage")
+def test_figure_text_recognizer_skips_masked_and_oversized_images(
+    mock_pdf_image: MagicMock,
+    _mock_session_class: MagicMock,
+) -> None:
+    with Pdf.new() as pdf:
+        masked = pdf.make_stream(b"masked")
+        soft_masked = pdf.make_stream(b"soft-masked")
+        alpha = pdf.make_stream(b"alpha")
+        oversized = pdf.make_stream(b"oversized")
+        for image in (masked, soft_masked, alpha, oversized):
+            image["/Width"] = 10
+            image["/Height"] = 10
+        masked["/Mask"] = Array([0, 0])
+        soft_masked["/SMask"] = pdf.make_stream(b"mask")
+        alpha["/SMaskInData"] = 1
+
+        with _figure_text_recognizer(
+            enabled=True,
+            detection_model_dir=_DETECTION_MODEL_DIR,
+            recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            ocr_execution_provider="cpu",
+            ocr_languages=["en"],
+        ) as recognize:
+            assert recognize is not None
+            assert recognize(masked) is None
+            assert recognize(soft_masked) is None
+            assert recognize(alpha) is None
+            assert recognize(oversized) is None
+
+    mock_pdf_image.assert_not_called()
 
 
 def _windows_dacl_sddl(path: Path) -> str:
@@ -2369,6 +2535,36 @@ class TestConvertToPdfa:
                 ocr_layout=True,
             )
 
+    @pytest.mark.parametrize("level", ["2b", "2u", "3b", "3u"])
+    def test_figure_text_ocr_requires_level_a(
+        self,
+        level: str,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        with pytest.raises(ConversionError, match="requires PDF/A-2a or PDF/A-3a"):
+            convert_to_pdfa(
+                sample_pdf,
+                tmp_dir / "figure-text.pdf",
+                level=level,
+                ocr_figure_text=True,
+                ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            )
+
+    def test_figure_text_ocr_requires_ocr_models(
+        self,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        with pytest.raises(ValueError, match="OCR requires"):
+            convert_to_pdfa(
+                sample_pdf,
+                tmp_dir / "figure-text.pdf",
+                level="3a",
+                ocr_figure_text=True,
+            )
+
     @patch("pdftopdfa.converter.onnxruntime_engine_config")
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
@@ -3538,6 +3734,38 @@ class TestConvertToPdfa:
 
         assert result.success is True
         assert expected in result.warnings
+
+    @patch("pdftopdfa.converter.ensure_logical_structure")
+    def test_level_a_reports_ocr_generated_figure_text_for_review(
+        self,
+        mock_ensure: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        mock_ensure.return_value = {
+            "semantic_repairs": 0,
+            "semantic_alternatives_review_required": 0,
+            "semantic_ocr_figure_text_review_required": 2,
+            "structure_rebuilt": False,
+        }
+
+        result = convert_to_pdfa(
+            sample_pdf,
+            tmp_dir / "ocr-figure-review.pdf",
+            level="3a",
+        )
+
+        assert (
+            "2 Figures require manual review: ActualText was generated by OCR"
+            in result.warnings
+        )
+        assert result.review_findings == (
+            PDFUAReviewFinding(
+                code="ocr_generated_figure_text",
+                message="Figure ActualText was generated by OCR",
+                count=2,
+            ),
+        )
 
     @patch("pdftopdfa.converter.ensure_logical_structure")
     def test_level_a_reports_unclassified_direct_vector_painting(

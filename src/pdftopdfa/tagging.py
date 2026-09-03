@@ -10,6 +10,7 @@ import math
 import re
 import unicodedata
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from tempfile import SpooledTemporaryFile
@@ -52,6 +53,12 @@ _MAX_FORM_SCAN_DEPTH = 64
 _PREFLIGHT_MEMORY_LIMIT = 16 * 1024 * 1024
 _TEXT_SHOW_OPERAND_COUNTS = {"Tj": 1, "TJ": 1, "'": 1, '"': 3}
 _ObjectKey = tuple[int, int]
+type _FigureClipPolygon = tuple[tuple[float, float], ...]
+type _FigureSourceImage = tuple[Stream, _FigureClipPolygon]
+type _FigureTextRecognizer = Callable[
+    [Stream, _FigureClipPolygon],
+    str | None,
+]
 _PAINTING_OPERATORS = frozenset(
     {"Tj", "TJ", "'", '"', "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "sh"}
 )
@@ -1303,7 +1310,7 @@ def _propagate_existing_marked_text_evidence(
     return repaired
 
 
-def _missing_structure_alternatives(
+def _structure_elements_missing_alternatives(
     pdf: pikepdf.Pdf,
     elements: list[Dictionary],
     content_references: dict[
@@ -1315,7 +1322,7 @@ def _missing_structure_alternatives(
             Dictionary | Stream | None,
         ],
     ],
-) -> int:
+) -> tuple[Dictionary, ...]:
     root = resolve_indirect(pdf.Root.get("/StructTreeRoot"))
     role_map = (
         resolve_indirect(root.get("/RoleMap")) if isinstance(root, Dictionary) else None
@@ -1341,7 +1348,7 @@ def _missing_structure_alternatives(
         )
     ]
     if not candidates:
-        return 0
+        return ()
     text_references, actual_text_references = _content_reference_description_evidence(
         content_references
     )
@@ -1353,7 +1360,7 @@ def _missing_structure_alternatives(
         content_references,
         actual_text_references,
     )
-    missing = 0
+    missing = []
     for element in candidates:
         element_key = _object_key(element)
         if element_key in elements_with_actual_text:
@@ -1367,8 +1374,109 @@ def _missing_structure_alternatives(
             for child in _structure_element_children(element)
         ):
             continue
-        missing += 1
-    return missing
+        missing.append(element)
+    return tuple(missing)
+
+
+def _missing_structure_alternatives(
+    pdf: pikepdf.Pdf,
+    elements: list[Dictionary],
+    content_references: dict[
+        tuple[_ObjectKey, int],
+        tuple[
+            Dictionary | Stream,
+            Dictionary,
+            Dictionary,
+            Dictionary | Stream | None,
+        ],
+    ],
+) -> int:
+    return len(
+        _structure_elements_missing_alternatives(
+            pdf,
+            elements,
+            content_references,
+        )
+    )
+
+
+def _add_existing_figure_ocr_actualtext(
+    pdf: pikepdf.Pdf,
+    elements: list[Dictionary],
+    content_references: dict[
+        tuple[_ObjectKey, int],
+        tuple[
+            Dictionary | Stream,
+            Dictionary,
+            Dictionary,
+            Dictionary | Stream | None,
+        ],
+    ],
+    recognizer: _FigureTextRecognizer | None,
+    image_invocations: dict[tuple[_ObjectKey, int], list[_FigureSourceImage]],
+    non_image_references: set[tuple[_ObjectKey, int]],
+) -> int:
+    if recognizer is None:
+        return 0
+
+    root = resolve_indirect(pdf.Root.get("/StructTreeRoot"))
+    role_map = (
+        resolve_indirect(root.get("/RoleMap")) if isinstance(root, Dictionary) else None
+    )
+    if not isinstance(role_map, Dictionary):
+        role_map = None
+    figures = {
+        key: element
+        for element in _structure_elements_missing_alternatives(
+            pdf,
+            elements,
+            content_references,
+        )
+        if _effective_structure_role(element.get("/S"), role_map) == "/Figure"
+        and (key := _object_key(element)) is not None
+    }
+    if not figures:
+        return 0
+
+    references_by_figure: dict[_ObjectKey, list[tuple[_ObjectKey, int]]] = {}
+    for reference, (_container, owner, _page, _stream) in content_references.items():
+        current: object = owner
+        visited: set[_ObjectKey] = set()
+        while isinstance(current := resolve_indirect(current), Dictionary):
+            current_key = _object_key(current)
+            if current_key is None or current_key in visited:
+                break
+            visited.add(current_key)
+            if _effective_structure_role(current.get("/S"), role_map) == "/Figure":
+                if current_key in figures:
+                    references_by_figure.setdefault(current_key, []).append(reference)
+                break
+            current = current.get("/P")
+
+    generated = 0
+    for figure_key, figure in figures.items():
+        references = references_by_figure.get(figure_key, [])
+        if (
+            not references
+            or set(references) & non_image_references
+            or any(reference not in image_invocations for reference in references)
+        ):
+            continue
+        recognized = [
+            recognizer(*source)
+            for reference in references
+            for source in image_invocations[reference]
+        ]
+        if any(text is None for text in recognized):
+            continue
+        values = [
+            text.strip() for text in recognized if text is not None and text.strip()
+        ]
+        if len(values) != len(recognized):
+            continue
+        figure["/ActualText"] = _bounded_pdf_string(" ".join(values))
+        generated += 1
+    return generated
 
 
 def _valid_table_header_association(
@@ -4105,6 +4213,27 @@ class _SemanticFormInvocation:
     target_name: Name | None = None
 
 
+def _image_clip_polygon(span: object) -> _FigureClipPolygon | None:
+    from .digital_layout import (
+        DirectXObjectSpan,
+        _inverse_matrix,
+        _normalize_polygon,
+        _transform_polygon,
+    )
+
+    if not isinstance(span, DirectXObjectSpan) or span.clip_polygon is None:
+        return None
+    try:
+        polygon = _transform_polygon(
+            span.clip_polygon,
+            _inverse_matrix(span.matrix),
+        )
+    except ValueError:
+        return None
+    clamped = tuple((min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0)) for x, y in polygon)
+    return _normalize_polygon(clamped) or None
+
+
 @dataclass(frozen=True, slots=True)
 class _MarkedVectorScope:
     marked_content_index: int
@@ -5037,6 +5166,7 @@ def _direct_artifact_items(
     inherited_resources: Dictionary | None = None,
     *,
     mcid_items_out: dict[tuple[str, int], tuple[int, ...]] | None = None,
+    vector_mcids_out: set[int] | None = None,
     optional_content: _DefaultOCVisibility | None = None,
     initial_state: InvocationPaintState | None = None,
     initial_clip_polygon: ClipPolygon | None = None,
@@ -6558,6 +6688,10 @@ def _direct_artifact_items(
                     has_ambiguous_unclassified_vector_paint = True
                 else:
                     has_semantic_vector_paint = True
+                    if vector_mcids_out is not None:
+                        vector_mcids_out.update(
+                            mcid for mcid in marked_mcids if mcid is not None
+                        )
                     if scope_index is None:
                         has_unclassified_vector_paint = True
                         if unclassified_vector_bbox is None:
@@ -6644,6 +6778,7 @@ def _digital_semantic_inputs(
     frozenset[int],
     frozenset[int],
     dict[str, object],
+    dict[str, _FigureSourceImage],
 ]:
     import statistics
 
@@ -6679,6 +6814,7 @@ def _digital_semantic_inputs(
     optional_artifacts: dict[str, object] = {}
     source_actual_texts: dict[str, str] = {}
     source_alt_texts: dict[str, str] = {}
+    source_images: dict[str, _FigureSourceImage] = {}
     form_invocations: dict[int, tuple[_SemanticFormInvocation, ...]] = {}
     vector_review_pages: set[int] = set()
     native_reading_pages: set[int] = set()
@@ -6845,6 +6981,29 @@ def _digital_semantic_inputs(
                     f"resource {resource_name} cannot be resolved safely"
                 )
             return form
+
+        def resolve_image_child(
+            span: DirectXObjectSpan,
+            effective_resources: Dictionary | None,
+        ) -> Stream | None:
+            if (
+                span.kind != "image"
+                or span.resource_name is None
+                or effective_resources is None
+            ):
+                return None
+            xobjects = resolve_indirect(effective_resources.get("/XObject"))
+            image = (
+                resolve_indirect(xobjects.get(Name(f"/{span.resource_name}")))
+                if isinstance(xobjects, Dictionary)
+                else None
+            )
+            if (
+                isinstance(image, Stream)
+                and resolve_indirect(image.get("/Subtype")) == Name.Image
+            ):
+                return image
+            return None
 
         def marked_form_content(
             span: DirectXObjectSpan,
@@ -7153,6 +7312,7 @@ def _digital_semantic_inputs(
             generated_artifact: bool = False,
             source_actual_text: str | None,
             source_alt_text: str | None = None,
+            source_image: Stream | None = None,
             source_bbox: tuple[float, float, float, float] | None = None,
             text_override: str | None = None,
             kind_override=None,
@@ -7248,6 +7408,19 @@ def _digital_semantic_inputs(
                 source_actual_texts[span_id] = source_actual_text
             if source_alt_text is not None:
                 source_alt_texts[span_id] = source_alt_text
+            if (
+                source_image is not None
+                and isinstance(span, DirectXObjectSpan)
+                and not span.intrinsic_visibility_uncertain
+                and span.entry_state.fill_alpha == 1.0
+                and not (
+                    style_override is not None
+                    and style_override.image_visibility_uncertain
+                )
+            ):
+                crop_polygon = _image_clip_polygon(span)
+                if crop_polygon is not None:
+                    source_images[span_id] = source_image, crop_polygon
             page_spans.append(
                 SemanticSpan(
                     span_id,
@@ -7477,6 +7650,11 @@ def _digital_semantic_inputs(
                     generated_artifact=child_hidden,
                     source_actual_text=(child_actual_text or fallback_actual_text),
                     source_alt_text=(child_alt_text or fallback_alt_text),
+                    source_image=(
+                        resolve_image_child(child, effective_resources)
+                        if isinstance(child, DirectXObjectSpan)
+                        else None
+                    ),
                 ):
                     invocation_span_ids.add(child_span_id)
 
@@ -7573,6 +7751,11 @@ def _digital_semantic_inputs(
                     generated_artifact=source_hidden,
                     source_actual_text=page_actual_texts.get((source, source_index)),
                     source_alt_text=page_alt_texts.get((source, source_index)),
+                    source_image=(
+                        resolve_image_child(span, resources)
+                        if isinstance(span, DirectXObjectSpan)
+                        else None
+                    ),
                 )
                 if len(page_spans) > spans_before and (
                     isinstance(span, DirectTextSpan)
@@ -7703,6 +7886,7 @@ def _digital_semantic_inputs(
         frozenset(vector_review_pages),
         frozenset(native_reading_pages),
         optional_artifacts,
+        source_images,
     )
 
 
@@ -7946,6 +8130,10 @@ def _requires_existing_image_visibility_rebuild(
             Dictionary | Stream | None,
         ],
     ],
+    *,
+    image_invocations_out: dict[tuple[_ObjectKey, int], list[_FigureSourceImage]]
+    | None = None,
+    non_image_references_out: set[tuple[_ObjectKey, int]] | None = None,
 ) -> tuple[bool, bool]:
     """Return rebuild and described-uncertainty results for tagged images."""
     from .digital_layout import (
@@ -7983,28 +8171,13 @@ def _requires_existing_image_visibility_rebuild(
             current = current.get("/P")
         return False
 
-    def image_state(
-        span: DirectTextSpan | DirectXObjectSpan,
-    ) -> tuple[bool, bool]:
-        if isinstance(span, DirectTextSpan):
-            return False, False
-        if span.kind in {"image", "inline_image"}:
-            return span.invisible, span.intrinsic_visibility_uncertain
-        invisible = False
-        uncertain = False
-        for child in span.children:
-            child_invisible, child_uncertain = image_state(child)
-            invisible = invisible or child_invisible
-            uncertain = uncertain or child_uncertain
-        return invisible, uncertain
-
     def inspect_container(
         owner: pikepdf.Page | Stream,
         spans: tuple[DirectTextSpan | DirectXObjectSpan, ...],
         resources: Dictionary | None,
         description: str,
         active_forms: frozenset[_ObjectKey] = frozenset(),
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, list[_FigureSourceImage], bool]:
         nonlocal described_uncertainty, rebuild
         container = owner.obj if isinstance(owner, pikepdf.Page) else owner
         container_key = _object_key(container)
@@ -8013,18 +8186,21 @@ def _requires_existing_image_visibility_rebuild(
                 "Cannot inspect existing image visibility: direct content container"
             )
         mcid_items: dict[tuple[str, int], tuple[int, ...]] = {}
+        vector_mcids: set[int] = set()
         actual_text_items: dict[tuple[str, int], str] = {}
         alt_text_items: dict[tuple[str, int], str] = {}
         (
             artifact_items,
             actual_text_items,
             alt_text_items,
+            has_semantic_vector_paint,
             *_paint,
         ) = _direct_artifact_items(
             owner,
             description,
             resources,
             mcid_items_out=mcid_items,
+            vector_mcids_out=vector_mcids,
         )
         effective_resources = (
             _page_resources(owner)
@@ -8033,9 +8209,17 @@ def _requires_existing_image_visibility_rebuild(
         )
         if not isinstance(effective_resources, Dictionary) or not effective_resources:
             effective_resources = resources
+        if non_image_references_out is not None:
+            non_image_references_out.update(
+                reference
+                for mcid in vector_mcids
+                if (reference := (container_key, mcid)) in content_references
+            )
 
         container_invisible = False
         container_uncertain = False
+        container_images: list[_FigureSourceImage] = []
+        container_has_other = has_semantic_vector_paint
         for span in spans:
             if isinstance(span, DirectTextSpan):
                 item = ("text", span.direct_text_index)
@@ -8068,17 +8252,50 @@ def _requires_existing_image_visibility_rebuild(
                         "Cannot inspect existing image visibility: Form provenance "
                         "is invalid"
                     )
-                invisible, uncertain = inspect_container(
+                invisible, uncertain, images, has_other = inspect_container(
                     form,
                     span.children,
                     effective_resources,
                     f"Form XObject /{span.resource_name} invoked by {description}",
                     active_forms | frozenset({form_key}),
                 )
+                has_other = has_other or span.final_paint_uncertain
+            elif isinstance(span, DirectTextSpan):
+                invisible, uncertain = False, False
+                images = []
+                has_other = True
+            elif span.kind == "inline_image":
+                invisible = span.invisible
+                uncertain = span.intrinsic_visibility_uncertain
+                images = []
+                has_other = True
             else:
-                invisible, uncertain = image_state(span)
+                invisible = span.invisible
+                uncertain = span.intrinsic_visibility_uncertain
+                images = []
+                has_other = span.final_paint_uncertain or uncertain
+                if not has_other and isinstance(effective_resources, Dictionary):
+                    xobjects = resolve_indirect(effective_resources.get("/XObject"))
+                    image = (
+                        resolve_indirect(xobjects.get(Name(f"/{span.resource_name}")))
+                        if span.resource_name is not None
+                        and isinstance(xobjects, Dictionary)
+                        else None
+                    )
+                    crop_polygon = _image_clip_polygon(span)
+                    if (
+                        isinstance(image, Stream)
+                        and resolve_indirect(image.get("/Subtype")) == Name.Image
+                        and crop_polygon is not None
+                        and span.entry_state.fill_alpha == 1.0
+                    ):
+                        images.append((image, crop_polygon))
+                    else:
+                        has_other = True
             container_invisible = container_invisible or invisible
             container_uncertain = container_uncertain or uncertain
+            container_images.extend(images)
+            container_has_other = container_has_other or has_other
             for mcid in mcid_items.get(item, ()):
                 reference = (container_key, mcid)
                 existing = content_references.get(reference)
@@ -8092,7 +8309,16 @@ def _requires_existing_image_visibility_rebuild(
                 if uncertain and described:
                     described_uncertainty = True
                 rebuild = rebuild or invisible
-        return container_invisible, container_uncertain
+                if image_invocations_out is not None and images:
+                    image_invocations_out.setdefault(reference, []).extend(images)
+                if non_image_references_out is not None and has_other:
+                    non_image_references_out.add(reference)
+        return (
+            container_invisible,
+            container_uncertain,
+            container_images,
+            container_has_other,
+        )
 
     for layout in extract_digital_layout(pdf, page_indices=page_indices):
         page = pdf.pages[layout.page_index]
@@ -9474,6 +9700,66 @@ def _missing_plan_alternatives(
     return missing
 
 
+def _add_ocr_figure_actualtext(
+    root: object,
+    source_images: dict[str, _FigureSourceImage],
+    source_actual_texts: dict[str, str],
+    source_alt_texts: dict[str, str],
+    recognizer: _FigureTextRecognizer | None,
+) -> int:
+    if recognizer is None:
+        return 0
+    walk = getattr(root, "walk", None)
+    if not callable(walk):
+        return 0
+
+    generated = 0
+    for node in walk():
+        if getattr(node, "role", None) != "Figure":
+            continue
+        actual_text = getattr(node, "actual_text", None)
+        if isinstance(actual_text, str) and actual_text.strip():
+            continue
+        if _semantic_node_source_text(node, source_actual_texts) is not None:
+            continue
+        if _semantic_node_source_text(node, source_alt_texts) is not None:
+            continue
+        if any(
+            getattr(child, "role", None) == "Caption"
+            and _semantic_node_has_content(child)
+            for child in getattr(node, "children", ())
+        ):
+            continue
+
+        references = tuple(getattr(node, "content", ()))
+        if not references or any(
+            reference.span_id not in source_images for reference in references
+        ):
+            continue
+        if any(
+            reference.span_id in source_actual_texts
+            or reference.span_id in source_alt_texts
+            for reference in references
+        ):
+            continue
+        recognized = [
+            recognizer(*source_images[reference.span_id]) for reference in references
+        ]
+        if any(text is None for text in recognized):
+            continue
+        values = [
+            text.strip() for text in recognized if text is not None and text.strip()
+        ]
+        if len(values) != len(references):
+            continue
+        source_actual_texts.update(
+            (reference.span_id, value)
+            for reference, value in zip(references, values, strict=True)
+        )
+        generated += 1
+    return generated
+
+
 def _normalize_pdfua_plan_tables(node: object) -> tuple[object, int]:
     """Demote inferred non-rectangular tables to conservative reading structure."""
     normalized_children = []
@@ -10054,6 +10340,7 @@ def _rebuild_semantic_structure(
     optional_content: _DefaultOCVisibility,
     *,
     pdfua: bool = False,
+    figure_text_recognizer: _FigureTextRecognizer | None = None,
 ) -> dict[str, int | bool]:
     from collections import Counter
 
@@ -10086,6 +10373,7 @@ def _rebuild_semantic_structure(
     form_vector_review_pages: frozenset[int] = frozenset()
     native_reading_pages: frozenset[int] = frozenset()
     optional_artifacts: dict[str, object] = {}
+    source_images: dict[str, _FigureSourceImage] = {}
     digital_form_invocations: dict[
         int,
         tuple[_SemanticFormInvocation, ...],
@@ -10101,6 +10389,7 @@ def _rebuild_semantic_structure(
         form_vector_review_pages,
         native_reading_pages,
         optional_artifacts,
+        source_images,
     ) = _digital_semantic_inputs(pdf, form_targets, optional_content)
     if forced_artifacts.keys() & optional_artifacts.keys():
         raise ConversionError(
@@ -10152,6 +10441,33 @@ def _rebuild_semantic_structure(
         )
 
     plan = build_semantic_plan(pages)
+    logical_span_ids = {
+        reference.span_id for node in plan.root.walk() for reference in node.content
+    }
+    for page_index, digital_page_spans in digital_spans.items():
+        logical_ocr_boxes = tuple(
+            span.bbox
+            for span in ocr_spans.get(page_index, ())
+            if span.id in logical_span_ids
+        )
+        for span in digital_page_spans:
+            if span.id not in source_images:
+                continue
+            if any(
+                span.bbox.left < ocr_box.right
+                and ocr_box.left < span.bbox.right
+                and span.bbox.top < ocr_box.bottom
+                and ocr_box.top < span.bbox.bottom
+                for ocr_box in logical_ocr_boxes
+            ):
+                del source_images[span.id]
+    ocr_figure_text_review_required = _add_ocr_figure_actualtext(
+        plan.root,
+        source_images,
+        source_actual_texts,
+        source_alt_texts,
+        figure_text_recognizer,
+    )
     table_review_required = 0
     if pdfua:
         normalized_root, table_review_required = _normalize_pdfua_plan_tables(plan.root)
@@ -10322,6 +10638,7 @@ def _rebuild_semantic_structure(
         "semantic_content_items": len(referenced_ids),
         "semantic_repairs": 0,
         "semantic_alternatives_review_required": alternatives_review_required,
+        "semantic_ocr_figure_text_review_required": (ocr_figure_text_review_required),
         "semantic_vector_review_required": vector_review_required,
         "semantic_scanned_visual_review_required": len(scanned_visual_review_pages),
         "semantic_link_review_required": link_review_required,
@@ -10467,6 +10784,7 @@ def _ensure_logical_structure_in_place(
     semantic: bool = False,
     pdfua: bool = False,
     ocr_manifest: dict[str, object] | None = None,
+    figure_text_recognizer: _FigureTextRecognizer | None = None,
     _content_preflight_complete: bool = False,
 ) -> dict[str, int | bool]:
     """Preserve, repair, or create a deterministic logical structure tree.
@@ -10556,6 +10874,10 @@ def _ensure_logical_structure_in_place(
     rich_existing_structure = (
         existing_elements is not None and _has_semantic_structure_roles(pdf)
     )
+    existing_image_invocations: dict[
+        tuple[_ObjectKey, int], list[_FigureSourceImage]
+    ] = {}
+    existing_non_image_references: set[tuple[_ObjectKey, int]] = set()
     hidden_optional_content_references = False
     if (
         semantic_requested
@@ -10583,10 +10905,21 @@ def _ensure_logical_structure_in_place(
                 _requires_existing_image_visibility_rebuild(
                     pdf,
                     existing_content_references,
+                    image_invocations_out=(
+                        existing_image_invocations
+                        if figure_text_recognizer is not None
+                        else None
+                    ),
+                    non_image_references_out=(
+                        existing_non_image_references
+                        if figure_text_recognizer is not None
+                        else None
+                    ),
                 )
             )
         except ConversionError:
-            pass
+            existing_image_invocations.clear()
+            existing_non_image_references.clear()
         else:
             if described_image_uncertainty:
                 raise ConversionError(
@@ -10631,6 +10964,14 @@ def _ensure_logical_structure_in_place(
             raise ConversionError(
                 "Cannot preserve logical structure after semantic repairs"
             )
+        ocr_figure_text_review_required = _add_existing_figure_ocr_actualtext(
+            pdf,
+            existing_elements,
+            existing_content_references,
+            figure_text_recognizer,
+            existing_image_invocations,
+            existing_non_image_references,
+        )
         alternatives_review_required = _missing_structure_alternatives(
             pdf,
             existing_elements,
@@ -10654,6 +10995,9 @@ def _ensure_logical_structure_in_place(
             "semantic_content_items": 0,
             "semantic_repairs": semantic_repairs,
             "semantic_alternatives_review_required": (alternatives_review_required),
+            "semantic_ocr_figure_text_review_required": (
+                ocr_figure_text_review_required
+            ),
             "semantic_vector_review_required": int(path_artifacts_tagged > 0),
             "semantic_scanned_visual_review_required": 0,
             "semantic_link_review_required": 0,
@@ -10673,6 +11017,7 @@ def _ensure_logical_structure_in_place(
                 ocr_manifest,
                 optional_content,
                 pdfua=pdfua,
+                figure_text_recognizer=figure_text_recognizer,
             )
         except (ConversionError, TypeError, ValueError) as exc:
             semantic_error = exc
@@ -10753,6 +11098,7 @@ def _ensure_logical_structure_in_place(
         "semantic_content_items": 0,
         "semantic_repairs": 0,
         "semantic_alternatives_review_required": 0,
+        "semantic_ocr_figure_text_review_required": 0,
         "semantic_vector_review_required": 0,
         "semantic_scanned_visual_review_required": 0,
         "semantic_link_review_required": 0,
@@ -10777,6 +11123,7 @@ def ensure_logical_structure(
     pdfua: bool = False,
     ocr_manifest: dict[str, object] | None = None,
     preflight: bool = True,
+    _figure_text_recognizer: _FigureTextRecognizer | None = None,
 ) -> dict[str, int | bool]:
     """Preserve, repair, or create a deterministic logical structure tree.
 
@@ -10841,6 +11188,7 @@ def ensure_logical_structure(
                         semantic=semantic,
                         pdfua=pdfua,
                         ocr_manifest=ocr_manifest,
+                        figure_text_recognizer=_figure_text_recognizer,
                         _content_preflight_complete=True,
                     )
         except ConversionError:
@@ -10855,6 +11203,7 @@ def ensure_logical_structure(
         semantic=semantic,
         pdfua=pdfua,
         ocr_manifest=ocr_manifest,
+        figure_text_recognizer=_figure_text_recognizer,
         _content_preflight_complete=True,
     )
     if pdfua:

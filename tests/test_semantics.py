@@ -13,6 +13,7 @@ from pdftopdfa.semantics import (
     SemanticPage,
     SemanticSpan,
     SpanKind,
+    StructureAttribute,
     StructureNode,
     build_semantic_plan,
 )
@@ -1452,6 +1453,28 @@ def test_repeated_large_margin_crossing_images_remain_figures() -> None:
     assert [node.role for node in plan.root.walk() if node.role == "Figure"] == [
         "Figure"
     ] * 3
+
+
+def test_figure_is_declared_as_block_content() -> None:
+    plan = build_semantic_plan(
+        [
+            _page(
+                _span(
+                    "image",
+                    "",
+                    50,
+                    100,
+                    width=100,
+                    height=80,
+                    kind=SpanKind.IMAGE,
+                )
+            )
+        ]
+    )
+
+    figure = next(node for node in plan.root.walk() if node.role == "Figure")
+
+    assert figure.attributes == (StructureAttribute("Layout", "Placement", "Block"),)
 
 
 def test_repeated_clusters_enforce_full_geometry_diameter() -> None:

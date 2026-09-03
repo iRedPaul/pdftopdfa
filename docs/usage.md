@@ -123,6 +123,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `--ocr-recognition-model-dir DIR` | Directory containing compatible PP-OCRv6 Medium recognition `inference.onnx` and `inference.yml` |
 | `--ocr-execution-provider [cpu\|directml\|directml:INDEX]` | ONNX Runtime execution provider (default: `cpu`); any non-CPU provider requires both model-directory options; DirectML uses the `directml` extra and is project-supported on Windows 11, while `directml:INDEX` selects a specific raw DXGI adapter index |
 | `--ocr-layout` | Order OCR lines by detected page columns without another OCR pass; requires both model-directory options and implies `--ocr`; see [OCR Page Layout](ocr.md#page-layout) |
+| `--ocr-figure-text` | Use sufficiently confident OCR text as review-required `ActualText` for otherwise undescribed direct image Figures; requires PDF/A-2a or PDF/A-3a and both model-directory options; see [OCR Figure Text](ocr.md#figure-text) |
 | `--deskew` | Straighten scan-like, raster-dominant pages; requires both model-directory options and implies `--ocr` |
 | `--rotate-pages` | Automatically orient pages with the bundled Paddle model; requires both model-directory options and implies `--ocr` |
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
@@ -207,6 +208,7 @@ def convert_to_pdfa(
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
     ocr_layout: bool = False,
+    ocr_figure_text: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
@@ -230,6 +232,11 @@ result = convert_to_pdfa(
     ocr_execution_provider="cpu",
 )
 ```
+
+Set `ocr_figure_text=True` with level `"2a"` or `"3a"` to generate
+review-required replacement text for otherwise undescribed direct image
+Figures. See [OCR Figure Text](ocr.md#figure-text) for its confidence and scope
+rules.
 
 Set `ocr_execution_provider="directml"` to use the project's supported
 DirectML configuration on Windows 11 after installing
@@ -365,6 +372,7 @@ def convert_directory(
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
     ocr_layout: bool = False,
+    ocr_figure_text: bool = False,
     force_overwrite: bool = False,
     convert_calibrated: bool = True,
     preserve_stamps: bool = False,
@@ -407,6 +415,7 @@ def convert_files(
     ocr_rotate_pages: bool = False,
     ocr_execution_provider: str = "cpu",
     ocr_layout: bool = False,
+    ocr_figure_text: bool = False,
     force_overwrite: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -514,13 +523,15 @@ non-compliance or an unavailable validator through
 OCR configuration is validated before input processing:
 
 - CLI use of `--ocr`, `--ocr-force`, `--deskew`, `--rotate-pages`,
-  `--ocr-layout`, or a non-CPU execution provider such as `directml` or
-  `directml:1` without both model-directory options raises a Click
-  `UsageError`.
+  `--ocr-layout`, `--ocr-figure-text`, or a non-CPU execution provider such as
+  `directml` or `directml:1` without both model-directory options raises a
+  Click `UsageError`.
 - Providing only one model-directory option also raises `UsageError`.
 - The high-level Python APIs raise `ValueError` when only one model directory
   is supplied, or when languages, OCR processing options, or
   a non-CPU `ocr_execution_provider` are supplied without the complete pair.
+- Figure text OCR requires PDF/A level `2a` or `3a`; other levels and
+  `pdfa=False` are rejected.
 - Forced OCR (`--ocr-force` or `ocr_force=True`) cannot be combined with
   deskew (`--deskew` or `ocr_deskew=True`).
 - Invalid language codes such as `eng` and `deu` are rejected. Use `en`, `de`,

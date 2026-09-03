@@ -28,7 +28,7 @@ from PIL import Image
 
 import pdftopdfa._ocr_runtime as ocr_runtime
 import pdftopdfa.digital_layout as digital_layout
-from pdftopdfa import recognize_image
+from pdftopdfa import OCRSession, recognize_image
 from pdftopdfa._ocr_runtime import (
     _DXGIAdapterDesc1,
     _is_directml_adapter,
@@ -264,9 +264,42 @@ def test_recognize_image_is_exposed_by_public_api(
         image_path,
         layout="single_line",
         allowed_characters="0123456789",
+        latin_only=False,
     )
     backend.close.assert_called_once_with()
     collect.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("languages", "latin_only"),
+    [(["de"], True), (["de", "japan"], False)],
+)
+def test_ocr_session_derives_decoder_script_from_languages(
+    languages: list[str],
+    latin_only: bool,
+    model_dirs: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "figure.png"
+    backend = MagicMock()
+    backend.recognize_image.return_value = [("Text", 0.95)]
+    with (
+        patch("pdftopdfa.ocr.onnxruntime_engine_config"),
+        patch("pdftopdfa.ocr_paddle._ImageOCRSession", return_value=backend),
+        OCRSession(
+            detection_model_dir=model_dirs[0],
+            recognition_model_dir=model_dirs[1],
+        ) as session,
+    ):
+        result = session.recognize_image(image_path, languages=languages)
+
+    assert result == [("Text", 0.95)]
+    backend.recognize_image.assert_called_once_with(
+        image_path,
+        layout="auto",
+        allowed_characters=None,
+        latin_only=latin_only,
+    )
 
 
 def test_recognize_image_preserves_error_and_release_behavior(

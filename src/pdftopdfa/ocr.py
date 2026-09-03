@@ -149,6 +149,7 @@ PADDLE_OCR_LANGUAGES = frozenset(
         "vi",
     }
 )
+_NON_LATIN_OCR_LANGUAGES = frozenset({"ch", "chinese_cht", "japan"})
 
 
 def validate_ocr_languages(languages: list[str]) -> list[str]:
@@ -164,6 +165,11 @@ def validate_ocr_languages(languages: list[str]) -> list[str]:
             f"Supported codes: {supported}"
         )
     return languages
+
+
+def _latin_only_ocr_languages(languages: list[str]) -> bool:
+    """Return whether OCR decoding should reject non-Latin letters."""
+    return not _NON_LATIN_OCR_LANGUAGES.intersection(languages)
 
 
 def _require_ocr_runtime(ocr_execution_provider: str) -> None:
@@ -240,11 +246,17 @@ class OCRSession:
         *,
         layout: str = "auto",
         allowed_characters: str | None = None,
+        languages: list[str] | None = None,
     ) -> list[tuple[str, float]]:
         """Recognize one image while retaining the session's loaded models."""
         with self._lock:
             if self._closed:
                 raise RuntimeError("OCRSession is closed")
+            latin_only = False
+            if languages is not None:
+                latin_only = _latin_only_ocr_languages(
+                    validate_ocr_languages(languages)
+                )
             if self._backend is None:
                 from .ocr_paddle import _ImageOCRSession
 
@@ -257,6 +269,7 @@ class OCRSession:
                 input_path,
                 layout=layout,
                 allowed_characters=allowed_characters,
+                latin_only=latin_only,
             )
 
 

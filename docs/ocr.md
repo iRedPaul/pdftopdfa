@@ -195,6 +195,37 @@ pdftopdfa --ocr-layout \
 The Python equivalent is `ocr_layout=True`. The keyword is available on
 `convert_to_pdfa()`, `convert_files()`, and `convert_directory()`.
 
+## Figure Text
+
+`--ocr-figure-text` recognizes text inside otherwise undescribed direct image
+Figures during PDF/A-2a or PDF/A-3a tagging. It is intended for text-based
+logos and similar images. Existing `Alt`, `ActualText`, or a textual Caption is
+never replaced.
+
+```bash
+pdftopdfa -l 3a --pdfua --ocr-figure-text \
+  --ocr-detection-model-dir "$DET_MODEL" \
+  --ocr-recognition-model-dir "$REC_MODEL" \
+  document.pdf
+```
+
+The converter extracts eligible direct Image XObjects and reuses one
+`OCRSession` across all candidates in the document. Non-empty OCR lines are
+whitespace-normalized and joined in recognition order. The result is accepted
+only when every non-empty line has confidence of at least `0.90`; an empty or
+less-confident result leaves the Figure undescribed and reported for manual
+review as before.
+
+Accepted text is written as `ActualText`, because it replaces text visibly
+contained in the image rather than describing all visual meaning. Every
+generated value is still reported as requiring author review. Inline images,
+Form XObjects, masks, diagrams without recognizable text, and authoritative
+visual descriptions remain outside this automatic step.
+
+The Python equivalent is `ocr_figure_text=True`. The flag requires both OCR
+model directories and level `"2a"` or `"3a"` on `convert_to_pdfa()`,
+`convert_files()`, and `convert_directory()`.
+
 ## Languages
 
 The default language code is `en`. Use `de` for German and `de+en` on the CLI
@@ -263,11 +294,11 @@ pdftopdfa --no-pdfa --deskew --rotate-pages \
   scan.pdf
 ```
 
-`--ocr`, `--ocr-force`, `--deskew`, `--rotate-pages`, `--ocr-layout`, and an
-explicit `--ocr-execution-provider directml` or `directml:INDEX` are rejected
-unless both text-model options are present. Providing only one text-model option
-is also rejected. `--ocr-lang` selects the recognition script and metadata but
-does not activate OCR by itself.
+`--ocr`, `--ocr-force`, `--deskew`, `--rotate-pages`, `--ocr-layout`,
+`--ocr-figure-text`, and an explicit `--ocr-execution-provider directml` or
+`directml:INDEX` are rejected unless both text-model options are present.
+Providing only one text-model option is also rejected. `--ocr-lang` selects the
+recognition script and metadata but does not activate OCR by itself.
 `--ocr-execution-provider` defaults to `cpu`.
 
 ## Python API
@@ -295,7 +326,7 @@ result = convert_to_pdfa(
 The same keywords are available on `convert_files()` and
 `convert_directory()`. Supplying only one directory, or supplying
 `ocr_languages`, `ocr_force`, `ocr_deskew`, `ocr_rotate_pages`, or
-`ocr_layout=True`, or
+`ocr_layout=True`, `ocr_figure_text=True`, or
 `ocr_execution_provider="directml"` or `"directml:INDEX"` without the complete
 text-model pair, raises `ValueError` before input processing starts. Set a
 DirectML provider only in an installation made with the `directml` extra.
