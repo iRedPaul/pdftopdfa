@@ -880,6 +880,109 @@ def test_existing_image_actualtext_skips_figure_ocr() -> None:
     assert result["semantic_ocr_figure_text_review_required"] == 0
 
 
+def test_described_nested_figure_is_not_replaced_by_parent_figure_ocr() -> None:
+    pdf = pikepdf.Pdf.new()
+    image = _image(pdf)
+    page = _page(
+        pdf,
+        b"/Figure <</MCID 0>> BDC q 100 0 0 80 50 100 cm /Im Do Q EMC",
+        Dictionary(XObject=Dictionary(Im=image)),
+        size=(400, 300),
+    )
+    root = _install_figure_structure(pdf, page, alt_text="Author description")
+    document = resolve_indirect(root["/K"])
+    inner = resolve_indirect(document["/K"])
+    outer = pdf.make_indirect(
+        Dictionary(Type=Name.StructElem, S=Name.Figure, P=document, K=inner)
+    )
+    inner["/P"] = outer
+    document["/K"] = outer
+
+    def recognize(
+        _candidate: pikepdf.Stream,
+        _crop_polygon: tuple[tuple[float, float], ...],
+    ) -> str | None:
+        raise AssertionError("OCR must not replace a nested Figure description")
+
+    result = ensure_logical_structure(
+        pdf,
+        semantic=True,
+        preflight=False,
+        _figure_text_recognizer=recognize,
+    )
+
+    assert result["structure_preserved"] is True
+    assert "/ActualText" not in outer
+    assert str(inner["/Alt"]) == "Author description"
+    assert result["semantic_alternatives_review_required"] == 1
+    assert result["semantic_ocr_figure_text_review_required"] == 0
+
+
+def test_translucent_direct_image_figure_skips_ocr_actualtext() -> None:
+    pdf = pikepdf.Pdf.new()
+    image = _image(pdf)
+    _page(
+        pdf,
+        b"q /Faint gs 100 0 0 80 50 100 cm /Im Do Q",
+        Dictionary(
+            ExtGState=Dictionary(Faint=Dictionary(ca=0.01)),
+            XObject=Dictionary(Im=image),
+        ),
+        size=(400, 300),
+    )
+
+    def recognize(
+        _candidate: pikepdf.Stream,
+        _crop_polygon: tuple[tuple[float, float], ...],
+    ) -> str | None:
+        raise AssertionError("OCR must not inspect a translucent image invocation")
+
+    result = ensure_logical_structure(
+        pdf,
+        semantic=True,
+        preflight=False,
+        _figure_text_recognizer=recognize,
+    )
+
+    figure = next(
+        item for item in _structure_objects(pdf) if item.get("/S") == Name.Figure
+    )
+    assert "/ActualText" not in figure
+    assert result["semantic_alternatives_review_required"] == 1
+    assert result["semantic_ocr_figure_text_review_required"] == 0
+
+
+def test_page_ocr_text_is_not_duplicated_as_figure_actualtext() -> None:
+    pdf, _form, manifest = _ocr_document()
+    page = pdf.pages[0]
+    resources = resolve_indirect(page.obj["/Resources"])
+    xobjects = resolve_indirect(resources["/XObject"])
+    xobjects["/Scan"] = _image(pdf)
+    page.obj["/Contents"].write(b"q 100 0 0 80 40 210 cm /Scan Do Q\nq /OCR-0 Do Q")
+
+    def recognize(
+        _candidate: pikepdf.Stream,
+        _crop_polygon: tuple[tuple[float, float], ...],
+    ) -> str | None:
+        raise AssertionError("OCR text must not be duplicated on its source Figure")
+
+    result = ensure_logical_structure(
+        pdf,
+        semantic=True,
+        preflight=False,
+        ocr_manifest=manifest,
+        _figure_text_recognizer=recognize,
+    )
+
+    figure = next(
+        item for item in _structure_objects(pdf) if item.get("/S") == Name.Figure
+    )
+    assert "/ActualText" not in figure
+    assert result["semantic_content_items"] == 2
+    assert result["semantic_alternatives_review_required"] == 1
+    assert result["semantic_ocr_figure_text_review_required"] == 0
+
+
 def test_pdfua_does_not_invent_fallback_alt_or_document_language() -> None:
     pdf = pikepdf.Pdf.new()
     font = _font(pdf)

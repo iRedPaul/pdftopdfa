@@ -1447,8 +1447,10 @@ def _add_existing_figure_ocr_actualtext(
             if current_key is None or current_key in visited:
                 break
             visited.add(current_key)
-            if current_key in figures:
-                references_by_figure.setdefault(current_key, []).append(reference)
+            if _effective_structure_role(current.get("/S"), role_map) == "/Figure":
+                if current_key in figures:
+                    references_by_figure.setdefault(current_key, []).append(reference)
+                break
             current = current.get("/P")
 
     generated = 0
@@ -7410,6 +7412,7 @@ def _digital_semantic_inputs(
                 source_image is not None
                 and isinstance(span, DirectXObjectSpan)
                 and not span.intrinsic_visibility_uncertain
+                and span.entry_state.fill_alpha == 1.0
                 and not (
                     style_override is not None
                     and style_override.image_visibility_uncertain
@@ -8284,6 +8287,7 @@ def _requires_existing_image_visibility_rebuild(
                         isinstance(image, Stream)
                         and resolve_indirect(image.get("/Subtype")) == Name.Image
                         and crop_polygon is not None
+                        and span.entry_state.fill_alpha == 1.0
                     ):
                         images.append((image, crop_polygon))
                     else:
@@ -10437,6 +10441,26 @@ def _rebuild_semantic_structure(
         )
 
     plan = build_semantic_plan(pages)
+    logical_span_ids = {
+        reference.span_id for node in plan.root.walk() for reference in node.content
+    }
+    for page_index, digital_page_spans in digital_spans.items():
+        logical_ocr_boxes = tuple(
+            span.bbox
+            for span in ocr_spans.get(page_index, ())
+            if span.id in logical_span_ids
+        )
+        for span in digital_page_spans:
+            if span.id not in source_images:
+                continue
+            if any(
+                span.bbox.left < ocr_box.right
+                and ocr_box.left < span.bbox.right
+                and span.bbox.top < ocr_box.bottom
+                and ocr_box.top < span.bbox.bottom
+                for ocr_box in logical_ocr_boxes
+            ):
+                del source_images[span.id]
     ocr_figure_text_review_required = _add_ocr_figure_actualtext(
         plan.root,
         source_images,
