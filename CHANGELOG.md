@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.9.9] - 2026-09-03
+
+### Features
+
+- Add opt-in OCR text extraction for otherwise undescribed image Figures in
+  PDF/A-2a and PDF/A-3a output
+- Add review-required Figure ActualText reporting for OCR-generated text
+
+### Changes
+
+- Preserve figure clipping and reuse extracted images across OCR crops
+- Allow larger figure raster dimensions and increase the maximum figure OCR
+  resolution
+
+### Bug Fixes
+
+- Skip unsupported, masked, translucent, and oversized images during figure OCR
+- Prevent OCR text duplication in Figure ActualText and preserve nested
+  descriptions
+
+### Documentation
+
+- Document opt-in figure text OCR and its required PDF/A conformance levels
+
 ## [0.9.8] - 2026-09-01
 
 ### Features
