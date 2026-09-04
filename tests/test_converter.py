@@ -3768,6 +3768,42 @@ class TestConvertToPdfa:
         )
 
     @patch("pdftopdfa.converter.ensure_logical_structure")
+    def test_level_a_reports_ocr_rejected_figure_artifacts_for_review(
+        self,
+        mock_ensure: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+    ) -> None:
+        mock_ensure.return_value = {
+            "semantic_repairs": 0,
+            "semantic_alternatives_review_required": 0,
+            "semantic_ocr_figure_artifacts": 2,
+            "structure_rebuilt": False,
+        }
+
+        result = convert_to_pdfa(
+            sample_pdf,
+            tmp_dir / "ocr-figure-artifact-review.pdf",
+            level="3a",
+        )
+
+        assert (
+            "2 Figures were marked as an Artifact after OCR found no trustworthy "
+            "text; manual review required"
+            in result.warnings
+        )
+        assert result.review_findings == (
+            PDFUAReviewFinding(
+                code="ocr_rejected_figure_artifact",
+                message=(
+                    "Figure was marked as an Artifact because OCR text was not "
+                    "trustworthy"
+                ),
+                count=2,
+            ),
+        )
+
+    @patch("pdftopdfa.converter.ensure_logical_structure")
     def test_level_a_reports_unclassified_direct_vector_painting(
         self,
         mock_ensure: MagicMock,

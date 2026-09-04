@@ -1415,9 +1415,9 @@ def _add_existing_figure_ocr_actualtext(
     recognizer: _FigureTextRecognizer | None,
     image_invocations: dict[tuple[_ObjectKey, int], list[_FigureSourceImage]],
     non_image_references: set[tuple[_ObjectKey, int]],
-) -> int:
+) -> tuple[int, int]:
     if recognizer is None:
-        return 0
+        return 0, 0
 
     root = resolve_indirect(pdf.Root.get("/StructTreeRoot"))
     role_map = (
@@ -1436,7 +1436,7 @@ def _add_existing_figure_ocr_actualtext(
         and (key := _object_key(element)) is not None
     }
     if not figures:
-        return 0
+        return 0, 0
 
     references_by_figure: dict[_ObjectKey, list[tuple[_ObjectKey, int]]] = {}
     for reference, (_container, owner, _page, _stream) in content_references.items():
@@ -1454,6 +1454,7 @@ def _add_existing_figure_ocr_actualtext(
             current = current.get("/P")
 
     generated = 0
+    artifacts = 0
     for figure_key, figure in figures.items():
         references = references_by_figure.get(figure_key, [])
         if (
@@ -1468,15 +1469,17 @@ def _add_existing_figure_ocr_actualtext(
             for source in image_invocations[reference]
         ]
         if any(text is None for text in recognized):
+            artifacts += 1
             continue
         values = [
             text.strip() for text in recognized if text is not None and text.strip()
         ]
         if len(values) != len(recognized):
+            artifacts += 1
             continue
         figure["/ActualText"] = _bounded_pdf_string(" ".join(values))
         generated += 1
-    return generated
+    return generated, artifacts
 
 
 def _valid_table_header_association(
@@ -9706,14 +9709,15 @@ def _add_ocr_figure_actualtext(
     source_actual_texts: dict[str, str],
     source_alt_texts: dict[str, str],
     recognizer: _FigureTextRecognizer | None,
-) -> int:
+) -> tuple[int, tuple[object, ...]]:
     if recognizer is None:
-        return 0
+        return 0, ()
     walk = getattr(root, "walk", None)
     if not callable(walk):
-        return 0
+        return 0, ()
 
     generated = 0
+    artifacts = []
     for node in walk():
         if getattr(node, "role", None) != "Figure":
             continue
@@ -9746,18 +9750,20 @@ def _add_ocr_figure_actualtext(
             recognizer(*source_images[reference.span_id]) for reference in references
         ]
         if any(text is None for text in recognized):
+            artifacts.append(node)
             continue
         values = [
             text.strip() for text in recognized if text is not None and text.strip()
         ]
         if len(values) != len(references):
+            artifacts.append(node)
             continue
         source_actual_texts.update(
             (reference.span_id, value)
             for reference, value in zip(references, values, strict=True)
         )
         generated += 1
-    return generated
+    return generated, tuple(artifacts)
 
 
 def _normalize_pdfua_plan_tables(node: object) -> tuple[object, int]:
@@ -10344,7 +10350,12 @@ def _rebuild_semantic_structure(
 ) -> dict[str, int | bool]:
     from collections import Counter
 
-    from .semantics import ArtifactKind, SemanticPage, build_semantic_plan
+    from .semantics import (
+        ArtifactKind,
+        ArtifactReference,
+        SemanticPage,
+        build_semantic_plan,
+    )
 
     ocr_spans: dict[int, tuple[object, ...]] = {}
     ocr_bindings: dict[str, _SemanticBinding] = {}
@@ -10461,13 +10472,40 @@ def _rebuild_semantic_structure(
                 for ocr_box in logical_ocr_boxes
             ):
                 del source_images[span.id]
-    ocr_figure_text_review_required = _add_ocr_figure_actualtext(
+    (
+        ocr_figure_text_review_required,
+        ocr_figure_artifact_nodes,
+    ) = _add_ocr_figure_actualtext(
         plan.root,
         source_images,
         source_actual_texts,
         source_alt_texts,
         figure_text_recognizer,
     )
+    if ocr_figure_artifact_nodes:
+        artifact_node_ids = {id(node) for node in ocr_figure_artifact_nodes}
+
+        def without_ocr_artifacts(node: object) -> object:
+            return replace(
+                node,
+                children=tuple(
+                    without_ocr_artifacts(child)
+                    for child in getattr(node, "children", ())
+                    if id(child) not in artifact_node_ids
+                ),
+            )
+
+        for node in ocr_figure_artifact_nodes:
+            for reference in getattr(node, "content", ()):
+                binding = bindings[reference.span_id]
+                forced_artifacts[reference.span_id] = ArtifactReference(
+                    reference.span_id,
+                    binding.page_number,
+                    ArtifactKind.LAYOUT,
+                    "Layout",
+                    None,
+                )
+        plan = replace(plan, root=without_ocr_artifacts(plan.root))
     table_review_required = 0
     if pdfua:
         normalized_root, table_review_required = _normalize_pdfua_plan_tables(plan.root)
@@ -10639,6 +10677,7 @@ def _rebuild_semantic_structure(
         "semantic_repairs": 0,
         "semantic_alternatives_review_required": alternatives_review_required,
         "semantic_ocr_figure_text_review_required": (ocr_figure_text_review_required),
+        "semantic_ocr_figure_artifacts": len(ocr_figure_artifact_nodes),
         "semantic_vector_review_required": vector_review_required,
         "semantic_scanned_visual_review_required": len(scanned_visual_review_pages),
         "semantic_link_review_required": link_review_required,
@@ -10964,7 +11003,10 @@ def _ensure_logical_structure_in_place(
             raise ConversionError(
                 "Cannot preserve logical structure after semantic repairs"
             )
-        ocr_figure_text_review_required = _add_existing_figure_ocr_actualtext(
+        (
+            ocr_figure_text_review_required,
+            ocr_figure_artifacts,
+        ) = _add_existing_figure_ocr_actualtext(
             pdf,
             existing_elements,
             existing_content_references,
@@ -10977,36 +11019,40 @@ def _ensure_logical_structure_in_place(
             existing_elements,
             existing_content_references,
         )
-        return {
-            "structure_preserved": True,
-            "structure_rebuilt": False,
-            "semantic_structure_generated": False,
-            "pages_tagged": 0,
-            "annotations_tagged": 0,
-            "mark_info_updated": mark_info_updated,
-            "structure_languages_normalized": languages_normalized,
-            "marked_content_languages_normalized": (
-                marked_content_languages_normalized
-            ),
-            "mcids_removed": 0,
-            "stream_structure_keys_removed": 0,
-            "path_artifacts_tagged": path_artifacts_tagged,
-            "artifacts_tagged": path_artifacts_tagged,
-            "semantic_content_items": 0,
-            "semantic_repairs": semantic_repairs,
-            "semantic_alternatives_review_required": (alternatives_review_required),
-            "semantic_ocr_figure_text_review_required": (
-                ocr_figure_text_review_required
-            ),
-            "semantic_vector_review_required": int(path_artifacts_tagged > 0),
-            "semantic_scanned_visual_review_required": 0,
-            "semantic_link_review_required": 0,
-            "semantic_form_review_required": _widgets_requiring_name_review(
-                pdf,
-                optional_content,
-            ),
-            "semantic_table_review_required": 0,
-        }
+        if not ocr_figure_artifacts:
+            return {
+                "structure_preserved": True,
+                "structure_rebuilt": False,
+                "semantic_structure_generated": False,
+                "pages_tagged": 0,
+                "annotations_tagged": 0,
+                "mark_info_updated": mark_info_updated,
+                "structure_languages_normalized": languages_normalized,
+                "marked_content_languages_normalized": (
+                    marked_content_languages_normalized
+                ),
+                "mcids_removed": 0,
+                "stream_structure_keys_removed": 0,
+                "path_artifacts_tagged": path_artifacts_tagged,
+                "artifacts_tagged": path_artifacts_tagged,
+                "semantic_content_items": 0,
+                "semantic_repairs": semantic_repairs,
+                "semantic_alternatives_review_required": (
+                    alternatives_review_required
+                ),
+                "semantic_ocr_figure_text_review_required": (
+                    ocr_figure_text_review_required
+                ),
+                "semantic_ocr_figure_artifacts": 0,
+                "semantic_vector_review_required": int(path_artifacts_tagged > 0),
+                "semantic_scanned_visual_review_required": 0,
+                "semantic_link_review_required": 0,
+                "semantic_form_review_required": _widgets_requiring_name_review(
+                    pdf,
+                    optional_content,
+                ),
+                "semantic_table_review_required": 0,
+            }
 
     if semantic_requested:
         assert optional_content is not None
@@ -11099,6 +11145,7 @@ def _ensure_logical_structure_in_place(
         "semantic_repairs": 0,
         "semantic_alternatives_review_required": 0,
         "semantic_ocr_figure_text_review_required": 0,
+        "semantic_ocr_figure_artifacts": 0,
         "semantic_vector_review_required": 0,
         "semantic_scanned_visual_review_required": 0,
         "semantic_link_review_required": 0,

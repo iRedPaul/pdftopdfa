@@ -324,7 +324,8 @@ def _ocr_execution_provider_callback(
     is_flag=True,
     help=(
         "Use sufficiently confident OCR text as review-required ActualText for "
-        "otherwise undescribed image Figures; requires PDF/A-2a or PDF/A-3a."
+        "otherwise undescribed image Figures and mark OCR-rejected Figures as "
+        "artifacts; requires PDF/A-2a or PDF/A-3a."
     ),
 )
 @click.option(

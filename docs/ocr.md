@@ -213,8 +213,8 @@ The converter extracts eligible direct Image XObjects and reuses one
 `OCRSession` across all candidates in the document. Non-empty OCR lines are
 whitespace-normalized and joined in recognition order. The result is accepted
 only when every non-empty line has confidence of at least `0.90`; an empty or
-less-confident result leaves the Figure undescribed and reported for manual
-review as before.
+less-confident result marks the Figure as a `Layout` artifact and reports that
+decision for manual review.
 
 Accepted text is written as `ActualText`, because it replaces text visibly
 contained in the image rather than describing all visual meaning. Every

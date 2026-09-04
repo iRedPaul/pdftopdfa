@@ -350,8 +350,9 @@ image, table, and reusable `OCRSession` APIs.
   With explicit `--ocr-figure-text` opt-in, sufficiently confident text from
   otherwise undescribed direct image Figures is written as review-required
   ActualText; this is replacement text, not an authoritative visual
-  description. Unrecognized or uncertain images and undescribed Formula
-  elements remain reported for manual review. Pages with unclassified
+  description. Direct image Figures rejected by OCR are marked as review-required
+  Layout artifacts. Ineligible images and undescribed Formula elements remain
+  reported for manual review. Pages with unclassified
   vector painting are likewise reported because decorative rules and
   meaningful vector diagrams cannot always be distinguished automatically.
   Full-page OCR scans that may contain unrecognized non-text visuals, Link

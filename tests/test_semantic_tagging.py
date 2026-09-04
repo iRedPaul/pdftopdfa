@@ -734,22 +734,22 @@ def test_digital_tj_tj_and_image_have_stable_parent_tree_after_reopen() -> None:
 
 
 @pytest.mark.parametrize(
-    ("recognized", "expected_actual_text", "missing_alternative", "ocr_review"),
+    ("recognized", "expected_actual_text", "ocr_review", "artifact_count"),
     [
         (
             "INFO Professionelle Lösungen für erfolgreiche Arbeit",
             "INFO Professionelle Lösungen für erfolgreiche Arbeit",
-            0,
             1,
+            0,
         ),
-        (None, None, 1, 0),
+        (None, None, 0, 1),
     ],
 )
 def test_direct_image_figure_uses_review_required_ocr_actualtext(
     recognized: str | None,
     expected_actual_text: str | None,
-    missing_alternative: int,
     ocr_review: int,
+    artifact_count: int,
 ) -> None:
     pdf = pikepdf.Pdf.new()
     image = _image(pdf)
@@ -777,24 +777,27 @@ def test_direct_image_figure_uses_review_required_ocr_actualtext(
         _figure_text_recognizer=recognize,
     )
 
-    figure = next(
+    figures = [
         item for item in _structure_objects(pdf) if item.get("/S") == Name.Figure
-    )
+    ]
     assert seen == [image.objgen]
     assert min(x for x, _y in seen_crops[0]) == pytest.approx(0.0)
     assert max(x for x, _y in seen_crops[0]) == pytest.approx(0.5)
     assert min(y for _x, y in seen_crops[0]) == pytest.approx(0.0)
     assert max(y for _x, y in seen_crops[0]) == pytest.approx(1.0)
     if expected_actual_text is None:
-        assert "/ActualText" not in figure
+        assert not figures
+        assert ("/Artifact", "/Layout", None, None) in _marked_content(pdf.pages[0])
     else:
+        figure = figures[0]
         assert str(figure["/ActualText"]) == expected_actual_text
-    assert "/Alt" not in figure
-    layout = resolve_indirect(figure["/A"])
-    assert layout["/O"] == Name.Layout
-    assert layout["/Placement"] == Name.Block
-    assert result["semantic_alternatives_review_required"] == missing_alternative
+        assert "/Alt" not in figure
+        layout = resolve_indirect(figure["/A"])
+        assert layout["/O"] == Name.Layout
+        assert layout["/Placement"] == Name.Block
+    assert result["semantic_alternatives_review_required"] == 0
     assert result["semantic_ocr_figure_text_review_required"] == ocr_review
+    assert result["semantic_ocr_figure_artifacts"] == artifact_count
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -844,6 +847,52 @@ def test_preserved_direct_image_figure_uses_ocr_actualtext(nested: bool) -> None
     assert str(figure["/ActualText"]) == "Existing Figure text"
     assert result["semantic_alternatives_review_required"] == 0
     assert result["semantic_ocr_figure_text_review_required"] == 1
+    assert result["semantic_ocr_figure_artifacts"] == 0
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_preserved_direct_image_figure_rejected_by_ocr_becomes_artifact(
+    nested: bool,
+) -> None:
+    pdf = pikepdf.Pdf.new()
+    image = _image(pdf)
+    if nested:
+        form = _form(
+            pdf,
+            b"q 100 0 0 80 50 100 cm /Im Do Q",
+            Dictionary(XObject=Dictionary(Im=image)),
+        )
+        content = b"/Figure <</MCID 0>> BDC /Fm Do EMC"
+        resources = Dictionary(XObject=Dictionary(Fm=form))
+    else:
+        content = b"/Figure <</MCID 0>> BDC q 100 0 0 80 50 100 cm /Im Do Q EMC"
+        resources = Dictionary(XObject=Dictionary(Im=image))
+    page = _page(pdf, content, resources, size=(400, 300))
+
+    _install_figure_structure(pdf, page)
+    result = ensure_logical_structure(
+        pdf,
+        semantic=True,
+        preflight=False,
+        _figure_text_recognizer=lambda _image, _crop: None,
+    )
+
+    assert result["structure_preserved"] is False
+    assert result["structure_rebuilt"] is True
+    assert "/Figure" not in _roles(pdf)
+    artifact_markers = [
+        marker
+        for item in pdf.objects
+        if isinstance(item, pikepdf.Stream)
+        and item.get("/Subtype") == Name.Form
+        for marker in _marked_content(item)
+    ]
+    if not nested:
+        artifact_markers.extend(_marked_content(page))
+    assert ("/Artifact", "/Layout", None, None) in artifact_markers
+    assert result["semantic_alternatives_review_required"] == 0
+    assert result["semantic_ocr_figure_text_review_required"] == 0
+    assert result["semantic_ocr_figure_artifacts"] == 1
 
 
 def test_existing_image_actualtext_skips_figure_ocr() -> None:
