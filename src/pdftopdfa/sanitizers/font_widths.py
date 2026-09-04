@@ -1313,13 +1313,14 @@ def _fix_cidfont_widths(
         return False
 
     try:
-        used_cids = (
+        mapped_cids = (
             map_type0_character_codes_to_cids(font, used_codes)
             if used_codes is not None
             else set()
         )
-        if used_cids is None:
-            used_cids = set()
+        candidate_cids = set(declared_widths)
+        if mapped_cids is not None:
+            candidate_cids.update(mapped_cids)
 
         # For CFF CID-keyed fonts without hmtx, use CFF-specific path
         is_cff_only = "CFF " in tt_font and "hmtx" not in tt_font
@@ -1330,7 +1331,7 @@ def _fix_cidfont_widths(
                 tt_font,
                 declared_widths,
                 declared_default_width,
-                used_cids,
+                candidate_cids,
             )
 
         if not _validate_font_program(tt_font, font_name):
@@ -1353,8 +1354,6 @@ def _fix_cidfont_widths(
             else:
                 return False
 
-        candidate_cids = set(declared_widths)
-        candidate_cids.update(used_cids)
         if not candidate_cids:
             return False
 
@@ -1444,7 +1443,7 @@ def _fix_cidfont_widths_cff(
     tt_font,
     declared_widths: dict[int, int],
     declared_default_width: int,
-    used_cids: set[int],
+    candidate_cids: set[int],
 ) -> bool:
     """Fixes widths for a CIDFontType0 with bare CFF font program.
 
@@ -1470,8 +1469,6 @@ def _fix_cidfont_widths_cff(
     # Compare declared vs CFF
     mismatches = 0
     comparable = 0
-    candidate_cids = set(declared_widths)
-    candidate_cids.update(used_cids)
     for cid in candidate_cids:
         actual = cid_to_width.get(cid)
         if actual is None:

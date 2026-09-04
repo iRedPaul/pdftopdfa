@@ -658,7 +658,11 @@ class TestCIDFontWidthFix:
         assert int(desc_font["/DW"]) == 1000
         assert _parse_w_array(desc_font["/W"]) == {2: 600}
 
-    def test_predefined_cmap_still_validates_declared_widths(self) -> None:
+    @pytest.mark.parametrize("encoding", ["/90ms-RKSJ-H", "/GB-EUC-H"])
+    def test_predefined_cmap_still_validates_declared_widths(
+        self,
+        encoding: str,
+    ) -> None:
         """Declared widths are checked when used character codes cannot be mapped."""
         pdf = new_pdf()
         font = _make_cidfont_with_widths(
@@ -666,7 +670,7 @@ class TestCIDFontWidthFix:
             w_array=[2, Array([999])],
             default_width=500,
         )
-        font[Name.Encoding] = Name("/90ms-RKSJ-H")
+        font[Name.Encoding] = Name(encoding)
         _build_pdf_with_font(pdf, font)
         pdf.pages[0].Contents = pdf.make_stream(b"BT /F1 12 Tf <82A0> Tj ET")
         pdf = _roundtrip(pdf)
