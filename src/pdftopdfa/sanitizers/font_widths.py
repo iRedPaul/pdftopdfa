@@ -17,7 +17,12 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from ..fonts.analysis import is_symbolic_font
-from ..fonts.glyph_usage import CharacterCode, FontUsageCache, collect_font_usage
+from ..fonts.glyph_usage import (
+    CharacterCode,
+    FontUsageCache,
+    _object_identity,
+    collect_font_usage,
+)
 from ..fonts.tounicode import (
     generate_tounicode_for_macroman,
     generate_tounicode_for_standard_encoding,
@@ -186,6 +191,8 @@ def sanitize_font_widths(
     # their width falls back to MissingWidth, which veraPDF flags as a
     # mismatch, so the declared range must be widened to cover them.
     usage = usage_cache.get() if usage_cache is not None else collect_font_usage(pdf)
+    # Serialized direct-object keys may be stale after earlier font repairs.
+    direct_usage = usage if usage_cache is None else None
 
     for font_name, font_obj, font_type in _iter_all_embedded_fonts(pdf):
         try:
@@ -196,10 +203,16 @@ def sanitize_font_widths(
                 if _fix_simple_font_widths(font_obj, font_name) or extended:
                     result["simple_font_widths_fixed"] += 1
             elif font_type == "CIDFont":
+                if font_obj.objgen == (0, 0):
+                    if direct_usage is None:
+                        direct_usage = collect_font_usage(pdf)
+                    used_codes = direct_usage.get(_object_identity(font_obj))
+                else:
+                    used_codes = usage.get(font_obj.objgen)
                 if _fix_cidfont_widths(
                     font_obj,
                     font_name,
-                    usage.get(font_obj.objgen),
+                    used_codes,
                 ):
                     result["cidfont_widths_fixed"] += 1
             elif font_type == "Type3":
