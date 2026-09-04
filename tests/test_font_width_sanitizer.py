@@ -13,6 +13,7 @@ from conftest import new_pdf, open_pdf, register_form_widget, resolve
 from fontTools.ttLib import TTFont
 from pikepdf import Array, Dictionary, Name, Pdf
 
+from pdftopdfa.fonts.glyph_usage import FontUsageCache
 from pdftopdfa.sanitizers.font_widths import (
     _parse_w_array,
     _validate_font_program,
@@ -637,6 +638,53 @@ class TestCIDFontWidthFix:
 
         assert result["cidfont_widths_fixed"] == 0
 
+    def test_unused_cidfont_glyphs_do_not_change_declared_widths(self) -> None:
+        """Unused glyph widths do not trigger a destructive /W rebuild."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_widths(
+            pdf,
+            w_array=[2, Array([600])],
+            default_width=1000,
+        )
+        _build_pdf_with_font(pdf, font)
+        pdf.pages[0].Contents = pdf.make_stream(b"BT /F1 12 Tf <0002> Tj ET")
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["cidfont_widths_fixed"] == 0
+        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
+        descendants = resolve(font_obj["/DescendantFonts"])
+        desc_font = resolve(descendants[0])
+        assert int(desc_font["/DW"]) == 1000
+        assert _parse_w_array(desc_font["/W"]) == {2: 600}
+
+    @pytest.mark.parametrize("encoding", ["/90ms-RKSJ-H", "/GB-EUC-H"])
+    def test_predefined_cmap_still_validates_declared_widths(
+        self,
+        encoding: str,
+    ) -> None:
+        """Declared widths are checked when used character codes cannot be mapped."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_widths(
+            pdf,
+            w_array=[2, Array([999])],
+            default_width=500,
+        )
+        font[Name.Encoding] = Name(encoding)
+        _build_pdf_with_font(pdf, font)
+        pdf.pages[0].Contents = pdf.make_stream(b"BT /F1 12 Tf <82A0> Tj ET")
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["cidfont_widths_fixed"] == 1
+        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
+        descendants = resolve(font_obj["/DescendantFonts"])
+        desc_font = resolve(descendants[0])
+        assert int(desc_font["/DW"]) == 500
+        assert _parse_w_array(desc_font["/W"]) == {2: 600}
+
     def test_cidfont_without_w_array_not_modified(self) -> None:
         """CIDFont without /W array stays unchanged when /DW already matches."""
         font_data, tt_font = _make_minimal_ttfont(
@@ -689,6 +737,9 @@ class TestCIDFontWidthFix:
         )
 
         _build_pdf_with_font(pdf, type0_font)
+        pdf.pages[0].Contents = pdf.make_stream(
+            b"BT /F1 12 Tf <0001000200030004> Tj ET"
+        )
         pdf = _roundtrip(pdf)
 
         result = sanitize_font_widths(pdf)
@@ -739,6 +790,9 @@ class TestCIDFontWidthFix:
         )
 
         _build_pdf_with_font(pdf, type0_font)
+        pdf.pages[0].Contents = pdf.make_stream(
+            b"BT /F1 12 Tf <0001000200030004> Tj ET"
+        )
         pdf = _roundtrip(pdf)
 
         result = sanitize_font_widths(pdf)
@@ -752,6 +806,40 @@ class TestCIDFontWidthFix:
         corrected_w = list(resolve(desc_font["/W"]))
         assert corrected_w[0] == 1
         assert [int(w) for w in resolve(corrected_w[1])] == [250, 600, 650, 700]
+
+    def test_direct_cidfont_without_w_array_is_corrected(self) -> None:
+        """Used direct Type0 fonts are included in width validation."""
+        pdf = new_pdf()
+        indirect_font = _make_cidfont_with_widths(
+            pdf,
+            w_array=[],
+            default_width=999,
+        )
+        descendants = indirect_font[Name.DescendantFonts]
+        del resolve(descendants[0])[Name.W]
+        direct_font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCIDFont"),
+            Encoding=Name("/Identity-H"),
+            DescendantFonts=descendants,
+        )
+        _build_pdf_with_font(pdf, direct_font)
+        pdf.pages[0].Contents = pdf.make_stream(b"BT /F1 12 Tf <0001> Tj ET")
+        pdf = _roundtrip(pdf)
+        usage_cache = FontUsageCache(pdf)
+        usage_cache.get()
+
+        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
+        assert font_obj.objgen == (0, 0)
+
+        result = sanitize_font_widths(pdf, usage_cache)
+
+        assert result["cidfont_widths_fixed"] == 1
+        descendants = resolve(font_obj["/DescendantFonts"])
+        desc_font = resolve(descendants[0])
+        assert int(desc_font["/DW"]) == 500
+        assert _parse_w_array(desc_font["/W"]) == {1: 250}
 
     def test_cidfont_without_w_array_with_cidtogidmap_stream_is_corrected(
         self,
@@ -804,6 +892,7 @@ class TestCIDFontWidthFix:
         )
 
         _build_pdf_with_font(pdf, type0_font)
+        pdf.pages[0].Contents = pdf.make_stream(b"BT /F1 12 Tf <000A000C> Tj ET")
         pdf = _roundtrip(pdf)
 
         result = sanitize_font_widths(pdf)
@@ -835,6 +924,9 @@ class TestCIDFontWidthFix:
             font_data=font_data,
         )
         _build_pdf_with_font(pdf, font)
+        pdf.pages[0].Contents = pdf.make_stream(
+            b"BT /F1 12 Tf <0001000200030004> Tj ET"
+        )
         pdf = _roundtrip(pdf)
 
         result = sanitize_font_widths(pdf)

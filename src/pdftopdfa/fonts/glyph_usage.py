@@ -408,9 +408,9 @@ class FontUsageCache:
             pdf: Opened pikepdf PDF object.
         """
         self._pdf = pdf
-        self._usage: dict[tuple[int, int], set[CharacterCode]] | None = None
+        self._usage: dict[_ObjectKey, set[CharacterCode]] | None = None
 
-    def get(self) -> dict[tuple[int, int], set[CharacterCode]]:
+    def get(self) -> dict[_ObjectKey, set[CharacterCode]]:
         """Returns the font usage map, collecting it on first access."""
         if self._usage is None:
             self._usage = collect_font_usage(self._pdf)
@@ -423,7 +423,7 @@ class FontUsageCache:
 
 def collect_font_usage(
     pdf: pikepdf.Pdf,
-) -> dict[tuple[int, int], set[CharacterCode]]:
+) -> dict[_ObjectKey, set[CharacterCode]]:
     """Collects character codes used with each font across the entire PDF.
 
     Iterates all pages and their nested structures (Form XObjects,
@@ -434,11 +434,10 @@ def collect_font_usage(
         pdf: Opened pikepdf PDF object.
 
     Returns:
-        Dictionary mapping font objgen (object_number, generation)
-        to the set of character codes used with that font.
-        Only fonts with objgen != (0,0) are included.
+        Dictionary mapping indirect font objgens, or serialized direct Type0
+        font identities, to the character codes used with each font.
     """
-    usage: dict[tuple[int, int], set[CharacterCode]] = {}
+    usage: dict[_ObjectKey, set[CharacterCode]] = {}
 
     for page in pdf.pages:
         for stream_owner, resources in _iter_content_streams_with_resources(page):
@@ -450,7 +449,7 @@ def collect_font_usage(
 def _process_content_stream(
     stream_owner: pikepdf.Object,
     resources: pikepdf.Object,
-    usage: dict[tuple[int, int], set[CharacterCode]],
+    usage: dict[_ObjectKey, set[CharacterCode]],
 ) -> None:
     """Parses a content stream and records character code usage.
 
@@ -475,7 +474,7 @@ def _process_content_stream(
         ]
     ] = []
 
-    def record_codes(operand: pikepdf.Object, objgen: tuple[int, int]) -> None:
+    def record_codes(operand: pikepdf.Object, font_key: _ObjectKey) -> None:
         if current_font_is_cid:
             try:
                 raw = bytes(operand)
@@ -484,12 +483,12 @@ def _process_content_stream(
             ranges = current_code_space_ranges or ((b"\x00\x00", b"\xff\xff"),)
             codes = split_cmap_codes(raw, ranges)
             if codes:
-                usage.setdefault(objgen, set()).update(codes)
+                usage.setdefault(font_key, set()).update(codes)
             return
 
         codes = _extract_char_codes(operand, False)
         if codes:
-            usage.setdefault(objgen, set()).update(codes)
+            usage.setdefault(font_key, set()).update(codes)
 
     def text_operands(
         operands: list[pikepdf.Object],
@@ -521,9 +520,10 @@ def _process_content_stream(
                 objgen = font_obj.objgen
             except Exception:
                 continue
-            if objgen == (0, 0):
-                continue
             is_cid = _is_cidfont(font_obj)
+            if objgen == (0, 0) and not is_cid:
+                continue
+            font_key = _object_identity(font_obj)
             ranges = get_font_code_space_ranges(font_obj) if is_cid else None
             for operand in strings:
                 try:
@@ -541,7 +541,7 @@ def _process_content_stream(
                 else:
                     codes = set(raw)
                 if codes:
-                    usage.setdefault(objgen, set()).update(codes)
+                    usage.setdefault(font_key, set()).update(codes)
 
     for operands, operator in instructions:
         if operator == _Q_OPERATOR:
@@ -587,8 +587,9 @@ def _process_content_stream(
             except Exception:
                 continue
 
-            if objgen == (0, 0):
+            if objgen == (0, 0) and not current_font_is_cid:
                 continue
 
+            font_key = _object_identity(current_font)
             for operand in text_operands(operands, operator):
-                record_codes(operand, objgen)
+                record_codes(operand, font_key)

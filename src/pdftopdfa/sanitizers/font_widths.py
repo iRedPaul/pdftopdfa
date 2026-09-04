@@ -17,12 +17,18 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from ..fonts.analysis import is_symbolic_font
-from ..fonts.glyph_usage import FontUsageCache, collect_font_usage
+from ..fonts.glyph_usage import (
+    CharacterCode,
+    FontUsageCache,
+    _object_identity,
+    collect_font_usage,
+)
 from ..fonts.tounicode import (
     generate_tounicode_for_macroman,
     generate_tounicode_for_standard_encoding,
     generate_tounicode_for_winansi,
     generate_tounicode_from_encoding_dict,
+    map_type0_character_codes_to_cids,
     parse_cidtogidmap_stream,
     parse_type1_font_program,
 )
@@ -185,6 +191,8 @@ def sanitize_font_widths(
     # their width falls back to MissingWidth, which veraPDF flags as a
     # mismatch, so the declared range must be widened to cover them.
     usage = usage_cache.get() if usage_cache is not None else collect_font_usage(pdf)
+    # Serialized direct-object keys may be stale after earlier font repairs.
+    direct_usage = usage if usage_cache is None else None
 
     for font_name, font_obj, font_type in _iter_all_embedded_fonts(pdf):
         try:
@@ -195,7 +203,17 @@ def sanitize_font_widths(
                 if _fix_simple_font_widths(font_obj, font_name) or extended:
                     result["simple_font_widths_fixed"] += 1
             elif font_type == "CIDFont":
-                if _fix_cidfont_widths(font_obj, font_name):
+                if font_obj.objgen == (0, 0):
+                    if direct_usage is None:
+                        direct_usage = collect_font_usage(pdf)
+                    used_codes = direct_usage.get(_object_identity(font_obj))
+                else:
+                    used_codes = usage.get(font_obj.objgen)
+                if _fix_cidfont_widths(
+                    font_obj,
+                    font_name,
+                    used_codes,
+                ):
                     result["cidfont_widths_fixed"] += 1
             elif font_type == "Type3":
                 if _fix_type3_font_widths(font_obj, font_name):
@@ -1280,12 +1298,17 @@ def _build_sparse_cidfont_w_array(
     return w_array
 
 
-def _fix_cidfont_widths(font: pikepdf.Object, font_name: str) -> bool:
+def _fix_cidfont_widths(
+    font: pikepdf.Object,
+    font_name: str,
+    used_codes: set[CharacterCode] | None,
+) -> bool:
     """Validates and fixes widths for a CIDFont (Type0).
 
     Args:
         font: Type0 font dictionary.
         font_name: Font name for logging.
+        used_codes: Character codes used with this font, or None.
 
     Returns:
         True if widths were corrected.
@@ -1303,6 +1326,15 @@ def _fix_cidfont_widths(font: pikepdf.Object, font_name: str) -> bool:
         return False
 
     try:
+        mapped_cids = (
+            map_type0_character_codes_to_cids(font, used_codes)
+            if used_codes is not None
+            else set()
+        )
+        candidate_cids = set(declared_widths)
+        if mapped_cids is not None:
+            candidate_cids.update(mapped_cids)
+
         # For CFF CID-keyed fonts without hmtx, use CFF-specific path
         is_cff_only = "CFF " in tt_font and "hmtx" not in tt_font
         if is_cff_only:
@@ -1312,6 +1344,7 @@ def _fix_cidfont_widths(font: pikepdf.Object, font_name: str) -> bool:
                 tt_font,
                 declared_widths,
                 declared_default_width,
+                candidate_cids,
             )
 
         if not _validate_font_program(tt_font, font_name):
@@ -1334,12 +1367,6 @@ def _fix_cidfont_widths(font: pikepdf.Object, font_name: str) -> bool:
             else:
                 return False
 
-        glyph_order = tt_font.getGlyphOrder()
-        if cid_to_gid is None:
-            candidate_cids = set(range(len(glyph_order)))
-        else:
-            candidate_cids = set(cid_to_gid)
-        candidate_cids.update(declared_widths)
         if not candidate_cids:
             return False
 
@@ -1429,6 +1456,7 @@ def _fix_cidfont_widths_cff(
     tt_font,
     declared_widths: dict[int, int],
     declared_default_width: int,
+    candidate_cids: set[int],
 ) -> bool:
     """Fixes widths for a CIDFontType0 with bare CFF font program.
 
@@ -1454,8 +1482,6 @@ def _fix_cidfont_widths_cff(
     # Compare declared vs CFF
     mismatches = 0
     comparable = 0
-    candidate_cids = set(cid_to_width)
-    candidate_cids.update(declared_widths)
     for cid in candidate_cids:
         actual = cid_to_width.get(cid)
         if actual is None:
