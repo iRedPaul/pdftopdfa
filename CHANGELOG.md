@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.10] - 2026-09-04
+
+### Bug Fixes
+
+- Preserve declared and used CID widths, including direct CID fonts, during font processing
+- Preserve tagged structure and mark OCR-rejected Figures as Layout artifacts
+- Deduplicate managed XMP properties during metadata synchronization
+
 ## [0.9.9] - 2026-09-03
 
 ### Features
