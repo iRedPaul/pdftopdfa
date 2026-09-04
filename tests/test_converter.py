@@ -47,7 +47,7 @@ from pdftopdfa.exceptions import (
 from pdftopdfa.metadata import NAMESPACES, embed_xmp_metadata
 from pdftopdfa.staging import publish_staged_file as publish_staged_file_impl
 from pdftopdfa.staging import staged_file_snapshot
-from pdftopdfa.tagging import ensure_logical_structure
+from pdftopdfa.tagging import _FigureOCRStatus, ensure_logical_structure
 from pdftopdfa.utils import resolve_indirect
 from pdftopdfa.validator import detect_iso_standards
 from pdftopdfa.verapdf import (
@@ -215,10 +215,10 @@ def test_figure_text_recognizer_skips_masked_and_oversized_images(
             ocr_languages=["en"],
         ) as recognize:
             assert recognize is not None
-            assert recognize(masked) is None
-            assert recognize(soft_masked) is None
-            assert recognize(alpha) is None
-            assert recognize(oversized) is None
+            assert recognize(masked) is _FigureOCRStatus.INELIGIBLE
+            assert recognize(soft_masked) is _FigureOCRStatus.INELIGIBLE
+            assert recognize(alpha) is _FigureOCRStatus.INELIGIBLE
+            assert recognize(oversized) is _FigureOCRStatus.INELIGIBLE
 
     mock_pdf_image.assert_not_called()
 
@@ -3789,8 +3789,7 @@ class TestConvertToPdfa:
 
         assert (
             "2 Figures were marked as an Artifact after OCR found no trustworthy "
-            "text; manual review required"
-            in result.warnings
+            "text; manual review required" in result.warnings
         )
         assert result.review_findings == (
             PDFUAReviewFinding(

@@ -68,7 +68,7 @@ from .staging import (
     publish_staged_file,
     staged_file_snapshot,
 )
-from .tagging import ensure_logical_structure
+from .tagging import _FigureOCRStatus, ensure_logical_structure
 from .utils import (
     get_required_pdf_version,
     is_pdf_encrypted,
@@ -172,7 +172,10 @@ def _figure_text_recognizer(
     ocr_execution_provider: str,
     ocr_languages: list[str],
 ) -> Iterator[
-    Callable[[pikepdf.Stream, tuple[tuple[float, float], ...] | None], str | None]
+    Callable[
+        [pikepdf.Stream, tuple[tuple[float, float], ...] | None],
+        str | None | _FigureOCRStatus,
+    ]
     | None
 ]:
     if not enabled:
@@ -183,7 +186,7 @@ def _figure_text_recognizer(
     assert recognition_model_dir is not None
     from .ocr import OCRSession
 
-    cache: dict[tuple[object, ...], str | None] = {}
+    cache: dict[tuple[object, ...], str | None | _FigureOCRStatus] = {}
     extracted_image_paths: dict[tuple[object, ...], Path | None] = {}
     with (
         tempfile.TemporaryDirectory(prefix="pdftopdfa-figure-ocr-") as directory,
@@ -221,8 +224,8 @@ def _figure_text_recognizer(
                 or height <= 0
                 or width * height > _FIGURE_OCR_MAX_PIXELS
             ):
-                cache[key] = None
-                return None
+                cache[key] = _FigureOCRStatus.INELIGIBLE
+                return _FigureOCRStatus.INELIGIBLE
             crop_path = None
             try:
                 from PIL import Image, ImageDraw
@@ -241,8 +244,8 @@ def _figure_text_recognizer(
                             extracted_image_paths[image_key] = source_path
                 input_path = extracted_image_paths[image_key]
                 if input_path is None:
-                    cache[key] = None
-                    return None
+                    cache[key] = _FigureOCRStatus.INELIGIBLE
+                    return _FigureOCRStatus.INELIGIBLE
                 if crop_polygon is not None:
                     with Image.open(input_path) as source:
                         width, height = source.size
@@ -258,8 +261,8 @@ def _figure_text_recognizer(
                         right = min(width, math.ceil(max(x for x, _y in points)))
                         lower = min(height, math.ceil(max(y for _x, y in points)))
                         if left >= right or upper >= lower:
-                            cache[key] = None
-                            return None
+                            cache[key] = _FigureOCRStatus.INELIGIBLE
+                            return _FigureOCRStatus.INELIGIBLE
                         cropped = source.crop((left, upper, right, lower)).convert(
                             "RGB"
                         )
@@ -284,8 +287,8 @@ def _figure_text_recognizer(
                 if crop_path is not None:
                     crop_path.unlink(missing_ok=True)
                 logger.warning("Could not extract Figure image for OCR: %s", exc)
-                cache[key] = None
-                return None
+                cache[key] = _FigureOCRStatus.INELIGIBLE
+                return _FigureOCRStatus.INELIGIBLE
             try:
                 text = _accepted_figure_ocr_text(
                     session.recognize_image(
@@ -2257,12 +2260,8 @@ def convert_to_pdfa(
                         count=ocr_figure_artifact_count,
                     )
                 )
-                figure_label = (
-                    "Figure" if ocr_figure_artifact_count == 1 else "Figures"
-                )
-                review_verb = (
-                    "was" if ocr_figure_artifact_count == 1 else "were"
-                )
+                figure_label = "Figure" if ocr_figure_artifact_count == 1 else "Figures"
+                review_verb = "was" if ocr_figure_artifact_count == 1 else "were"
                 warnings.append(
                     f"{ocr_figure_artifact_count} {figure_label} {review_verb} "
                     "marked as an Artifact after OCR found no trustworthy text; "

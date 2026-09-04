@@ -20,6 +20,7 @@ import pdftopdfa.tagging as tagging
 from pdftopdfa.exceptions import ConversionError
 from pdftopdfa.tagging import (
     _existing_structure_elements,
+    _FigureOCRStatus,
     _has_unambiguous_existing_reading_order_inversion,
     _remove_native_text_from_ocr_word,
     ensure_logical_structure,
@@ -869,7 +870,7 @@ def test_preserved_direct_image_figure_rejected_by_ocr_becomes_artifact(
         resources = Dictionary(XObject=Dictionary(Im=image))
     page = _page(pdf, content, resources, size=(400, 300))
 
-    _install_figure_structure(pdf, page)
+    root = _install_figure_structure(pdf, page)
     result = ensure_logical_structure(
         pdf,
         semantic=True,
@@ -877,22 +878,126 @@ def test_preserved_direct_image_figure_rejected_by_ocr_becomes_artifact(
         _figure_text_recognizer=lambda _image, _crop: None,
     )
 
-    assert result["structure_preserved"] is False
-    assert result["structure_rebuilt"] is True
+    assert result["structure_preserved"] is True
+    assert result["structure_rebuilt"] is False
+    assert pdf.Root["/StructTreeRoot"].objgen == root.objgen
     assert "/Figure" not in _roles(pdf)
     artifact_markers = [
         marker
         for item in pdf.objects
-        if isinstance(item, pikepdf.Stream)
-        and item.get("/Subtype") == Name.Form
+        if isinstance(item, pikepdf.Stream) and item.get("/Subtype") == Name.Form
         for marker in _marked_content(item)
     ]
-    if not nested:
-        artifact_markers.extend(_marked_content(page))
+    artifact_markers.extend(_marked_content(page))
     assert ("/Artifact", "/Layout", None, None) in artifact_markers
     assert result["semantic_alternatives_review_required"] == 0
     assert result["semantic_ocr_figure_text_review_required"] == 0
     assert result["semantic_ocr_figure_artifacts"] == 1
+
+
+def test_rejected_figure_preserves_other_author_structure() -> None:
+    pdf = pikepdf.Pdf.new()
+    described_image = _image(pdf, b"\xff\x00\x00")
+    rejected_image = _image(pdf, b"\x00\xff\x00")
+    page = _page(
+        pdf,
+        (
+            b"/Illustration <</MCID 0>> BDC "
+            b"q 80 0 0 80 30 100 cm /Described Do Q EMC "
+            b"/Figure <</MCID 1>> BDC "
+            b"q 80 0 0 80 150 100 cm /Rejected Do Q EMC"
+        ),
+        Dictionary(
+            XObject=Dictionary(Described=described_image, Rejected=rejected_image)
+        ),
+        size=(400, 300),
+    )
+    page.obj["/StructParents"] = 0
+    root = pdf.make_indirect(
+        Dictionary(
+            Type=Name.StructTreeRoot,
+            RoleMap=Dictionary(Illustration=Name.Figure),
+        )
+    )
+    document = pdf.make_indirect(
+        Dictionary(Type=Name.StructElem, S=Name.Document, P=root)
+    )
+    described = pdf.make_indirect(
+        Dictionary(
+            Type=Name.StructElem,
+            S=Name("/Illustration"),
+            P=document,
+            Pg=page.obj,
+            K=0,
+            Alt=String("Author description"),
+        )
+    )
+    rejected = pdf.make_indirect(
+        Dictionary(Type=Name.StructElem, S=Name.Figure, P=document, Pg=page.obj, K=1)
+    )
+    document["/K"] = Array([described, rejected])
+    root["/K"] = document
+    parent_tree = NumberTree.new(pdf)
+    parent_tree[0] = Array([described, rejected])
+    root["/ParentTree"] = parent_tree.obj
+    root["/ParentTreeNextKey"] = 1
+    pdf.Root["/StructTreeRoot"] = root
+
+    seen = []
+
+    def recognize(
+        candidate: pikepdf.Stream,
+        _crop_polygon: tuple[tuple[float, float], ...],
+    ) -> None:
+        seen.append(candidate.objgen)
+
+    result = ensure_logical_structure(
+        pdf,
+        semantic=True,
+        preflight=False,
+        _figure_text_recognizer=recognize,
+    )
+
+    assert result["structure_preserved"] is True
+    assert result["structure_rebuilt"] is False
+    assert pdf.Root["/StructTreeRoot"].objgen == root.objgen
+    assert seen == [rejected_image.objgen]
+    assert _roles(pdf) == ["/Document", "/Illustration"]
+    assert str(described["/Alt"]) == "Author description"
+    assert str(root["/RoleMap"]["/Illustration"]) == "/Figure"
+    assert _marked_content(page) == [
+        ("/Illustration", None, None, 0),
+        ("/Artifact", "/Layout", None, None),
+    ]
+    parent_array = resolve_indirect(NumberTree(root["/ParentTree"])[0])
+    assert isinstance(parent_array, Array)
+    assert len(parent_array) == 1
+    assert parent_array[0].objgen == described.objgen
+    assert result["semantic_ocr_figure_artifacts"] == 1
+
+
+def test_ocr_ineligible_figure_remains_structured_for_manual_review() -> None:
+    pdf = pikepdf.Pdf.new()
+    image = _image(pdf)
+    _page(
+        pdf,
+        b"q 100 0 0 80 50 100 cm /Im Do Q",
+        Dictionary(XObject=Dictionary(Im=image)),
+        size=(400, 300),
+    )
+
+    result = ensure_logical_structure(
+        pdf,
+        semantic=True,
+        preflight=False,
+        _figure_text_recognizer=(lambda _image, _crop: _FigureOCRStatus.INELIGIBLE),
+    )
+
+    assert "/Figure" in _roles(pdf)
+    assert ("/Artifact", "/Layout", None, None) not in _marked_content(pdf.pages[0])
+    assert result["semantic_alternatives_review_required"] == 1
+    assert result["semantic_ocr_figure_text_review_required"] == 0
+    assert result["semantic_ocr_figure_artifacts"] == 0
 
 
 def test_existing_image_actualtext_skips_figure_ocr() -> None:
