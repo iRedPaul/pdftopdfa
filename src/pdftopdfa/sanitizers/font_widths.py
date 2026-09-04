@@ -1319,7 +1319,7 @@ def _fix_cidfont_widths(
             else set()
         )
         if used_cids is None:
-            return False
+            used_cids = set()
 
         # For CFF CID-keyed fonts without hmtx, use CFF-specific path
         is_cff_only = "CFF " in tt_font and "hmtx" not in tt_font

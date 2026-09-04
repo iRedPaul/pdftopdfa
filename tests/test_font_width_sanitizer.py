@@ -658,6 +658,28 @@ class TestCIDFontWidthFix:
         assert int(desc_font["/DW"]) == 1000
         assert _parse_w_array(desc_font["/W"]) == {2: 600}
 
+    def test_predefined_cmap_still_validates_declared_widths(self) -> None:
+        """Declared widths are checked when used character codes cannot be mapped."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_widths(
+            pdf,
+            w_array=[2, Array([999])],
+            default_width=500,
+        )
+        font[Name.Encoding] = Name("/90ms-RKSJ-H")
+        _build_pdf_with_font(pdf, font)
+        pdf.pages[0].Contents = pdf.make_stream(b"BT /F1 12 Tf <82A0> Tj ET")
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["cidfont_widths_fixed"] == 1
+        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
+        descendants = resolve(font_obj["/DescendantFonts"])
+        desc_font = resolve(descendants[0])
+        assert int(desc_font["/DW"]) == 500
+        assert _parse_w_array(desc_font["/W"]) == {2: 600}
+
     def test_cidfont_without_w_array_not_modified(self) -> None:
         """CIDFont without /W array stays unchanged when /DW already matches."""
         font_data, tt_font = _make_minimal_ttfont(
