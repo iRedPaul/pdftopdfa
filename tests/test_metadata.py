@@ -1188,6 +1188,34 @@ class TestXmpPreservation:
         xmp_str = xmp.decode("utf-8")
         assert "pdfuaid" in xmp_str or NAMESPACES["pdfuaid"] in xmp_str
 
+    def test_element_form_wins_over_duplicate_attribute(self) -> None:
+        """A property represented twice is emitted once as an element."""
+        ns_rdf = NAMESPACES["rdf"]
+        ns_fx = NAMESPACES["fx"]
+        xmp_xml = f"""\
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="{ns_rdf}" xmlns:fx="{ns_fx}">
+    <rdf:Description rdf:about="">
+      <fx:ConformanceLevel>EN 16931</fx:ConformanceLevel>
+    </rdf:Description>
+    <rdf:Description rdf:about="" fx:ConformanceLevel="EN 16931"/>
+  </rdf:RDF>
+</x:xmpmeta>"""
+        tree = etree.fromstring(xmp_xml.encode("utf-8"))
+
+        xmp = create_xmp_metadata(
+            {"title": "Test"},
+            pdfa_part=3,
+            pdfa_conformance="A",
+            existing_xmp_tree=tree,
+        )
+
+        result = _parse_xmp_xml(xmp)
+        descriptions = result.findall(f".//{{{ns_rdf}}}Description")
+        tag = f"{{{ns_fx}}}ConformanceLevel"
+        assert [elem.text for elem in result.iter(tag)] == ["EN 16931"]
+        assert all(tag not in description.attrib for description in descriptions)
+
     def test_problematic_xmpmm_properties_stripped(self) -> None:
         """PDF/A-unsafe xmpMM properties are dropped during preservation."""
         ns_rdf = NAMESPACES["rdf"]

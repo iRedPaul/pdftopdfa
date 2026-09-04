@@ -637,6 +637,27 @@ class TestCIDFontWidthFix:
 
         assert result["cidfont_widths_fixed"] == 0
 
+    def test_unused_cidfont_glyphs_do_not_change_declared_widths(self) -> None:
+        """Unused glyph widths do not trigger a destructive /W rebuild."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_widths(
+            pdf,
+            w_array=[2, Array([600])],
+            default_width=1000,
+        )
+        _build_pdf_with_font(pdf, font)
+        pdf.pages[0].Contents = pdf.make_stream(b"BT /F1 12 Tf <0002> Tj ET")
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        assert result["cidfont_widths_fixed"] == 0
+        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
+        descendants = resolve(font_obj["/DescendantFonts"])
+        desc_font = resolve(descendants[0])
+        assert int(desc_font["/DW"]) == 1000
+        assert _parse_w_array(desc_font["/W"]) == {2: 600}
+
     def test_cidfont_without_w_array_not_modified(self) -> None:
         """CIDFont without /W array stays unchanged when /DW already matches."""
         font_data, tt_font = _make_minimal_ttfont(
@@ -689,6 +710,9 @@ class TestCIDFontWidthFix:
         )
 
         _build_pdf_with_font(pdf, type0_font)
+        pdf.pages[0].Contents = pdf.make_stream(
+            b"BT /F1 12 Tf <0001000200030004> Tj ET"
+        )
         pdf = _roundtrip(pdf)
 
         result = sanitize_font_widths(pdf)
@@ -739,6 +763,9 @@ class TestCIDFontWidthFix:
         )
 
         _build_pdf_with_font(pdf, type0_font)
+        pdf.pages[0].Contents = pdf.make_stream(
+            b"BT /F1 12 Tf <0001000200030004> Tj ET"
+        )
         pdf = _roundtrip(pdf)
 
         result = sanitize_font_widths(pdf)
@@ -804,6 +831,7 @@ class TestCIDFontWidthFix:
         )
 
         _build_pdf_with_font(pdf, type0_font)
+        pdf.pages[0].Contents = pdf.make_stream(b"BT /F1 12 Tf <000A000C> Tj ET")
         pdf = _roundtrip(pdf)
 
         result = sanitize_font_widths(pdf)
@@ -835,6 +863,9 @@ class TestCIDFontWidthFix:
             font_data=font_data,
         )
         _build_pdf_with_font(pdf, font)
+        pdf.pages[0].Contents = pdf.make_stream(
+            b"BT /F1 12 Tf <0001000200030004> Tj ET"
+        )
         pdf = _roundtrip(pdf)
 
         result = sanitize_font_widths(pdf)

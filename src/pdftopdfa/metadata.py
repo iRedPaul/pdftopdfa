@@ -2090,6 +2090,7 @@ def _collect_preserved_elements(
     ns_rdf = NAMESPACES["rdf"]
     preserved_elements: list[etree._Element] = []
     preserved_attrs: dict[str, str] = {}
+    preserved_element_tags: set[str] = set()
     extra_namespaces: dict[str, str] = {}
 
     # Invert NAMESPACES for URI->prefix lookup
@@ -2147,7 +2148,12 @@ def _collect_preserved_elements(
                             tag,
                         )
                         continue
+                if tag in preserved_element_tags:
+                    logger.debug("Stripping duplicate preserved property: %s", tag)
+                    continue
+                preserved_attrs.pop(tag, None)
                 preserved_elements.append(copy.deepcopy(child))
+                preserved_element_tags.add(tag)
                 _normalize_structural_properties(preserved_elements[-1])
 
                 # Track namespace for serialization
@@ -2164,6 +2170,12 @@ def _collect_preserved_elements(
                 # mutually exclusive per RDF spec; some source PDFs use the
                 # non-namespaced form which would conflict with rdf:about)
                 if attr_name in ("about", "ID", "nodeID"):
+                    continue
+                if attr_name in preserved_element_tags:
+                    logger.debug(
+                        "Stripping attribute duplicate of preserved property: %s",
+                        attr_name,
+                    )
                     continue
                 # Validate attribute value against known type constraints
                 if attr_name.startswith("{"):
