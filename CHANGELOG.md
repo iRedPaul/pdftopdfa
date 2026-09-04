@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.11] - 2026-09-04
+
+### Bug Fixes
+
+- Remove redundant OCR figure artifacts
+
 ## [0.9.10] - 2026-09-04
 
 ### Bug Fixes
