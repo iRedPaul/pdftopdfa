@@ -10716,6 +10716,7 @@ def _rebuild_semantic_structure(
     logical_span_ids = {
         reference.span_id for node in plan.root.walk() for reference in node.content
     }
+    redundant_ocr_image_ids = set()
     for page_index, digital_page_spans in digital_spans.items():
         logical_ocr_boxes = tuple(
             span.bbox
@@ -10733,6 +10734,22 @@ def _rebuild_semantic_structure(
                 for ocr_box in logical_ocr_boxes
             ):
                 del source_images[span.id]
+                if (
+                    figure_text_recognizer is not None
+                    and span.id in logical_span_ids
+                    and span.id not in source_actual_texts
+                    and span.id not in source_alt_texts
+                ):
+                    redundant_ocr_image_ids.add(span.id)
+    redundant_ocr_figure_nodes = tuple(
+        node
+        for node in plan.root.walk()
+        if getattr(node, "role", None) == "Figure"
+        and any(
+            reference.span_id in redundant_ocr_image_ids
+            for reference in getattr(node, "content", ())
+        )
+    )
     (
         ocr_figure_text_review_required,
         ocr_figure_artifact_nodes,
@@ -10743,8 +10760,12 @@ def _rebuild_semantic_structure(
         source_alt_texts,
         figure_text_recognizer,
     )
-    if ocr_figure_artifact_nodes:
-        artifact_node_ids = {id(node) for node in ocr_figure_artifact_nodes}
+    figure_artifact_nodes = (
+        *redundant_ocr_figure_nodes,
+        *ocr_figure_artifact_nodes,
+    )
+    if figure_artifact_nodes:
+        artifact_node_ids = {id(node) for node in figure_artifact_nodes}
 
         def without_ocr_artifacts(node: object) -> object:
             return replace(
@@ -10756,7 +10777,7 @@ def _rebuild_semantic_structure(
                 ),
             )
 
-        for node in ocr_figure_artifact_nodes:
+        for node in figure_artifact_nodes:
             for reference in getattr(node, "content", ()):
                 binding = bindings[reference.span_id]
                 forced_artifacts[reference.span_id] = ArtifactReference(

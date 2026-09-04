@@ -1106,13 +1106,24 @@ def test_translucent_direct_image_figure_skips_ocr_actualtext() -> None:
     assert result["semantic_ocr_figure_text_review_required"] == 0
 
 
-def test_page_ocr_text_is_not_duplicated_as_figure_actualtext() -> None:
-    pdf, _form, manifest = _ocr_document()
+def test_redo_ocr_text_overlapping_logo_artifacts_redundant_figure() -> None:
+    pdf, form, manifest = _ocr_document()
     page = pdf.pages[0]
     resources = resolve_indirect(page.obj["/Resources"])
     xobjects = resolve_indirect(resources["/XObject"])
-    xobjects["/Scan"] = _image(pdf)
-    page.obj["/Contents"].write(b"q 100 0 0 80 40 210 cm /Scan Do Q\nq /OCR-0 Do Q")
+    xobjects["/Logo"] = _image(pdf)
+    page.obj["/Contents"].write(b"q 100 0 0 80 40 210 cm /Logo Do Q\nq /OCR-0 Do Q")
+    form.write(
+        b"/Span <</MCID 7>> BDC\n"
+        b"BT /F1 10 Tf 3 Tr 1 0 0 1 40 220 Tm (NordBrief) Tj ET\n"
+        b"EMC"
+    )
+    manifest["pages"][0]["lines"][0].update(
+        {
+            "text": "NordBrief",
+            "bbox": {"left": 40, "top": 60, "right": 140, "bottom": 80},
+        }
+    )
 
     def recognize(
         _candidate: pikepdf.Stream,
@@ -1123,17 +1134,17 @@ def test_page_ocr_text_is_not_duplicated_as_figure_actualtext() -> None:
     result = ensure_logical_structure(
         pdf,
         semantic=True,
+        pdfua=True,
         preflight=False,
         ocr_manifest=manifest,
         _figure_text_recognizer=recognize,
     )
 
-    figure = next(
-        item for item in _structure_objects(pdf) if item.get("/S") == Name.Figure
-    )
-    assert "/ActualText" not in figure
-    assert result["semantic_content_items"] == 2
-    assert result["semantic_alternatives_review_required"] == 1
+    assert "/Figure" not in _roles(pdf)
+    assert ("/Artifact", "/Layout", None, None) in _marked_content(page)
+    assert result["semantic_content_items"] == 1
+    assert result["artifacts_tagged"] == 1
+    assert result["semantic_alternatives_review_required"] == 0
     assert result["semantic_ocr_figure_text_review_required"] == 0
 
 
