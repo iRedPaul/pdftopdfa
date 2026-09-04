@@ -123,7 +123,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `--ocr-recognition-model-dir DIR` | Directory containing compatible PP-OCRv6 Medium recognition `inference.onnx` and `inference.yml` |
 | `--ocr-execution-provider [cpu\|directml\|directml:INDEX]` | ONNX Runtime execution provider (default: `cpu`); any non-CPU provider requires both model-directory options; DirectML uses the `directml` extra and is project-supported on Windows 11, while `directml:INDEX` selects a specific raw DXGI adapter index |
 | `--ocr-layout` | Order OCR lines by detected page columns without another OCR pass; requires both model-directory options and implies `--ocr`; see [OCR Page Layout](ocr.md#page-layout) |
-| `--ocr-figure-text` | Use sufficiently confident OCR text as review-required `ActualText` for otherwise undescribed direct image Figures; requires PDF/A-2a or PDF/A-3a and both model-directory options; see [OCR Figure Text](ocr.md#figure-text) |
+| `--ocr-figure-text` | Use sufficiently confident OCR text as review-required `ActualText` for otherwise undescribed direct image Figures and mark OCR-rejected Figures as Layout artifacts; requires PDF/A-2a or PDF/A-3a and both model-directory options; see [OCR Figure Text](ocr.md#figure-text) |
 | `--deskew` | Straighten scan-like, raster-dominant pages; requires both model-directory options and implies `--ocr` |
 | `--rotate-pages` | Automatically orient pages with the bundled Paddle model; requires both model-directory options and implies `--ocr` |
 | `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |

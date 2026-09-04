@@ -13,6 +13,7 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
+from enum import Enum
 from tempfile import SpooledTemporaryFile
 from typing import TYPE_CHECKING
 
@@ -55,9 +56,15 @@ _TEXT_SHOW_OPERAND_COUNTS = {"Tj": 1, "TJ": 1, "'": 1, '"': 3}
 _ObjectKey = tuple[int, int]
 type _FigureClipPolygon = tuple[tuple[float, float], ...]
 type _FigureSourceImage = tuple[Stream, _FigureClipPolygon]
+
+
+class _FigureOCRStatus(Enum):
+    INELIGIBLE = "ineligible"
+
+
 type _FigureTextRecognizer = Callable[
     [Stream, _FigureClipPolygon],
-    str | None,
+    str | None | _FigureOCRStatus,
 ]
 _PAINTING_OPERATORS = frozenset(
     {"Tj", "TJ", "'", '"', "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "sh"}
@@ -1415,9 +1422,16 @@ def _add_existing_figure_ocr_actualtext(
     recognizer: _FigureTextRecognizer | None,
     image_invocations: dict[tuple[_ObjectKey, int], list[_FigureSourceImage]],
     non_image_references: set[tuple[_ObjectKey, int]],
-) -> int:
+    object_owners: dict[
+        tuple[_ObjectKey, _ObjectKey],
+        tuple[Dictionary | Stream, _ObjectKey, Dictionary],
+    ],
+) -> tuple[
+    int,
+    tuple[tuple[Dictionary, tuple[tuple[_ObjectKey, int], ...]], ...],
+]:
     if recognizer is None:
-        return 0
+        return 0, ()
 
     root = resolve_indirect(pdf.Root.get("/StructTreeRoot"))
     role_map = (
@@ -1436,7 +1450,39 @@ def _add_existing_figure_ocr_actualtext(
         and (key := _object_key(element)) is not None
     }
     if not figures:
-        return 0
+        return 0, ()
+
+    elements_by_key = {
+        key: element
+        for element in elements
+        if (key := _object_key(element)) is not None
+    }
+    elements_with_objects: set[_ObjectKey] = set()
+    for _referenced_object, owner_key, _page in object_owners.values():
+        current = elements_by_key.get(owner_key)
+        visited: set[_ObjectKey] = set()
+        while isinstance(current, Dictionary):
+            current_key = _object_key(current)
+            if current_key is None or current_key in visited:
+                break
+            visited.add(current_key)
+            elements_with_objects.add(current_key)
+            current = resolve_indirect(current.get("/P"))
+
+    figures_with_figure_descendants: set[_ObjectKey] = set()
+    for element in elements:
+        if _effective_structure_role(element.get("/S"), role_map) != "/Figure":
+            continue
+        current = resolve_indirect(element.get("/P"))
+        visited: set[_ObjectKey] = set()
+        while isinstance(current, Dictionary):
+            current_key = _object_key(current)
+            if current_key is None or current_key in visited:
+                break
+            visited.add(current_key)
+            if current_key in figures:
+                figures_with_figure_descendants.add(current_key)
+            current = resolve_indirect(current.get("/P"))
 
     references_by_figure: dict[_ObjectKey, list[tuple[_ObjectKey, int]]] = {}
     for reference, (_container, owner, _page, _stream) in content_references.items():
@@ -1454,10 +1500,13 @@ def _add_existing_figure_ocr_actualtext(
             current = current.get("/P")
 
     generated = 0
+    artifacts = []
     for figure_key, figure in figures.items():
         references = references_by_figure.get(figure_key, [])
         if (
             not references
+            or figure_key in elements_with_objects
+            or figure_key in figures_with_figure_descendants
             or set(references) & non_image_references
             or any(reference not in image_invocations for reference in references)
         ):
@@ -1467,16 +1516,227 @@ def _add_existing_figure_ocr_actualtext(
             for reference in references
             for source in image_invocations[reference]
         ]
+        if any(result is _FigureOCRStatus.INELIGIBLE for result in recognized):
+            continue
         if any(text is None for text in recognized):
+            artifacts.append((figure, tuple(references)))
             continue
         values = [
-            text.strip() for text in recognized if text is not None and text.strip()
+            text.strip()
+            for text in recognized
+            if isinstance(text, str) and text.strip()
         ]
         if len(values) != len(recognized):
+            artifacts.append((figure, tuple(references)))
             continue
         figure["/ActualText"] = _bounded_pdf_string(" ".join(values))
         generated += 1
-    return generated
+    return generated, tuple(artifacts)
+
+
+def _artifact_existing_figures(
+    pdf: pikepdf.Pdf,
+    figures: tuple[tuple[Dictionary, tuple[tuple[_ObjectKey, int], ...]], ...],
+    content_references: dict[
+        tuple[_ObjectKey, int],
+        tuple[
+            Dictionary | Stream,
+            Dictionary,
+            Dictionary,
+            Dictionary | Stream | None,
+        ],
+    ],
+    object_owners: dict[
+        tuple[_ObjectKey, _ObjectKey],
+        tuple[Dictionary | Stream, _ObjectKey, Dictionary],
+    ],
+    *,
+    pdfua: bool,
+) -> list[Dictionary]:
+    targets_by_container: dict[_ObjectKey, set[int]] = {}
+    containers: dict[_ObjectKey, Dictionary | Stream] = {}
+    artifact_references: set[tuple[_ObjectKey, int]] = set()
+    for _figure, references in figures:
+        for reference in references:
+            container, _owner, _page, _stream_owner = content_references[reference]
+            targets_by_container.setdefault(reference[0], set()).add(reference[1])
+            containers[reference[0]] = container
+            artifact_references.add(reference)
+
+    pages = {
+        key: page
+        for page in pdf.pages
+        if (key := _object_key(page.obj)) in targets_by_container
+    }
+    resource_contexts: dict[_ObjectKey, list[Dictionary | None]] = {}
+    for key, container in containers.items():
+        if key in pages:
+            resource_contexts[key] = [_page_resources(pages[key])]
+            continue
+        resources = resolve_indirect(container.get("/Resources"))
+        resource_contexts[key] = [
+            resources if isinstance(resources, Dictionary) else None
+        ]
+    for page in pdf.pages:
+        for owner, resources in _iter_content_streams_with_resources(page):
+            owner_key = _object_key(owner)
+            if not isinstance(owner, Stream) or owner_key not in targets_by_container:
+                continue
+            resolved_resources = resolve_indirect(resources)
+            _append_resource_context(
+                resource_contexts[owner_key],
+                (
+                    resolved_resources
+                    if isinstance(resolved_resources, Dictionary)
+                    else None
+                ),
+            )
+
+    for container_key, targets in targets_by_container.items():
+        owner: pikepdf.Page | Stream
+        if container_key in pages:
+            owner = pages[container_key]
+        else:
+            container = containers[container_key]
+            if not isinstance(container, Stream):
+                raise ConversionError(
+                    "Cannot preserve logical structure: invalid Figure content "
+                    "container"
+                )
+            owner = container
+        instructions = list(pikepdf.parse_content_stream(owner))
+        found: set[int] = set()
+        for index, instruction in enumerate(instructions):
+            if (
+                isinstance(instruction, pikepdf.ContentStreamInlineImage)
+                or instruction.operator != _BDC
+                or len(instruction.operands) < 2
+            ):
+                continue
+            mcids = set()
+            for resources in resource_contexts[container_key]:
+                properties = _marked_content_properties(
+                    list(instruction.operands),
+                    resources,
+                )
+                mcid = (
+                    resolve_indirect(properties.get("/MCID"))
+                    if properties is not None
+                    else None
+                )
+                if isinstance(mcid, int) and not isinstance(mcid, bool):
+                    mcids.add(mcid)
+            matched = mcids & targets
+            if not matched:
+                continue
+            instructions[index] = _artifact_marker(None)
+            found.update(matched)
+        if found != targets:
+            raise ConversionError(
+                "Cannot preserve logical structure: rejected Figure content "
+                "could not be marked as an Artifact"
+            )
+        content = pikepdf.unparse_content_stream(instructions)
+        if isinstance(owner, pikepdf.Page):
+            owner.obj["/Contents"] = pdf.make_stream(content)
+        else:
+            owner.write(content)
+
+        if not any(
+            reference[0] == container_key and reference not in artifact_references
+            for reference in content_references
+        ):
+            if "/StructParents" in containers[container_key]:
+                del containers[container_key]["/StructParents"]
+
+    structure_root = resolve_indirect(pdf.Root.get("/StructTreeRoot"))
+    if not isinstance(structure_root, Dictionary):
+        raise ConversionError(
+            "Cannot preserve logical structure: missing structure root"
+        )
+    removed_elements: list[Dictionary] = []
+    for figure, _references in figures:
+        pending = [figure]
+        while pending:
+            value = resolve_indirect(pending.pop())
+            if isinstance(value, Array):
+                pending.extend(value)
+            elif (
+                isinstance(value, Dictionary)
+                and resolve_indirect(value.get("/Type")) == Name.StructElem
+            ):
+                removed_elements.append(value)
+                pending.append(value.get("/K"))
+
+        parent = resolve_indirect(figure.get("/P"))
+        if not isinstance(parent, Dictionary):
+            raise ConversionError(
+                "Cannot preserve logical structure: rejected Figure has no parent"
+            )
+
+        def remove_figure(value: object) -> tuple[object | None, bool]:
+            resolved = resolve_indirect(value)
+            if isinstance(resolved, Dictionary) and _same_object(resolved, figure):
+                return None, True
+            if not isinstance(resolved, Array):
+                return value, False
+            replacement = Array()
+            removed = False
+            for item in resolved:
+                child, child_removed = remove_figure(item)
+                if child is not None:
+                    replacement.append(child)
+                removed = removed or child_removed
+            return replacement, removed
+
+        replacement, removed = remove_figure(parent.get("/K"))
+        if not removed:
+            raise ConversionError(
+                "Cannot preserve logical structure: rejected Figure is not a child "
+                "of its parent"
+            )
+        if replacement is None:
+            if "/K" in parent:
+                del parent["/K"]
+        else:
+            parent["/K"] = replacement
+
+    id_tree_object = resolve_indirect(structure_root.get("/IDTree"))
+    if isinstance(id_tree_object, Dictionary):
+        id_tree = NameTree(id_tree_object)
+        for element in removed_elements:
+            identifier = resolve_indirect(element.get("/ID"))
+            if isinstance(identifier, String):
+                del id_tree[str(identifier)]
+
+    repaired_content_references: dict[
+        tuple[_ObjectKey, int],
+        tuple[
+            Dictionary | Stream,
+            Dictionary,
+            Dictionary,
+            Dictionary | Stream | None,
+        ],
+    ] = {}
+    repaired_object_owners: dict[
+        tuple[_ObjectKey, _ObjectKey],
+        tuple[Dictionary | Stream, _ObjectKey, Dictionary],
+    ] = {}
+    elements = _existing_structure_elements(
+        pdf,
+        pdfua=pdfua,
+        content_references_out=repaired_content_references,
+        object_owners_out=repaired_object_owners,
+    )
+    if elements is None:
+        raise ConversionError(
+            "Cannot preserve logical structure after artifacting rejected Figures"
+        )
+    content_references.clear()
+    content_references.update(repaired_content_references)
+    object_owners.clear()
+    object_owners.update(repaired_object_owners)
+    return elements
 
 
 def _valid_table_header_association(
@@ -9706,14 +9966,15 @@ def _add_ocr_figure_actualtext(
     source_actual_texts: dict[str, str],
     source_alt_texts: dict[str, str],
     recognizer: _FigureTextRecognizer | None,
-) -> int:
+) -> tuple[int, tuple[object, ...]]:
     if recognizer is None:
-        return 0
+        return 0, ()
     walk = getattr(root, "walk", None)
     if not callable(walk):
-        return 0
+        return 0, ()
 
     generated = 0
+    artifacts = []
     for node in walk():
         if getattr(node, "role", None) != "Figure":
             continue
@@ -9745,19 +10006,25 @@ def _add_ocr_figure_actualtext(
         recognized = [
             recognizer(*source_images[reference.span_id]) for reference in references
         ]
+        if any(result is _FigureOCRStatus.INELIGIBLE for result in recognized):
+            continue
         if any(text is None for text in recognized):
+            artifacts.append(node)
             continue
         values = [
-            text.strip() for text in recognized if text is not None and text.strip()
+            text.strip()
+            for text in recognized
+            if isinstance(text, str) and text.strip()
         ]
         if len(values) != len(references):
+            artifacts.append(node)
             continue
         source_actual_texts.update(
             (reference.span_id, value)
             for reference, value in zip(references, values, strict=True)
         )
         generated += 1
-    return generated
+    return generated, tuple(artifacts)
 
 
 def _normalize_pdfua_plan_tables(node: object) -> tuple[object, int]:
@@ -10344,7 +10611,12 @@ def _rebuild_semantic_structure(
 ) -> dict[str, int | bool]:
     from collections import Counter
 
-    from .semantics import ArtifactKind, SemanticPage, build_semantic_plan
+    from .semantics import (
+        ArtifactKind,
+        ArtifactReference,
+        SemanticPage,
+        build_semantic_plan,
+    )
 
     ocr_spans: dict[int, tuple[object, ...]] = {}
     ocr_bindings: dict[str, _SemanticBinding] = {}
@@ -10461,13 +10733,40 @@ def _rebuild_semantic_structure(
                 for ocr_box in logical_ocr_boxes
             ):
                 del source_images[span.id]
-    ocr_figure_text_review_required = _add_ocr_figure_actualtext(
+    (
+        ocr_figure_text_review_required,
+        ocr_figure_artifact_nodes,
+    ) = _add_ocr_figure_actualtext(
         plan.root,
         source_images,
         source_actual_texts,
         source_alt_texts,
         figure_text_recognizer,
     )
+    if ocr_figure_artifact_nodes:
+        artifact_node_ids = {id(node) for node in ocr_figure_artifact_nodes}
+
+        def without_ocr_artifacts(node: object) -> object:
+            return replace(
+                node,
+                children=tuple(
+                    without_ocr_artifacts(child)
+                    for child in getattr(node, "children", ())
+                    if id(child) not in artifact_node_ids
+                ),
+            )
+
+        for node in ocr_figure_artifact_nodes:
+            for reference in getattr(node, "content", ()):
+                binding = bindings[reference.span_id]
+                forced_artifacts[reference.span_id] = ArtifactReference(
+                    reference.span_id,
+                    binding.page_number,
+                    ArtifactKind.LAYOUT,
+                    "Layout",
+                    None,
+                )
+        plan = replace(plan, root=without_ocr_artifacts(plan.root))
     table_review_required = 0
     if pdfua:
         normalized_root, table_review_required = _normalize_pdfua_plan_tables(plan.root)
@@ -10639,6 +10938,7 @@ def _rebuild_semantic_structure(
         "semantic_repairs": 0,
         "semantic_alternatives_review_required": alternatives_review_required,
         "semantic_ocr_figure_text_review_required": (ocr_figure_text_review_required),
+        "semantic_ocr_figure_artifacts": len(ocr_figure_artifact_nodes),
         "semantic_vector_review_required": vector_review_required,
         "semantic_scanned_visual_review_required": len(scanned_visual_review_pages),
         "semantic_link_review_required": link_review_required,
@@ -10964,14 +11264,30 @@ def _ensure_logical_structure_in_place(
             raise ConversionError(
                 "Cannot preserve logical structure after semantic repairs"
             )
-        ocr_figure_text_review_required = _add_existing_figure_ocr_actualtext(
+        (
+            ocr_figure_text_review_required,
+            ocr_figure_artifact_candidates,
+        ) = _add_existing_figure_ocr_actualtext(
             pdf,
             existing_elements,
             existing_content_references,
             figure_text_recognizer,
             existing_image_invocations,
             existing_non_image_references,
+            existing_object_owners,
         )
+        ocr_figure_artifacts = len(ocr_figure_artifact_candidates)
+        ocr_figure_artifact_references = sum(
+            len(references) for _figure, references in ocr_figure_artifact_candidates
+        )
+        if ocr_figure_artifact_candidates:
+            existing_elements = _artifact_existing_figures(
+                pdf,
+                ocr_figure_artifact_candidates,
+                existing_content_references,
+                existing_object_owners,
+                pdfua=pdfua,
+            )
         alternatives_review_required = _missing_structure_alternatives(
             pdf,
             existing_elements,
@@ -10988,16 +11304,19 @@ def _ensure_logical_structure_in_place(
             "marked_content_languages_normalized": (
                 marked_content_languages_normalized
             ),
-            "mcids_removed": 0,
+            "mcids_removed": ocr_figure_artifact_references,
             "stream_structure_keys_removed": 0,
             "path_artifacts_tagged": path_artifacts_tagged,
-            "artifacts_tagged": path_artifacts_tagged,
+            "artifacts_tagged": (
+                path_artifacts_tagged + ocr_figure_artifact_references
+            ),
             "semantic_content_items": 0,
             "semantic_repairs": semantic_repairs,
-            "semantic_alternatives_review_required": (alternatives_review_required),
+            "semantic_alternatives_review_required": alternatives_review_required,
             "semantic_ocr_figure_text_review_required": (
                 ocr_figure_text_review_required
             ),
+            "semantic_ocr_figure_artifacts": ocr_figure_artifacts,
             "semantic_vector_review_required": int(path_artifacts_tagged > 0),
             "semantic_scanned_visual_review_required": 0,
             "semantic_link_review_required": 0,
@@ -11099,6 +11418,7 @@ def _ensure_logical_structure_in_place(
         "semantic_repairs": 0,
         "semantic_alternatives_review_required": 0,
         "semantic_ocr_figure_text_review_required": 0,
+        "semantic_ocr_figure_artifacts": 0,
         "semantic_vector_review_required": 0,
         "semantic_scanned_visual_review_required": 0,
         "semantic_link_review_required": 0,
