@@ -202,6 +202,21 @@ def _iter_fonts_from_resources(
         if kind == "font":
             assert font_key is not None
             yield font_key, obj
+            if (
+                isinstance(obj, pikepdf.Dictionary)
+                and str(obj.get("/Subtype")) == "/Type3"
+                and not _check_visited(obj, visited)
+            ):
+                type3_resources = _resolve_indirect(obj.get("/Resources"))
+                if isinstance(type3_resources, pikepdf.Dictionary):
+                    tasks.append(
+                        (
+                            "resources",
+                            type3_resources,
+                            None,
+                            _descendant_ancestors(obj, current_ancestors),
+                        )
+                    )
             continue
 
         try:
@@ -238,21 +253,7 @@ def _iter_fonts_from_resources(
                         key_str = str(raw_font_key)
                     except (UnicodeDecodeError, UnicodeEncodeError):
                         key_str = repr(raw_font_key)
-                    discovered.append(("font", font_obj, key_str, ()))
-
-                    if str(font_obj.get("/Subtype")) == "/Type3" and not _check_visited(
-                        font_obj, visited
-                    ):
-                        type3_resources = _resolve_indirect(font_obj.get("/Resources"))
-                        if isinstance(type3_resources, pikepdf.Dictionary):
-                            discovered.append(
-                                (
-                                    "resources",
-                                    type3_resources,
-                                    None,
-                                    _descendant_ancestors(font_obj, current_ancestors),
-                                )
-                            )
+                    discovered.append(("font", font_obj, key_str, current_ancestors))
                 except Exception:
                     continue
 
@@ -319,6 +320,13 @@ def _iter_fonts_from_resources(
                     extgstate = _resolve_indirect(extgstate_dict[gs_key])
                     if not isinstance(extgstate, pikepdf.Dictionary):
                         continue
+                    font = _resolve_indirect(extgstate.get("/Font"))
+                    if isinstance(font, pikepdf.Array) and len(font) == 2:
+                        font_obj = _resolve_indirect(font[0])
+                        if isinstance(font_obj, pikepdf.Dictionary):
+                            discovered.append(
+                                ("font", font_obj, str(gs_key), current_ancestors)
+                            )
                     soft_mask = _resolve_indirect(extgstate.get("/SMask"))
                     if not isinstance(soft_mask, pikepdf.Dictionary):
                         continue

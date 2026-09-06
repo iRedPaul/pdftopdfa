@@ -7,6 +7,7 @@
 from itertools import islice
 
 import pikepdf
+import pytest
 from conftest import new_pdf
 from pikepdf import Array, Dictionary, Name
 
@@ -32,6 +33,70 @@ def _make_page_with_content(pdf, content_bytes, font_dict, resources=None):
     page = pikepdf.Page(page_dict)
     pdf.pages.append(page)
     return page
+
+
+@pytest.mark.parametrize("cid", [False, True])
+def test_extgstate_font_selection_and_graphics_state_restore(cid):
+    pdf = new_pdf()
+    first = pdf.make_indirect(Dictionary(Subtype=Name.Type1, BaseFont=Name.Helvetica))
+    second = pdf.make_indirect(
+        Dictionary(
+            Subtype=Name.Type0 if cid else Name.Type1,
+            BaseFont=Name.Courier,
+            Encoding=Name("/Identity-H") if cid else Name.WinAnsiEncoding,
+        )
+    )
+    text = b"<0042>" if cid else b"(B)"
+    _make_page_with_content(
+        pdf,
+        b"BT /F1 12 Tf (A) Tj q /GS gs " + text + b" Tj Q (C) Tj ET",
+        Dictionary(),
+        resources=Dictionary(
+            Font=Dictionary(F1=first),
+            ExtGState=Dictionary(GS=Dictionary(Font=Array([second, 12]))),
+        ),
+    )
+    usage = collect_font_usage(pdf)
+    assert usage[first.objgen] == {65, 67}
+    assert usage[second.objgen] == ({b"\x00B"} if cid else {66})
+
+
+def test_extgstate_type3_charproc_fonts_are_discovered_and_counted():
+    from pdftopdfa.fonts.traversal import iter_all_page_fonts
+    from pdftopdfa.utils import iter_type3_fonts
+
+    pdf = new_pdf()
+    child = pdf.make_indirect(
+        Dictionary(
+            Subtype=Name.Type1,
+            BaseFont=Name.Helvetica,
+        )
+    )
+    type3 = pdf.make_indirect(
+        Dictionary(
+            Subtype=Name.Type3,
+            CharProcs=Dictionary(A=pdf.make_stream(b"500 0 d0 BT /F1 12 Tf (B) Tj ET")),
+            Resources=Dictionary(Font=Dictionary(F1=child)),
+        )
+    )
+    page = _make_page_with_content(
+        pdf,
+        b"BT /GS gs (A) Tj ET",
+        Dictionary(),
+        resources=Dictionary(
+            ExtGState=Dictionary(GS=Dictionary(Font=Array([type3, 12])))
+        ),
+    )
+    assert {font.objgen for _name, font in iter_all_page_fonts(page)} == {
+        type3.objgen,
+        child.objgen,
+    }
+    assert [font.objgen for _name, font in iter_type3_fonts(page.Resources, set())] == [
+        type3.objgen
+    ]
+    usage = collect_font_usage(pdf)
+    assert usage[child.objgen] == {66}
+    assert usage[type3.objgen] == {65}
 
 
 def test_resource_graph_traversal_handles_1200_nested_forms_and_type3() -> None:

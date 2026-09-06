@@ -1982,7 +1982,7 @@ class TestEnsureAppearanceStreams:
         annot_no_ap2 = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Highlight,
+                Subtype=Name.Square,
                 Rect=Array([200, 0, 250, 50]),
             )
         )
@@ -2007,7 +2007,7 @@ class TestEnsureAppearanceStreams:
         annot1 = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Highlight,
+                Subtype=Name.Square,
                 Rect=Array([0, 0, 100, 50]),
             )
         )

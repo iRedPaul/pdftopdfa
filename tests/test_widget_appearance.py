@@ -969,8 +969,8 @@ class TestIntegration:
         assert b"Visible" in content
         assert b"BT" in content
 
-    def test_non_widget_gets_empty_appearance(self, make_pdf_with_page):
-        """Non-Widget annotation gets empty appearance stream."""
+    def test_note_gets_visible_appearance(self, make_pdf_with_page):
+        """A note icon remains visible when its normal appearance is generated."""
         pdf = make_pdf_with_page()
         annot = pdf.make_indirect(
             Dictionary(
@@ -987,10 +987,11 @@ class TestIntegration:
         ap = resolve(resolved.get("/AP"))
         n = resolve(ap.get("/N"))
         content = bytes(n.read_bytes())
-        assert content == b""
+        assert b" re B" in content
+        assert b" l S" in content
 
     def test_mixed_widget_and_non_widget(self, make_pdf_with_page):
-        """Mixed annotations: widget gets visible, non-widget gets empty."""
+        """Both form fields and note icons receive visible appearances."""
         pdf = make_pdf_with_page()
         font = _make_font_dict(pdf)
         font_dict = Dictionary()
