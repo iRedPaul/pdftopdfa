@@ -750,6 +750,7 @@ def _convert_single_file(
         convert_calibrated=convert_calibrated,
         preserve_stamps=preserve_stamps,
         allow_signature_invalidation=allow_signature_invalidation,
+        _allow_output_overwrite=force,
     )
 
     _print_result(result, quiet)

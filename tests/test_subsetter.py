@@ -362,6 +362,28 @@ class TestSubsetFontData:
 class TestFontSubsetter:
     """Tests for FontSubsetter."""
 
+    def test_form_inherited_font_keeps_glyphs_with_empty_local_resources(self):
+        from fontTools.ttLib import TTFont
+
+        pdf = new_pdf()
+        font = _make_embedded_truetype_font(pdf, "ReviewFont", _load_liberation_sans())
+        form = pdf.make_stream(b"BT 72 600 Td (BBBB) Tj ET")
+        form.Subtype = Name.Form
+        form.BBox = Array([0, 0, 612, 792])
+        form.Resources = Dictionary()
+        page = pdf.add_blank_page()
+        page.Resources = Dictionary(
+            Font=Dictionary(F1=font),
+            XObject=Dictionary(Fm=form),
+        )
+        page.Contents = pdf.make_stream(b"BT /F1 24 Tf 72 700 Td (AAAA) Tj ET /Fm Do")
+        result = FontSubsetter(pdf).subset_all_fonts()
+        assert result.fonts_subsetted
+        with TTFont(BytesIO(font.FontDescriptor.FontFile2.read_bytes())) as subset:
+            for code in (65, 66):
+                glyph = subset.getBestCmap()[code]
+                assert subset["glyf"][glyph].numberOfContours > 0
+
     def test_subset_simple_font(self):
         """Subsets a simple TrueType font and adds prefix."""
         pdf = new_pdf()

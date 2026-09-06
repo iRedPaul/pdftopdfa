@@ -265,6 +265,13 @@ maximum archival robustness. Set `preserve_stamps=True` or pass
 `--preserve-stamps` to convert known proprietary stamp annotations to standard
 `/Stamp` annotations instead.
 
+Missing normal appearances are generated for basic Square annotations, note and
+attachment icons, default Draft stamps, and supported form widgets. Other visible
+annotations without a usable normal appearance cause conversion to fail while
+preserving an existing destination. This prevents FreeText, highlights, ink, or
+other annotations from silently disappearing. Save such PDFs with annotation
+appearances in the originating application before converting them.
+
 For PDF/A-2a and PDF/A-3a, `pdftopdfa` preserves a valid rich Tagged PDF
 structure when the page content remains unchanged and locally repairs safe,
 missing properties such as table-header scope. Trustworthy existing Alt,

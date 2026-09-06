@@ -60,6 +60,146 @@ _DETECTION_MODEL_DIR = Path("paddle-detection")
 _RECOGNITION_MODEL_DIR = Path("paddle-recognition")
 
 
+@pytest.mark.parametrize("processing_only", [False, True])
+def test_failed_publication_rollback_retains_original_backup(
+    sample_pdf: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    processing_only: bool,
+) -> None:
+    from pdftopdfa import staging
+
+    output = tmp_path / "output.pdf"
+    sentinel = b"original destination"
+    output.write_bytes(sentinel)
+    snapshot = staging.staged_file_snapshot
+    replace = os.replace
+    published = False
+
+    def fail_rollback(source, destination):
+        nonlocal published
+        if Path(source).name == "backup.pdf":
+            raise PermissionError("destination locked during recovery")
+        replace(source, destination)
+        if Path(destination) == output:
+            published = True
+
+    def fail_verification(path):
+        if Path(path) == output and published:
+            raise ConversionError("cannot read published output")
+        return snapshot(path)
+
+    with (
+        patch.object(staging.os, "replace", side_effect=fail_rollback),
+        patch.object(staging, "staged_file_snapshot", side_effect=fail_verification),
+        pytest.raises(ConversionError, match="cannot read published output"),
+    ):
+        convert_to_pdfa(sample_pdf, output, pdfa=not processing_only)
+
+    backups = list(tmp_path.rglob("backup.pdf"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == sentinel
+    assert str(backups[0]) in caplog.text
+    assert "recovery copy retained" in caplog.text
+
+
+def test_conversion_embeds_font_selected_only_by_extgstate(tmp_path: Path) -> None:
+    source, output = tmp_path / "gs.pdf", tmp_path / "gs-out.pdf"
+    with Pdf.new() as pdf:
+        page = pdf.add_blank_page()
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type1,
+                BaseFont=Name.Helvetica,
+                Encoding=Name.WinAnsiEncoding,
+            )
+        )
+        page.Resources = Dictionary(
+            ExtGState=Dictionary(
+                GS=Dictionary(Font=Array([font, 24])),
+            )
+        )
+        page.Contents = pdf.make_stream(b"BT /GS gs 72 700 Td (Hello) Tj ET")
+        pdf.save(source)
+    result = convert_to_pdfa(source, output)
+    assert result.success
+    with Pdf.open(output) as pdf:
+        font = pdf.pages[0].Resources.ExtGState.GS.Font[0]
+        assert font.FontDescriptor.FontFile2.read_bytes()
+        assert font.ToUnicode.read_bytes()
+    if is_verapdf_available():
+        assert validate_with_verapdf(output, flavour="3b").compliant
+
+
+@pytest.mark.parametrize("opacity", [1, 0.5])
+def test_square_annotation_remains_visible_after_conversion(tmp_path: Path, opacity):
+    pdfium = pytest.importorskip("pypdfium2")
+    source, output = tmp_path / "square.pdf", tmp_path / "square-out.pdf"
+    with Pdf.new() as pdf:
+        page = pdf.add_blank_page(page_size=(200, 200))
+        page.Annots = Array(
+            [
+                pdf.make_indirect(
+                    Dictionary(
+                        Type=Name.Annot,
+                        Subtype=Name.Square,
+                        Rect=Array([20, 20, 180, 180]),
+                        C=Array([1, 0, 0]),
+                        IC=Array([1, 0, 0]),
+                        CA=opacity,
+                        F=4,
+                    )
+                )
+            ]
+        )
+        pdf.save(source)
+    assert convert_to_pdfa(source, output).success
+    pixels = []
+    for path in (source, output):
+        with pdfium.PdfDocument(path) as pdf:
+            page = pdf[0]
+            bitmap = page.render(scale=1, draw_annots=True)
+            try:
+                pixels.append(bitmap.to_pil().getpixel((100, 100)))
+            finally:
+                bitmap.close()
+                page.close()
+    assert pixels[0] != (255, 255, 255)
+    assert pixels[1] == pixels[0]
+    if is_verapdf_available():
+        assert validate_with_verapdf(output, flavour="3b").compliant
+
+
+@pytest.mark.parametrize("subtype", ["/FreeText", "/Highlight", "/Ink"])
+def test_unreconstructable_annotation_preserves_existing_destination(
+    tmp_path: Path,
+    subtype: str,
+) -> None:
+    source, output = tmp_path / "annotation.pdf", tmp_path / "out.pdf"
+    sentinel = b"previous output"
+    output.write_bytes(sentinel)
+    with Pdf.new() as pdf:
+        page = pdf.add_blank_page()
+        page.Annots = Array(
+            [
+                pdf.make_indirect(
+                    Dictionary(
+                        Type=Name.Annot,
+                        Subtype=Name(subtype),
+                        Rect=Array([20, 20, 180, 180]),
+                        Contents="Keep this annotation",
+                        F=4,
+                    )
+                )
+            ]
+        )
+        pdf.save(source)
+    with pytest.raises(ConversionError, match="without a normal appearance"):
+        convert_to_pdfa(source, output)
+    assert output.read_bytes() == sentinel
+
+
 @pytest.mark.parametrize(
     ("results", "expected"),
     [
@@ -1444,7 +1584,9 @@ class TestConvertToPdfa:
 
         assert output_path.read_bytes() == foreign
         assert not foreign_path.exists()
-        assert not list(tmp_dir.glob(".output_pdfa_stage_*"))
+        backups = list(tmp_dir.glob(".output_pdfa_stage_*/backup.pdf"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == b"existing output"
 
     def test_convert_nonexistent_file(self, tmp_dir: Path) -> None:
         """Non-existent file raises ConversionError."""
