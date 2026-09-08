@@ -26,6 +26,7 @@ from .base import (
 )
 from .widget_appearance import (
     _color_array_to_ops,
+    _format_pdf_number,
     _get_border_width,
     _get_rect_dimensions,
     _make_form_stream,
@@ -214,12 +215,6 @@ def _append_page_content_stream(page, stream: Stream) -> None:
         return
 
     page.obj[Name.Contents] = Array([contents, stream])
-
-
-def _format_pdf_number(value: float) -> str:
-    """Format a float as a compact PDF numeric literal."""
-    text = f"{value:.12f}".rstrip("0").rstrip(".")
-    return text or "0"
 
 
 def _appearance_invocation_stream(
@@ -738,6 +733,10 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
             stroke = ""
         fill = _color_array_to_ops(annot.get("/IC"))
         border = annot.get("/BS", Dictionary())
+        if not isinstance(border, Dictionary):
+            raise ConversionError(
+                "Cannot create Square appearance: invalid border dictionary"
+            )
         style = border.get("/S", Name.S)
         if style not in (Name.S, Name.D):
             raise ConversionError(

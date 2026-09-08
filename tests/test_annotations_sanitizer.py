@@ -787,6 +787,57 @@ class TestEnsureAppearanceStreams:
         else:
             assert expected_dash in content
 
+    @pytest.mark.parametrize("border", [42, Array([1]), Name.S, "invalid"])
+    def test_square_malformed_border_raises(self, make_pdf_with_page, border):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(
+                Subtype=Name.Square,
+                Rect=Array([0, 0, 100, 100]),
+                BS=border,
+            )
+        )
+        pdf.pages[0].Annots = Array([annot])
+
+        with pytest.raises(ConversionError, match="invalid border dictionary"):
+            ensure_appearance_streams(pdf)
+
+    @pytest.mark.parametrize(
+        "color, stroke_op, fill_op",
+        [
+            ([0.00001], "G", "g"),
+            ([1, 0.00001, 0], "RG", "rg"),
+            ([0, 0.00001, 0, 1], "K", "k"),
+        ],
+    )
+    def test_square_small_color_components(
+        self, make_pdf_with_page, color, stroke_op, fill_op
+    ):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(
+                Subtype=Name.Square,
+                Rect=Array([0, 0, 100, 100]),
+                C=Array(color),
+                IC=Array(color),
+            )
+        )
+        pdf.pages[0].Annots = Array([annot])
+
+        assert ensure_appearance_streams(pdf) == 1
+        instructions = pikepdf.parse_content_stream(annot.AP.N)
+        assert [str(op) for _, op in instructions] == [
+            "q",
+            stroke_op,
+            fill_op,
+            "w",
+            "re",
+            "B",
+            "Q",
+        ]
+        for instruction in instructions[1:3]:
+            assert [float(value) for value in instruction.operands] == color
+
     @pytest.mark.parametrize("size", [0.00004, 100, 10000000])
     def test_square_appearance_uses_pdf_numeric_operands(
         self, make_pdf_with_page, size

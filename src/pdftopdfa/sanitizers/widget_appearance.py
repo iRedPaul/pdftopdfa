@@ -253,6 +253,12 @@ def _resolve_font_resource(font_name, annot, acroform):
 # ---------------------------------------------------------------------------
 
 
+def _format_pdf_number(value: float) -> str:
+    """Format a float as a compact PDF numeric literal."""
+    text = f"{value:.12f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
 def _color_array_to_ops(arr, stroke=False):
     """Convert a /MK color array to PDF content stream operators.
 
@@ -276,17 +282,13 @@ def _color_array_to_ops(arr, stroke=False):
         return ""
     elif n == 1:
         op = "G" if stroke else "g"
-        return f"{components[0]:.4g} {op}"
     elif n == 3:
         op = "RG" if stroke else "rg"
-        return f"{components[0]:.4g} {components[1]:.4g} {components[2]:.4g} {op}"
     elif n == 4:
         op = "K" if stroke else "k"
-        return (
-            f"{components[0]:.4g} {components[1]:.4g} "
-            f"{components[2]:.4g} {components[3]:.4g} {op}"
-        )
-    return ""
+    else:
+        return ""
+    return " ".join(_format_pdf_number(c) for c in components) + f" {op}"
 
 
 # ---------------------------------------------------------------------------
