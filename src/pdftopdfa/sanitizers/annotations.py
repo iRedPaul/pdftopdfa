@@ -758,8 +758,10 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
         inset = border_width / 2 if stroke else 0
         paint = "B" if stroke and fill else "S" if stroke else "f" if fill else "n"
         content = (
-            f"q {stroke} {fill} {border_width:g} w {dash} "
-            f"{inset:g} {inset:g} {width - 2 * inset:g} {height - 2 * inset:g} "
+            f"q {stroke} {fill} {_format_pdf_number(border_width)} w {dash} "
+            f"{_format_pdf_number(inset)} {_format_pdf_number(inset)} "
+            f"{_format_pdf_number(width - 2 * inset)} "
+            f"{_format_pdf_number(height - 2 * inset)} "
             f"re {paint} Q"
         ).encode("ascii")
     elif subtype in (Name.Text, Name.FileAttachment):

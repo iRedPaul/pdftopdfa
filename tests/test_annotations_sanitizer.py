@@ -787,6 +787,35 @@ class TestEnsureAppearanceStreams:
         else:
             assert expected_dash in content
 
+    @pytest.mark.parametrize("size", [0.00004, 100, 10000000])
+    def test_square_appearance_uses_pdf_numeric_operands(
+        self, make_pdf_with_page, size
+    ):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(
+                Subtype=Name.Square,
+                Rect=Array([0, 0, size, size]),
+                BS=Dictionary(W=0.00001),
+            )
+        )
+        pdf.pages[0].Annots = Array([annot])
+
+        assert ensure_appearance_streams(pdf) == 1
+        instructions = pikepdf.parse_content_stream(annot.AP.N)
+        assert [str(operator) for _, operator in instructions] == [
+            "q",
+            "G",
+            "w",
+            "re",
+            "S",
+            "Q",
+        ]
+        assert [float(value) for value in instructions[2].operands] == [0.00001]
+        assert [float(value) for value in instructions[3].operands] == pytest.approx(
+            [0.000005, 0.000005, size - 0.00001, size - 0.00001]
+        )
+
     def test_skips_annotation_with_existing_ap_n(self, make_pdf_with_page):
         """Annotations with existing /AP /N are left alone."""
         pdf = make_pdf_with_page()
