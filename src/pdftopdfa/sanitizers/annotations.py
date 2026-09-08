@@ -767,9 +767,7 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
                 raise ConversionError(
                     "Cannot create Square appearance: invalid dash array"
                 )
-            dash = (
-                "[" + " ".join(_format_pdf_number(v) for v in values) + "] 0 d"
-            )
+            dash = "[" + " ".join(_format_pdf_number(v) for v in values) + "] 0 d"
         inset = border_width / 2 if stroke else 0
         paint = "B" if stroke and fill else "S" if stroke else "f" if fill else "n"
         content = (
