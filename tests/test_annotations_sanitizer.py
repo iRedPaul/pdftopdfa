@@ -816,6 +816,45 @@ class TestEnsureAppearanceStreams:
             [0.000005, 0.000005, size - 0.00001, size - 0.00001]
         )
 
+    @pytest.mark.parametrize("subtype", [Name.Text, Name.FileAttachment])
+    @pytest.mark.parametrize("size", [0.00004, 100, 10000000])
+    def test_note_appearance_uses_pdf_numeric_operands(
+        self, make_pdf_with_page, subtype, size
+    ):
+        pdf = make_pdf_with_page()
+        width, height = size, size * 2
+        annot = pdf.make_indirect(
+            Dictionary(Subtype=subtype, Rect=Array([0, 0, width, height]))
+        )
+        pdf.pages[0].Annots = Array([annot])
+
+        assert ensure_appearance_streams(pdf) == 1
+        instructions = pikepdf.parse_content_stream(annot.AP.N)
+        assert [str(operator) for _, operator in instructions] == [
+            "q",
+            "rg",
+            "G",
+            "w",
+            "re",
+            "B",
+            "m",
+            "l",
+            "m",
+            "l",
+            "S",
+            "Q",
+        ]
+        for index, expected in [
+            (4, [0.5, 0.5, width - 1, height - 1]),
+            (6, [width * 0.2, height * 0.7]),
+            (7, [width * 0.8, height * 0.7]),
+            (8, [width * 0.2, height * 0.5]),
+            (9, [width * 0.8, height * 0.5]),
+        ]:
+            assert [float(value) for value in instructions[index].operands] == (
+                pytest.approx(expected)
+            )
+
     def test_skips_annotation_with_existing_ap_n(self, make_pdf_with_page):
         """Annotations with existing /AP /N are left alone."""
         pdf = make_pdf_with_page()

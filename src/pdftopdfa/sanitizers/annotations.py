@@ -770,11 +770,17 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
         fill = _color_array_to_ops(annot.get("/C", Array([1, 1, 0.8])))
         paint = "B" if fill else "S"
         content = (
-            f"q {fill} 0 G 1 w 0.5 0.5 {width - 1:g} {height - 1:g} re {paint} "
-            f"{width * 0.2:g} {height * 0.7:g} m "
-            f"{width * 0.8:g} {height * 0.7:g} l "
-            f"{width * 0.2:g} {height * 0.5:g} m "
-            f"{width * 0.8:g} {height * 0.5:g} l S Q"
+            f"q {fill} 0 G 1 w 0.5 0.5 "
+            f"{_format_pdf_number(width - 1)} "
+            f"{_format_pdf_number(height - 1)} re {paint} "
+            f"{_format_pdf_number(width * 0.2)} "
+            f"{_format_pdf_number(height * 0.7)} m "
+            f"{_format_pdf_number(width * 0.8)} "
+            f"{_format_pdf_number(height * 0.7)} l "
+            f"{_format_pdf_number(width * 0.2)} "
+            f"{_format_pdf_number(height * 0.5)} m "
+            f"{_format_pdf_number(width * 0.8)} "
+            f"{_format_pdf_number(height * 0.5)} l S Q"
         ).encode("ascii")
     else:
         raise ConversionError(
