@@ -704,6 +704,8 @@ def _create_draft_stamp_appearance_stream(pdf: Pdf, annot) -> Stream:
 
 def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
     """Create a meaningful appearance when the source has no normal one."""
+    if annot.get("/Subtype") == Name.Widget:
+        return create_widget_appearance(pdf, annot, pdf.Root.get("/AcroForm"))
     width, height = _get_rect_dimensions(annot)
     if (
         width <= 0

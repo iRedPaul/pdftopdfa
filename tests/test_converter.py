@@ -61,6 +61,35 @@ _RECOGNITION_MODEL_DIR = Path("paddle-recognition")
 
 
 @pytest.mark.parametrize("processing_only", [False, True])
+@pytest.mark.parametrize("hard_links", [False, True])
+def test_successful_overwrite_cleans_staging_directory(
+    sample_pdf: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    processing_only: bool,
+    hard_links: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "output.pdf"
+    output.write_bytes(b"original destination")
+    if not hard_links:
+
+        def unsupported_link(*args, **kwargs):
+            raise OSError(errno.ENOTSUP, "hard links unsupported")
+
+        monkeypatch.setattr(os, "link", unsupported_link)
+
+    result = convert_to_pdfa(sample_pdf, output, pdfa=not processing_only)
+
+    assert result.success
+    with Pdf.open(output) as pdf:
+        assert len(pdf.pages) == 1
+    assert not list(tmp_path.glob(".output*_stage_*"))
+    assert not list(tmp_path.rglob("backup.pdf"))
+    assert "recovery copy retained" not in caplog.text
+
+
+@pytest.mark.parametrize("processing_only", [False, True])
 def test_failed_publication_rollback_retains_original_backup(
     sample_pdf: Path,
     tmp_path: Path,

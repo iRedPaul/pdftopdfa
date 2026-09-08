@@ -1035,6 +1035,40 @@ class TestEnsureAppearanceStreams:
         n = resolve(ap.get("/N"))
         assert isinstance(n, pikepdf.Stream)
 
+    @pytest.mark.parametrize("normal", [Dictionary(), Dictionary(On=42), 42])
+    def test_generates_widget_appearance_without_usable_stream(
+        self, make_pdf_with_page, normal
+    ):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name.Widget,
+                FT=Name.Tx,
+                V="Visible field value",
+                Rect=Array([0, 0, 200, 30]),
+                AP=Dictionary(N=normal),
+            )
+        )
+        pdf.pages[0].Annots = Array([annot])
+        register_form_widget(pdf, annot)
+        pdf.Root.AcroForm.DA = "/Helv 12 Tf 0 g"
+        pdf.Root.AcroForm.DR = Dictionary(
+            Font=Dictionary(
+                Helv=Dictionary(
+                    Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica
+                )
+            )
+        )
+        pdf = save_and_reopen(pdf)
+
+        assert ensure_appearance_streams(pdf) == 1
+
+        appearance = pdf.pages[0].Annots[0].AP.N
+        assert isinstance(appearance, pikepdf.Stream)
+        assert b"Visible field value" in appearance.read_bytes()
+        assert appearance.Resources.Font
+
     def test_leaves_valid_stream_ap_n_unchanged(self, make_pdf_with_page):
         """Non-widget annotation with valid Stream /AP/N is not modified."""
         pdf = make_pdf_with_page()
