@@ -935,6 +935,35 @@ class TestFontEmbedderIntegration:
         not _liberation_fonts_available(),
         reason="Liberation fonts not installed",
     )
+    @pytest.mark.parametrize(
+        "entries",
+        [
+            b"2 beginbfchar\n<01> <00660069>\n<02> <0041>\nendbfchar",
+            b"1 beginbfrange\n<01> <02> [<00660069> <0041>]\nendbfrange",
+        ],
+    )
+    def test_embed_missing_font_with_multiscalar_tounicode(
+        self, pdf_with_helvetica, entries
+    ):
+        """Mixed ligature and scalar mappings must not prevent embedding."""
+        font = pdf_with_helvetica.pages[0].Resources.Font.F1
+        font[Name.ToUnicode] = pdf_with_helvetica.make_stream(
+            b"begincmap\n1 begincodespacerange\n<00> <FF>\n"
+            b"endcodespacerange\n" + entries + b"\nendcmap"
+        )
+
+        with FontEmbedder(pdf_with_helvetica) as embedder:
+            result = embedder.embed_missing_fonts()
+
+        assert result.fonts_embedded == ["Helvetica"]
+        assert result.fonts_failed == []
+        assert is_font_embedded(font)
+        assert font.Encoding == Name.WinAnsiEncoding
+
+    @pytest.mark.skipif(
+        not _liberation_fonts_available(),
+        reason="Liberation fonts not installed",
+    )
     def test_replace_subsetted_standard14_font(self, pdf_with_helvetica):
         """Subsetted embedded Standard-14 fonts are refreshed to full fonts."""
         embedder = FontEmbedder(pdf_with_helvetica)

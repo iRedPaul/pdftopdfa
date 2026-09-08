@@ -59,7 +59,6 @@ from .tounicode import (
     get_font_code_space_ranges,
     get_type0_cid_encoding_map,
     parse_cidtogidmap_stream,
-    parse_tounicode_cmap,
     parse_tounicode_cmap_sequences,
     resolve_glyph_to_unicode,
     resolve_symbol_glyph_to_unicode,
@@ -1332,12 +1331,15 @@ class FontEmbedder:
         if tounicode is not None:
             try:
                 tounicode = _resolve_indirect(tounicode)
-                mapping = parse_tounicode_cmap(bytes(tounicode.read_bytes()))
+                mapping = parse_tounicode_cmap_sequences(bytes(tounicode.read_bytes()))
                 if mapping:
+                    # The preserved encoding requires one Unicode scalar per code.
+                    if any(len(sequence) != 1 for sequence in mapping.values()):
+                        return {}
                     return {
-                        code: unicode_val
-                        for code, unicode_val in mapping.items()
-                        if 0 <= code <= 255
+                        int.from_bytes(code, "big"): sequence[0]
+                        for code, sequence in mapping.items()
+                        if int.from_bytes(code, "big") <= 255
                     }
             except Exception:
                 logger.debug("Could not parse existing ToUnicode for font refresh")
