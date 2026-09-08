@@ -934,6 +934,25 @@ class TestEnsureAppearanceStreams:
         with pytest.raises(ConversionError, match="invalid opacity"):
             ensure_appearance_streams(pdf)
 
+    @pytest.mark.parametrize("width", [Name.bad, "2", Array([2]), True, -1])
+    @pytest.mark.parametrize("legacy", [False, True])
+    def test_square_malformed_bs_width_raises(self, make_pdf_with_page, width, legacy):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(
+                Subtype=Name.Square,
+                Rect=Array([0, 0, 100, 100]),
+                BS=Dictionary(W=width),
+            )
+        )
+        if legacy:
+            annot.Border = Array([0, 0, 3])
+        pdf.pages[0].Annots = Array([annot])
+
+        with pytest.raises(ConversionError, match="invalid border width"):
+            ensure_appearance_streams(pdf)
+        assert "/AP" not in annot
+
     @pytest.mark.parametrize("border", [42, Array([1]), Name.S, "invalid"])
     def test_square_malformed_border_raises(self, make_pdf_with_page, border):
         pdf = make_pdf_with_page()

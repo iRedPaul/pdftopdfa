@@ -516,7 +516,12 @@ def publish_staged_file(
             except BaseException:
                 backup.unlink(missing_ok=True)
                 raise
-        os.replace(staged, destination)
+        try:
+            os.replace(staged, destination)
+        except OSError:
+            if backup is not None:
+                backup.unlink(missing_ok=True)
+            raise
         published_by_this_call = True
 
     try:

@@ -359,7 +359,9 @@ class FontEmbedder:
                 use_fallback = False
                 if font_type == "CIDFont":
                     if font_usage is None:
-                        font_usage = collect_font_usage(self.pdf)
+                        font_usage = collect_font_usage(
+                            self.pdf, require_resolved_font=True
+                        )
                     # Preserve encoding (Identity-H or Identity-V)
                     encoding = self._get_cidfont_encoding(font_obj)
                     success = self._embed_cidfont(

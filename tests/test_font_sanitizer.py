@@ -1305,6 +1305,21 @@ class TestCMapUseCMap:
         assert cmap.get("/UseCMap") is None
         assert b"<0041> 65" in cmap.read_bytes()
 
+    def test_usecmap_fallback_only_usage_does_not_justify_stripping(self):
+        pdf, cmap = self._make_unresolved_local_cmap_pdf(b"\x00B")
+        page = pdf.pages[0]
+        page.Contents.Filter = Name.FlateDecode
+        form = pdf.make_stream(b"BT <0041> Tj ET")
+        form.Subtype = Name.Form
+        form.BBox = Array([0, 0, 100, 100])
+        form.Resources = Dictionary()
+        page.Resources.XObject = Dictionary(Fm=form)
+
+        with pytest.raises(ConversionError, match="Cannot resolve inherited CMap"):
+            sanitize_cidfont_structures(pdf)
+
+        assert cmap.get("/UseCMap") == Name("/Adobe-Korea1-2")
+
     def test_usecmap_nonstandard_name_fails_for_used_inherited_code(
         self,
     ) -> None:

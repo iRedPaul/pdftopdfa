@@ -401,17 +401,21 @@ class FontUsageCache:
             pdf: Opened pikepdf PDF object.
         """
         self._pdf = pdf
-        self._usage: dict[_ObjectKey, set[CharacterCode]] | None = None
+        self._usage: dict[bool, dict[_ObjectKey, set[CharacterCode]]] = {}
 
-    def get(self) -> dict[_ObjectKey, set[CharacterCode]]:
-        """Returns the font usage map, collecting it on first access."""
-        if self._usage is None:
-            self._usage = collect_font_usage(self._pdf)
-        return self._usage
+    def get(
+        self, *, require_resolved_font: bool = False
+    ) -> dict[_ObjectKey, set[CharacterCode]]:
+        """Returns the requested usage map, collecting it on first access."""
+        if require_resolved_font not in self._usage:
+            self._usage[require_resolved_font] = collect_font_usage(
+                self._pdf, require_resolved_font=require_resolved_font
+            )
+        return self._usage[require_resolved_font]
 
     def invalidate(self) -> None:
         """Drops the cached usage map after content streams changed."""
-        self._usage = None
+        self._usage.clear()
 
 
 def collect_font_usage(
@@ -428,7 +432,8 @@ def collect_font_usage(
     Args:
         pdf: Opened pikepdf PDF object.
         require_resolved_font: Exclude fonts matched only by the conservative
-            fallback, so subsetting retains the no-usage safety check.
+            fallback, so font replacement and subsetting retain the no-usage
+            safety check.
 
     Returns:
         Dictionary mapping indirect font objgens, or serialized direct Type0

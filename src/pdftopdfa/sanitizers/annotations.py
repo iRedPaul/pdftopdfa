@@ -724,11 +724,26 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
                 "Cannot preserve Square annotation without an appearance: "
                 "border effects and rectangle differences require a source appearance"
             )
-        border_width = _get_border_width(annot)
-        if not math.isfinite(border_width) or border_width < 0:
+        border = annot.get("/BS", Dictionary())
+        if not isinstance(border, Dictionary):
+            raise ConversionError(
+                "Cannot create Square appearance: invalid border dictionary"
+            )
+        border_width = (
+            border.get("/W", 1)
+            if annot.get("/BS") is not None
+            else _get_border_width(annot)
+        )
+        if (
+            isinstance(border_width, bool)
+            or not isinstance(border_width, (int, float, Decimal))
+            or not math.isfinite(border_width)
+            or border_width < 0
+        ):
             raise ConversionError(
                 "Cannot create Square appearance: invalid border width"
             )
+        border_width = float(border_width)
         for key in ("/C", "/IC"):
             color = annot.get(key)
             if color is not None and (
@@ -749,11 +764,6 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
         if border_width == 0:
             stroke = ""
         fill = _color_array_to_ops(annot.get("/IC"))
-        border = annot.get("/BS", Dictionary())
-        if not isinstance(border, Dictionary):
-            raise ConversionError(
-                "Cannot create Square appearance: invalid border dictionary"
-            )
         style = border.get("/S", Name.S)
         if style not in (Name.S, Name.D):
             raise ConversionError(

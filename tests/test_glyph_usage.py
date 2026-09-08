@@ -891,3 +891,18 @@ class TestFontUsageCache:
         refreshed = cache.get()
         assert refreshed is not first
         assert refreshed[font.objgen] == {65, 66, 67}
+
+    def test_resolved_usage_is_cached_separately_and_invalidated(self):
+        pdf, font = self._make_pdf_with_usage()
+        pdf.pages[0].Contents = pdf.make_stream(b"BT (A) Tj ET")
+        cache = FontUsageCache(pdf)
+
+        assert cache.get()[font.objgen] == {65}
+        resolved = cache.get(require_resolved_font=True)
+        assert resolved == {}
+        assert cache.get(require_resolved_font=True) is resolved
+
+        pdf.pages[0].Contents = pdf.make_stream(b"BT /F1 12 Tf (B) Tj ET")
+        cache.invalidate()
+        assert cache.get()[font.objgen] == {66}
+        assert cache.get(require_resolved_font=True)[font.objgen] == {66}

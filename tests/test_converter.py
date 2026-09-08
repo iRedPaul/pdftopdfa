@@ -90,6 +90,37 @@ def test_successful_overwrite_cleans_staging_directory(
 
 
 @pytest.mark.parametrize("processing_only", [False, True])
+@pytest.mark.parametrize("hard_links", [False, True])
+def test_initial_publication_failure_cleans_backup(
+    sample_pdf, tmp_path, caplog, processing_only, hard_links, monkeypatch
+):
+    output = tmp_path / "output.pdf"
+    output.write_bytes(b"original destination")
+    replace = os.replace
+
+    def fail_publication(source, destination):
+        if Path(destination) == output:
+            raise PermissionError("destination locked")
+        return replace(source, destination)
+
+    if not hard_links:
+
+        def unsupported_link(*args, **kwargs):
+            raise OSError(errno.ENOTSUP, "hard links unsupported")
+
+        monkeypatch.setattr(os, "link", unsupported_link)
+    monkeypatch.setattr(os, "replace", fail_publication)
+
+    with pytest.raises(PermissionError, match="destination locked"):
+        convert_to_pdfa(sample_pdf, output, pdfa=not processing_only)
+
+    assert output.read_bytes() == b"original destination"
+    assert not list(tmp_path.glob(".output*"))
+    assert not list(tmp_path.rglob("backup.pdf"))
+    assert "recovery copy retained" not in caplog.text
+
+
+@pytest.mark.parametrize("processing_only", [False, True])
 def test_failed_publication_rollback_retains_original_backup(
     sample_pdf: Path,
     tmp_path: Path,
