@@ -481,9 +481,7 @@ def _get_border_width(annot):
         bs = annot.get("/BS")
         if bs is not None:
             bs = _resolve(bs)
-            bw = bs.get("/W")
-            if bw is not None:
-                return float(bw)
+            return float(bs.get("/W", 1))
     except Exception:
         pass
 

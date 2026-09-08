@@ -751,8 +751,24 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
             if legacy_border is not None and len(legacy_border) == 4:
                 values = legacy_border[3]
         if values is not None:
+            if not isinstance(values, Array):
+                raise ConversionError(
+                    "Cannot create Square appearance: invalid dash array"
+                )
+            try:
+                values = [float(v) for v in values]
+            except (TypeError, ValueError) as e:
+                raise ConversionError(
+                    "Cannot create Square appearance: invalid dash array"
+                ) from e
+            if any(not math.isfinite(v) or v < 0 for v in values) or (
+                values and not any(values)
+            ):
+                raise ConversionError(
+                    "Cannot create Square appearance: invalid dash array"
+                )
             dash = (
-                "[" + " ".join(_format_pdf_number(float(v)) for v in values) + "] 0 d"
+                "[" + " ".join(_format_pdf_number(v) for v in values) + "] 0 d"
             )
         inset = border_width / 2 if stroke else 0
         paint = "B" if stroke and fill else "S" if stroke else "f" if fill else "n"
@@ -788,7 +804,12 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
     resources = Dictionary()
     opacity = annot.get("/CA", 1)
     if opacity != 1:
-        opacity = float(opacity)
+        try:
+            opacity = float(opacity)
+        except (TypeError, ValueError) as e:
+            raise ConversionError(
+                "Cannot create annotation appearance: invalid opacity"
+            ) from e
         if not math.isfinite(opacity) or not 0 <= opacity <= 1:
             raise ConversionError(
                 "Cannot create annotation appearance: invalid opacity"

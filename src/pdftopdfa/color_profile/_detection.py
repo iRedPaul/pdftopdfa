@@ -388,7 +388,7 @@ def _process_resource_graph(
                     _process_shadings(shadings, analysis, location_prefix)
 
                 type3_fonts = value.get("/Font")
-                if type3_fonts is not None:
+                if type3_fonts is not None or "/ExtGState" in value:
                     stack.append(("type3", value, location_prefix))
 
                 patterns = value.get("/Pattern")

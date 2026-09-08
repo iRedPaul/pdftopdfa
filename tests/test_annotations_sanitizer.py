@@ -787,6 +787,54 @@ class TestEnsureAppearanceStreams:
         else:
             assert expected_dash in content
 
+    def test_square_border_style_default_width_overrides_legacy_border(
+        self, make_pdf_with_page
+    ):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(
+                Subtype=Name.Square,
+                Rect=Array([0, 0, 100, 100]),
+                BS=Dictionary(S=Name.S),
+                Border=Array([0, 0, 10]),
+            )
+        )
+        pdf.pages[0].Annots = Array([annot])
+
+        assert ensure_appearance_streams(pdf) == 1
+        assert b"1 w" in annot.AP.N.read_bytes()
+        assert b"0.5 0.5 99 99 re S" in annot.AP.N.read_bytes()
+
+    @pytest.mark.parametrize("legacy", [False, True])
+    @pytest.mark.parametrize(
+        "dash", [42, Name.bad, Array([Name.bad]), Array([-1, 2]), Array([0, 0])]
+    )
+    def test_square_malformed_dash_raises(self, make_pdf_with_page, legacy, dash):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(Subtype=Name.Square, Rect=Array([0, 0, 100, 100]))
+        )
+        if legacy:
+            annot.Border = Array([0, 0, 1, dash])
+        else:
+            annot.BS = Dictionary(S=Name.D, D=dash)
+        pdf.pages[0].Annots = Array([annot])
+
+        with pytest.raises(ConversionError, match="invalid dash array"):
+            ensure_appearance_streams(pdf)
+
+    @pytest.mark.parametrize("subtype", [Name.Square, Name.Text, Name.FileAttachment])
+    @pytest.mark.parametrize("opacity", [Name.bad, Array([1]), "bad", -0.1, 1.1])
+    def test_malformed_opacity_raises(self, make_pdf_with_page, subtype, opacity):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(Subtype=subtype, Rect=Array([0, 0, 100, 100]), CA=opacity)
+        )
+        pdf.pages[0].Annots = Array([annot])
+
+        with pytest.raises(ConversionError, match="invalid opacity"):
+            ensure_appearance_streams(pdf)
+
     @pytest.mark.parametrize("border", [42, Array([1]), Name.S, "invalid"])
     def test_square_malformed_border_raises(self, make_pdf_with_page, border):
         pdf = make_pdf_with_page()

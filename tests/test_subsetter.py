@@ -749,6 +749,46 @@ class TestFontSubsetter:
 class TestNoUsageFontsNotSubsetted:
     """Fonts without any collected glyph usage must not be subsetted."""
 
+    def test_unresolved_text_does_not_enable_subsetting_unrelated_font(
+        self, monkeypatch
+    ):
+        pdf = new_pdf()
+        font_data = _load_liberation_sans()
+        caller = _make_embedded_truetype_font(pdf, "Caller", font_data)
+        unrelated = _make_embedded_truetype_font(pdf, "Unrelated", font_data)
+        inherited = pdf.make_stream(b"BT (B) Tj ET")
+        inherited.Subtype = Name.Form
+        inherited.BBox = Array([0, 0, 100, 100])
+        inherited.Resources = Dictionary()
+        unreadable = pdf.make_stream(b"BT /F2 12 Tf (Z) Tj ET")
+        unreadable.Subtype = Name.Form
+        unreadable.BBox = Array([0, 0, 100, 100])
+        unreadable.Resources = Dictionary(Font=Dictionary(F2=unrelated))
+        page = pdf.add_blank_page()
+        page.Resources = Dictionary(
+            Font=Dictionary(F1=caller),
+            XObject=Dictionary(Inherited=inherited, Unreadable=unreadable),
+        )
+        page.Contents = pdf.make_stream(
+            b"BT /F1 12 Tf (A) Tj ET /Inherited Do /Unreadable Do"
+        )
+        parse = pikepdf.parse_content_stream
+
+        def parse_with_unreadable_stream(owner, *args, **kwargs):
+            if isinstance(owner, Stream) and owner.objgen == unreadable.objgen:
+                raise pikepdf.PdfError("Unparsable content stream")
+            return parse(owner, *args, **kwargs)
+
+        monkeypatch.setattr(
+            pikepdf, "parse_content_stream", parse_with_unreadable_stream
+        )
+        result = FontSubsetter(pdf).subset_all_fonts()
+
+        assert any("Caller" in name for name in result.fonts_subsetted)
+        assert "Unrelated (no glyph usage found)" in result.fonts_skipped
+        assert unrelated.FontDescriptor.FontFile2.read_bytes() == font_data
+        assert unrelated.BaseFont == Name.Unrelated
+
     def test_simple_font_without_usage_is_skipped(self):
         """A font never seen in a text operator is skipped, not emptied."""
         pdf = new_pdf()

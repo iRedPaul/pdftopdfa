@@ -2928,6 +2928,39 @@ class TestShadingDefaultColorSpaces:
         default_rgb = pdf.pages[0][Name.Resources][Name.ColorSpace][Name.DefaultRGB]
         assert default_rgb[0] == Name.ICCBased
 
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_extgstate_only_type3_font_gets_default_rgb(self, nested) -> None:
+        pdf = new_pdf()
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type3,
+                CharProcs=Dictionary(
+                    A=pdf.make_stream(b"1000 0 d0 1 0 0 rg 0 0 100 100 re f")
+                ),
+                Resources=Dictionary(),
+            )
+        )
+        resources = Dictionary(
+            ExtGState=Dictionary(GS=Dictionary(Font=Array([font, 12])))
+        )
+        page = pdf.add_blank_page()
+        if nested:
+            form = pdf.make_stream(b"/GS gs BT (A) Tj ET")
+            form.Subtype = Name.Form
+            form.BBox = Array([0, 0, 100, 100])
+            form.Resources = resources
+            page.Resources = Dictionary(XObject=Dictionary(Fm=form))
+        else:
+            page.Resources = resources
+        page.Contents = pdf.make_stream(b"0 1 0 0 k 0 0 200 200 re f")
+
+        embed_color_profiles(pdf, "2b")
+
+        default_rgb = font.Resources.ColorSpace.DefaultRGB
+        assert default_rgb[0] == Name.ICCBased
+        assert default_rgb[1].N == 3
+
     def test_shading_in_type3_font_uses_font_default(self) -> None:
         """A Type3-font shading uses the font's DefaultRGB."""
         pdf = new_pdf()

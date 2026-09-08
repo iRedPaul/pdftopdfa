@@ -416,6 +416,8 @@ class FontUsageCache:
 
 def collect_font_usage(
     pdf: pikepdf.Pdf,
+    *,
+    require_resolved_font: bool = False,
 ) -> dict[_ObjectKey, set[CharacterCode]]:
     """Collects character codes used with each font across the entire PDF.
 
@@ -425,20 +427,28 @@ def collect_font_usage(
 
     Args:
         pdf: Opened pikepdf PDF object.
+        require_resolved_font: Exclude fonts matched only by the conservative
+            fallback, so subsetting retains the no-usage safety check.
 
     Returns:
         Dictionary mapping indirect font objgens, or serialized direct Type0
         font identities, to the character codes used with each font.
     """
     usage: dict[_ObjectKey, set[CharacterCode]] = {}
+    unresolved_usage: dict[_ObjectKey, set[CharacterCode]] = {}
 
     for page in pdf.pages:
         # A nested stream can inherit a font even with its own empty Resources.
         # Keep its unresolved text in every possible calling font on this page.
         page_fonts = tuple(font for _name, font in iter_all_page_fonts(page))
         for stream_owner, resources in _iter_content_streams_with_resources(page):
-            _process_content_stream(stream_owner, resources, usage, page_fonts)
+            _process_content_stream(
+                stream_owner, resources, usage, page_fonts, unresolved_usage
+            )
 
+    for font_key, codes in unresolved_usage.items():
+        if not require_resolved_font or font_key in usage:
+            usage.setdefault(font_key, set()).update(codes)
     return usage
 
 
@@ -447,6 +457,7 @@ def _process_content_stream(
     resources: pikepdf.Object,
     usage: dict[_ObjectKey, set[CharacterCode]],
     page_fonts: tuple[pikepdf.Object, ...],
+    unresolved_usage: dict[_ObjectKey, set[CharacterCode]],
 ) -> None:
     """Parses a content stream and records character code usage.
 
@@ -535,7 +546,7 @@ def _process_content_stream(
                 else:
                     codes = set(raw)
                 if codes:
-                    usage.setdefault(font_key, set()).update(codes)
+                    unresolved_usage.setdefault(font_key, set()).update(codes)
 
     for operands, operator in instructions:
         if operator == _Q_OPERATOR:
