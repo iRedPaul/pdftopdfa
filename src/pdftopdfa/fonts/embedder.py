@@ -336,6 +336,7 @@ class FontEmbedder:
         preserved_fonts: set[str] = set()
         processed_font_ids: set[tuple[int, int]] = set()
         font_usage: dict[tuple[int, int], set[CharacterCode]] | None = None
+        conservative_usage: dict[tuple[int, int], set[CharacterCode]] | None = None
 
         for font_key, font_obj in self._iter_unique_fonts(processed_font_ids):
             try:
@@ -362,13 +363,25 @@ class FontEmbedder:
                         font_usage = collect_font_usage(
                             self.pdf, require_resolved_font=True
                         )
+                    used_codes = font_usage.get(font_obj.objgen, set())
+                    if not used_codes:
+                        if conservative_usage is None:
+                            conservative_usage = collect_font_usage(self.pdf)
+                        if conservative_usage.get(font_obj.objgen):
+                            logger.warning(
+                                "Cannot safely replace CID font %s: unresolved usage",
+                                base_name,
+                            )
+                            if base_name not in result.fonts_failed:
+                                result.fonts_failed.append(base_name)
+                            continue
                     # Preserve encoding (Identity-H or Identity-V)
                     encoding = self._get_cidfont_encoding(font_obj)
                     success = self._embed_cidfont(
                         font_obj,
                         base_name,
                         encoding=encoding,
-                        used_codes=font_usage.get(font_obj.objgen, set()),
+                        used_codes=used_codes,
                     )
                 else:
                     # Replace font (use fallback for unknown fonts)

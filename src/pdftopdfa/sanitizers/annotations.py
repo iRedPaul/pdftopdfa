@@ -718,6 +718,24 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
         and (name is None or str(name) == "/Draft")
     ):
         return _create_draft_stamp_appearance_stream(pdf, annot)
+    if subtype in (Name.Square, Name.Text, Name.FileAttachment):
+        for key in ("/C", "/IC") if subtype == Name.Square else ("/C",):
+            color = annot.get(key)
+            if color is not None and (
+                not isinstance(color, Array)
+                or len(color) not in (0, 1, 3, 4)
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float, Decimal))
+                    or not math.isfinite(value)
+                    or not 0 <= value <= 1
+                    for value in color
+                )
+            ):
+                raise ConversionError(
+                    f"Cannot create {str(subtype)[1:]} appearance: "
+                    f"invalid {key} color array"
+                )
     if subtype == Name.Square:
         if annot.get("/BE") is not None or annot.get("/RD") is not None:
             raise ConversionError(
@@ -744,22 +762,6 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
                 "Cannot create Square appearance: invalid border width"
             )
         border_width = float(border_width)
-        for key in ("/C", "/IC"):
-            color = annot.get(key)
-            if color is not None and (
-                not isinstance(color, Array)
-                or len(color) not in (0, 1, 3, 4)
-                or any(
-                    isinstance(value, bool)
-                    or not isinstance(value, (int, float, Decimal))
-                    or not math.isfinite(value)
-                    or not 0 <= value <= 1
-                    for value in color
-                )
-            ):
-                raise ConversionError(
-                    f"Cannot create Square appearance: invalid {key} color array"
-                )
         stroke = _color_array_to_ops(annot.get("/C", Array([0])), stroke=True)
         if border_width == 0:
             stroke = ""

@@ -877,7 +877,15 @@ class TestEnsureAppearanceStreams:
                 ensure_appearance_streams(pdf)
             assert "/AP" not in annot
 
-    @pytest.mark.parametrize("key", ["/C", "/IC"])
+    @pytest.mark.parametrize(
+        "subtype, key",
+        [
+            (Name.Square, "/C"),
+            (Name.Square, "/IC"),
+            (Name.Text, "/C"),
+            (Name.FileAttachment, "/C"),
+        ],
+    )
     @pytest.mark.parametrize(
         "color",
         [
@@ -892,11 +900,11 @@ class TestEnsureAppearanceStreams:
             Array([1.1]),
         ],
     )
-    def test_square_malformed_color_raises(self, make_pdf_with_page, key, color):
+    def test_malformed_color_raises(self, make_pdf_with_page, subtype, key, color):
         pdf = make_pdf_with_page()
         annot = pdf.make_indirect(
             Dictionary(
-                Subtype=Name.Square,
+                Subtype=subtype,
                 Rect=Array([0, 0, 100, 100]),
             )
         )
