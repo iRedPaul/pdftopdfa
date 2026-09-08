@@ -377,6 +377,7 @@ class FontEmbedder:
                         font_obj,
                         base_name,
                         use_fallback=use_fallback,
+                        preserve_existing_encoding=True,
                     )
 
                 if base_name in processed_fonts:
@@ -1201,7 +1202,7 @@ class FontEmbedder:
             use_fallback: If True, use the fallback font (LiberationSans)
                 instead of looking up font_name in FONT_REPLACEMENTS.
             preserve_existing_encoding: If True, keep the font's current
-                code-to-Unicode mapping (used when refreshing subset fonts).
+                code-to-Unicode mapping when replacing its font program.
 
         Returns:
             A pair of success and whether the bundled fallback font was used.
@@ -1296,10 +1297,10 @@ class FontEmbedder:
         font_obj: pikepdf.Object,
         tt_font: "TTFont",
     ) -> tuple[list[int], Dictionary, bytes] | None:
-        """Preserve a simple font's visible code mapping during refresh.
+        """Preserve a simple font's code mapping during replacement.
 
-        Embedded subset fonts sometimes use a custom byte-to-glyph layout
-        together with a ToUnicode CMap. Refreshing the font program must keep
+        Simple fonts sometimes use a custom byte-to-glyph layout
+        together with a ToUnicode CMap. Replacing the font program must keep
         those byte codes mapped to the same Unicode text, otherwise rendered
         output changes even if the replacement font is metrically compatible.
         """

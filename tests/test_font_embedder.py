@@ -895,6 +895,46 @@ class TestFontEmbedderIntegration:
         not _liberation_fonts_available(),
         reason="Liberation fonts not installed",
     )
+    @pytest.mark.parametrize("with_tounicode", [False, True])
+    def test_embed_missing_font_preserves_custom_ocr_encoding(
+        self, pdf_with_helvetica, with_tounicode
+    ):
+        """Embedding must not turn custom OCR character codes into .notdef."""
+        from pdftopdfa.fonts.subsetter import _resolve_simple_font_encoding
+        from pdftopdfa.sanitizers.notdef_usage import sanitize_notdef_usage
+
+        pdf = pdf_with_helvetica
+        font = pdf.pages[0].Resources.Font.F1
+        font[Name.Subtype] = Name.TrueType
+        font[Name.BaseFont] = Name("/ArialMT")
+        font[Name.Encoding] = Dictionary(
+            BaseEncoding=Name.WinAnsiEncoding,
+            Differences=Array([0, Name.A, Name.F, Name.Z, Name.space]),
+        )
+        mapping = dict(enumerate(map(ord, "AFZ ")))
+        if with_tounicode:
+            font[Name.ToUnicode] = pdf.make_stream(
+                generate_tounicode_cmap_data(mapping)
+            )
+        content = b"BT /F1 12 Tf 3 Tr <000102> Tj [<03> -20 <0001>] TJ ET"
+        pdf.pages[0].Contents = pdf.make_stream(content)
+
+        with FontEmbedder(pdf) as embedder:
+            result = embedder.embed_missing_fonts()
+            assert result.fonts_embedded == ["ArialMT"]
+            embedder.subset_embedded_fonts()
+
+        assert sanitize_notdef_usage(pdf)["notdef_usage_fixed"] == 0
+        assert pdf.pages[0].Contents.read_bytes() == content
+        encoding = _resolve_simple_font_encoding(font)
+        assert [encoding[code] for code in mapping] == ["A", "F", "Z", "space"]
+        actual = parse_tounicode_cmap(font.ToUnicode.read_bytes())
+        assert {code: actual[code] for code in mapping} == mapping
+
+    @pytest.mark.skipif(
+        not _liberation_fonts_available(),
+        reason="Liberation fonts not installed",
+    )
     def test_replace_subsetted_standard14_font(self, pdf_with_helvetica):
         """Subsetted embedded Standard-14 fonts are refreshed to full fonts."""
         embedder = FontEmbedder(pdf_with_helvetica)
