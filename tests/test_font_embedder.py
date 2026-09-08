@@ -936,6 +936,54 @@ class TestFontEmbedderIntegration:
         reason="Liberation fonts not installed",
     )
     @pytest.mark.parametrize(
+        "encoding_name, with_differences",
+        [
+            ("/WinAnsiEncoding", False),
+            ("/MacRomanEncoding", False),
+            ("/StandardEncoding", False),
+            ("/WinAnsiEncoding", True),
+        ],
+    )
+    def test_embed_missing_font_with_partial_tounicode(
+        self, pdf_with_helvetica, encoding_name, with_differences
+    ):
+        """Codes absent from ToUnicode retain their encoding and glyph widths."""
+        from pdftopdfa.fonts.subsetter import _resolve_simple_font_encoding
+
+        pdf = pdf_with_helvetica
+        font = pdf.pages[0].Resources.Font.F1
+        font.Encoding = Name(encoding_name)
+        if with_differences:
+            font.Encoding = Dictionary(
+                BaseEncoding=Name(encoding_name),
+                Differences=Array([65, Name.F, 87, Name.i]),
+            )
+        font.ToUnicode = pdf.make_stream(generate_tounicode_cmap_data({65: ord("Z")}))
+        content = b"BT /F1 12 Tf (AW) Tj ET"
+        pdf.pages[0].Contents = pdf.make_stream(content)
+
+        with FontEmbedder(pdf) as embedder:
+            result = embedder.embed_missing_fonts()
+
+        assert result.fonts_embedded == ["Helvetica"]
+        assert result.fonts_failed == []
+        assert pdf.pages[0].Contents.read_bytes() == content
+        expected = {65: "Z", 87: "i" if with_differences else "W"}
+        encoding = _resolve_simple_font_encoding(font)
+        mapping = parse_tounicode_cmap(font.ToUnicode.read_bytes())
+        with TTFont(BytesIO(font.FontDescriptor.FontFile2.read_bytes())) as tt_font:
+            scale = 1000 / tt_font["head"].unitsPerEm
+            for code, glyph_name in expected.items():
+                assert encoding[code] == glyph_name
+                assert mapping[code] == ord(glyph_name)
+                advance = tt_font["hmtx"].metrics[glyph_name][0]
+                assert font.Widths[code - int(font.FirstChar)] == round(advance * scale)
+
+    @pytest.mark.skipif(
+        not _liberation_fonts_available(),
+        reason="Liberation fonts not installed",
+    )
+    @pytest.mark.parametrize(
         "entries",
         [
             b"2 beginbfchar\n<01> <00660069>\n<02> <0041>\nendbfchar",
