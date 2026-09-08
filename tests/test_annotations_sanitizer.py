@@ -823,6 +823,105 @@ class TestEnsureAppearanceStreams:
         with pytest.raises(ConversionError, match="invalid dash array"):
             ensure_appearance_streams(pdf)
 
+    @pytest.mark.parametrize(
+        "border",
+        [
+            42,
+            Name.bad,
+            "bad",
+            Array([]),
+            Array([0, 0]),
+            Array([0, 0, 1, Array([]), 0]),
+            Array([Name.bad, 0, 1]),
+            Array([0, 0, "1"]),
+            Array([0, 0, -1]),
+            Array([True, 0, 1]),
+        ],
+    )
+    def test_square_malformed_legacy_border_raises(self, make_pdf_with_page, border):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(
+                Subtype=Name.Square,
+                Rect=Array([0, 0, 100, 100]),
+                Border=border,
+            )
+        )
+        pdf.pages[0].Annots = Array([annot])
+
+        with pytest.raises(
+            ConversionError, match="invalid (legacy Border|border width)"
+        ):
+            ensure_appearance_streams(pdf)
+        assert "/AP" not in annot
+
+    @pytest.mark.parametrize("radii", [(10, 10), (10, 0), (0, 10)])
+    @pytest.mark.parametrize("has_bs", [False, True])
+    def test_square_legacy_corner_radii(self, make_pdf_with_page, radii, has_bs):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(
+                Subtype=Name.Square,
+                Rect=Array([0, 0, 100, 100]),
+                Border=Array([*radii, 2]),
+            )
+        )
+        if has_bs:
+            annot.BS = Dictionary(W=2)
+        pdf.pages[0].Annots = Array([annot])
+
+        if has_bs:
+            assert ensure_appearance_streams(pdf) == 1
+        else:
+            with pytest.raises(ConversionError, match="rounded corners"):
+                ensure_appearance_streams(pdf)
+            assert "/AP" not in annot
+
+    @pytest.mark.parametrize("key", ["/C", "/IC"])
+    @pytest.mark.parametrize(
+        "color",
+        [
+            Name.bad,
+            42,
+            "bad",
+            Array([0, 1]),
+            Array([Name.bad]),
+            Array(["0.5"]),
+            Array([True]),
+            Array([-0.1]),
+            Array([1.1]),
+        ],
+    )
+    def test_square_malformed_color_raises(self, make_pdf_with_page, key, color):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(
+                Subtype=Name.Square,
+                Rect=Array([0, 0, 100, 100]),
+            )
+        )
+        annot[key] = color
+        pdf.pages[0].Annots = Array([annot])
+
+        with pytest.raises(ConversionError, match="invalid .* color array"):
+            ensure_appearance_streams(pdf)
+        assert "/AP" not in annot
+
+    @pytest.mark.parametrize("key, paint", [("/C", "n"), ("/IC", "S")])
+    def test_square_empty_color_is_transparent(self, make_pdf_with_page, key, paint):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(
+                Subtype=Name.Square,
+                Rect=Array([0, 0, 100, 100]),
+            )
+        )
+        annot[key] = Array([])
+        pdf.pages[0].Annots = Array([annot])
+
+        assert ensure_appearance_streams(pdf) == 1
+        assert str(pikepdf.parse_content_stream(annot.AP.N)[-2].operator) == paint
+
     @pytest.mark.parametrize("subtype", [Name.Square, Name.Text, Name.FileAttachment])
     @pytest.mark.parametrize("opacity", [Name.bad, Array([1]), "bad", -0.1, 1.1])
     def test_malformed_opacity_raises(self, make_pdf_with_page, subtype, opacity):

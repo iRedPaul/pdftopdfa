@@ -8,6 +8,7 @@ import logging
 import math
 import threading
 from collections.abc import Iterator
+from decimal import Decimal
 
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
@@ -728,6 +729,22 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
             raise ConversionError(
                 "Cannot create Square appearance: invalid border width"
             )
+        for key in ("/C", "/IC"):
+            color = annot.get(key)
+            if color is not None and (
+                not isinstance(color, Array)
+                or len(color) not in (0, 1, 3, 4)
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float, Decimal))
+                    or not math.isfinite(value)
+                    or not 0 <= value <= 1
+                    for value in color
+                )
+            ):
+                raise ConversionError(
+                    f"Cannot create Square appearance: invalid {key} color array"
+                )
         stroke = _color_array_to_ops(annot.get("/C", Array([0])), stroke=True)
         if border_width == 0:
             stroke = ""
@@ -748,8 +765,28 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
             values = border.get("/D", Array([3]))
         elif annot.get("/BS") is None:
             legacy_border = annot.get("/Border")
-            if legacy_border is not None and len(legacy_border) == 4:
-                values = legacy_border[3]
+            if legacy_border is not None:
+                if (
+                    not isinstance(legacy_border, Array)
+                    or len(legacy_border) not in (3, 4)
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float, Decimal))
+                        or not math.isfinite(value)
+                        or value < 0
+                        for value in list(legacy_border)[:3]
+                    )
+                ):
+                    raise ConversionError(
+                        "Cannot create Square appearance: invalid legacy Border"
+                    )
+                if legacy_border[0] != 0 or legacy_border[1] != 0:
+                    raise ConversionError(
+                        "Cannot preserve Square annotation without an appearance: "
+                        "rounded corners require a source appearance"
+                    )
+                if len(legacy_border) == 4:
+                    values = legacy_border[3]
         if values is not None:
             if not isinstance(values, Array):
                 raise ConversionError(
