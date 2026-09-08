@@ -922,6 +922,25 @@ class TestEnsureAppearanceStreams:
         assert ensure_appearance_streams(pdf) == 1
         assert str(pikepdf.parse_content_stream(annot.AP.N)[-2].operator) == paint
 
+    @pytest.mark.parametrize("subtype", [Name.Text, Name.FileAttachment])
+    @pytest.mark.parametrize("color", [None, [], [0], [1, 0, 0], [0, 1, 0, 0]])
+    def test_note_color_transparency(self, make_pdf_with_page, subtype, color):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(Subtype=subtype, Rect=Array([0, 0, 100, 100]))
+        )
+        if color is not None:
+            annot.C = Array(color)
+        pdf.pages[0].Annots = Array([annot])
+
+        assert ensure_appearance_streams(pdf) == 1
+        paint_ops = [
+            str(operator)
+            for _, operator in pikepdf.parse_content_stream(annot.AP.N)
+            if str(operator) in {"S", "s", "f", "F", "f*", "B", "B*", "b", "b*"}
+        ]
+        assert paint_ops == ([] if color == [] else ["B", "S"])
+
     @pytest.mark.parametrize("subtype", [Name.Square, Name.Text, Name.FileAttachment])
     @pytest.mark.parametrize("opacity", [Name.bad, Array([1]), "bad", -0.1, 1.1])
     def test_malformed_opacity_raises(self, make_pdf_with_page, subtype, opacity):

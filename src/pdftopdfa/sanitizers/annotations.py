@@ -825,10 +825,11 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
             f"re {paint} Q"
         ).encode("ascii")
     elif subtype in (Name.Text, Name.FileAttachment):
-        # Note and attachment icon shapes are viewer-dependent. Keep a visible
-        # paper icon; Contents and the attached file remain on the annotation.
+        # Note and attachment icon shapes are viewer-dependent. Use a paper icon
+        # unless transparent; Contents and the attached file remain on the annotation.
         fill = _color_array_to_ops(annot.get("/C", Array([1, 1, 0.8])))
-        paint = "B" if fill else "S"
+        paint = "B" if fill else "n"
+        stroke = "S" if fill else "n"
         content = (
             f"q {fill} 0 G 1 w 0.5 0.5 "
             f"{_format_pdf_number(width - 1)} "
@@ -840,7 +841,7 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
             f"{_format_pdf_number(width * 0.2)} "
             f"{_format_pdf_number(height * 0.5)} m "
             f"{_format_pdf_number(width * 0.8)} "
-            f"{_format_pdf_number(height * 0.5)} l S Q"
+            f"{_format_pdf_number(height * 0.5)} l {stroke} Q"
         ).encode("ascii")
     else:
         raise ConversionError(
