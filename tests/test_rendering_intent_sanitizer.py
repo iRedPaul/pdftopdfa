@@ -572,6 +572,32 @@ class TestUndefinedOperatorsAndResources:
         assert "/ColorSpace" in font_resources
         assert "/CS0" in font_resources.ColorSpace
 
+    @pytest.mark.parametrize("also_in_fonts", [False, True])
+    def test_extgstate_type3_charprocs_sanitized(self, also_in_fonts):
+        pdf = new_pdf()
+        charproc = pdf.make_stream(b"0 0 d0 /Bad ri 42 UnknownOperator /CS0 cs")
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type3,
+                CharProcs=Dictionary(a=charproc),
+            )
+        )
+        _make_pdf_with_extgstate(pdf, Dictionary(Font=Array([font, 12])))
+        resources = pdf.pages[0].Resources
+        resources.ColorSpace = Dictionary(CS0=Name.DeviceRGB)
+        if also_in_fonts:
+            resources.Font = Dictionary(F1=font)
+
+        result = sanitize_rendering_intent(pdf)
+
+        assert result["ri_operators_fixed"] == 1
+        assert result["undefined_operators_removed"] == 1
+        instructions = pikepdf.parse_content_stream(charproc)
+        assert [str(i.operator) for i in instructions] == ["d0", "ri", "cs"]
+        assert instructions[1].operands[0] == Name.RelativeColorimetric
+        assert font.Resources.ColorSpace.CS0 == Name.DeviceRGB
+
     def test_equal_direct_type3_fonts_are_both_materialized(self):
         """Equal direct dictionaries are distinct mutable resource owners."""
         pdf = new_pdf()

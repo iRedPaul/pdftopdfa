@@ -182,7 +182,7 @@ class FontSubsetter:
         result = SubsettingResult()
 
         # Collect glyph usage across all content streams
-        font_usage = collect_font_usage(self.pdf)
+        font_usage = collect_font_usage(self.pdf, require_resolved_font=True)
 
         # Iterate all fonts and subset eligible ones
         processed_ids: set[tuple[int, int]] = set()

@@ -5,11 +5,14 @@
 """Annotation handling for PDF/A compliance."""
 
 import logging
+import math
 import threading
 from collections.abc import Iterator
+from decimal import Decimal
 
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
+from ..exceptions import ConversionError
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 from .base import (
@@ -22,7 +25,14 @@ from .base import (
     ANNOT_FLAG_TOGGLENOVIEW,
     FORBIDDEN_ANNOTATION_SUBTYPES,
 )
-from .widget_appearance import create_widget_appearance
+from .widget_appearance import (
+    _color_array_to_ops,
+    _format_pdf_number,
+    _get_border_width,
+    _get_rect_dimensions,
+    _make_form_stream,
+    create_widget_appearance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -206,12 +216,6 @@ def _append_page_content_stream(page, stream: Stream) -> None:
         return
 
     page.obj[Name.Contents] = Array([contents, stream])
-
-
-def _format_pdf_number(value: float) -> str:
-    """Format a float as a compact PDF numeric literal."""
-    text = f"{value:.12f}".rstrip("0").rstrip(".")
-    return text or "0"
 
 
 def _appearance_invocation_stream(
@@ -696,6 +700,16 @@ def _create_draft_stamp_appearance_stream(pdf: Pdf, annot) -> Stream:
 
 def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
     """Create a meaningful appearance when the source has no normal one."""
+    if annot.get("/Subtype") == Name.Widget:
+        return create_widget_appearance(pdf, annot, pdf.Root.get("/AcroForm"))
+    width, height = _get_rect_dimensions(annot)
+    if (
+        width <= 0
+        or height <= 0
+        or not math.isfinite(width)
+        or not math.isfinite(height)
+    ):
+        raise ConversionError("Cannot create annotation appearance: invalid Rect")
     subtype = annot.get("/Subtype")
     name = annot.get("/Name")
     if (
@@ -704,7 +718,153 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
         and (name is None or str(name) == "/Draft")
     ):
         return _create_draft_stamp_appearance_stream(pdf, annot)
-    return _create_minimal_appearance_stream(pdf, annot)
+    if subtype in (Name.Square, Name.Text, Name.FileAttachment):
+        for key in ("/C", "/IC") if subtype == Name.Square else ("/C",):
+            color = annot.get(key)
+            if color is not None and (
+                not isinstance(color, Array)
+                or len(color) not in (0, 1, 3, 4)
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float, Decimal))
+                    or not math.isfinite(value)
+                    or not 0 <= value <= 1
+                    for value in color
+                )
+            ):
+                raise ConversionError(
+                    f"Cannot create {str(subtype)[1:]} appearance: "
+                    f"invalid {key} color array"
+                )
+    if subtype == Name.Square:
+        if annot.get("/BE") is not None or annot.get("/RD") is not None:
+            raise ConversionError(
+                "Cannot preserve Square annotation without an appearance: "
+                "border effects and rectangle differences require a source appearance"
+            )
+        border = annot.get("/BS", Dictionary())
+        if not isinstance(border, Dictionary):
+            raise ConversionError(
+                "Cannot create Square appearance: invalid border dictionary"
+            )
+        border_width = (
+            border.get("/W", 1)
+            if annot.get("/BS") is not None
+            else _get_border_width(annot)
+        )
+        if (
+            isinstance(border_width, bool)
+            or not isinstance(border_width, (int, float, Decimal))
+            or not math.isfinite(border_width)
+            or border_width < 0
+        ):
+            raise ConversionError(
+                "Cannot create Square appearance: invalid border width"
+            )
+        border_width = float(border_width)
+        stroke = _color_array_to_ops(annot.get("/C", Array([0])), stroke=True)
+        if border_width == 0:
+            stroke = ""
+        fill = _color_array_to_ops(annot.get("/IC"))
+        style = border.get("/S", Name.S)
+        if style not in (Name.S, Name.D):
+            raise ConversionError(
+                "Cannot create Square appearance: unsupported border style"
+            )
+        dash = ""
+        values = None
+        if style == Name.D:
+            values = border.get("/D", Array([3]))
+        elif annot.get("/BS") is None:
+            legacy_border = annot.get("/Border")
+            if legacy_border is not None:
+                if (
+                    not isinstance(legacy_border, Array)
+                    or len(legacy_border) not in (3, 4)
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float, Decimal))
+                        or not math.isfinite(value)
+                        or value < 0
+                        for value in list(legacy_border)[:3]
+                    )
+                ):
+                    raise ConversionError(
+                        "Cannot create Square appearance: invalid legacy Border"
+                    )
+                if legacy_border[0] != 0 or legacy_border[1] != 0:
+                    raise ConversionError(
+                        "Cannot preserve Square annotation without an appearance: "
+                        "rounded corners require a source appearance"
+                    )
+                if len(legacy_border) == 4:
+                    values = legacy_border[3]
+        if values is not None:
+            if not isinstance(values, Array):
+                raise ConversionError(
+                    "Cannot create Square appearance: invalid dash array"
+                )
+            try:
+                values = [float(v) for v in values]
+            except (TypeError, ValueError) as e:
+                raise ConversionError(
+                    "Cannot create Square appearance: invalid dash array"
+                ) from e
+            if any(not math.isfinite(v) or v < 0 for v in values) or (
+                values and not any(values)
+            ):
+                raise ConversionError(
+                    "Cannot create Square appearance: invalid dash array"
+                )
+            dash = "[" + " ".join(_format_pdf_number(v) for v in values) + "] 0 d"
+        inset = border_width / 2 if stroke else 0
+        paint = "B" if stroke and fill else "S" if stroke else "f" if fill else "n"
+        content = (
+            f"q {stroke} {fill} {_format_pdf_number(border_width)} w {dash} "
+            f"{_format_pdf_number(inset)} {_format_pdf_number(inset)} "
+            f"{_format_pdf_number(width - 2 * inset)} "
+            f"{_format_pdf_number(height - 2 * inset)} "
+            f"re {paint} Q"
+        ).encode("ascii")
+    elif subtype in (Name.Text, Name.FileAttachment):
+        # Note and attachment icon shapes are viewer-dependent. Use a paper icon
+        # unless transparent; Contents and the attached file remain on the annotation.
+        fill = _color_array_to_ops(annot.get("/C", Array([1, 1, 0.8])))
+        paint = "B" if fill else "n"
+        stroke = "S" if fill else "n"
+        content = (
+            f"q {fill} 0 G 1 w 0.5 0.5 "
+            f"{_format_pdf_number(width - 1)} "
+            f"{_format_pdf_number(height - 1)} re {paint} "
+            f"{_format_pdf_number(width * 0.2)} "
+            f"{_format_pdf_number(height * 0.7)} m "
+            f"{_format_pdf_number(width * 0.8)} "
+            f"{_format_pdf_number(height * 0.7)} l "
+            f"{_format_pdf_number(width * 0.2)} "
+            f"{_format_pdf_number(height * 0.5)} m "
+            f"{_format_pdf_number(width * 0.8)} "
+            f"{_format_pdf_number(height * 0.5)} l {stroke} Q"
+        ).encode("ascii")
+    else:
+        raise ConversionError(
+            f"Cannot preserve {subtype} annotation without a normal appearance stream"
+        )
+    resources = Dictionary()
+    opacity = annot.get("/CA", 1)
+    if opacity != 1:
+        try:
+            opacity = float(opacity)
+        except (TypeError, ValueError) as e:
+            raise ConversionError(
+                "Cannot create annotation appearance: invalid opacity"
+            ) from e
+        if not math.isfinite(opacity) or not 0 <= opacity <= 1:
+            raise ConversionError(
+                "Cannot create annotation appearance: invalid opacity"
+            )
+        resources.ExtGState = Dictionary(Opacity=Dictionary(CA=opacity, ca=opacity))
+        content = b"q /Opacity gs " + content + b" Q"
+    return _make_form_stream(pdf, width, height, content, resources)
 
 
 def remove_needs_appearances(pdf: Pdf) -> bool:
@@ -841,8 +1001,9 @@ def ensure_appearance_streams(pdf: Pdf, level: str = "3b") -> int:
     PDF/A-2/3 (ISO 19005-2/3, clause 6.5.3) requires all annotations
     (except Popup) to have an /AP dictionary with at least an /N
     (Normal appearance) entry. For Widget annotations (form fields),
-    visible appearance streams are generated; for other annotation types,
-    minimal empty Form XObjects are used.
+    visible appearance streams are generated. Supported non-widget types get
+    visible appearances; unsupported missing appearances raise ConversionError
+    instead of hiding their content in an empty Form XObject.
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
@@ -927,6 +1088,8 @@ def ensure_appearance_streams(pdf: Pdf, level: str = "3b") -> int:
                             ap,
                         )
 
+            except ConversionError:
+                raise
             except Exception as e:
                 log_suppressed_error(
                     logger,

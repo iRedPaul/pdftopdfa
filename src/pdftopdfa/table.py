@@ -726,9 +726,9 @@ def _serialize_result(
     if not isinstance(html, str):
         raise OCRError("PaddleOCR table result field pred_html must be a string")
     box_values = _sequence(_field(table_result, "cell_box_list"), "cell_box_list")
-    if not box_values:
-        return TableRecognitionResult(table_type=table_type, html=html, cells=())
     cell_data = _html_cell_data(html)
+    if not cell_data:
+        return TableRecognitionResult(table_type=table_type, html=html, cells=())
     boxes: tuple[TableBoundingBox | None, ...]
     confidences: tuple[float | None, ...]
     if len(cell_data) == len(box_values):

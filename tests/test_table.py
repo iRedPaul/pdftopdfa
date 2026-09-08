@@ -716,7 +716,7 @@ def test_cell_confidence_averages_contained_ocr_and_empty_cell_is_none(
             {
                 "table_res_list": [
                     {
-                        "pred_html": "<table><tr><td></td></tr></table>",
+                        "pred_html": "<table></table>",
                         "cell_box_list": [],
                         "table_ocr_pred": {},
                     }
@@ -743,10 +743,12 @@ def test_empty_results_are_plain_typed_results(
     assert result.cells == ()
 
 
+@pytest.mark.parametrize("boxes", [(), ((0, 0, 120, 80),)])
 def test_inconsistent_html_and_box_cells_keep_structure_without_boxes(
     model_dirs: dict[str, Path],
     image_path: Path,
     caplog: pytest.LogCaptureFixture,
+    boxes: tuple,
 ) -> None:
     html = (
         "<table><tbody>"
@@ -756,7 +758,7 @@ def test_inconsistent_html_and_box_cells_keep_structure_without_boxes(
     )
     classifier, pipeline = _fake_models(
         "wired_table",
-        _prediction(html=html, boxes=((0, 0, 120, 80),)),
+        _prediction(html=html, boxes=boxes),
     )
 
     with (
@@ -784,7 +786,7 @@ def test_inconsistent_html_and_box_cells_keep_structure_without_boxes(
         (1, 1, 1, 1, "C", None, None),
     ]
     assert "html=3" in caplog.text
-    assert "cell_box_list=1" in caplog.text
+    assert f"cell_box_list={len(boxes)}" in caplog.text
 
 
 def test_skewed_cell_boxes_are_grouped_into_rows_by_top_tolerance(

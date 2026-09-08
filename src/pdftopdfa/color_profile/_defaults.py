@@ -85,7 +85,9 @@ def _apply_defaults_to_resource_graph(
                     ("xobjects", Name.XObject),
                 ):
                     child = value.get(key)
-                    if child is not None:
+                    if child is not None or (
+                        task_kind == "type3" and Name.ExtGState in value
+                    ):
                         stack.append(
                             (
                                 task_kind,

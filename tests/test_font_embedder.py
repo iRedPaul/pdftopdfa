@@ -141,6 +141,77 @@ def _build_unembedded_cidfont_pdf(
     return font, encoding
 
 
+@pytest.mark.parametrize("resolved", [False, True])
+def test_embedding_does_not_treat_fallback_only_usage_as_resolved(resolved):
+    pdf = new_pdf()
+    font, _ = _build_unembedded_cidfont_pdf(
+        pdf,
+        cmap_data=b"1 begincodespacerange <0000> <FFFF> endcodespacerange",
+        content_codes=b"\x00A",
+    )
+    page = pdf.pages[0]
+    if not resolved:
+        page.Contents = pdf.make_stream(b"BT /F1 12 Tf <0041> Tj ET")
+        page.Contents.Filter = Name.FlateDecode
+    form = pdf.make_stream(b"BT <0042> Tj ET")
+    form.Subtype = Name.Form
+    form.BBox = Array([0, 0, 100, 100])
+    form.Resources = Dictionary()
+    page.Resources.XObject = Dictionary(Fm=form)
+
+    with (
+        FontEmbedder(pdf) as embedder,
+        patch.object(embedder, "_embed_cidfont", return_value=False) as embed,
+    ):
+        embedder.embed_missing_fonts()
+
+    if resolved:
+        assert embed.call_count == 1
+        assert embed.call_args.args[0].objgen == font.objgen
+        assert embed.call_args.kwargs["used_codes"] == {b"\x00A", b"\x00B"}
+    else:
+        embed.assert_not_called()
+
+
+@pytest.mark.parametrize("resolved", [False, True])
+def test_embedding_preserves_cidfont_with_inherited_only_usage(resolved):
+    pdf = new_pdf()
+    font, encoding = _build_unembedded_cidfont_pdf(
+        pdf,
+        cmap_data=(
+            b"begincmap\n/UniJIS-UCS2-V usecmap\n"
+            b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n"
+            b"1 begincidchar <0041> 65535 endcidchar\nendcmap"
+        ),
+        content_codes=b"\x00A",
+        nested=True,
+    )
+    page = pdf.pages[0]
+    form = page.Resources.XObject.Fm1
+    form.Resources = Dictionary()
+    form.write(b"BT <0041> Tj ET")
+    page.Resources.Font = Dictionary(F1=font)
+    page.Contents = pdf.make_stream(
+        b"BT /F1 12 Tf " + (b"<0042> Tj " if resolved else b"") + b"ET /Fm1 Do"
+    )
+    original_font = font.unparse()
+    with (
+        FontEmbedder(pdf) as embedder,
+        patch.object(embedder, "_embed_cidfont", return_value=True) as embed,
+    ):
+        result = embedder.embed_missing_fonts()
+
+    if resolved:
+        assert result.fonts_failed == []
+        assert embed.call_args.kwargs["used_codes"] == {b"\x00A", b"\x00B"}
+    else:
+        embed.assert_not_called()
+        assert result.fonts_failed == ["MissingJapaneseFont"]
+        assert result.fonts_embedded == []
+        assert font.unparse() == original_font
+        assert font.Encoding.objgen == encoding.objgen
+
+
 class TestFontReplacements:
     """Tests for font mapping."""
 

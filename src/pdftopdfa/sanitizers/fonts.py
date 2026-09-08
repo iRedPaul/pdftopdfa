@@ -442,7 +442,9 @@ def _sanitize_cmap_encoding(
                 if effective_mapping is None:
                     used_codes: set[CharacterCode] | None = None
                     if font_dict.objgen != (0, 0):
-                        used_codes = usage_cache.get().get(font_dict.objgen)
+                        used_codes = usage_cache.get(require_resolved_font=True).get(
+                            font_dict.objgen
+                        )
                     local_mapping = parse_cid_encoding_cmap(data.encode("latin-1"))
                     if (
                         not used_codes

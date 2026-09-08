@@ -779,6 +779,7 @@ def _staged_input_copy(input_path: Path, output_path: Path) -> Iterator[Path]:
         delete=False,
     )
     staged_output = Path(staging.name) / f"snapshot{output_path.suffix}"
+    completed = False
     try:
         copy_to_private_stage(
             input_path,
@@ -786,15 +787,20 @@ def _staged_input_copy(input_path: Path, output_path: Path) -> Iterator[Path]:
             staged_output.name,
         )
         yield staged_output
+        completed = True
     finally:
-        try:
-            staging.cleanup()
-        except Exception as cleanup_error:
-            logger.warning(
-                "Could not delete staged unchanged copy: %s (%s)",
-                staged_output,
-                cleanup_error,
-            )
+        backup = staged_output.with_name(f"backup{output_path.suffix}")
+        if not completed and backup.exists():
+            logger.error("Publication failed; recovery copy retained at %s", backup)
+        else:
+            try:
+                staging.cleanup()
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Could not delete staged unchanged copy: %s (%s)",
+                    staged_output,
+                    cleanup_error,
+                )
 
 
 def _copy_input_to_output(
@@ -2659,14 +2665,20 @@ def convert_to_pdfa(
                 )
 
         if final_output_temp_directory is not None:
-            try:
-                final_output_temp_directory.cleanup()
-            except Exception as cleanup_error:
-                logger.warning(
-                    "Could not delete private PDF/A staging directory: %s (%s)",
-                    final_output_temp_directory.name,
-                    cleanup_error,
-                )
+            backup = (
+                Path(final_output_temp_directory.name) / f"backup{output_path.suffix}"
+            )
+            if final_output_temp_file is not None and backup.exists():
+                logger.error("Publication failed; recovery copy retained at %s", backup)
+            else:
+                try:
+                    final_output_temp_directory.cleanup()
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "Could not delete private PDF/A staging directory: %s (%s)",
+                        final_output_temp_directory.name,
+                        cleanup_error,
+                    )
 
         # Cleanup: Delete OCR temporary files
         ocr_cleanup_files = (

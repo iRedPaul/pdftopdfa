@@ -40,6 +40,28 @@ OCR_MODEL_ARGS = [
 ]
 
 
+@pytest.mark.parametrize("processing_only", [False, True])
+def test_single_file_preserves_target_created_during_conversion(
+    sample_pdf: Path, tmp_path: Path, processing_only: bool
+) -> None:
+    output = tmp_path / "concurrent.pdf"
+    sentinel = b"concurrent writer"
+    convert = cli_module.convert_to_pdfa
+
+    def create_target(**kwargs):
+        output.write_bytes(sentinel)
+        return convert(**kwargs)
+
+    args = [str(sample_pdf), str(output)]
+    if processing_only:
+        args.append("--no-pdfa")
+    with patch.object(cli_module, "convert_to_pdfa", side_effect=create_target):
+        result = CliRunner().invoke(main, args)
+    assert result.exit_code == EXIT_CONVERSION_FAILED
+    assert "already exists" in result.output
+    assert output.read_bytes() == sentinel
+
+
 @pytest.fixture
 def runner() -> CliRunner:
     """CLI Test Runner."""

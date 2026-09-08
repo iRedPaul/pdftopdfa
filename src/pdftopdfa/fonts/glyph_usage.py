@@ -16,9 +16,10 @@ from collections.abc import Iterator
 
 import pikepdf
 
+from ..utils import iter_type3_fonts
 from ..utils import resolve_indirect as _resolve_indirect
 from .tounicode import get_font_code_space_ranges, split_cmap_codes
-from .traversal import get_page_resources
+from .traversal import get_page_resources, iter_all_page_fonts
 
 CharacterCode = int | bytes
 _ObjectKey = tuple[int, int] | tuple[str, bytes]
@@ -324,36 +325,28 @@ def _iter_resource_graph(
                 except Exception:
                     continue
 
-        fonts = _resolve_indirect(resources.get("/Font"))
-        if isinstance(fonts, pikepdf.Dictionary):
-            for name in list(fonts.keys()):
-                try:
-                    font = _resolve_indirect(fonts[name])
-                    if (
-                        not isinstance(font, pikepdf.Dictionary)
-                        or str(font.get("/Subtype")) != "/Type3"
-                    ):
-                        continue
-                    t3_resources = _resolve_indirect(font.get("/Resources"))
-                    if not isinstance(t3_resources, pikepdf.Dictionary):
-                        t3_resources = resources
-                    font_context = (
-                        _object_identity(font),
-                        _object_identity(t3_resources),
-                    )
-                    if font_context in processed:
-                        continue
-                    processed.add(font_context)
-                    charprocs = _resolve_indirect(font.get("/CharProcs"))
-                    if isinstance(charprocs, pikepdf.Dictionary):
-                        for proc_name in list(charprocs.keys()):
-                            proc = _resolve_indirect(charprocs[proc_name])
-                            if isinstance(proc, pikepdf.Stream):
-                                discovered.append(("stream", proc, t3_resources))
-                    if _object_identity(t3_resources) != _object_identity(resources):
-                        discovered.append(("resources", t3_resources, None))
-                except Exception:
+        for _name, font in iter_type3_fonts(resources, set()):
+            try:
+                t3_resources = _resolve_indirect(font.get("/Resources"))
+                if not isinstance(t3_resources, pikepdf.Dictionary):
+                    t3_resources = resources
+                font_context = (
+                    _object_identity(font),
+                    _object_identity(t3_resources),
+                )
+                if font_context in processed:
                     continue
+                processed.add(font_context)
+                charprocs = _resolve_indirect(font.get("/CharProcs"))
+                if isinstance(charprocs, pikepdf.Dictionary):
+                    for proc_name in list(charprocs.keys()):
+                        proc = _resolve_indirect(charprocs[proc_name])
+                        if isinstance(proc, pikepdf.Stream):
+                            discovered.append(("stream", proc, t3_resources))
+                if _object_identity(t3_resources) != _object_identity(resources):
+                    discovered.append(("resources", t3_resources, None))
+            except Exception:
+                continue
 
         tasks.extend(reversed(discovered))
 
@@ -408,21 +401,27 @@ class FontUsageCache:
             pdf: Opened pikepdf PDF object.
         """
         self._pdf = pdf
-        self._usage: dict[_ObjectKey, set[CharacterCode]] | None = None
+        self._usage: dict[bool, dict[_ObjectKey, set[CharacterCode]]] = {}
 
-    def get(self) -> dict[_ObjectKey, set[CharacterCode]]:
-        """Returns the font usage map, collecting it on first access."""
-        if self._usage is None:
-            self._usage = collect_font_usage(self._pdf)
-        return self._usage
+    def get(
+        self, *, require_resolved_font: bool = False
+    ) -> dict[_ObjectKey, set[CharacterCode]]:
+        """Returns the requested usage map, collecting it on first access."""
+        if require_resolved_font not in self._usage:
+            self._usage[require_resolved_font] = collect_font_usage(
+                self._pdf, require_resolved_font=require_resolved_font
+            )
+        return self._usage[require_resolved_font]
 
     def invalidate(self) -> None:
         """Drops the cached usage map after content streams changed."""
-        self._usage = None
+        self._usage.clear()
 
 
 def collect_font_usage(
     pdf: pikepdf.Pdf,
+    *,
+    require_resolved_font: bool = False,
 ) -> dict[_ObjectKey, set[CharacterCode]]:
     """Collects character codes used with each font across the entire PDF.
 
@@ -432,17 +431,29 @@ def collect_font_usage(
 
     Args:
         pdf: Opened pikepdf PDF object.
+        require_resolved_font: Exclude fonts matched only by the conservative
+            fallback, so font replacement and subsetting retain the no-usage
+            safety check.
 
     Returns:
         Dictionary mapping indirect font objgens, or serialized direct Type0
         font identities, to the character codes used with each font.
     """
     usage: dict[_ObjectKey, set[CharacterCode]] = {}
+    unresolved_usage: dict[_ObjectKey, set[CharacterCode]] = {}
 
     for page in pdf.pages:
+        # A nested stream can inherit a font even with its own empty Resources.
+        # Keep its unresolved text in every possible calling font on this page.
+        page_fonts = tuple(font for _name, font in iter_all_page_fonts(page))
         for stream_owner, resources in _iter_content_streams_with_resources(page):
-            _process_content_stream(stream_owner, resources, usage)
+            _process_content_stream(
+                stream_owner, resources, usage, page_fonts, unresolved_usage
+            )
 
+    for font_key, codes in unresolved_usage.items():
+        if not require_resolved_font or font_key in usage:
+            usage.setdefault(font_key, set()).update(codes)
     return usage
 
 
@@ -450,6 +461,8 @@ def _process_content_stream(
     stream_owner: pikepdf.Object,
     resources: pikepdf.Object,
     usage: dict[_ObjectKey, set[CharacterCode]],
+    page_fonts: tuple[pikepdf.Object, ...],
+    unresolved_usage: dict[_ObjectKey, set[CharacterCode]],
 ) -> None:
     """Parses a content stream and records character code usage.
 
@@ -510,13 +523,10 @@ def _process_content_stream(
         operator: pikepdf.Operator,
     ) -> None:
         """Conservatively preserve shown codes for every effective font."""
-        font_dict = _resolve_indirect(resources.get("/Font"))
-        if not isinstance(font_dict, pikepdf.Dictionary):
-            return
         strings = list(text_operands(operands, operator))
-        for font_key in list(font_dict.keys()):
+        for font_obj in page_fonts:
             try:
-                font_obj = _resolve_indirect(font_dict[font_key])
+                font_obj = _resolve_indirect(font_obj)
                 objgen = font_obj.objgen
             except Exception:
                 continue
@@ -541,7 +551,7 @@ def _process_content_stream(
                 else:
                     codes = set(raw)
                 if codes:
-                    usage.setdefault(font_key, set()).update(codes)
+                    unresolved_usage.setdefault(font_key, set()).update(codes)
 
     for operands, operator in instructions:
         if operator == _Q_OPERATOR:
@@ -559,6 +569,20 @@ def _process_content_stream(
                 current_font = None
                 current_font_is_cid = False
                 current_code_space_ranges = None
+        elif operator == pikepdf.Operator("gs"):
+            states = resources.get("/ExtGState")
+            if operands and isinstance(states, pikepdf.Dictionary):
+                state = states.get(str(operands[0]))
+                if isinstance(state, pikepdf.Dictionary):
+                    font = state.get("/Font")
+                    if isinstance(font, pikepdf.Array) and len(font) == 2:
+                        font_obj = font[0]
+                        if isinstance(font_obj, pikepdf.Dictionary):
+                            current_font = font_obj
+                            current_font_is_cid = _is_cidfont(font_obj)
+                            current_code_space_ranges = get_font_code_space_ranges(
+                                font_obj
+                            )
         elif operator == _TF_OPERATOR:
             # Tf: set current font
             if operands:

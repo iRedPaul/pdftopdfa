@@ -20,7 +20,7 @@ from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..exceptions import ConversionError
 from ..fonts.glyph_usage import find_ambiguous_resource_context_streams
-from ..utils import log_suppressed_error
+from ..utils import iter_type3_fonts, log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 
 logger = logging.getLogger(__name__)
@@ -268,34 +268,26 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
                 ):
                     discovered.append(("stream", smask, Name.G, resources))
 
-        fonts = _resolve_indirect(resources.get("/Font"))
-        if isinstance(fonts, Dictionary):
-            for name in list(fonts.keys()):
-                font = _resolve_indirect(fonts[name])
-                if (
-                    not isinstance(font, Dictionary)
-                    or str(font.get("/Subtype")) != "/Type3"
-                ):
-                    continue
-                font_resources = _resolve_indirect(font.get("/Resources"))
-                if not isinstance(font_resources, Dictionary):
-                    font_resources = resources
-                font_context = (
-                    _object_identity(font),
-                    _object_identity(font_resources),
+        for _font_name, font in iter_type3_fonts(resources, set()):
+            font_resources = _resolve_indirect(font.get("/Resources"))
+            if not isinstance(font_resources, Dictionary):
+                font_resources = resources
+            font_context = (
+                _object_identity(font),
+                _object_identity(font_resources),
+            )
+            if font_context in processed_type3:
+                continue
+            processed_type3.add(font_context)
+            charprocs = _resolve_indirect(font.get("/CharProcs"))
+            if isinstance(charprocs, Dictionary):
+                discovered.extend(
+                    ("stream", charprocs, char_name, font_resources)
+                    for char_name in list(charprocs.keys())
+                    if isinstance(_resolve_indirect(charprocs[char_name]), Stream)
                 )
-                if font_context in processed_type3:
-                    continue
-                processed_type3.add(font_context)
-                charprocs = _resolve_indirect(font.get("/CharProcs"))
-                if isinstance(charprocs, Dictionary):
-                    discovered.extend(
-                        ("stream", charprocs, char_name, font_resources)
-                        for char_name in list(charprocs.keys())
-                        if isinstance(_resolve_indirect(charprocs[char_name]), Stream)
-                    )
-                if font_resources is not resources:
-                    discovered.append(("resources", font_resources, None, None))
+            if font_resources is not resources:
+                discovered.append(("resources", font_resources, None, None))
         return discovered
 
     def appearance_tasks(container, key, page_resources) -> list[tuple]:
@@ -717,28 +709,6 @@ def _iter_soft_mask_groups(resources, visited: set[tuple[int, int]]):
         yield group
 
 
-def _iter_type3_fonts(resources, visited: set[tuple[int, int]]):
-    """Yield Type3 fonts from a resources dictionary with cycle detection."""
-    resources = _resolve_indirect(resources)
-    if not isinstance(resources, Dictionary):
-        return
-
-    fonts = resources.get("/Font")
-    fonts = _resolve_indirect(fonts) if fonts else None
-    if not isinstance(fonts, Dictionary):
-        return
-
-    for font_name in list(fonts.keys()):
-        font = _resolve_indirect(fonts[font_name])
-        if not isinstance(font, Dictionary):
-            continue
-        if str(font.get("/Subtype")) != "/Type3":
-            continue
-        if not _visit_once(font, visited):
-            continue
-        yield font_name, font
-
-
 def _ensure_explicit_resources_in_resource_graph(
     resources,
     visited_forms: set[tuple[int, int]],
@@ -778,7 +748,7 @@ def _ensure_explicit_resources_in_resource_graph(
             if isinstance(form_resources, Dictionary):
                 pending.append(form_resources)
 
-        for _font_name, font in _iter_type3_fonts(parent, visited_fonts):
+        for _font_name, font in iter_type3_fonts(parent, visited_fonts):
             if not _visit_once(font, processed_owners):
                 continue
             font_resources, added, merged = _ensure_associated_resources(
@@ -859,7 +829,7 @@ def _sanitize_operators_in_resource_graph(
             sanitize_stream(form)
             pending.append(_resolve_indirect(form.get("/Resources")))
 
-        for _font_name, font in _iter_type3_fonts(parent, visited_fonts):
+        for _font_name, font in iter_type3_fonts(parent, visited_fonts):
             charprocs = _resolve_indirect(font.get("/CharProcs"))
             if isinstance(charprocs, Dictionary):
                 for name in list(charprocs.keys()):

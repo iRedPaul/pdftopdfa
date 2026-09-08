@@ -1892,8 +1892,10 @@ class TestEnsureAppearanceStreams:
         annot = _resolve_indirect(annot)
         assert annot.get("/AP") is None
 
-    def test_adds_ap_to_zero_width_annotation(self, tmp_path: Path) -> None:
-        """Annotation with zero width but non-zero height is NOT exempt and gets /AP.
+    def test_rejects_zero_width_annotation_without_appearance(
+        self, tmp_path: Path
+    ) -> None:
+        """A zero-width annotation is not exempt and cannot get a visible appearance.
 
         Rect=[50, 600, 50, 50]: x1==x2 but y1!=y2, so only one pair matches.
         Per ISO 19005-2 rule 6.3.3, BOTH pairs must be equal to be exempt.
@@ -1915,12 +1917,8 @@ class TestEnsureAppearanceStreams:
         pdf.save(test_path)
 
         pdf = open_pdf(test_path)
-        added = ensure_appearance_streams(pdf)
-        assert added == 1
-
-        annot = pdf.pages[0].Annots[0]
-        annot = _resolve_indirect(annot)
-        assert annot.get("/AP") is not None
+        with pytest.raises(ConversionError, match="invalid Rect"):
+            ensure_appearance_streams(pdf)
 
     def test_skips_annotation_with_existing_ap_n(self, tmp_path: Path) -> None:
         """Annotation that already has /AP /N returns 0."""
@@ -1982,7 +1980,7 @@ class TestEnsureAppearanceStreams:
         annot_no_ap2 = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Highlight,
+                Subtype=Name.Square,
                 Rect=Array([200, 0, 250, 50]),
             )
         )
@@ -2007,7 +2005,7 @@ class TestEnsureAppearanceStreams:
         annot1 = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Highlight,
+                Subtype=Name.Square,
                 Rect=Array([0, 0, 100, 50]),
             )
         )
@@ -2067,8 +2065,8 @@ class TestEnsureAppearanceStreams:
         assert float(bbox[2]) == pytest.approx(200.0)
         assert float(bbox[3]) == pytest.approx(50.0)
 
-    def test_annotation_without_rect_gets_zero_bbox(self, tmp_path: Path) -> None:
-        """Missing Rect produces BBox=[0,0,0,0]."""
+    def test_rejects_annotation_without_rect(self, tmp_path: Path) -> None:
+        """Missing Rect cannot produce a meaningful appearance."""
         pdf = new_pdf()
         page = pikepdf.Page(Dictionary(Type=Name.Page))
         pdf.pages.append(page)
@@ -2086,18 +2084,8 @@ class TestEnsureAppearanceStreams:
         pdf.save(test_path)
 
         pdf = open_pdf(test_path)
-        added = ensure_appearance_streams(pdf)
-        assert added == 1
-
-        annot = pdf.pages[0].Annots[0]
-        annot = _resolve_indirect(annot)
-        n = annot["/AP"]["/N"]
-        n = _resolve_indirect(n)
-        bbox = n["/BBox"]
-        assert float(bbox[0]) == 0
-        assert float(bbox[1]) == 0
-        assert float(bbox[2]) == 0
-        assert float(bbox[3]) == 0
+        with pytest.raises(ConversionError, match="invalid Rect"):
+            ensure_appearance_streams(pdf)
 
     def test_widget_annotation_gets_ap(self, tmp_path: Path) -> None:
         """Widget annotation is NOT exempt (only Popup is)."""

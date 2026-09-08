@@ -9,7 +9,7 @@ import sys
 from collections.abc import Generator
 from typing import Any
 
-from pikepdf import Dictionary, Pdf
+from pikepdf import Array, Dictionary, Pdf
 
 from .exceptions import ConversionError
 
@@ -181,7 +181,8 @@ def iter_type3_fonts(
 ) -> Generator[tuple[str, Dictionary], None, None]:
     """Yield Type3 font objects from a Resources dictionary.
 
-    Extracts fonts with ``/Subtype /Type3`` from ``/Resources/Font``,
+    Extracts fonts with ``/Subtype /Type3`` from ``/Resources/Font`` and
+    ``/Resources/ExtGState/*/Font``,
     using cycle detection via ``objgen`` to avoid infinite loops.
 
     Args:
@@ -195,17 +196,20 @@ def iter_type3_fonts(
     if not isinstance(resources, Dictionary):
         return
 
-    fonts = resources.get("/Font")
-    if not fonts:
-        return
+    fonts = resolve_indirect(resources.get("/Font"))
+    candidates = list(fonts.items()) if isinstance(fonts, Dictionary) else []
+    states = resolve_indirect(resources.get("/ExtGState"))
+    if isinstance(states, Dictionary):
+        for name, state in states.items():
+            if not isinstance(state, Dictionary):
+                continue
+            font = resolve_indirect(state.get("/Font"))
+            if isinstance(font, Array) and len(font) == 2:
+                candidates.append((name, font[0]))
 
-    fonts = resolve_indirect(fonts)
-    if not isinstance(fonts, Dictionary):
-        return
-
-    for font_name in list(fonts.keys()):
+    for font_name, font in candidates:
         try:
-            font = resolve_indirect(fonts[font_name])
+            font = resolve_indirect(font)
         except (AttributeError, TypeError, ValueError):
             continue
 
