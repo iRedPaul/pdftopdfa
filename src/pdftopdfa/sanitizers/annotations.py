@@ -704,6 +704,14 @@ def _create_draft_stamp_appearance_stream(pdf: Pdf, annot) -> Stream:
 
 def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
     """Create a meaningful appearance when the source has no normal one."""
+    width, height = _get_rect_dimensions(annot)
+    if (
+        width <= 0
+        or height <= 0
+        or not math.isfinite(width)
+        or not math.isfinite(height)
+    ):
+        raise ConversionError("Cannot create annotation appearance: invalid Rect")
     subtype = annot.get("/Subtype")
     name = annot.get("/Name")
     if (
@@ -712,11 +720,6 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
         and (name is None or str(name) == "/Draft")
     ):
         return _create_draft_stamp_appearance_stream(pdf, annot)
-    width, height = _get_rect_dimensions(annot)
-    if width <= 0 or height <= 0:
-        return _create_minimal_appearance_stream(pdf, annot)
-    if not math.isfinite(width) or not math.isfinite(height):
-        raise ConversionError("Cannot create annotation appearance: invalid Rect")
     if subtype == Name.Square:
         if annot.get("/BE") is not None or annot.get("/RD") is not None:
             raise ConversionError(
@@ -739,8 +742,14 @@ def _create_missing_appearance_stream(pdf: Pdf, annot) -> Stream:
                 "Cannot create Square appearance: unsupported border style"
             )
         dash = ""
+        values = None
         if style == Name.D:
             values = border.get("/D", Array([3]))
+        elif annot.get("/BS") is None:
+            legacy_border = annot.get("/Border")
+            if legacy_border is not None and len(legacy_border) == 4:
+                values = legacy_border[3]
+        if values is not None:
             dash = (
                 "[" + " ".join(_format_pdf_number(float(v)) for v in values) + "] 0 d"
             )

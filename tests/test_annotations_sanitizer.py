@@ -9,6 +9,7 @@ import pytest
 from conftest import register_form_widget, resolve, save_and_reopen
 from pikepdf import Array, Dictionary, Name
 
+from pdftopdfa.exceptions import ConversionError
 from pdftopdfa.sanitizers.annotations import (
     ensure_appearance_streams,
     fix_annotation_flags,
@@ -731,41 +732,60 @@ class TestEnsureAppearanceStreams:
         result = ensure_appearance_streams(pdf)
         assert result == 0
 
-    def test_adds_ap_to_zero_width_annotation(self, make_pdf_with_page):
-        """Zero-width (but non-zero height) annotation is NOT exempt per spec.
+    @pytest.mark.parametrize("subtype", ["/Text", "/Square", "/Circle", "/Stamp"])
+    @pytest.mark.parametrize("rect", [[100, 700, 100, 720], [100, 700, 120, 700]])
+    def test_rejects_partially_degenerate_rect(self, make_pdf_with_page, subtype, rect):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(Dictionary(Subtype=Name(subtype), Rect=Array(rect)))
+        pdf.pages[0].Annots = Array([annot])
 
-        ISO 19005-2 rule 6.3.3 requires BOTH x1==x2 AND y1==y2 for exemption.
-        """
+        with pytest.raises(ConversionError, match="invalid Rect"):
+            ensure_appearance_streams(pdf)
+        assert "/AP" not in annot
+
+    @pytest.mark.parametrize("subtype", ["/Text", "/Square", "/Circle", "/Stamp"])
+    def test_skips_fully_degenerate_rect(self, make_pdf_with_page, subtype):
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(Subtype=Name(subtype), Rect=Array([100, 700, 100, 700]))
+        )
+        pdf.pages[0].Annots = Array([annot])
+
+        assert ensure_appearance_streams(pdf) == 0
+        assert "/AP" not in annot
+
+    @pytest.mark.parametrize(
+        ("legacy_dash", "border_style", "expected_dash"),
+        [
+            ([4, 2], None, b"[4 2] 0 d"),
+            ([], None, b"[] 0 d"),
+            ([4, 2], "S", None),
+            ([4, 2], "D", b"[3] 0 d"),
+        ],
+    )
+    def test_square_legacy_border_dash(
+        self, make_pdf_with_page, legacy_dash, border_style, expected_dash
+    ):
         pdf = make_pdf_with_page()
         annot = pdf.make_indirect(
             Dictionary(
-                Type=Name.Annot,
-                Subtype=Name.Text,
-                Rect=Array([100, 700, 100, 720]),
+                Subtype=Name.Square,
+                Rect=Array([0, 0, 100, 100]),
+                Border=Array([0, 0, 2, Array(legacy_dash)]),
             )
         )
-        pdf.pages[0]["/Annots"] = Array([annot])
-        pdf = save_and_reopen(pdf)
-        result = ensure_appearance_streams(pdf)
-        assert result == 1
+        if border_style is not None:
+            annot.BS = Dictionary(S=Name("/" + border_style), W=2)
+        pdf.pages[0].Annots = Array([annot])
 
-    def test_adds_ap_to_zero_height_annotation(self, make_pdf_with_page):
-        """Zero-height (but non-zero width) annotation is NOT exempt per spec.
-
-        ISO 19005-2 rule 6.3.3 requires BOTH x1==x2 AND y1==y2 for exemption.
-        """
-        pdf = make_pdf_with_page()
-        annot = pdf.make_indirect(
-            Dictionary(
-                Type=Name.Annot,
-                Subtype=Name.Text,
-                Rect=Array([100, 700, 120, 700]),
-            )
-        )
-        pdf.pages[0]["/Annots"] = Array([annot])
-        pdf = save_and_reopen(pdf)
-        result = ensure_appearance_streams(pdf)
-        assert result == 1
+        assert ensure_appearance_streams(pdf) == 1
+        content = annot.AP.N.read_bytes()
+        assert b"2 w" in content
+        assert b"re S" in content
+        if expected_dash is None:
+            assert b"0 d" not in content
+        else:
+            assert expected_dash in content
 
     def test_skips_annotation_with_existing_ap_n(self, make_pdf_with_page):
         """Annotations with existing /AP /N are left alone."""
