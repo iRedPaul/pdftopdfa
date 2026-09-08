@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.9.12] - 2026-09-08
+
+### Bug Fixes
+
+- Generate missing appearances for supported annotations and reject unsupported visible annotations without usable appearances
+- Validate annotation rectangles and borders and preserve dash patterns, small color values, and transparent note icons
+- Preserve OCR font encodings when embedding fonts with partial or multiscalar ToUnicode mappings
+- Preserve fonts with unresolved glyph or CID usage and improve font traversal through graphics states
+- Sanitize rendering intents and color spaces in Type3 character procedures
+- Preserve existing outputs and recovery copies on publication failures
+- Retain recognized table cells when cell-detection boxes are missing
+
+### Documentation
+
+- Document annotation appearance support and conversion failures that prevent content loss
+
 ## [0.9.11] - 2026-09-04
 
 ### Bug Fixes
