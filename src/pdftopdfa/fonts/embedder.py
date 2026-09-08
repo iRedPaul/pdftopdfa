@@ -59,7 +59,6 @@ from .tounicode import (
     get_font_code_space_ranges,
     get_type0_cid_encoding_map,
     parse_cidtogidmap_stream,
-    parse_tounicode_cmap,
     parse_tounicode_cmap_sequences,
     resolve_glyph_to_unicode,
     resolve_symbol_glyph_to_unicode,
@@ -377,6 +376,7 @@ class FontEmbedder:
                         font_obj,
                         base_name,
                         use_fallback=use_fallback,
+                        preserve_existing_encoding=True,
                     )
 
                 if base_name in processed_fonts:
@@ -1201,7 +1201,7 @@ class FontEmbedder:
             use_fallback: If True, use the fallback font (LiberationSans)
                 instead of looking up font_name in FONT_REPLACEMENTS.
             preserve_existing_encoding: If True, keep the font's current
-                code-to-Unicode mapping (used when refreshing subset fonts).
+                code-to-Unicode mapping when replacing its font program.
 
         Returns:
             A pair of success and whether the bundled fallback font was used.
@@ -1296,10 +1296,10 @@ class FontEmbedder:
         font_obj: pikepdf.Object,
         tt_font: "TTFont",
     ) -> tuple[list[int], Dictionary, bytes] | None:
-        """Preserve a simple font's visible code mapping during refresh.
+        """Preserve a simple font's code mapping during replacement.
 
-        Embedded subset fonts sometimes use a custom byte-to-glyph layout
-        together with a ToUnicode CMap. Refreshing the font program must keep
+        Simple fonts sometimes use a custom byte-to-glyph layout
+        together with a ToUnicode CMap. Replacing the font program must keep
         those byte codes mapped to the same Unicode text, otherwise rendered
         output changes even if the replacement font is metrically compatible.
         """
@@ -1327,39 +1327,45 @@ class FontEmbedder:
         font_obj: pikepdf.Object,
     ) -> dict[int, int]:
         """Return the current simple font's code-to-Unicode mapping."""
+        tounicode_mapping: dict[int, int] = {}
         tounicode = font_obj.get("/ToUnicode")
         if tounicode is not None:
             try:
                 tounicode = _resolve_indirect(tounicode)
-                mapping = parse_tounicode_cmap(bytes(tounicode.read_bytes()))
+                mapping = parse_tounicode_cmap_sequences(bytes(tounicode.read_bytes()))
                 if mapping:
-                    return {
-                        code: unicode_val
-                        for code, unicode_val in mapping.items()
-                        if 0 <= code <= 255
+                    # The preserved encoding requires one Unicode scalar per code.
+                    if any(len(sequence) != 1 for sequence in mapping.values()):
+                        return {}
+                    tounicode_mapping = {
+                        int.from_bytes(code, "big"): sequence[0]
+                        for code, sequence in mapping.items()
+                        if int.from_bytes(code, "big") <= 255
                     }
             except Exception:
                 logger.debug("Could not parse existing ToUnicode for font refresh")
 
         encoding = font_obj.get("/Encoding")
         if encoding is None:
-            return {}
+            return tounicode_mapping
 
+        encoding_mapping: dict[int, int] = {}
         if isinstance(encoding, pikepdf.Name):
             enc_name = _safe_str(encoding)
             if enc_name == "/WinAnsiEncoding":
-                return generate_tounicode_for_winansi()
-            if enc_name == "/MacRomanEncoding":
-                return generate_tounicode_for_macroman()
-            if enc_name == "/StandardEncoding":
-                return generate_tounicode_for_standard_encoding()
-            return {}
+                encoding_mapping = generate_tounicode_for_winansi()
+            elif enc_name == "/MacRomanEncoding":
+                encoding_mapping = generate_tounicode_for_macroman()
+            elif enc_name == "/StandardEncoding":
+                encoding_mapping = generate_tounicode_for_standard_encoding()
+        else:
+            try:
+                encoding_mapping = generate_tounicode_from_encoding_dict(encoding)
+            except Exception:
+                logger.debug("Could not derive encoding mapping for font refresh")
 
-        try:
-            return generate_tounicode_from_encoding_dict(encoding)
-        except Exception:
-            logger.debug("Could not derive encoding mapping for font refresh")
-            return {}
+        # ToUnicode overrides the encoding only for codes it explicitly maps.
+        return encoding_mapping | tounicode_mapping
 
     @staticmethod
     def _build_glyph_names_from_unicode_map(
