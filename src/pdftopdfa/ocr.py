@@ -360,6 +360,7 @@ class _DeskewPlan:
     regular_ocr_pages: tuple[int, ...]
     redo_ocr_pages: tuple[int, ...]
     strip_text_pages: tuple[int, ...]
+    ambiguous_scan_pages: tuple[int, ...] = ()
 
 
 def _object_key(value: "pikepdf.Object") -> _ObjectKey:
@@ -1148,6 +1149,7 @@ def _plan_deskew_ocr(
             tuple(regular_ocr_pages),
             tuple(redo_ocr_pages),
             tuple(strip_text_pages),
+            tuple(ambiguous_scan_pages),
         )
     except Exception as exc:
         log_suppressed_error(
@@ -3135,6 +3137,8 @@ def apply_ocr(
                         redo=True,
                     )
                 elif not regular_pages:
+                    if plan.ambiguous_scan_pages:
+                        raise PriorOcrFoundError()
                     shutil.copy2(current_input, staged_output_path)
         else:
             plan = _plan_deskew_ocr(
@@ -3152,6 +3156,8 @@ def apply_ocr(
                 and not plan.regular_ocr_pages
                 and not plan.redo_ocr_pages
             ):
+                if plan.ambiguous_scan_pages:
+                    raise PriorOcrFoundError()
                 shutil.copy2(ocr_input_path, staged_output_path)
             else:
                 if pipeline_temp is None:

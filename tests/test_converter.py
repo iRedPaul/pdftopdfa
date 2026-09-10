@@ -2563,23 +2563,31 @@ class TestConvertToPdfa:
             "ua1",
         ]
 
+    @pytest.mark.parametrize("preserve_input", [False, True])
+    @pytest.mark.parametrize("failed_profile", ["2a", "ua1"])
     @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_pdfua_failure_is_structured_and_not_published(
-        self, mock_verapdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    def test_pdfua_failure_retains_validation_evidence(
+        self,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        preserve_input: bool,
+        failed_profile: str,
     ) -> None:
-        """A failed UA profile cannot replace the canonical enterprise output."""
+        """Candidate validation evidence survives original-input fallback."""
         mock_verapdf.side_effect = [
-            VeraPDFResult(compliant=True, flavour="2a"),
             VeraPDFResult(
-                compliant=False,
-                flavour="ua1",
-                errors=["Rule 7.1 failed"],
-            ),
+                compliant=profile != failed_profile,
+                flavour=profile,
+                errors=["Validation rule failed"] if profile == failed_profile else [],
+            )
+            for profile in ("2a", "ua1")
         ]
         output_path = tmp_dir / "output.pdf"
         output_path.write_bytes(b"approved output")
 
-        result = convert_to_pdfa.__wrapped__(
+        convert = convert_to_pdfa if preserve_input else convert_to_pdfa.__wrapped__
+        result = convert(
             sample_pdf,
             output_path,
             level="2a",
@@ -2587,14 +2595,21 @@ class TestConvertToPdfa:
         )
 
         assert result.pdfua_status is PDFUAStatus.VALIDATION_FAILED
-        assert result.published is False
+        assert result.validation_failed
+        assert result.candidate_sha256 is not None
+        assert result.published is preserve_input
+        assert result.success is preserve_input
+        assert result.skipped is preserve_input
+        assert not result.target_produced
         assert [evidence.profile for evidence in result.validation_results] == [
             "2a",
             "ua1",
         ]
-        assert result.validation_results[0].compliant is True
-        assert result.validation_results[1].compliant is False
-        assert output_path.read_bytes() == b"approved output"
+        for evidence in result.validation_results:
+            assert evidence.compliant is (evidence.profile != failed_profile)
+        assert output_path.read_bytes() == (
+            sample_pdf.read_bytes() if preserve_input else b"approved output"
+        )
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
     def test_convert_with_failing_validation_sets_flag(

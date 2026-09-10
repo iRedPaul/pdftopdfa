@@ -2811,7 +2811,7 @@ class TestApplyOcr:
         with patch(
             "pdftopdfa.ocr.ocrmypdf.ocr", side_effect=_copy_ocr_input
         ) as mock_ocr:
-            apply_ocr(
+            result = apply_ocr(
                 input_path,
                 output_path,
                 detection_model_dir=model_dirs[0],
@@ -2821,10 +2821,13 @@ class TestApplyOcr:
             )
 
         if with_scan:
+            assert result == output_path
             mock_ocr.assert_called_once()
             assert mock_ocr.call_args.kwargs["pages"] == "2"
             assert mock_ocr.call_args.kwargs["deskew"] is deskew
         else:
+            assert result is None
+            assert output_path.read_bytes() == input_path.read_bytes()
             mock_ocr.assert_not_called()
         with Pdf.open(input_path) as source, Pdf.open(output_path) as output:
             assert len(output.pages) == len(source.pages)
@@ -2836,6 +2839,41 @@ class TestApplyOcr:
             )
         assert json.loads(manifest_path.read_text())["pages"] == []
         assert "OCR skipped for page(s) [1]" in caplog.text
+
+    @pytest.mark.parametrize("deskew", [False, True])
+    @pytest.mark.parametrize("pdfa", [False, True])
+    def test_all_ambiguous_conversion_reports_ocr_skipped(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        deskew: bool,
+        pdfa: bool,
+    ) -> None:
+        from pdftopdfa.converter import convert_to_pdfa
+
+        input_path = tmp_dir / "ambiguous.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, hidden_form_text=True, vector=True)
+            pdf.save(input_path)
+
+        with patch("pdftopdfa.ocr.ocrmypdf.ocr") as mock_ocr:
+            result = convert_to_pdfa(
+                input_path,
+                output_path,
+                pdfa=pdfa,
+                ocr_detection_model_dir=model_dirs[0],
+                ocr_recognition_model_dir=model_dirs[1],
+                ocr_deskew=deskew,
+            )
+
+        mock_ocr.assert_not_called()
+        assert result.success and result.skipped and result.published
+        assert not result.target_produced
+        assert any("OCR skipped" in warning for warning in result.warnings)
+        assert not any("OCR performed" in warning for warning in result.warnings)
+        assert output_path.read_bytes() == input_path.read_bytes()
 
     def test_prior_ocr_preserves_original_text_before_deskew_preparation(
         self,

@@ -575,11 +575,12 @@ class TestOcrAnnotationIntegration:
 
         original = _make_pdf_with_stamp(tmp_dir, "integration.pdf")
 
-        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> None:
+        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> Path:
             """Simulate OCR by copying the source file."""
             import shutil
 
             shutil.copy2(str(src), str(dst))
+            return dst
 
         mock_apply_ocr.side_effect = fake_apply_ocr
 
@@ -593,7 +594,7 @@ class TestOcrAnnotationIntegration:
             ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
         )
 
-        assert result.success
+        assert result.success and not result.skipped
         # Check annotations survived
         with pikepdf.open(output) as merged:
             annots = merged.pages[0].get("/Annots")
@@ -619,10 +620,11 @@ class TestOcrAnnotationIntegration:
         original = tmp_dir / "acro_only.pdf"
         pdf.save(str(original))
 
-        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> None:
+        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> Path:
             with pikepdf.open(src) as prepared:
                 assert "/AcroForm" not in prepared.Root
             shutil.copy2(src, dst)
+            return dst
 
         mock_apply_ocr.side_effect = fake_apply_ocr
 
@@ -636,7 +638,7 @@ class TestOcrAnnotationIntegration:
             ocr_force=True,
         )
 
-        assert result.success
+        assert result.success and not result.skipped
         assert mock_apply_ocr.call_args.kwargs["force"] is True
         with pikepdf.open(output) as processed:
             assert str(processed.Root.AcroForm.Fields[0].T) == "field1"
@@ -668,7 +670,7 @@ class TestOcrAnnotationIntegration:
             ocr_deskew=True,
         )
 
-        assert result.success
+        assert result.success and not result.skipped
         assert mock_apply_ocr.call_args.kwargs["deskew"] is True
         assert mock_apply_ocr.call_args.kwargs["_annotated_pages"] == frozenset({1})
 
@@ -685,7 +687,7 @@ class TestOcrAnnotationIntegration:
 
         original = _make_pdf_with_stamp(tmp_dir, "mismatch_integration.pdf")
 
-        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> None:
+        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> Path:
             pdf = new_pdf()
             for _ in range(2):
                 pdf.pages.append(
@@ -697,6 +699,7 @@ class TestOcrAnnotationIntegration:
                     )
                 )
             pdf.save(dst)
+            return dst
 
         mock_apply_ocr.side_effect = fake_apply_ocr
 
@@ -730,10 +733,11 @@ class TestOcrAnnotationIntegration:
         original = tmp_dir / "plain.pdf"
         pdf.save(str(original))
 
-        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> None:
+        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> Path:
             import shutil
 
             shutil.copy2(str(src), str(dst))
+            return dst
 
         mock_apply_ocr.side_effect = fake_apply_ocr
 
@@ -762,10 +766,11 @@ class TestOcrAnnotationIntegration:
 
         original = _make_pdf_with_stamp(tmp_dir, "warn.pdf")
 
-        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> None:
+        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> Path:
             import shutil
 
             shutil.copy2(str(src), str(dst))
+            return dst
 
         mock_apply_ocr.side_effect = fake_apply_ocr
 
@@ -797,10 +802,11 @@ class TestOcrAnnotationIntegration:
 
         original = _make_pdf_with_stamp(tmp_dir, "cleanup.pdf")
 
-        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> None:
+        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> Path:
             import shutil
 
             shutil.copy2(str(src), str(dst))
+            return dst
 
         mock_apply_ocr.side_effect = fake_apply_ocr
 

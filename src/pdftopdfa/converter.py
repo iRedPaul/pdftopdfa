@@ -1395,9 +1395,13 @@ def _preserve_input_on_failure(
             target_produced=False,
             processing_time=time.perf_counter() - started,
             pdfua_status=(
-                PDFUAStatus.NOT_PRODUCED
-                if kwargs.get("pdfua", False)
-                else PDFUAStatus.NOT_REQUESTED
+                result.pdfua_status
+                if result.validation_failed
+                else (
+                    PDFUAStatus.NOT_PRODUCED
+                    if kwargs.get("pdfua", False)
+                    else PDFUAStatus.NOT_REQUESTED
+                )
             ),
         )
 
