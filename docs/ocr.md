@@ -55,6 +55,13 @@ created in private same-filesystem staging directories, then checked for
 pathname identity and byte-for-byte stability immediately before atomic
 publication.
 
+OCR preflight checks content size, operator counts, Form recursion, and raster
+limits. It leaves path ordering to the PDF renderer instead of applying the
+stricter path rules used for semantic layout extraction. Digital layout extraction
+also accepts empty path starts and style changes before painting.
+During conversion, encrypted PDFs are copied unchanged with a warning before OCR
+starts, including when they open with an empty user password.
+
 ## Installation
 
 Install exactly one OCR runtime. For CPU inference:

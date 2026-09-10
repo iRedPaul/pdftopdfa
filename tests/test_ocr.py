@@ -1231,6 +1231,39 @@ class TestRotatedOcrFormBoxes:
 class TestOcrResourcePreflight:
     """Tests for fail-closed page geometry and raster limits."""
 
+    @pytest.mark.parametrize("in_form", [False, True])
+    @pytest.mark.parametrize(
+        "content",
+        [
+            b"0 0 m 10 10 l q Q S",
+            b"0 0 m 10 10 l 1 0 0 1 5 5 cm S",
+            b"0 0 m 10 10 l BT ET S",
+            b"0 0 m 10 10 l W 2 w n",
+            b"0 0 m 10 10 l",
+            b"0 0 m 10 10 l BI /W 1 /H 1 /CS /G /BPC 8 ID \x00 EI S",
+        ],
+    )
+    def test_path_ordering_does_not_block_ocr(
+        self, tmp_dir: Path, content: bytes, in_form: bool
+    ) -> None:
+        path = tmp_dir / "renderable-path.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(100, 100))
+            stream = pdf.make_stream(content)
+            if in_form:
+                stream[Name.Subtype] = Name.Form
+                stream[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+                stream[Name.Resources] = Dictionary()
+                page.obj[Name.Resources] = Dictionary(XObject=Dictionary(Fm=stream))
+                page.obj[Name.Contents] = pdf.make_stream(b"/Fm Do")
+            else:
+                page.obj[Name.Contents] = stream
+            pdf.save(path)
+        original = path.read_bytes()
+
+        assert _preflight_ocr_input(path) == 600
+        assert path.read_bytes() == original
+
     @pytest.mark.parametrize(
         ("page_size", "expected_oversample"),
         [

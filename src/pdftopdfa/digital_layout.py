@@ -93,6 +93,30 @@ _PATH_CONTINUATION_OPERATORS = frozenset({"l", "c", "v", "y", "h"})
 _PATH_PAINTING_OPERATORS = frozenset(
     {"n", "S", "s", "f", "F", "f*", "B", "B*", "b", "b*"}
 )
+_PATH_STYLE_OPERATORS = frozenset(
+    {
+        "w",
+        "J",
+        "j",
+        "M",
+        "d",
+        "ri",
+        "i",
+        "gs",
+        "CS",
+        "cs",
+        "SC",
+        "SCN",
+        "sc",
+        "scn",
+        "G",
+        "g",
+        "RG",
+        "rg",
+        "K",
+        "k",
+    }
+)
 _TEXT_BASE14_FONTS = frozenset(
     {
         "Courier",
@@ -1548,7 +1572,14 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
     def _rectangular_clip_polygon(self) -> ClipPolygon:
         if not self.curpath:
             raise PDFInterpreterError("Clipping operator has no current path")
-        segments = list(self.curpath)
+        # Consecutive movetos replace an empty subpath; a trailing moveto
+        # likewise contributes no area to the clipping path.
+        segments = [
+            segment
+            for index, segment in enumerate(self.curpath)
+            if segment[0] != "m"
+            or (index + 1 < len(self.curpath) and self.curpath[index + 1][0] != "m")
+        ]
         while segments and segments[-1][0] == "h":
             segments.pop()
         if (
@@ -2477,6 +2508,7 @@ def _validate_content_work_budget(
     decoded_content_budget: _DecodedContentBudget | None = None,
     *,
     strict_provenance: bool = True,
+    validate_path_objects: bool = True,
     max_form_nesting_depth: int | None = _MAX_FORM_NESTING_DEPTH,
 ) -> None:
     document_operator_count = 0
@@ -2498,6 +2530,7 @@ def _validate_content_work_budget(
             decoded_content_budget.charge(owner, page_index)
             pending_clip = False
             has_current_path = False
+            has_path_segments = False
             for instruction in pikepdf.parse_content_stream(owner):
                 if strict_provenance:
                     page_operator_count += 1
@@ -2513,16 +2546,17 @@ def _validate_content_work_budget(
                         )
                 if isinstance(instruction, pikepdf.ContentStreamInlineImage):
                     if strict_provenance:
-                        if pending_clip:
+                        if validate_path_objects and pending_clip:
                             raise ConversionError(
                                 "Digital layout clipping path has no immediate "
                                 "path-painting terminator"
                             )
-                        if has_current_path:
+                        if validate_path_objects and has_path_segments:
                             raise ConversionError(
                                 "Digital layout path object is interrupted before "
                                 "painting"
                             )
+                        has_current_path = False
                         inline_image = instruction.iimage.obj
                         width = resolve_indirect(inline_image.get("/Width"))
                         height = resolve_indirect(inline_image.get("/Height"))
@@ -2532,7 +2566,7 @@ def _validate_content_work_budget(
                             )
                     continue
                 operator_name = str(instruction.operator)
-                if strict_provenance:
+                if strict_provenance and validate_path_objects:
                     if pending_clip and operator_name not in _PATH_PAINTING_OPERATORS:
                         raise ConversionError(
                             "Digital layout clipping path has no immediate "
@@ -2542,12 +2576,14 @@ def _validate_content_work_budget(
                         pending_clip = False
                     if operator_name in _PATH_START_OPERATORS:
                         has_current_path = True
+                        has_path_segments |= operator_name == "re"
                     elif operator_name in _PATH_CONTINUATION_OPERATORS:
                         if not has_current_path:
                             raise ConversionError(
                                 "Digital layout path construction operator has no "
                                 "current subpath"
                             )
+                        has_path_segments = True
                     elif operator_name in {"W", "W*"}:
                         if not has_current_path:
                             raise ConversionError(
@@ -2556,10 +2592,18 @@ def _validate_content_work_budget(
                         pending_clip = True
                     elif operator_name in _PATH_PAINTING_OPERATORS:
                         has_current_path = False
-                    elif has_current_path:
-                        raise ConversionError(
-                            "Digital layout path object is interrupted before painting"
-                        )
+                        has_path_segments = False
+                    elif (
+                        has_current_path and operator_name not in _PATH_STYLE_OPERATORS
+                    ):
+                        if has_path_segments:
+                            raise ConversionError(
+                                "Digital layout path object is interrupted before "
+                                "painting"
+                            )
+                        # Some producers leave a bare moveto before text or an
+                        # image. It has no painted geometry to interrupt.
+                        has_current_path = False
                 expected_operands = _DIRECT_TEXT_OPERAND_COUNTS.get(operator_name)
                 if (
                     strict_provenance
@@ -2642,11 +2686,11 @@ def _validate_content_work_budget(
                         active_forms | frozenset({form_key}),
                     )
                 )
-            if strict_provenance and pending_clip:
+            if strict_provenance and validate_path_objects and pending_clip:
                 raise ConversionError(
                     "Digital layout clipping path has no path-painting terminator"
                 )
-            if strict_provenance and has_current_path:
+            if strict_provenance and validate_path_objects and has_path_segments:
                 raise ConversionError(
                     "Digital layout path object has no path-painting terminator"
                 )
