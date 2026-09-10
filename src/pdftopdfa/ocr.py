@@ -2196,6 +2196,9 @@ def _validate_ocr_content_work_budget(
                     canonical_pdf,
                     frozenset(range(len(canonical_pdf.pages))),
                     _DecodedContentBudget(),
+                    # OCR renders paths; it does not need the path ordering
+                    # required for exact semantic layout extraction.
+                    validate_path_objects=False,
                 )
     except OCRError:
         raise

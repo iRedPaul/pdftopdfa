@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Bug Fixes
+
+- Keep OCR content resource limits without rejecting renderer-tolerated path ordering; accept empty subpaths and path style changes during digital layout extraction
+- Copy encrypted inputs unchanged with a warning and skip OCR and validation, including for empty user passwords and requested PDF/UA output
+
 ## [0.9.12] - 2026-09-08
 
 ### Bug Fixes

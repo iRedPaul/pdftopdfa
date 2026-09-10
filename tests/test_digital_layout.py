@@ -1561,6 +1561,65 @@ def test_rejects_unpainted_path_object_at_end_of_stream() -> None:
         extract_digital_layout(pdf)
 
 
+@pytest.mark.parametrize("in_form", [False, True])
+@pytest.mark.parametrize(
+    "path",
+    [
+        b"0 0 m 10 10 l 2.25 w 0.75 0.75 0.75 RG S",
+        b"0 0 m q 5 5 m 10 10 m BT /F1 10 Tf (Invoice) Tj ET Q",
+    ],
+)
+def test_accepts_invoice_path_sequences(path: bytes, in_form: bool) -> None:
+    pdf = pikepdf.Pdf.new()
+    resources = Dictionary(Font=Dictionary(F1=_font(pdf)))
+    content = path + b" BT /F1 10 Tf 20 20 Td (Visible) Tj ET"
+    if in_form:
+        form = _form(pdf, content, resources, bbox=(0, 0, 200, 100))
+        _page(pdf, b"/Fm Do", Dictionary(XObject=Dictionary(Fm=form)))
+    else:
+        _page(pdf, content, resources)
+
+    spans = extract_digital_layout(pdf)[0].spans
+    if in_form:
+        spans = spans[0].children
+    assert spans[-1].text == "Visible"
+    assert spans[-1].final_paint_uncertain is False
+
+
+def test_empty_subpaths_do_not_make_rectangular_clip_uncertain() -> None:
+    pdf = pikepdf.Pdf.new()
+    _page(
+        pdf,
+        (
+            b"0 0 m q 5 5 m 10 10 m 0 0 100 100 re 150 150 m W n "
+            b"BT /F1 10 Tf 20 20 Td (Visible) Tj ET Q"
+        ),
+        Dictionary(Font=Dictionary(F1=_font(pdf))),
+    )
+
+    span = extract_digital_layout(pdf)[0].spans[0]
+    assert span.text == "Visible"
+    assert span.clip_bbox == (0.0, 0.0, 100.0, 100.0)
+    assert span.final_paint_uncertain is False
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"0 0 m 10 10 l 2 w",
+        b"0 0 m 10 10 l 20 20 m BT ET S",
+        b"0 0 m 10 10 l W 2 w n",
+        b"0 0 m q 10 10 l S Q",
+    ],
+)
+def test_tolerated_path_sequences_do_not_bypass_path_guards(content: bytes) -> None:
+    pdf = pikepdf.Pdf.new()
+    _page(pdf, content)
+
+    with pytest.raises(ConversionError, match="path|subpath"):
+        extract_digital_layout(pdf)
+
+
 def test_accepts_multiple_subpaths_started_by_moveto_or_rectangle() -> None:
     pdf = pikepdf.Pdf.new()
     _page(pdf, b"0 0 m 10 10 l 20 20 5 5 re S")

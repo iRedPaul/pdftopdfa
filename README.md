@@ -45,8 +45,7 @@ preserving the original content, fonts, and layout where possible.
 
 pdftopdfa applies a multi-step conversion pipeline to make a PDF compliant with the PDF/A standard:
 
-1. **Pre-check** -- converts encrypted PDFs that open with an empty user
-   password, copies password-protected and, by default, digitally signed PDFs
+1. **Pre-check** -- copies encrypted and, by default, digitally signed PDFs
    unchanged, and otherwise detects if the PDF is already a valid PDF/A file
    (skips conversion if the existing conformance level meets or exceeds the
    target within the same PDF/A part; optionally skips any veraPDF-compliant
@@ -369,16 +368,13 @@ image, table, and reusable `OCRSession` APIs.
   PDF/UA-2 generation is not implemented: it requires a separate PDF 2.0 and
   PDF/A-4 output track. The low-level validator API can inspect an existing
   file with the `ua2` profile.
-- **Encrypted PDFs** -- encryption is removed from PDFs that open with an empty
-  user password. PDFs that require a password cannot be converted and are
-  ordinarily copied unchanged. With an automatically generated output name, the unchanged copy
-  still receives the `_pdfa.pdf` suffix; it is not a converted PDF/A file.
-  When PDF/A validation is requested, the unchanged input is not published by
-  default because the requested target could not be produced or validated.
-  A requested PDF/UA target returns `success=False` and
-  `pdfua_status="not_produced"` and preserves the destination without
-  publishing the protected input. `--publish-noncompliant` explicitly enables
-  unchanged copy-through.
+- **Encrypted PDFs** -- copied unchanged with a warning, including PDFs with an
+  empty user password. OCR and validation are skipped. This also applies when
+  PDF/UA or `--validate` is requested, without requiring `--publish-noncompliant`.
+  The result reports `success=True`, `skipped=True`, and no produced PDF/A target;
+  a requested PDF/UA target reports `pdfua_status="not_produced"`.
+  With an automatically generated output name, the unchanged copy still receives
+  the `_pdfa.pdf` suffix; it is not a converted PDF/A file.
 - **Digitally signed PDFs** -- signed PDFs are ordinarily copied unchanged because conversion would invalidate their signatures. Requested PDF/A validation withholds the unchanged input by default. A requested PDF/UA target returns `success=False` and `pdfua_status="not_produced"` without publishing by default; use `--allow-signature-invalidation` only when an unsigned archival copy is intentional
 - **Font replacement** -- fonts without a suitable metrically compatible replacement produce a warning; the resulting file may not be fully compliant
 - **Non-embedded CIDFonts (Identity encoding)** -- content streams reference glyph IDs of the original font; after replacement with a substitute font the same glyph IDs point to different or missing glyphs, so the affected text may render incorrectly or invisibly. Text extraction and copy/paste stay correct because the original ToUnicode mapping is preserved. A warning is emitted for each replaced CIDFont

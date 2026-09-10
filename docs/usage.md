@@ -563,16 +563,15 @@ except ConversionError as exc:
     print(f"Conversion failed: {exc}")
 ```
 
-Encrypted PDFs are ordinarily copied to the output path unchanged and returned with
-`success=True`, `skipped=True`, and a warning that conversion was skipped. The
-copy has not been converted and is not guaranteed to conform to PDF/A, even if
-its default output name ends in `_pdfa.pdf`. If PDF/A validation was requested,
-the unchanged input is not published by default and the result records an
-incomplete validation. If PDF/UA was requested, fail-closed publication
-preserves an existing destination and returns `success=False`,
-`published=False`, `target_produced=False`, and
-`pdfua_status="not_produced"`. `publication_policy="always"` or
-`--publish-noncompliant` explicitly enables unchanged copy-through.
+Encrypted PDFs, including those with an empty user password, are copied to the
+output path unchanged with `success=True`, `skipped=True`, `published=True`,
+and a warning. OCR and validation are skipped, even when requested. No validation
+failure is reported, and `validation_results` is empty. This copy behavior applies
+regardless of publication policy and respects the usual overwrite setting.
+The copy has not been converted and is not guaranteed to conform to PDF/A, even
+if its default output name ends in `_pdfa.pdf`. A requested PDF/A target reports
+`level=None` and `target_produced=False`; a requested PDF/UA target also reports
+`pdfua_status="not_produced"`. Encrypted files do not stop batch processing.
 
 Digitally signed PDFs are also copied unchanged by default, because OCR,
 metadata repair, font embedding, and PDF/A rewriting would invalidate the

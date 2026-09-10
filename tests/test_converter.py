@@ -1665,24 +1665,55 @@ class TestConvertToPdfa:
             convert_to_pdfa(input_path, output_path, level="invalid")
 
     def test_convert_encrypted_pdf(self, encrypted_pdf: Path, tmp_dir: Path) -> None:
-        """An encrypted PDF with an empty user password is converted."""
+        """An encrypted PDF with an empty user password is copied unchanged."""
         output_path = tmp_dir / "output.pdf"
         result = convert_to_pdfa(encrypted_pdf, output_path)
 
         assert result.success is True
-        assert result.skipped is False
-        assert result.level == "3b"
-        assert "Encryption removed for PDF/A compliance" in result.warnings
+        assert result.skipped is True
+        assert result.level is None
+        assert any("encrypted" in warning for warning in result.warnings)
         assert output_path.exists()
-        assert output_path.read_bytes() != encrypted_pdf.read_bytes()
+        assert output_path.read_bytes() == encrypted_pdf.read_bytes()
 
         with Pdf.open(output_path) as pdf:
-            assert pdf.is_encrypted is False
-            metadata = pdf.Root["/Metadata"]
-            assert metadata["/Type"] == Name.Metadata
-            assert metadata["/Subtype"] == Name.XML
-            output_intent = pdf.Root["/OutputIntents"][0]
-            assert output_intent["/DestOutputProfile"]["/N"] == 3
+            assert pdf.is_encrypted is True
+
+    @pytest.mark.parametrize("requires_password", [False, True])
+    @pytest.mark.parametrize("pdfa", [False, True])
+    def test_encrypted_pdf_is_copied_before_ocr(
+        self,
+        encrypted_pdf: Path,
+        password_encrypted_pdf: Path,
+        tmp_dir: Path,
+        requires_password: bool,
+        pdfa: bool,
+    ) -> None:
+        input_path = password_encrypted_pdf if requires_password else encrypted_pdf
+        original_bytes = input_path.read_bytes()
+        output_path = tmp_dir / "unchanged-ocr.pdf"
+        with (
+            patch("pdftopdfa.ocr.apply_ocr") as ocr,
+            patch("pdftopdfa.ocr.is_ocr_available", return_value=False) as available,
+        ):
+            result = convert_to_pdfa(
+                input_path,
+                output_path,
+                pdfa=pdfa,
+                ocr_languages=["de"],
+                ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+                ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            )
+
+        ocr.assert_not_called()
+        available.assert_not_called()
+        assert result.success is True
+        assert result.skipped is True
+        assert result.error is None
+        assert any("encrypted" in warning for warning in result.warnings)
+        assert not any("signature" in warning for warning in result.warnings)
+        assert input_path.read_bytes() == original_bytes
+        assert output_path.read_bytes() == original_bytes
 
     @pytest.mark.parametrize("pdfa", [True, False])
     def test_password_encrypted_pdf_is_copied_unchanged(
@@ -2509,109 +2540,47 @@ class TestConvertToPdfa:
         assert any("published despite" in warning for warning in result.warnings)
         assert output_path.read_bytes().startswith(b"%PDF-")
 
+    @pytest.mark.parametrize("requires_password", [False, True])
+    @pytest.mark.parametrize("pdfua", [False, True])
+    @pytest.mark.parametrize("publication_policy", [None, "validated", "always"])
     @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_encrypted_validation_failure_preserves_destination(
+    def test_encrypted_input_is_copied_even_with_requested_validation(
         self,
         mock_verapdf: MagicMock,
+        encrypted_pdf: Path,
         password_encrypted_pdf: Path,
         tmp_dir: Path,
+        requires_password: bool,
+        pdfua: bool,
+        publication_policy: str | None,
     ) -> None:
-        """An encrypted input cannot bypass fail-closed PDF/A validation."""
+        input_path = password_encrypted_pdf if requires_password else encrypted_pdf
         output_path = tmp_dir / "output.pdf"
-        sentinel = b"existing output"
-        output_path.write_bytes(sentinel)
-
-        result = convert_to_pdfa(password_encrypted_pdf, output_path, validate=True)
-
-        assert result.success is False
-        assert result.skipped is True
-        assert result.validation_failed is True
-        assert result.level is None
-        assert result.target_produced is False
-        assert result.published is False
-        assert result.pdfua_status is PDFUAStatus.NOT_REQUESTED
-        assert result.validation_results == (
-            ProfileValidationResult(
-                profile="3b",
-                error=(
-                    "PDF/A-3b validation could not run because the encrypted input "
-                    "could not be converted"
-                ),
-            ),
-        )
-        assert output_path.read_bytes() == sentinel
-        mock_verapdf.assert_not_called()
-
-    @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_encrypted_validation_failure_can_be_explicitly_published(
-        self,
-        mock_verapdf: MagicMock,
-        password_encrypted_pdf: Path,
-        tmp_dir: Path,
-    ) -> None:
-        """Best-effort publication retains failure state for encrypted input."""
-        output_path = tmp_dir / "output.pdf"
+        output_path.write_bytes(b"previous output")
 
         result = convert_to_pdfa(
-            password_encrypted_pdf,
+            input_path,
             output_path,
+            level="2a",
             validate=True,
-            publication_policy="always",
+            pdfua=pdfua,
+            publication_policy=publication_policy,
         )
 
-        assert result.success is False
-        assert result.validation_failed is True
-        assert result.published is True
-        assert any("published despite" in warning for warning in result.warnings)
-        assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
-        mock_verapdf.assert_not_called()
-
-    @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_pdfua_encrypted_skip_is_not_validated(
-        self,
-        mock_verapdf: MagicMock,
-        password_encrypted_pdf: Path,
-        tmp_dir: Path,
-    ) -> None:
-        """Mandatory PDF/UA validation is skipped for an unchanged input."""
-        output_path = tmp_dir / "output.pdf"
-        output_path.write_bytes(b"approved output")
-
-        result = convert_to_pdfa(
-            password_encrypted_pdf,
-            output_path,
-            level="2a",
-            pdfua=True,
-        )
-
-        assert result.success is False
+        assert result.success is True
         assert result.skipped is True
+        assert result.error is None
         assert result.validation_failed is False
+        assert result.validation_results == ()
         assert result.level is None
         assert result.target_produced is False
-        assert result.published is False
-        assert result.pdfua_status is PDFUAStatus.NOT_PRODUCED
-        assert output_path.read_bytes() == b"approved output"
-        mock_verapdf.assert_not_called()
-
-    def test_pdfua_encrypted_copy_requires_explicit_publication_policy(
-        self, password_encrypted_pdf: Path, tmp_dir: Path
-    ) -> None:
-        """Unsafe protected copy-through remains available only by opt-in."""
-        output_path = tmp_dir / "output.pdf"
-
-        result = convert_to_pdfa(
-            password_encrypted_pdf,
-            output_path,
-            level="2a",
-            pdfua=True,
-            publication_policy="always",
-        )
-
-        assert result.success is False
         assert result.published is True
-        assert result.pdfua_status is PDFUAStatus.NOT_PRODUCED
-        assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
+        assert result.pdfua_status is (
+            PDFUAStatus.NOT_PRODUCED if pdfua else PDFUAStatus.NOT_REQUESTED
+        )
+        assert any("encrypted" in warning for warning in result.warnings)
+        assert output_path.read_bytes() == input_path.read_bytes()
+        mock_verapdf.assert_not_called()
 
     @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_with_ocr_language_fails_when_unavailable(
@@ -5048,31 +5017,37 @@ class TestConvertFiles:
         assert not output_path.exists()
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_convert_files_fails_closed_for_encrypted_validation(
+    def test_convert_files_copies_encrypted_input_with_validation(
         self,
         mock_verapdf: MagicMock,
         password_encrypted_pdf: Path,
+        sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """Batch validation does not publish an unchanged encrypted input."""
+        """An encrypted skip does not stop conversion of the following file."""
         output_path = tmp_dir / "output.pdf"
+        converted_path = tmp_dir / "converted.pdf"
+        mock_verapdf.return_value = VeraPDFResult(compliant=True, flavour="3a")
 
         results = convert_files(
-            [(password_encrypted_pdf, output_path)],
+            [(password_encrypted_pdf, output_path), (sample_pdf, converted_path)],
             level="3a",
             validate=True,
         )
 
-        assert len(results) == 1
+        assert len(results) == 2
         result = results[0]
-        assert result.success is False
-        assert result.validation_failed is True
+        assert result.success is True
+        assert result.validation_failed is False
         assert result.skipped is True
         assert result.level is None
-        assert result.published is False
+        assert result.published is True
         assert any("PDF is encrypted" in warning for warning in result.warnings)
-        assert not output_path.exists()
-        mock_verapdf.assert_not_called()
+        assert output_path.read_bytes() == password_encrypted_pdf.read_bytes()
+        assert results[1].success is True
+        assert results[1].skipped is False
+        assert converted_path.exists()
+        mock_verapdf.assert_called_once()
 
     def test_convert_files_copies_password_encrypted_input(
         self,

@@ -839,78 +839,44 @@ def _copy_encrypted_input(
     *,
     pdfa: bool,
     pdfua: bool = False,
-    publish_unconverted: bool = False,
     validation_profile: str | None = None,
     start_time: float,
     allow_overwrite: bool = True,
 ) -> ConversionResult:
     """Handle an encrypted input without treating it as converted output."""
     warning = (
-        "Conversion skipped: PDF is encrypted and cannot be converted"
+        "Conversion skipped: PDF is encrypted; copied unchanged"
         if pdfa
-        else "Processing skipped: PDF is encrypted and cannot be processed"
+        else "Processing skipped: PDF is encrypted; copied unchanged"
     )
     logger.warning("%s: %s", warning, input_path)
     warnings = [warning]
-    validation_error = None
     if validation_profile is not None:
-        validation_error = (
-            f"PDF/A-{validation_profile} validation could not run because the "
-            "encrypted input could not be converted"
-        )
-        warnings.append(f"Validation: {validation_error}")
-
-    publication_requires_opt_in = pdfua or validation_error is not None
-    published = not publication_requires_opt_in or publish_unconverted
-    if published:
-        _copy_input_to_output(
-            input_path,
-            output_path,
-            allow_overwrite=allow_overwrite,
-        )
-    elif pdfua:
         warnings.append(
-            "Encrypted input was not published because the PDF/UA target "
-            "could not be produced"
+            f"PDF/A-{validation_profile} validation skipped: encrypted input "
+            "copied unchanged"
         )
-    if validation_error is not None:
+    if pdfua:
         warnings.append(
-            _VALIDATION_PUBLICATION_WARNING
-            if published
-            else _VALIDATION_WITHHELD_WARNING
+            "PDF/UA target was not produced: encrypted input copied unchanged"
         )
+    _copy_input_to_output(
+        input_path,
+        output_path,
+        allow_overwrite=allow_overwrite,
+    )
     processing_time = time.perf_counter() - start_time
     return ConversionResult(
-        success=not publication_requires_opt_in,
+        success=True,
         input_path=input_path,
         output_path=output_path,
         level=None,
         warnings=warnings,
         processing_time=processing_time,
-        error=(
-            "PDF/UA target was not produced because the input is encrypted"
-            if pdfua
-            else (
-                _VALIDATION_FAILURE_ERROR if published else _VALIDATION_WITHHELD_ERROR
-            )
-            if validation_error is not None
-            else None
-        ),
-        validation_failed=validation_error is not None,
         skipped=True,
-        published=published,
+        published=True,
         target_produced=not pdfa,
         pdfua_status=(PDFUAStatus.NOT_PRODUCED if pdfua else PDFUAStatus.NOT_REQUESTED),
-        validation_results=(
-            (
-                ProfileValidationResult(
-                    profile=validation_profile,
-                    error=validation_error,
-                ),
-            )
-            if validation_profile is not None
-            else ()
-        ),
     )
 
 
@@ -1528,18 +1494,16 @@ def convert_to_pdfa(
         # 0. Check if PDF is already PDF/A compliant (before OCR)
         with pikepdf.open(input_path) as check_pdf:
             if is_pdf_encrypted(check_pdf):
-                if not pdfa:
-                    check_pdf.close()
-                    return _copy_encrypted_input(
-                        input_path,
-                        output_path,
-                        pdfa=False,
-                        pdfua=False,
-                        publish_unconverted=True,
-                        start_time=start_time,
-                        allow_overwrite=_allow_output_overwrite,
-                    )
-                warnings.append("Encryption removed for PDF/A compliance")
+                check_pdf.close()
+                return _copy_encrypted_input(
+                    input_path,
+                    output_path,
+                    pdfa=pdfa,
+                    pdfua=pdfua,
+                    validation_profile=level if validate and not pdfua else None,
+                    start_time=start_time,
+                    allow_overwrite=_allow_output_overwrite,
+                )
             if pdfa and len(check_pdf.pages) == 0:
                 raise UnsupportedPDFError(
                     "PDF contains no pages and cannot be converted to PDF/A"
@@ -2614,9 +2578,6 @@ def convert_to_pdfa(
             output_path,
             pdfa=pdfa,
             pdfua=pdfua,
-            publish_unconverted=(
-                effective_publication_policy is PublicationPolicy.ALWAYS
-            ),
             validation_profile=level if validate and not pdfua else None,
             start_time=start_time,
             allow_overwrite=_allow_output_overwrite,
