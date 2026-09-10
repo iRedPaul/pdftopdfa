@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.9.13] - 2026-09-10
+
 ### Bug Fixes
 
 - Keep OCR content resource limits without rejecting renderer-tolerated path ordering; accept empty subpaths and path style changes during digital layout extraction
