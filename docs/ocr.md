@@ -360,6 +360,8 @@ result_path = apply_ocr(
 `apply_ocr()` raises `OCRError` for missing, structurally invalid, unreadable,
 or incompatible model artifacts, an unavailable requested provider, and OCR
 execution failures.
+If an existing text layer cannot be replaced, it copies the original PDF to
+the output path and returns `None` instead of a processed output path.
 
 Individual images can be recognized without creating a PDF:
 

@@ -2853,7 +2853,7 @@ class TestApplyOcr:
             "pdftopdfa.ocr.ocrmypdf.ocr",
             side_effect=PriorOcrFoundError(),
         ):
-            apply_ocr(
+            result = apply_ocr(
                 input_path,
                 output_path,
                 detection_model_dir=model_dirs[0],
@@ -2861,6 +2861,7 @@ class TestApplyOcr:
                 deskew=True,
             )
 
+        assert result is None
         assert output_path.read_bytes() == input_path.read_bytes()
 
     def test_prior_ocr_publishes_original_pdf_and_empty_manifest_atomically(

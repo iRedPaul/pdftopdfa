@@ -2860,7 +2860,7 @@ def apply_ocr(
     layout: bool = False,
     _annotated_pages: frozenset[int] | None = None,
     _manifest_output_path: Path | None = None,
-) -> Path:
+) -> Path | None:
     """Performs OCR on a PDF.
 
     Uses PaddleOCR for recognition and OCRmyPDF for rasterization, text-layer
@@ -2892,7 +2892,8 @@ def apply_ocr(
             markers and layout-derived reading order in the OCR text Forms.
 
     Returns:
-        Path to the OCR-processed PDF.
+        Path to the OCR-processed PDF, or None if an existing text layer could
+        not be replaced and the original input was copied to output_path.
 
     Raises:
         OCRError: If OCR is not available or fails.
@@ -2987,6 +2988,7 @@ def apply_ocr(
     manifest_run_number = 0
     existing_ocr_form_names: list[frozenset[str]] = []
     completed_successfully = False
+    skipped = False
     staged_output_snapshot: StagedFileSnapshot | None = None
     staged_manifest_snapshot: StagedFileSnapshot | None = None
 
@@ -3225,6 +3227,7 @@ def apply_ocr(
         raise OCRError(f"OCR failed: PDF is encrypted ({input_path})") from e
 
     except PriorOcrFoundError:
+        skipped = True
         logger.warning(
             "OCR skipped: an existing text layer could not be replaced; "
             "discarding the OCR attempt and preserving the original PDF"
@@ -3402,5 +3405,7 @@ def apply_ocr(
                     exc,
                 )
 
+    if skipped:
+        return None
     logger.info("OCR completed successfully: %s", output_path)
     return output_path

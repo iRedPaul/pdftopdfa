@@ -114,6 +114,59 @@ def test_any_conversion_stage_failure_preserves_input(
     assert not list(tmp_path.glob(".*_stage_*"))
 
 
+@pytest.mark.parametrize("exists", [False, True])
+def test_failed_in_place_conversion_does_not_report_publication(
+    sample_pdf: Path, tmp_path: Path, exists: bool
+) -> None:
+    input_path = sample_pdf if exists else tmp_path / "missing.pdf"
+    original = sample_pdf.read_bytes()
+
+    result = convert_to_pdfa(input_path, input_path)
+
+    assert not result.success and not result.published and not result.target_produced
+    assert "Input and output paths must differ" in result.error
+    assert sample_pdf.read_bytes() == original
+    assert input_path.exists() is exists
+
+
+def test_invalid_pdf_fallback_creates_destination_parent(tmp_path: Path) -> None:
+    input_path = tmp_path / "invalid.pdf"
+    input_path.write_bytes(b"invalid PDF")
+    output_path = tmp_path / "new" / "nested" / "output.pdf"
+
+    result = convert_to_pdfa(input_path, output_path)
+
+    assert result.success and result.skipped and result.published
+    assert not result.target_produced
+    assert output_path.read_bytes() == input_path.read_bytes()
+
+
+@pytest.mark.parametrize("pdfa", [False, True])
+def test_skipped_ocr_preserves_original_without_claiming_processing(
+    sample_pdf: Path, tmp_path: Path, pdfa: bool
+) -> None:
+    output_path = tmp_path / "output.pdf"
+    with (
+        patch("pdftopdfa.ocr.is_ocr_available", return_value=True),
+        patch("pdftopdfa.ocr.apply_ocr", return_value=None) as apply_ocr,
+    ):
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            pdfa=pdfa,
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        )
+
+    apply_ocr.assert_called_once()
+    assert result.success and result.skipped and result.published
+    assert not result.target_produced
+    assert result.level is None
+    assert any("OCR skipped" in warning for warning in result.warnings)
+    assert not any("OCR performed" in warning for warning in result.warnings)
+    assert output_path.read_bytes() == sample_pdf.read_bytes()
+
+
 def test_failed_original_copy_returns_error_without_replacing_destination(
     sample_pdf: Path, tmp_path: Path
 ) -> None:

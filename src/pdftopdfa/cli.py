@@ -912,9 +912,7 @@ def _convert_directory(
     ]
     skipped = [r for r in results if r.success and r.skipped]
     failed = [r for r in results if not r.success and not r.validation_failed]
-    validation_failures = [
-        r for r in results if r.validation_failed and not (r.success and r.skipped)
-    ]
+    validation_failures = [r for r in results if r.validation_failed]
     review_required = [
         r for r in results if r.review_required and not r.validation_failed
     ]

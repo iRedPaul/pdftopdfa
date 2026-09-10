@@ -2009,15 +2009,17 @@ class TestDirectoryValidationFailures:
             assert "Summary:" not in result.output
 
     @pytest.mark.parametrize("quiet", [False, True])
+    @pytest.mark.parametrize("copied", [False, True])
     @patch("pdftopdfa.cli.convert_directory")
-    def test_validation_fallback_copy_failure_is_reported(
+    def test_validation_fallback_is_reported(
         self,
         mock_convert_dir: MagicMock,
         runner: CliRunner,
         tmp_dir: Path,
         quiet: bool,
+        copied: bool,
     ) -> None:
-        """Failed original-input copies remain visible after validation fails."""
+        """Validation failures remain visible regardless of fallback success."""
         input_dir = tmp_dir / "input"
         input_dir.mkdir()
         input_path = input_dir / "test.pdf"
@@ -2027,14 +2029,15 @@ class TestDirectoryValidationFailures:
         )
         mock_convert_dir.return_value = [
             ConversionResult(
-                success=False,
+                success=copied,
                 input_path=input_path,
                 output_path=tmp_dir / "test_pdfa.pdf",
                 level=None,
                 warnings=["Validation: Rule 6.1.2 failed"],
-                error=error,
+                error=None if copied else error,
                 validation_failed=True,
-                published=False,
+                skipped=copied,
+                published=copied,
             )
         ]
         arguments = [str(input_dir)]
@@ -2043,8 +2046,10 @@ class TestDirectoryValidationFailures:
 
         result = runner.invoke(main, arguments)
 
-        assert result.exit_code == EXIT_VALIDATION_FAILED
-        assert f"test.pdf: {error}" in result.stderr
+        assert result.exit_code == (EXIT_SUCCESS if copied else EXIT_VALIDATION_FAILED)
+        assert "1 file(s) failed validation" in result.stderr
+        if not copied:
+            assert f"test.pdf: {error}" in result.stderr
         assert "Validation: Rule 6.1.2 failed" in result.stderr
         if quiet:
             assert "Summary:" not in result.output

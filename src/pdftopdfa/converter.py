@@ -1362,6 +1362,11 @@ def _preserve_input_on_failure(
             )
 
         try:
+            if _path_identity(input_path) == _path_identity(output_path):
+                raise ConversionError(
+                    f"Input and output paths must differ: {input_path}"
+                )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
             _copy_input_to_output(
                 input_path,
                 output_path,
@@ -1921,7 +1926,7 @@ def convert_to_pdfa(
                 else:
                     preserve_annots = False
 
-            apply_ocr(
+            ocr_output = apply_ocr(
                 ocr_source,
                 ocr_temp_file,
                 effective_ocr_languages,
@@ -1935,6 +1940,10 @@ def convert_to_pdfa(
                 _annotated_pages=annotated_pages,
                 _manifest_output_path=ocr_manifest_temp_file,
             )
+            if ocr_output is None:
+                raise OCRError(
+                    "OCR skipped: an existing text layer could not be replaced"
+                )
 
             # Re-inject original annotations into OCR output.
             if preserve_annots:
