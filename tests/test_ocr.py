@@ -1736,20 +1736,19 @@ class TestOcrResourcePreflight:
         assert manifest_path.read_bytes() == manifest_sentinel
 
     @pytest.mark.parametrize(
-        ("box_name", "coordinates", "message"),
+        ("box_name", "coordinates"),
         [
-            (Name.MediaBox, [0, 0, 2, 100], "page-boundary limits"),
-            (Name.MediaBox, [0, 0, 14_401, 100], "page-boundary limits"),
-            (Name.MediaBox, [100, 0, 0, 100], "non-normalized MediaBox"),
-            (Name.CropBox, [-1, 0, 90, 90], "outside its MediaBox"),
+            (Name.MediaBox, [0, 0, 2, 100]),
+            (Name.MediaBox, [0, 0, 14_401, 100]),
+            (Name.MediaBox, [100, 0, 0, 100]),
+            (Name.CropBox, [-1, 0, 90, 90]),
         ],
     )
-    def test_rejects_page_boxes_that_pdfa_sanitization_would_change(
+    def test_repairs_page_boxes_before_preflight(
         self,
         tmp_dir: Path,
         box_name: Name,
         coordinates: list[int],
-        message: str,
     ) -> None:
         path = tmp_dir / f"invalid-{str(box_name)[1:]}.pdf"
         with Pdf.new() as pdf:
@@ -1757,8 +1756,29 @@ class TestOcrResourcePreflight:
             page.obj[box_name] = pikepdf.Array(coordinates)
             pdf.save(path)
 
-        with pytest.raises(OCRError, match=message):
-            _preflight_ocr_input(path)
+        original = path.read_bytes()
+        assert _preflight_ocr_input(path) == 600
+        assert path.read_bytes() == original
+
+    @pytest.mark.parametrize(
+        "box_name", ["/CropBox", "/BleedBox", "/TrimBox", "/ArtBox"]
+    )
+    @pytest.mark.parametrize("edge", range(4))
+    @pytest.mark.parametrize("excess", [0.00001, 0.001, 100])
+    def test_preflight_repairs_overflowing_page_boxes(
+        self, tmp_dir: Path, box_name: str, edge: int, excess: float
+    ) -> None:
+        path = tmp_dir / "rounded-box.pdf"
+        with Pdf.new() as pdf:
+            page = pdf.add_blank_page(page_size=(650.88, 864))
+            coordinates = [0, 0, 650.88, 864]
+            coordinates[edge] += excess if edge >= 2 else -excess
+            page.obj[box_name] = pikepdf.Array(coordinates)
+            pdf.save(path)
+
+        original = path.read_bytes()
+        assert _preflight_ocr_input(path) == 600
+        assert path.read_bytes() == original
 
     @pytest.mark.parametrize(
         ("page_size", "rotate_pages", "exceeds_limit"),
@@ -1907,6 +1927,57 @@ def test_invisible_form_cleanup_preserves_text_show_operator(
 
 
 class TestApplyOcr:
+    @pytest.mark.parametrize(
+        "mode", [{}, {"force": True}, {"deskew": True}, {"rotate_pages": True}]
+    )
+    @pytest.mark.parametrize("inherited", [False, True])
+    @pytest.mark.parametrize(
+        "crop_box",
+        [[-50, -50, 150, 150], [200, 200, 300, 300], [90, 90, 10, 10], [0, 0, 100]],
+    )
+    def test_repairs_page_boxes_before_ocr(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        mode: dict[str, bool],
+        inherited: bool,
+        crop_box: list[int],
+    ) -> None:
+        input_path = tmp_dir / "invalid-box.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf)
+            page = pdf.pages[0]
+            owner = page.obj.Parent if inherited else page.obj
+            owner[Name.CropBox] = pikepdf.Array(crop_box)
+            pdf.save(input_path)
+        original = input_path.read_bytes()
+        expected = (
+            [10, 10, 90, 90] if crop_box == [90, 90, 10, 10] else [0, 0, 100, 100]
+        )
+
+        def process(source: Path, destination: Path, **kwargs: object) -> None:
+            with Pdf.open(source) as pdf:
+                assert list(pdf.pages[0].cropbox) == expected
+            _copy_ocr_input(source, destination, **kwargs)
+
+        with (
+            patch("pdftopdfa.ocr.ocrmypdf.ocr", side_effect=process) as run_ocr,
+            patch("pdftopdfa.ocr.normalize_pdf_orientation", side_effect=process),
+        ):
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                **mode,
+            )
+        run_ocr.assert_called_once()
+        assert input_path.read_bytes() == original
+        with Pdf.open(output_path) as pdf:
+            assert list(pdf.pages[0].cropbox) == expected
+
     @pytest.mark.parametrize("manifest_alias", ["input", "output"])
     def test_rejects_manifest_path_aliasing_pdf_paths(
         self,
