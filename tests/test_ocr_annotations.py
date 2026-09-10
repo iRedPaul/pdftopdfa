@@ -9,7 +9,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pikepdf
-import pytest
 from conftest import make_pdf_with_page, new_pdf, resolve
 from pikepdf import Array, Dictionary, Name, Pdf
 
@@ -19,7 +18,6 @@ from pdftopdfa.converter import (
     _restore_annotations_after_ocr,
     _strip_annotations_for_ocr,
 )
-from pdftopdfa.exceptions import OCRError
 
 _DETECTION_MODEL_DIR = Path("paddle-detection")
 _RECOGNITION_MODEL_DIR = Path("paddle-recognition")
@@ -577,11 +575,12 @@ class TestOcrAnnotationIntegration:
 
         original = _make_pdf_with_stamp(tmp_dir, "integration.pdf")
 
-        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> None:
+        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> Path:
             """Simulate OCR by copying the source file."""
             import shutil
 
             shutil.copy2(str(src), str(dst))
+            return dst
 
         mock_apply_ocr.side_effect = fake_apply_ocr
 
@@ -595,7 +594,7 @@ class TestOcrAnnotationIntegration:
             ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
         )
 
-        assert result.success
+        assert result.success and not result.skipped
         # Check annotations survived
         with pikepdf.open(output) as merged:
             annots = merged.pages[0].get("/Annots")
@@ -621,10 +620,11 @@ class TestOcrAnnotationIntegration:
         original = tmp_dir / "acro_only.pdf"
         pdf.save(str(original))
 
-        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> None:
+        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> Path:
             with pikepdf.open(src) as prepared:
                 assert "/AcroForm" not in prepared.Root
             shutil.copy2(src, dst)
+            return dst
 
         mock_apply_ocr.side_effect = fake_apply_ocr
 
@@ -638,7 +638,7 @@ class TestOcrAnnotationIntegration:
             ocr_force=True,
         )
 
-        assert result.success
+        assert result.success and not result.skipped
         assert mock_apply_ocr.call_args.kwargs["force"] is True
         with pikepdf.open(output) as processed:
             assert str(processed.Root.AcroForm.Fields[0].T) == "field1"
@@ -670,13 +670,13 @@ class TestOcrAnnotationIntegration:
             ocr_deskew=True,
         )
 
-        assert result.success
+        assert result.success and not result.skipped
         assert mock_apply_ocr.call_args.kwargs["deskew"] is True
         assert mock_apply_ocr.call_args.kwargs["_annotated_pages"] == frozenset({1})
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
-    def test_page_count_mismatch_aborts_conversion(
+    def test_page_count_mismatch_preserves_original_with_annotations(
         self,
         mock_is_available: MagicMock,
         mock_apply_ocr: MagicMock,
@@ -687,7 +687,7 @@ class TestOcrAnnotationIntegration:
 
         original = _make_pdf_with_stamp(tmp_dir, "mismatch_integration.pdf")
 
-        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> None:
+        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> Path:
             pdf = new_pdf()
             for _ in range(2):
                 pdf.pages.append(
@@ -699,21 +699,24 @@ class TestOcrAnnotationIntegration:
                     )
                 )
             pdf.save(dst)
+            return dst
 
         mock_apply_ocr.side_effect = fake_apply_ocr
 
         output = tmp_dir / "mismatch_output.pdf"
-        with pytest.raises(OCRError, match="prevent annotation loss"):
-            convert_to_pdfa(
-                original,
-                output,
-                level="2b",
-                ocr_languages=["en"],
-                ocr_detection_model_dir=_DETECTION_MODEL_DIR,
-                ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
-            )
+        result = convert_to_pdfa(
+            original,
+            output,
+            level="2b",
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        )
 
-        assert not output.exists()
+        assert result.success and result.skipped
+        assert not result.target_produced
+        assert any("prevent annotation loss" in warning for warning in result.warnings)
+        assert output.read_bytes() == original.read_bytes()
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
@@ -730,10 +733,11 @@ class TestOcrAnnotationIntegration:
         original = tmp_dir / "plain.pdf"
         pdf.save(str(original))
 
-        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> None:
+        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> Path:
             import shutil
 
             shutil.copy2(str(src), str(dst))
+            return dst
 
         mock_apply_ocr.side_effect = fake_apply_ocr
 
@@ -762,10 +766,11 @@ class TestOcrAnnotationIntegration:
 
         original = _make_pdf_with_stamp(tmp_dir, "warn.pdf")
 
-        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> None:
+        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> Path:
             import shutil
 
             shutil.copy2(str(src), str(dst))
+            return dst
 
         mock_apply_ocr.side_effect = fake_apply_ocr
 
@@ -797,10 +802,11 @@ class TestOcrAnnotationIntegration:
 
         original = _make_pdf_with_stamp(tmp_dir, "cleanup.pdf")
 
-        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> None:
+        def fake_apply_ocr(src: Path, dst: Path, *args, **kwargs) -> Path:
             import shutil
 
             shutil.copy2(str(src), str(dst))
+            return dst
 
         mock_apply_ocr.side_effect = fake_apply_ocr
 

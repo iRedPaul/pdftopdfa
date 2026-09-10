@@ -20,7 +20,8 @@ preserving the original content, fonts, and layout where possible.
   (ISO 19005-2 and ISO 19005-3), including Tagged PDF output for scanned
   documents
 - **PDF/UA-1** -- optional dual-conformance output with PDF/A-2a or PDF/A-3a
-- **Auditable PDF/UA workflow** -- fail-closed publication, explicit machine and
+- **Auditable PDF/UA workflow** -- validated candidates, original-input fallback,
+  explicit machine and
   author-review states, and atomic JSON evidence reports
 - **Automatic font embedding** -- uses policy-approved Windows system fonts or bundled replacements
 - **Font subsetting** -- reduces file size by removing unused glyphs
@@ -94,8 +95,12 @@ is not bundled. Install version 1.30.2 or newer and make its launcher available 
 `VERAPDF_PATH` to the executable or its parent directory. `--validate` and
 `validate=True` opt ordinary PDF/A output into validation. PDF/UA output always
 attempts validation against both the selected PDF/A profile and veraPDF's `ua1`
-profile. Validation is fail-closed: if a requested check cannot run or fails,
-the staged candidate is not published and an existing destination is preserved.
+profile. If a requested check cannot run or fails, the staged candidate is
+withheld and the original input is copied to the output instead. Processing
+errors in OCR, fonts, sanitization, tagging, or saving use the same fallback.
+The result reports `skipped=True`, `level=None`, and `target_produced=False`
+with a warning; the unchanged copy is not a converted PDF/A. If even copying
+is impossible, a failed result is returned and batch processing continues.
 Use `--publish-noncompliant` or `publication_policy="always"` only when an
 explicitly non-conforming review candidate is required.
 
@@ -129,8 +134,9 @@ OCR uses PaddleOCR 3.7 with the selected ONNX Runtime provider. Installing the
 DirectML extra does not select it automatically; use
 `--ocr-execution-provider directml` or
 `ocr_execution_provider="directml"`. CPU remains the default. If DirectML is
-requested but unavailable, processing stops with an error instead of falling
-back to the CPU.
+requested but unavailable, the OCR runtime reports an error without switching
+to the CPU. The high-level converter preserves the original input and reports
+the cause as a warning.
 
 On a machine with several GPUs, `directml:<index>` passes a raw DXGI adapter
 index, for example `--ocr-execution-provider directml:1`. Plain `directml` uses
@@ -321,8 +327,9 @@ Supplying both model directories enables OCR in `convert_to_pdfa()`,
 `convert_files()`, and `convert_directory()`. Supplying only one directory, or
 requesting OCR through `ocr_languages`, `ocr_force`, `ocr_deskew`,
 `ocr_rotate_pages`, `ocr_layout=True`, `ocr_figure_text=True`, or a non-CPU
-execution provider without both directories, raises `ValueError` before
-processing starts. Set
+execution provider without both directories fails configuration validation.
+`convert_to_pdfa()` handles this through the original-input fallback; batch-wide
+configuration checks still reject the invocation. Set
 `ocr_execution_provider="directml"` to use the supported DirectML configuration
 on Windows 11, or `ocr_execution_provider="directml:1"` to pass a specific raw
 DXGI adapter index.
@@ -375,7 +382,13 @@ image, table, and reusable `OCRSession` APIs.
   a requested PDF/UA target reports `pdfua_status="not_produced"`.
   With an automatically generated output name, the unchanged copy still receives
   the `_pdfa.pdf` suffix; it is not a converted PDF/A file.
-- **Digitally signed PDFs** -- signed PDFs are ordinarily copied unchanged because conversion would invalidate their signatures. Requested PDF/A validation withholds the unchanged input by default. A requested PDF/UA target returns `success=False` and `pdfua_status="not_produced"` without publishing by default; use `--allow-signature-invalidation` only when an unsigned archival copy is intentional
+- **Digitally signed PDFs** -- signed PDFs are ordinarily copied unchanged because
+  conversion would invalidate their signatures, including when `--validate` or
+  `--pdfua` is requested. If copying succeeds, the result reports `success=True`,
+  `published=True`, `skipped=True`, and `target_produced=False`; a requested
+  PDF/UA target reports `pdfua_status="not_produced"`. The unchanged copy is not
+  a converted or validated target. Use `--allow-signature-invalidation` only when
+  an unsigned archival copy is intentional.
 - **Font replacement** -- fonts without a suitable metrically compatible replacement produce a warning; the resulting file may not be fully compliant
 - **Non-embedded CIDFonts (Identity encoding)** -- content streams reference glyph IDs of the original font; after replacement with a substitute font the same glyph IDs point to different or missing glyphs, so the affected text may render incorrectly or invisibly. Text extraction and copy/paste stay correct because the original ToUnicode mapping is preserved. A warning is emitted for each replaced CIDFont
 

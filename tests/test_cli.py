@@ -23,7 +23,6 @@ from pdftopdfa.cli import (
     EXIT_FILE_NOT_FOUND,
     EXIT_GENERAL_ERROR,
     EXIT_PERMISSION_ERROR,
-    EXIT_REVIEW_REQUIRED,
     EXIT_SUCCESS,
     EXIT_VALIDATION_FAILED,
     main,
@@ -630,7 +629,7 @@ class TestCliConvert:
 
     @patch("pdftopdfa.cli.convert_to_pdfa")
     @pytest.mark.parametrize("quiet", [False, True])
-    def test_cli_single_file_known_validation_failure_returns_exit_code(
+    def test_cli_reports_published_validation_failure_without_aborting(
         self,
         mock_convert_to_pdfa,
         quiet: bool,
@@ -646,13 +645,14 @@ class TestCliConvert:
         ]
         review_warning = "Generated alternatives require review"
         mock_convert_to_pdfa.return_value = ConversionResult(
-            success=False,
+            success=True,
             input_path=sample_pdf,
             output_path=output_path,
             level="2b",
             warnings=[*validation_errors, review_warning],
             error="Validation failed; output candidate was published",
             validation_failed=True,
+            target_produced=False,
         )
 
         result = cli_module._convert_single_file(
@@ -665,13 +665,14 @@ class TestCliConvert:
             pdfua=True,
         )
 
-        assert result == EXIT_VALIDATION_FAILED
+        assert result == EXIT_SUCCESS
         captured = capsys.readouterr()
         assert all(error in captured.err for error in validation_errors)
         assert (review_warning in captured.out) is not quiet
+        assert "Converted to PDF/A" not in captured.out
 
     @patch("pdftopdfa.cli.convert_to_pdfa")
-    def test_cli_returns_distinct_author_review_status(
+    def test_cli_reports_author_review_without_aborting(
         self,
         mock_convert_to_pdfa: MagicMock,
         sample_pdf: Path,
@@ -697,7 +698,7 @@ class TestCliConvert:
             pdfua=True,
         )
 
-        assert result == EXIT_REVIEW_REQUIRED
+        assert result == EXIT_SUCCESS
 
     def test_cli_convert_simple(
         self, runner: CliRunner, sample_pdf: Path, tmp_dir: Path
@@ -834,6 +835,70 @@ class TestCliPermissionErrors:
 
         assert result.exit_code == EXIT_PERMISSION_ERROR
         assert "Access denied: read-only" in result.output
+
+    @pytest.mark.parametrize("directory", [False, True])
+    @pytest.mark.parametrize(
+        ("error_type", "expected_exit"),
+        [(PermissionError, EXIT_PERMISSION_ERROR), (OSError, EXIT_CONVERSION_FAILED)],
+    )
+    def test_fallback_copy_failure_keeps_error_category(
+        self,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        directory: bool,
+        error_type: type[OSError],
+        expected_exit: int,
+    ) -> None:
+        from pdftopdfa.converter import _copy_input_to_output
+
+        input_dir = tmp_dir / "inputs"
+        input_dir.mkdir()
+        first = input_dir / "first.pdf"
+        first.write_bytes(sample_pdf.read_bytes())
+        output_dir = tmp_dir / "outputs"
+        output_dir.mkdir()
+        output = output_dir / ("first_pdfa.pdf" if directory else "output.pdf")
+        output.write_bytes(b"existing output")
+        if directory:
+            (input_dir / "second.pdf").write_bytes(sample_pdf.read_bytes())
+        report_path = tmp_dir / "audit.json"
+
+        def copy_or_fail(source, destination, **kwargs):
+            if source == first:
+                raise error_type("destination locked")
+            return _copy_input_to_output(source, destination, **kwargs)
+
+        with (
+            patch("pdftopdfa.converter.save_pdfa", side_effect=error_type("locked")),
+            patch(
+                "pdftopdfa.converter._copy_input_to_output", side_effect=copy_or_fail
+            ),
+        ):
+            result = runner.invoke(
+                main,
+                [
+                    str(input_dir if directory else first),
+                    str(output_dir if directory else output),
+                    "--force",
+                    "--audit-report",
+                    str(report_path),
+                ],
+            )
+
+        assert result.exit_code == expected_exit
+        assert "destination locked" in result.output
+        assert output.read_bytes() == b"existing output"
+        report = json.loads(report_path.read_text())
+        assert report["results"][0]["permission_error"] is (
+            error_type is PermissionError
+        )
+        if directory:
+            assert len(report["results"]) == 2
+            assert report["results"][1]["success"]
+            assert (
+                output_dir / "second_pdfa.pdf"
+            ).read_bytes() == sample_pdf.read_bytes()
 
 
 class TestCliForceOverwrite:
@@ -1081,14 +1146,14 @@ class TestCliValidation:
         "pdftopdfa.converter.validate_with_verapdf",
         side_effect=VeraPDFError("veraPDF not installed"),
     )
-    def test_cli_missing_validator_withholds_output_and_returns_failure(
+    def test_cli_missing_validator_preserves_input_without_aborting(
         self,
         _mock_validate: MagicMock,
         runner: CliRunner,
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """A missing validator suppresses publication of the staged output."""
+        """A missing validator preserves the source without publishing the candidate."""
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
@@ -1096,9 +1161,9 @@ class TestCliValidation:
             [str(sample_pdf), str(output_path), "--validate"],
         )
 
-        assert result.exit_code == EXIT_VALIDATION_FAILED
+        assert result.exit_code == EXIT_SUCCESS
         assert "Validation: veraPDF could not run" in result.output
-        assert not output_path.exists()
+        assert output_path.read_bytes() == sample_pdf.read_bytes()
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
     def test_cli_encrypted_input_is_copied_with_validation_warning(
@@ -1431,7 +1496,7 @@ class TestCliOcr:
     )
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
-    def test_cli_directml_unavailable_fails_without_cpu_fallback(
+    def test_cli_directml_unavailable_preserves_input_without_cpu_fallback(
         self,
         _mock_is_ocr_available,
         mock_apply_ocr,
@@ -1440,7 +1505,7 @@ class TestCliOcr:
         sample_pdf: Path,
         tmp_dir: Path,
     ) -> None:
-        """Unavailable DirectML is a clear conversion error, not CPU fallback."""
+        """Unavailable DirectML preserves the input and reports the missing provider."""
         output_path = tmp_dir / "output.pdf"
 
         result = runner.invoke(
@@ -1454,10 +1519,10 @@ class TestCliOcr:
             ],
         )
 
-        assert result.exit_code == EXIT_CONVERSION_FAILED
+        assert result.exit_code == EXIT_SUCCESS
         assert "DmlExecutionProvider is unavailable" in result.output
         assert "pdftopdfa[directml]" in result.output
-        assert not output_path.exists()
+        assert output_path.read_bytes() == sample_pdf.read_bytes()
         mock_apply_ocr.assert_not_called()
 
     @patch("pdftopdfa.ocr.apply_ocr")
@@ -1854,10 +1919,10 @@ class TestDirectoryValidationFailures:
     """Tests for validation failure surfacing in directory mode."""
 
     @patch("pdftopdfa.cli.convert_directory")
-    def test_validation_failure_returns_exit_code(
+    def test_published_validation_failure_does_not_abort(
         self, mock_convert_dir, runner: CliRunner, tmp_dir: Path
     ) -> None:
-        """Directory mode returns EXIT_VALIDATION_FAILED on validation failure."""
+        """Published validation failures are reported without aborting."""
         input_dir = tmp_dir / "input"
         input_dir.mkdir()
         (input_dir / "test.pdf").write_bytes(b"%PDF-1.4 dummy")
@@ -1875,18 +1940,18 @@ class TestDirectoryValidationFailures:
 
         result = runner.invoke(main, [str(input_dir)])
 
-        assert result.exit_code == EXIT_VALIDATION_FAILED
+        assert result.exit_code == EXIT_SUCCESS
 
     @patch("pdftopdfa.verapdf.is_verapdf_available", return_value=True)
     @patch("pdftopdfa.cli.convert_directory")
-    def test_skipped_validation_failure_returns_exit_code(
+    def test_skipped_validation_failure_does_not_abort(
         self,
         mock_convert_dir,
         _mock_available: MagicMock,
         runner: CliRunner,
         tmp_dir: Path,
     ) -> None:
-        """A skipped, unvalidated copy is still a validation failure."""
+        """A copied input reports the validation failure without aborting the batch."""
         input_dir = tmp_dir / "input"
         input_dir.mkdir()
         input_path = input_dir / "encrypted.pdf"
@@ -1906,8 +1971,9 @@ class TestDirectoryValidationFailures:
 
         result = runner.invoke(main, [str(input_dir), "--validate"])
 
-        assert result.exit_code == EXIT_VALIDATION_FAILED
-        assert "1 file(s) failed validation" in result.output
+        assert result.exit_code == EXIT_SUCCESS
+        assert "1 file(s) skipped and copied unchanged" in result.output
+        assert "Validation: veraPDF could not run" in result.output
 
     @patch("pdftopdfa.cli.convert_directory")
     def test_conversion_failure_takes_priority_over_validation(
@@ -2006,6 +2072,52 @@ class TestDirectoryValidationFailures:
         if quiet:
             assert "Summary:" not in result.output
 
+    @pytest.mark.parametrize("quiet", [False, True])
+    @pytest.mark.parametrize("copied", [False, True])
+    @patch("pdftopdfa.cli.convert_directory")
+    def test_validation_fallback_is_reported(
+        self,
+        mock_convert_dir: MagicMock,
+        runner: CliRunner,
+        tmp_dir: Path,
+        quiet: bool,
+        copied: bool,
+    ) -> None:
+        """Validation failures remain visible regardless of fallback success."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        input_path = input_dir / "test.pdf"
+        input_path.write_bytes(b"%PDF-1.4 dummy")
+        error = (
+            "Validation failed; could not preserve original input: Permission denied"
+        )
+        mock_convert_dir.return_value = [
+            ConversionResult(
+                success=copied,
+                input_path=input_path,
+                output_path=tmp_dir / "test_pdfa.pdf",
+                level=None,
+                warnings=["Validation: Rule 6.1.2 failed"],
+                error=None if copied else error,
+                validation_failed=True,
+                skipped=copied,
+                published=copied,
+            )
+        ]
+        arguments = [str(input_dir)]
+        if quiet:
+            arguments.append("--quiet")
+
+        result = runner.invoke(main, arguments)
+
+        assert result.exit_code == (EXIT_SUCCESS if copied else EXIT_VALIDATION_FAILED)
+        assert "1 file(s) failed validation" in result.stderr
+        if not copied:
+            assert f"test.pdf: {error}" in result.stderr
+        assert "Validation: Rule 6.1.2 failed" in result.stderr
+        if quiet:
+            assert "Summary:" not in result.output
+
     @patch("pdftopdfa.cli.convert_directory")
     def test_no_validation_failure_returns_success(
         self, mock_convert_dir, runner: CliRunner, tmp_dir: Path
@@ -2030,14 +2142,14 @@ class TestDirectoryValidationFailures:
 
     @pytest.mark.parametrize("quiet", [True, False])
     @patch("pdftopdfa.cli.convert_directory")
-    def test_review_required_returns_distinct_exit_code(
+    def test_review_required_is_reported_without_aborting(
         self,
         mock_convert_dir: MagicMock,
         runner: CliRunner,
         tmp_dir: Path,
         quiet: bool,
     ) -> None:
-        """Batch automation can gate machine-valid files needing review."""
+        """Batch processing reports outstanding review without aborting."""
         input_dir = tmp_dir / "input"
         input_dir.mkdir()
         input_path = input_dir / "test.pdf"
@@ -2057,5 +2169,5 @@ class TestDirectoryValidationFailures:
 
         result = runner.invoke(main, arguments)
 
-        assert result.exit_code == EXIT_REVIEW_REQUIRED
+        assert result.exit_code == EXIT_SUCCESS
         assert "review" in result.output.lower()

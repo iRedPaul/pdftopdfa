@@ -158,7 +158,15 @@ def _print_result(result: ConversionResult, quiet: bool) -> None:
                 )
                 details = f"{result.processing_time:.2f}s"
             else:
-                action = "Skipped" if result.skipped else "Converted to PDF/A"
+                action = (
+                    "Skipped"
+                    if result.skipped
+                    else (
+                        "Converted to PDF/A"
+                        if result.target_produced
+                        else "Produced non-conforming candidate"
+                    )
+                )
                 details = f"PDF/A-{result.level}, {result.processing_time:.2f}s"
             print_success(
                 f"{action}: {result.input_path.name} -> "
@@ -757,10 +765,8 @@ def _convert_single_file(
     if audit_report is not None:
         _write_audit_report(audit_report, [result])
 
-    if result.validation_failed:
-        return EXIT_VALIDATION_FAILED
-    if not result.success:
-        return EXIT_CONVERSION_FAILED
+    if result.permission_error:
+        return EXIT_PERMISSION_ERROR
     if result.pdfua_status is PDFUAStatus.REVIEW_REQUIRED:
         if quiet:
             click.echo(
@@ -770,7 +776,13 @@ def _convert_single_file(
                 ),
                 err=True,
             )
-        return EXIT_REVIEW_REQUIRED
+        return EXIT_SUCCESS if result.published else EXIT_REVIEW_REQUIRED
+    if result.success and result.published:
+        return EXIT_SUCCESS
+    if result.validation_failed:
+        return EXIT_VALIDATION_FAILED
+    if not result.success:
+        return EXIT_CONVERSION_FAILED
 
     return EXIT_SUCCESS
 
@@ -900,9 +912,7 @@ def _convert_directory(
         and not r.validation_failed
         and not r.review_required
     ]
-    skipped = [
-        r for r in results if r.success and r.skipped and not r.validation_failed
-    ]
+    skipped = [r for r in results if r.success and r.skipped]
     failed = [r for r in results if not r.success and not r.validation_failed]
     validation_failures = [r for r in results if r.validation_failed]
     review_required = [
@@ -941,6 +951,8 @@ def _convert_directory(
             val_warnings = [
                 w for w in result.warnings if w.startswith(_VALIDATION_PREFIXES)
             ]
+            if not result.success and result.error:
+                val_warnings.insert(0, result.error)
             for w in val_warnings:
                 click.echo(
                     _encode_for_console(
@@ -958,6 +970,10 @@ def _convert_directory(
             err=True,
         )
 
+    if all(result.success and result.published for result in results):
+        return EXIT_SUCCESS
+    if any(result.permission_error for result in results):
+        return EXIT_PERMISSION_ERROR
     if failed:
         if all(result.error == "Output file already exists" for result in failed):
             return EXIT_GENERAL_ERROR

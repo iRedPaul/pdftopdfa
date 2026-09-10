@@ -360,7 +360,7 @@ class _DeskewPlan:
     regular_ocr_pages: tuple[int, ...]
     redo_ocr_pages: tuple[int, ...]
     strip_text_pages: tuple[int, ...]
-    ambiguous_scan_pages: tuple[int, ...]
+    ambiguous_scan_pages: tuple[int, ...] = ()
 
 
 def _object_key(value: "pikepdf.Object") -> _ObjectKey:
@@ -1137,6 +1137,12 @@ def _plan_deskew_ocr(
             logger.warning(
                 "Deskew skipped for %d annotated scan-like page(s)",
                 annotated_scan_pages,
+            )
+        if ambiguous_scan_pages:
+            logger.warning(
+                "OCR skipped for page(s) %s: the existing text layer cannot be "
+                "safely replaced; original page content preserved",
+                ambiguous_scan_pages,
             )
         return _DeskewPlan(
             tuple(deskew_pages),
@@ -2856,7 +2862,7 @@ def apply_ocr(
     layout: bool = False,
     _annotated_pages: frozenset[int] | None = None,
     _manifest_output_path: Path | None = None,
-) -> Path:
+) -> Path | None:
     """Performs OCR on a PDF.
 
     Uses PaddleOCR for recognition and OCRmyPDF for rasterization, text-layer
@@ -2888,7 +2894,8 @@ def apply_ocr(
             markers and layout-derived reading order in the OCR text Forms.
 
     Returns:
-        Path to the OCR-processed PDF.
+        Path to the OCR-processed PDF, or None if an existing text layer could
+        not be replaced and the original input was copied to output_path.
 
     Raises:
         OCRError: If OCR is not available or fails.
@@ -2983,6 +2990,7 @@ def apply_ocr(
     manifest_run_number = 0
     existing_ocr_form_names: list[frozenset[str]] = []
     completed_successfully = False
+    skipped = False
     staged_output_snapshot: StagedFileSnapshot | None = None
     staged_manifest_snapshot: StagedFileSnapshot | None = None
 
@@ -3095,12 +3103,6 @@ def apply_ocr(
             if plan is None:
                 run_ocr(ocr_input_path, staged_output_path)
             else:
-                if plan.ambiguous_scan_pages:
-                    raise OCRError(
-                        "OCR cannot safely replace an existing text layer on "
-                        "ambiguous scan-like page(s): "
-                        f"{list(plan.ambiguous_scan_pages)}"
-                    )
                 regular_pages = tuple(
                     sorted((*plan.regular_ocr_pages, *plan.deskew_pages))
                 )
@@ -3135,6 +3137,8 @@ def apply_ocr(
                         redo=True,
                     )
                 elif not regular_pages:
+                    if plan.ambiguous_scan_pages:
+                        raise PriorOcrFoundError()
                     shutil.copy2(current_input, staged_output_path)
         else:
             plan = _plan_deskew_ocr(
@@ -3147,17 +3151,13 @@ def apply_ocr(
                     "identified safely"
                 )
                 run_ocr(ocr_input_path, staged_output_path)
-            elif plan.ambiguous_scan_pages:
-                raise OCRError(
-                    "OCR cannot safely replace an existing text layer on "
-                    "ambiguous scan-like page(s): "
-                    f"{list(plan.ambiguous_scan_pages)}"
-                )
             elif (
                 not plan.deskew_pages
                 and not plan.regular_ocr_pages
                 and not plan.redo_ocr_pages
             ):
+                if plan.ambiguous_scan_pages:
+                    raise PriorOcrFoundError()
                 shutil.copy2(ocr_input_path, staged_output_path)
             else:
                 if pipeline_temp is None:
@@ -3232,11 +3232,26 @@ def apply_ocr(
     except EncryptedPdfError as e:
         raise OCRError(f"OCR failed: PDF is encrypted ({input_path})") from e
 
-    except PriorOcrFoundError as e:
-        raise OCRError(
-            "OCR failed: the selected page already contains an OCR text layer; "
-            "refusing to publish it as PaddleOCR output"
-        ) from e
+    except PriorOcrFoundError:
+        skipped = True
+        logger.warning(
+            "OCR skipped: an existing text layer could not be replaced; "
+            "discarding the OCR attempt and preserving the original PDF"
+        )
+        try:
+            shutil.copy2(input_path, staged_output_path)
+            if staged_manifest_path is not None:
+                _write_ocr_document_manifest(
+                    staged_manifest_path, staged_output_path, languages, {}, {}
+                )
+            staged_output_snapshot = staged_file_snapshot(staged_output_path)
+            if staged_manifest_path is not None:
+                staged_manifest_snapshot = staged_file_snapshot(staged_manifest_path)
+        except OSError as exc:
+            raise OCRError(
+                f"Could not preserve the original PDF after OCR: {exc}"
+            ) from exc
+        completed_successfully = True
 
     except MissingDependencyError as e:
         raise OCRError(f"OCR failed: {_format_ocr_exception(e)}") from e
@@ -3396,5 +3411,7 @@ def apply_ocr(
                     exc,
                 )
 
+    if skipped:
+        return None
     logger.info("OCR completed successfully: %s", output_path)
     return output_path

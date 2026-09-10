@@ -59,6 +59,144 @@ from pdftopdfa.verapdf import (
 _DETECTION_MODEL_DIR = Path("paddle-detection")
 _RECOGNITION_MODEL_DIR = Path("paddle-recognition")
 
+# Rejection/rollback tests use __wrapped__ to retain coverage of the inner
+# pipeline's checks before the public original-input fallback handles failures.
+
+
+@pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
+def test_successful_conversion_does_not_use_original_fallback(
+    sample_pdf: Path, tmp_path: Path, level: str
+) -> None:
+    result = convert_to_pdfa(sample_pdf, tmp_path / "output.pdf", level=level)
+    assert result.success and result.published and result.target_produced
+    assert not result.skipped and not result.validation_failed
+    assert result.level == level
+
+
+@pytest.mark.parametrize(
+    "failure_target",
+    [
+        "pdftopdfa.converter._validate_ocr_configuration",
+        "pdftopdfa.converter.pikepdf.open",
+        "pdftopdfa.converter.check_font_compliance",
+        "pdftopdfa.converter.sanitize_for_pdfa",
+        "pdftopdfa.converter.embed_color_profiles",
+        "pdftopdfa.converter.ensure_logical_structure",
+        "pdftopdfa.converter.save_pdfa",
+        "pdftopdfa.converter._validate_pdfa_output",
+        "pdftopdfa.ocr.apply_ocr",
+    ],
+)
+def test_any_conversion_stage_failure_preserves_input(
+    sample_pdf: Path, tmp_path: Path, failure_target: str
+) -> None:
+    output = tmp_path / "output.pdf"
+    output.write_bytes(b"previous output")
+    original = sample_pdf.read_bytes()
+    options = {}
+    if failure_target == "pdftopdfa.ocr.apply_ocr":
+        options = {
+            "ocr_detection_model_dir": _DETECTION_MODEL_DIR,
+            "ocr_recognition_model_dir": _RECOGNITION_MODEL_DIR,
+        }
+
+    with patch(failure_target, side_effect=RuntimeError("stage failed")) as failing:
+        result = convert_to_pdfa(
+            sample_pdf, output, level="3a", validate=True, **options
+        )
+
+    failing.assert_called()
+    assert result.success and result.skipped and result.published
+    assert not result.target_produced
+    assert result.level is None
+    assert any("stage failed" in warning for warning in result.warnings)
+    assert output.read_bytes() == original == sample_pdf.read_bytes()
+    assert not list(tmp_path.glob(".*_stage_*"))
+
+
+@pytest.mark.parametrize("exists", [False, True])
+def test_failed_in_place_conversion_does_not_report_publication(
+    sample_pdf: Path, tmp_path: Path, exists: bool
+) -> None:
+    input_path = sample_pdf if exists else tmp_path / "missing.pdf"
+    original = sample_pdf.read_bytes()
+
+    result = convert_to_pdfa(input_path, input_path)
+
+    assert not result.success and not result.published and not result.target_produced
+    assert "Input and output paths must differ" in result.error
+    assert sample_pdf.read_bytes() == original
+    assert input_path.exists() is exists
+
+
+def test_invalid_pdf_fallback_creates_destination_parent(tmp_path: Path) -> None:
+    input_path = tmp_path / "invalid.pdf"
+    input_path.write_bytes(b"invalid PDF")
+    output_path = tmp_path / "new" / "nested" / "output.pdf"
+
+    result = convert_to_pdfa(input_path, output_path)
+
+    assert result.success and result.skipped and result.published
+    assert not result.target_produced
+    assert output_path.read_bytes() == input_path.read_bytes()
+
+
+@pytest.mark.parametrize("pdfa", [False, True])
+def test_skipped_ocr_preserves_original_without_claiming_processing(
+    sample_pdf: Path, tmp_path: Path, pdfa: bool
+) -> None:
+    output_path = tmp_path / "output.pdf"
+    with (
+        patch("pdftopdfa.ocr.is_ocr_available", return_value=True),
+        patch("pdftopdfa.ocr.apply_ocr", return_value=None) as apply_ocr,
+    ):
+        result = convert_to_pdfa(
+            sample_pdf,
+            output_path,
+            pdfa=pdfa,
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        )
+
+    apply_ocr.assert_called_once()
+    assert result.success and result.skipped and result.published
+    assert not result.target_produced
+    assert result.level is None
+    assert any("OCR skipped" in warning for warning in result.warnings)
+    assert not any("OCR performed" in warning for warning in result.warnings)
+    assert output_path.read_bytes() == sample_pdf.read_bytes()
+
+
+def test_failed_original_copy_returns_error_without_replacing_destination(
+    sample_pdf: Path, tmp_path: Path
+) -> None:
+    output = tmp_path / "output.pdf"
+    output.write_bytes(b"previous output")
+    with (
+        patch(
+            "pdftopdfa.converter.sanitize_for_pdfa", side_effect=RuntimeError("stage")
+        ),
+        patch(
+            "pdftopdfa.converter._copy_input_to_output",
+            side_effect=PermissionError("destination locked"),
+        ),
+    ):
+        result = convert_to_pdfa(sample_pdf, output)
+
+    assert not result.success and not result.published and not result.target_produced
+    assert result.permission_error
+    assert result.to_dict()["permission_error"] is True
+    assert "stage" in result.error and "destination locked" in result.error
+    assert output.read_bytes() == b"previous output"
+
+
+def test_cancelled_conversion_is_not_caught(sample_pdf: Path, tmp_path: Path) -> None:
+    with (
+        patch("pdftopdfa.converter.sanitize_for_pdfa", side_effect=KeyboardInterrupt),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        convert_to_pdfa(sample_pdf, tmp_path / "output.pdf")
+
 
 @pytest.mark.parametrize("processing_only", [False, True])
 @pytest.mark.parametrize("hard_links", [False, True])
@@ -112,7 +250,7 @@ def test_initial_publication_failure_cleans_backup(
     monkeypatch.setattr(os, "replace", fail_publication)
 
     with pytest.raises(PermissionError, match="destination locked"):
-        convert_to_pdfa(sample_pdf, output, pdfa=not processing_only)
+        convert_to_pdfa.__wrapped__(sample_pdf, output, pdfa=not processing_only)
 
     assert output.read_bytes() == b"original destination"
     assert not list(tmp_path.glob(".output*"))
@@ -154,7 +292,7 @@ def test_failed_publication_rollback_retains_original_backup(
         patch.object(staging, "staged_file_snapshot", side_effect=fail_verification),
         pytest.raises(ConversionError, match="cannot read published output"),
     ):
-        convert_to_pdfa(sample_pdf, output, pdfa=not processing_only)
+        convert_to_pdfa.__wrapped__(sample_pdf, output, pdfa=not processing_only)
 
     backups = list(tmp_path.rglob("backup.pdf"))
     assert len(backups) == 1
@@ -256,7 +394,7 @@ def test_unreconstructable_annotation_preserves_existing_destination(
         )
         pdf.save(source)
     with pytest.raises(ConversionError, match="without a normal appearance"):
-        convert_to_pdfa(source, output)
+        convert_to_pdfa.__wrapped__(source, output)
     assert output.read_bytes() == sentinel
 
 
@@ -751,7 +889,7 @@ class TestConvertToPdfa:
             pdf.save(input_path)
 
         with pytest.raises(UnsupportedPDFError, match="contains no pages"):
-            convert_to_pdfa(input_path, output_path, level=level)
+            convert_to_pdfa.__wrapped__(input_path, output_path, level=level)
 
         assert not output_path.exists()
 
@@ -870,7 +1008,7 @@ class TestConvertToPdfa:
             side_effect=partial_copy,
         ):
             with pytest.raises(PermissionError, match="copy interrupted"):
-                convert_to_pdfa(sample_pdf, output_path, pdfa=False)
+                convert_to_pdfa.__wrapped__(sample_pdf, output_path, pdfa=False)
 
         assert output_path.read_bytes() == sentinel
         assert not list(tmp_dir.glob(".processed_copy_*"))
@@ -966,7 +1104,7 @@ class TestConvertToPdfa:
     def test_no_pdfa_rejects_validation(self, sample_pdf: Path, tmp_dir: Path) -> None:
         """The public API rejects PDF/A validation in processing-only mode."""
         with pytest.raises(ConversionError, match="validation cannot be used"):
-            convert_to_pdfa(
+            convert_to_pdfa.__wrapped__(
                 sample_pdf,
                 tmp_dir / "processed.pdf",
                 pdfa=False,
@@ -1014,7 +1152,7 @@ class TestConvertToPdfa:
     ) -> None:
         """Processing-only mode does not silently ignore unavailable OCR."""
         with pytest.raises(OCRError, match="OCR not available"):
-            convert_to_pdfa(
+            convert_to_pdfa.__wrapped__(
                 sample_pdf,
                 tmp_dir / "processed.pdf",
                 pdfa=False,
@@ -1171,7 +1309,7 @@ class TestConvertToPdfa:
 
         with patch.object(pikepdf.Pdf, "save", partial_save):
             with pytest.raises(PermissionError, match="disk full"):
-                convert_to_pdfa(sample_pdf, output_path, level="2b")
+                convert_to_pdfa.__wrapped__(sample_pdf, output_path, level="2b")
 
         assert output_path.read_bytes() == sentinel
         assert not list(tmp_dir.glob(".*_pdfa_stage_*"))
@@ -1196,7 +1334,7 @@ class TestConvertToPdfa:
 
         with patch(failure_target, side_effect=RuntimeError("hardening failed")):
             with pytest.raises(ConversionError, match="hardening failed"):
-                convert_to_pdfa(sample_pdf, output_path, level="2b")
+                convert_to_pdfa.__wrapped__(sample_pdf, output_path, level="2b")
 
         assert output_path.read_bytes() == sentinel
         assert not list(tmp_dir.glob(".*_pdfa_stage_*"))
@@ -1222,7 +1360,7 @@ class TestConvertToPdfa:
 
         with patch("builtins.open", side_effect=fail_staged_header):
             with pytest.raises(ConversionError, match="binary comment check"):
-                convert_to_pdfa(sample_pdf, output_path, level="2b")
+                convert_to_pdfa.__wrapped__(sample_pdf, output_path, level="2b")
 
         assert output_path.read_bytes() == sentinel
         assert not list(tmp_dir.glob(".*_pdfa_stage_*"))
@@ -1244,7 +1382,7 @@ class TestConvertToPdfa:
 
         with patch("pdftopdfa.converter.pikepdf.open", side_effect=fail_staged_reopen):
             with pytest.raises(ConversionError, match="could not reopen"):
-                convert_to_pdfa(sample_pdf, output_path, level="2b")
+                convert_to_pdfa.__wrapped__(sample_pdf, output_path, level="2b")
 
         assert output_path.read_bytes() == sentinel
         assert not list(tmp_dir.glob(".*_pdfa_stage_*"))
@@ -1269,7 +1407,7 @@ class TestConvertToPdfa:
             return_value=wrong_version_settings,
         ):
             with pytest.raises(ConversionError, match="does not start with"):
-                convert_to_pdfa(sample_pdf, output_path, level="2b")
+                convert_to_pdfa.__wrapped__(sample_pdf, output_path, level="2b")
 
         assert output_path.read_bytes() == sentinel
         assert not list(tmp_dir.glob(".*_pdfa_stage_*"))
@@ -1307,7 +1445,7 @@ class TestConvertToPdfa:
             side_effect=reopen_with_invalid_id,
         ):
             with pytest.raises(ConversionError, match="trailer /ID"):
-                convert_to_pdfa(sample_pdf, output_path, level="2b")
+                convert_to_pdfa.__wrapped__(sample_pdf, output_path, level="2b")
 
         assert output_path.read_bytes() == sentinel
         assert not list(tmp_dir.glob(".*_pdfa_stage_*"))
@@ -1344,7 +1482,7 @@ class TestConvertToPdfa:
 
         with patch.object(pikepdf.Pdf, "save", save_without_comment_then_fail):
             with pytest.raises(ConversionError, match="Could not add binary comment"):
-                convert_to_pdfa(sample_pdf, output_path, level="2b")
+                convert_to_pdfa.__wrapped__(sample_pdf, output_path, level="2b")
 
         assert output_path.read_bytes() == sentinel
         assert not list(tmp_dir.glob(".*_pdfa_stage_*"))
@@ -1381,7 +1519,7 @@ class TestConvertToPdfa:
             patch.object(Path, "write_bytes", fail_staged_rewrite),
         ):
             with pytest.raises(ConversionError, match="Could not truncate"):
-                convert_to_pdfa(sample_pdf, output_path, level="2b")
+                convert_to_pdfa.__wrapped__(sample_pdf, output_path, level="2b")
 
         assert output_path.read_bytes() == sentinel
         assert not list(tmp_dir.glob(".*_pdfa_stage_*"))
@@ -1406,7 +1544,7 @@ class TestConvertToPdfa:
             caplog.at_level(logging.WARNING),
         ):
             with pytest.raises(ConversionError, match="primary"):
-                convert_to_pdfa(sample_pdf, output_path, level="2b")
+                convert_to_pdfa.__wrapped__(sample_pdf, output_path, level="2b")
 
         assert output_path.read_bytes() == sentinel
         assert not list(tmp_dir.glob(".*_pdfa_stage_*"))
@@ -1485,7 +1623,7 @@ class TestConvertToPdfa:
             ),
             pytest.raises(ConversionError, match="changed after validation"),
         ):
-            convert_to_pdfa(
+            convert_to_pdfa.__wrapped__(
                 sample_pdf,
                 output_path,
                 level="2a",
@@ -1523,7 +1661,7 @@ class TestConvertToPdfa:
             side_effect=PermissionError("destination is locked"),
         ):
             with pytest.raises(PermissionError, match="destination is locked"):
-                convert_to_pdfa(sample_pdf, output_path, level="2b")
+                convert_to_pdfa.__wrapped__(sample_pdf, output_path, level="2b")
 
         staged_path = mock_save.call_args.args[1]
         assert output_path.read_bytes() == sentinel
@@ -1559,7 +1697,7 @@ class TestConvertToPdfa:
             ),
             pytest.raises(ConversionError, match="post-publication inspection"),
         ):
-            convert_to_pdfa(sample_pdf, output_path, level="2b")
+            convert_to_pdfa.__wrapped__(sample_pdf, output_path, level="2b")
 
         if original is None:
             assert not output_path.exists()
@@ -1601,7 +1739,7 @@ class TestConvertToPdfa:
             ),
             pytest.raises(ConversionError, match="differs from validated candidate"),
         ):
-            convert_to_pdfa(sample_pdf, output_path, level="2b")
+            convert_to_pdfa.__wrapped__(sample_pdf, output_path, level="2b")
 
         restored = output_path.stat()
         assert output_path.read_bytes() == sentinel
@@ -1640,7 +1778,7 @@ class TestConvertToPdfa:
             ),
             pytest.raises(ConversionError, match="differs from validated candidate"),
         ):
-            convert_to_pdfa(sample_pdf, output_path, level="2b")
+            convert_to_pdfa.__wrapped__(sample_pdf, output_path, level="2b")
 
         assert output_path.read_bytes() == foreign
         assert not foreign_path.exists()
@@ -1654,7 +1792,7 @@ class TestConvertToPdfa:
         output_path = tmp_dir / "output.pdf"
 
         with pytest.raises(ConversionError):
-            convert_to_pdfa(nonexistent, output_path)
+            convert_to_pdfa.__wrapped__(nonexistent, output_path)
 
     def test_convert_invalid_level_raises_error(self, tmp_dir: Path) -> None:
         """Invalid level raises ConversionError before any processing."""
@@ -1662,7 +1800,7 @@ class TestConvertToPdfa:
         output_path = tmp_dir / "output.pdf"
 
         with pytest.raises(ConversionError, match="Invalid PDF/A level"):
-            convert_to_pdfa(input_path, output_path, level="invalid")
+            convert_to_pdfa.__wrapped__(input_path, output_path, level="invalid")
 
     def test_convert_encrypted_pdf(self, encrypted_pdf: Path, tmp_dir: Path) -> None:
         """An encrypted PDF with an empty user password is copied unchanged."""
@@ -1770,7 +1908,7 @@ class TestConvertToPdfa:
     ) -> None:
         """PDF/UA-1 is only emitted with PDF/A-2a or PDF/A-3a."""
         with pytest.raises(ConversionError, match="PDF/A-2a or PDF/A-3a"):
-            convert_to_pdfa(
+            convert_to_pdfa.__wrapped__(
                 sample_pdf,
                 tmp_dir / "output.pdf",
                 level=level,
@@ -1862,7 +2000,7 @@ class TestConvertToPdfa:
     ) -> None:
         """Catalog language overrides must be valid BCP 47 tags."""
         with pytest.raises(ConversionError, match="BCP 47"):
-            convert_to_pdfa(
+            convert_to_pdfa.__wrapped__(
                 sample_pdf,
                 tmp_dir / "output.pdf",
                 level="2a",
@@ -2305,7 +2443,7 @@ class TestConvertToPdfa:
         original = sample_pdf.read_bytes()
 
         with pytest.raises(ConversionError, match="Input and output paths must differ"):
-            convert_to_pdfa(
+            convert_to_pdfa.__wrapped__(
                 sample_pdf,
                 sample_pdf,
                 pdfa=pdfa,
@@ -2339,7 +2477,7 @@ class TestConvertToPdfa:
             pytest.skip(f"Hard links are not supported: {exc}")
 
         with pytest.raises(ConversionError, match="Input and output paths must differ"):
-            convert_to_pdfa(
+            convert_to_pdfa.__wrapped__(
                 input_path,
                 output_path,
                 pdfa=pdfa,
@@ -2427,23 +2565,31 @@ class TestConvertToPdfa:
             "ua1",
         ]
 
+    @pytest.mark.parametrize("preserve_input", [False, True])
+    @pytest.mark.parametrize("failed_profile", ["2a", "ua1"])
     @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_pdfua_failure_is_structured_and_not_published(
-        self, mock_verapdf: MagicMock, sample_pdf: Path, tmp_dir: Path
+    def test_pdfua_failure_retains_validation_evidence(
+        self,
+        mock_verapdf: MagicMock,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        preserve_input: bool,
+        failed_profile: str,
     ) -> None:
-        """A failed UA profile cannot replace the canonical enterprise output."""
+        """Candidate validation evidence survives original-input fallback."""
         mock_verapdf.side_effect = [
-            VeraPDFResult(compliant=True, flavour="2a"),
             VeraPDFResult(
-                compliant=False,
-                flavour="ua1",
-                errors=["Rule 7.1 failed"],
-            ),
+                compliant=profile != failed_profile,
+                flavour=profile,
+                errors=["Validation rule failed"] if profile == failed_profile else [],
+            )
+            for profile in ("2a", "ua1")
         ]
         output_path = tmp_dir / "output.pdf"
         output_path.write_bytes(b"approved output")
 
-        result = convert_to_pdfa(
+        convert = convert_to_pdfa if preserve_input else convert_to_pdfa.__wrapped__
+        result = convert(
             sample_pdf,
             output_path,
             level="2a",
@@ -2451,14 +2597,26 @@ class TestConvertToPdfa:
         )
 
         assert result.pdfua_status is PDFUAStatus.VALIDATION_FAILED
-        assert result.published is False
+        assert any("Conversion target was not published" in w for w in result.warnings)
+        assert not any("output was not published" in w.lower() for w in result.warnings)
+        assert result.to_dict()["warnings"] == result.warnings
+        if preserve_input:
+            assert any("original input copied unchanged" in w for w in result.warnings)
+        assert result.validation_failed
+        assert result.candidate_sha256 is not None
+        assert result.published is preserve_input
+        assert result.success is preserve_input
+        assert result.skipped is preserve_input
+        assert not result.target_produced
         assert [evidence.profile for evidence in result.validation_results] == [
             "2a",
             "ua1",
         ]
-        assert result.validation_results[0].compliant is True
-        assert result.validation_results[1].compliant is False
-        assert output_path.read_bytes() == b"approved output"
+        for evidence in result.validation_results:
+            assert evidence.compliant is (evidence.profile != failed_profile)
+        assert output_path.read_bytes() == (
+            sample_pdf.read_bytes() if preserve_input else b"approved output"
+        )
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
     def test_convert_with_failing_validation_sets_flag(
@@ -2472,11 +2630,11 @@ class TestConvertToPdfa:
         output_path = tmp_dir / "output.pdf"
         sentinel = b"existing output"
         output_path.write_bytes(sentinel)
-        result = convert_to_pdfa(sample_pdf, output_path, validate=True)
+        result = convert_to_pdfa.__wrapped__(sample_pdf, output_path, validate=True)
 
         assert result.success is False
         assert result.validation_failed is True
-        assert result.error == "Validation failed; output was not published"
+        assert result.error == "Validation failed; conversion target was not published"
         assert result.published is False
         assert result.target_produced is False
         assert any("Validation: Rule 6.1.2 failed" in w for w in result.warnings)
@@ -2500,11 +2658,11 @@ class TestConvertToPdfa:
         sentinel = b"existing output"
         output_path.write_bytes(sentinel)
 
-        result = convert_to_pdfa(sample_pdf, output_path, validate=True)
+        result = convert_to_pdfa.__wrapped__(sample_pdf, output_path, validate=True)
 
         assert result.success is False
         assert result.validation_failed is True
-        assert result.error == "Validation failed; output was not published"
+        assert result.error == "Validation failed; conversion target was not published"
         assert result.published is False
         assert "Validation: veraPDF could not run: veraPDF crashed" in result.warnings
         assert result.validation_results == (
@@ -2535,7 +2693,7 @@ class TestConvertToPdfa:
             publication_policy="always",
         )
 
-        assert result.success is False
+        assert result.success is True
         assert result.published is True
         assert any("published despite" in warning for warning in result.warnings)
         assert output_path.read_bytes().startswith(b"%PDF-")
@@ -2591,7 +2749,7 @@ class TestConvertToPdfa:
         output_path = tmp_dir / "output.pdf"
 
         with pytest.raises(OCRError, match="OCR not available"):
-            convert_to_pdfa(
+            convert_to_pdfa.__wrapped__(
                 sample_pdf,
                 output_path,
                 ocr_languages=["de"],
@@ -2614,7 +2772,7 @@ class TestConvertToPdfa:
             patch("pdftopdfa.ocr.is_ocr_available", return_value=False),
             pytest.raises(OCRError, match=r"pdftopdfa\[directml\]"),
         ):
-            convert_to_pdfa(
+            convert_to_pdfa.__wrapped__(
                 sample_pdf,
                 output_path,
                 ocr_detection_model_dir=_DETECTION_MODEL_DIR,
@@ -2700,7 +2858,7 @@ class TestConvertToPdfa:
     ) -> None:
         """Layout processing cannot run without the OCR model pair."""
         with pytest.raises(ValueError, match="OCR requires"):
-            convert_to_pdfa(
+            convert_to_pdfa.__wrapped__(
                 sample_pdf,
                 tmp_dir / "layout.pdf",
                 ocr_layout=True,
@@ -2714,7 +2872,7 @@ class TestConvertToPdfa:
         tmp_dir: Path,
     ) -> None:
         with pytest.raises(ConversionError, match="requires PDF/A-2a or PDF/A-3a"):
-            convert_to_pdfa(
+            convert_to_pdfa.__wrapped__(
                 sample_pdf,
                 tmp_dir / "figure-text.pdf",
                 level=level,
@@ -2729,7 +2887,7 @@ class TestConvertToPdfa:
         tmp_dir: Path,
     ) -> None:
         with pytest.raises(ValueError, match="OCR requires"):
-            convert_to_pdfa(
+            convert_to_pdfa.__wrapped__(
                 sample_pdf,
                 tmp_dir / "figure-text.pdf",
                 level="3a",
@@ -2869,7 +3027,7 @@ class TestConvertToPdfa:
         output_path = tmp_dir / "output.pdf"
 
         with pytest.raises(OCRError, match="Deskew cannot be combined"):
-            convert_to_pdfa(
+            convert_to_pdfa.__wrapped__(
                 sample_pdf,
                 output_path,
                 ocr_detection_model_dir=_DETECTION_MODEL_DIR,
@@ -2888,7 +3046,7 @@ class TestConvertToPdfa:
 
         with pytest.raises(ValueError, match="must be provided together"):
             if api_name == "single":
-                convert_to_pdfa(
+                convert_to_pdfa.__wrapped__(
                     input_path,
                     output_path,
                     ocr_detection_model_dir=_DETECTION_MODEL_DIR,
@@ -2919,7 +3077,7 @@ class TestConvertToPdfa:
 
         with pytest.raises(ValueError, match="OCR execution provider"):
             if api_name == "single":
-                convert_to_pdfa(
+                convert_to_pdfa.__wrapped__(
                     input_path,
                     output_path,
                     ocr_execution_provider="cuda",
@@ -2985,7 +3143,7 @@ class TestConvertToPdfa:
             "pdftopdfa.converter.tempfile.mkstemp", side_effect=tracking_mkstemp
         ):
             with pytest.raises(OCRError):
-                convert_to_pdfa(
+                convert_to_pdfa.__wrapped__(
                     annotated_pdf,
                     output_path,
                     ocr_languages=["en"],
@@ -3470,7 +3628,7 @@ class TestConvertToPdfa:
         sentinel = b"existing output"
         output_path.write_bytes(sentinel)
 
-        result = convert_to_pdfa(
+        result = convert_to_pdfa.__wrapped__(
             signed_input,
             output_path,
             level="3b",
@@ -3514,39 +3672,56 @@ class TestConvertToPdfa:
             publication_policy="always",
         )
 
-        assert result.success is False
+        assert result.success is True
         assert result.validation_failed is True
         assert result.published is True
         assert any("published despite" in warning for warning in result.warnings)
         assert output_path.read_bytes() == signed_input.read_bytes()
         mock_verapdf.assert_not_called()
 
+    @pytest.mark.parametrize("preserve_input", [False, True])
+    @pytest.mark.parametrize("pdfua", [False, True])
     @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_pdfua_signed_skip_preserves_existing_destination(
+    def test_signed_validation_skip_reports_publication_accurately(
         self,
         mock_verapdf: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
+        preserve_input: bool,
+        pdfua: bool,
     ) -> None:
-        """A protected signed input cannot replace a canonical PDF/UA target."""
+        """Signed-input fallback warnings match the published original and audit."""
         signed_input = tmp_dir / "signed_input.pdf"
         _write_signed_pdf(sample_pdf, signed_input)
         output_path = tmp_dir / "output.pdf"
         output_path.write_bytes(b"approved output")
 
-        result = convert_to_pdfa(
+        convert = convert_to_pdfa if preserve_input else convert_to_pdfa.__wrapped__
+        result = convert(
             signed_input,
             output_path,
             level="2a",
-            pdfua=True,
+            pdfua=pdfua,
+            validate=True,
         )
 
-        assert result.success is False
+        assert result.success is preserve_input
         assert result.skipped is True
-        assert result.published is False
+        assert result.published is preserve_input
         assert result.target_produced is False
-        assert result.pdfua_status is PDFUAStatus.NOT_PRODUCED
-        assert output_path.read_bytes() == b"approved output"
+        assert result.pdfua_status is (
+            PDFUAStatus.NOT_PRODUCED if pdfua else PDFUAStatus.NOT_REQUESTED
+        )
+        assert not any(
+            "signed input was not published" in w.lower() for w in result.warnings
+        )
+        assert not any("output was not published" in w.lower() for w in result.warnings)
+        assert result.to_dict()["warnings"] == result.warnings
+        if preserve_input:
+            assert any("original input copied unchanged" in w for w in result.warnings)
+        assert output_path.read_bytes() == (
+            signed_input.read_bytes() if preserve_input else b"approved output"
+        )
         mock_verapdf.assert_not_called()
 
     def test_signed_pdf_can_be_converted_with_explicit_invalidation(
@@ -4310,7 +4485,7 @@ class TestConvertToPdfa:
         output_path = tmp_dir / "output.pdf"
 
         with pytest.raises(ConversionError, match="PDF processing error"):
-            convert_to_pdfa(corrupt_path, output_path)
+            convert_to_pdfa.__wrapped__(corrupt_path, output_path)
 
     @patch(
         "pdftopdfa.converter.save_pdfa", side_effect=PermissionError("access denied")
@@ -4323,7 +4498,7 @@ class TestConvertToPdfa:
     ) -> None:
         """Output permission failures remain distinguishable to API callers."""
         with pytest.raises(PermissionError, match="access denied"):
-            convert_to_pdfa(sample_pdf, tmp_dir / "output.pdf")
+            convert_to_pdfa.__wrapped__(sample_pdf, tmp_dir / "output.pdf")
 
     def test_convert_with_calibrated_false(
         self, sample_pdf: Path, tmp_dir: Path
@@ -4908,8 +5083,9 @@ class TestConvertDirectory:
         )
 
         assert len(results) == 1
-        assert results[0].success is False
-        assert "OCR not available" in (results[0].error or "")
+        assert results[0].success and results[0].skipped
+        assert any("OCR not available" in warning for warning in results[0].warnings)
+        assert results[0].output_path.read_bytes() == sample_pdf_bytes
 
     @patch("pdftopdfa.converter.convert_files")
     def test_convert_directory_passes_skip_any_pdfa(
@@ -5007,14 +5183,15 @@ class TestConvertFiles:
 
         assert len(results) == 1
         result = results[0]
-        assert result.success is False
+        assert result.success is True
         assert result.validation_failed is True
-        assert result.skipped is False
-        assert result.level == "2a"
+        assert result.skipped is True
+        assert result.level is None
+        assert not result.target_produced
         assert "Validation: veraPDF could not run: validator crashed" in result.warnings
         assert any("not published" in warning for warning in result.warnings)
-        assert result.published is False
-        assert not output_path.exists()
+        assert result.published is True
+        assert output_path.read_bytes() == sample_pdf.read_bytes()
 
     @patch("pdftopdfa.converter.validate_with_verapdf")
     def test_convert_files_copies_encrypted_input_with_validation(
@@ -5496,8 +5673,10 @@ class TestConvertFiles:
 
         assert len(results) == 3
         assert results[0].success is True
-        assert results[1].success is False
-        assert results[1].error is not None
+        assert results[1].success and results[1].skipped
+        assert not results[1].target_produced
+        assert results[1].warnings
+        assert out_bad.read_bytes() == bad.read_bytes()
         assert results[2].success is True
 
     @patch("pdftopdfa.converter.convert_to_pdfa")
@@ -5526,6 +5705,8 @@ class TestConvertFiles:
         assert len(results) == 2
         assert results[0].success is False
         assert results[0].error == "Access denied"
+        assert results[0].permission_error
+        assert not results[1].permission_error
         assert results[1].success is True
         assert mock_convert_to_pdfa.call_count == 2
 

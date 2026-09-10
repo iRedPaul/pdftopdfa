@@ -408,7 +408,11 @@ def convert_single(args):
             level=level,
             validate=True,
         )
-        result["success"] = conv_result.success and not conv_result.validation_failed
+        result["success"] = (
+            conv_result.success
+            and conv_result.target_produced
+            and not conv_result.validation_failed
+        )
         result["validation_failed"] = conv_result.validation_failed
         result["skipped"] = conv_result.skipped
         result["warnings"] = conv_result.warnings
@@ -431,6 +435,9 @@ def convert_single(args):
         elif conv_result.error:
             result["error"] = conv_result.error
             result["error_type"] = "ConversionResult.error"
+        elif not conv_result.target_produced:
+            result["error"] = "Requested PDF/A target was not produced"
+            result["error_type"] = "TargetNotProduced"
     except Exception as e:
         result["error"] = str(e)
         result["error_type"] = type(e).__name__
@@ -739,10 +746,7 @@ def analyze_results(results, total_time):
     skipped = [r for r in results if _is_skipped_result(r)]
     if skipped:
         unique_skipped = len({r["relative_path"] for r in skipped})
-        print(
-            f"Skipped: {len(skipped)} runs across {unique_skipped} file(s) "
-            "(reported as successful passthroughs)"
-        )
+        print(f"Skipped: {len(skipped)} runs across {unique_skipped} file(s)")
 
     # Results by level
     print("\n--- Results by PDF/A Level ---")

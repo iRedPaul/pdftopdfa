@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 import run_corpus_test
+from pdftopdfa.converter import ConversionResult
 from pdftopdfa.utils import SUPPORTED_LEVELS
 
 
@@ -183,6 +184,7 @@ def test_validation_skipped_warning_fails_conversion(tmp_path, monkeypatch) -> N
         "convert_to_pdfa",
         lambda **kwargs: SimpleNamespace(
             success=True,
+            target_produced=True,
             validation_failed=False,
             skipped=False,
             warnings=[warning],
@@ -197,6 +199,37 @@ def test_validation_skipped_warning_fails_conversion(tmp_path, monkeypatch) -> N
     assert result["validation_failed"] is False
     assert result["error"] == warning
     assert result["error_type"] == "ValidationSkipped"
+
+
+@pytest.mark.parametrize("target_produced", [False, True])
+@pytest.mark.parametrize("skipped", [False, True])
+def test_corpus_success_requires_produced_target(
+    tmp_path, monkeypatch, target_produced: bool, skipped: bool
+) -> None:
+    """Only produced targets pass, including already-compliant skipped inputs."""
+    input_path = tmp_path / "input.pdf"
+    monkeypatch.setattr(run_corpus_test, "CORPUS_DIR", tmp_path)
+    monkeypatch.setattr(
+        run_corpus_test,
+        "convert_to_pdfa",
+        lambda **kwargs: ConversionResult(
+            success=True,
+            input_path=input_path,
+            output_path=tmp_path / "output.pdf",
+            level="2a" if target_produced else None,
+            target_produced=target_produced,
+            skipped=skipped,
+        ),
+    )
+
+    result = run_corpus_test.convert_single((input_path, "2a", tmp_path))
+
+    assert result["success"] is target_produced
+    assert result["skipped"] is skipped
+    assert result["error_type"] == (None if target_produced else "TargetNotProduced")
+    assert result["error"] == (
+        None if target_produced else "Requested PDF/A target was not produced"
+    )
 
 
 def test_main_fails_before_scanning_when_verapdf_is_unavailable(
@@ -241,7 +274,10 @@ def test_task_timeout_terminates_hung_worker_and_keeps_completed_result(
     assert timeout["relative_path"] == "slow.pdf"
 
 
-def test_main_returns_nonzero_when_any_corpus_task_fails(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("preserved_original", [False, True])
+def test_main_returns_nonzero_when_any_corpus_task_fails(
+    tmp_path, monkeypatch, preserved_original: bool
+) -> None:
     """A failed conversion makes the corpus command fail as a release gate."""
     corpus_dir = tmp_path / "corpus"
     input_path = corpus_dir / "input.pdf"
@@ -253,6 +289,13 @@ def test_main_returns_nonzero_when_any_corpus_task_fails(tmp_path, monkeypatch) 
         "validation failed",
         "ValidationFailed",
     )
+    if preserved_original:
+        input_path.write_bytes(b"corrupt PDF")
+        failure = run_corpus_test.convert_single((input_path, "2a", tmp_path))
+        assert failure["skipped"]
+        assert not failure["validation_failed"]
+        assert failure["error_type"] == "TargetNotProduced"
+        assert any("original input copied unchanged" in w for w in failure["warnings"])
     monkeypatch.setattr(run_corpus_test, "RESULTS_DIR", tmp_path / "results")
     monkeypatch.setattr(run_corpus_test, "LEVELS", ["2a"])
     monkeypatch.setattr(run_corpus_test, "get_verapdf_version", lambda: "veraPDF")
