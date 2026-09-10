@@ -357,6 +357,9 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
 
             prior_context = first_context.setdefault(stream_key, context_key)
             if prior_context != context_key:
+                # Cloned resources can still point back to the source stream.
+                active.add(stream_key)
+                tasks.append(("exit", stream_key, None, None))
                 stream = _clone_stream(pdf, stream)
                 container[key] = stream
                 stream_key = _stream_identity(stream)
