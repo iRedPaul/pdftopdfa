@@ -9,6 +9,7 @@ import pytest
 from conftest import new_pdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
+import pdftopdfa.sanitizers.rendering_intent as rendering_intent
 from pdftopdfa.sanitizers.extgstate import sanitize_extgstate
 from pdftopdfa.sanitizers.rendering_intent import (
     sanitize_rendering_intent,
@@ -500,6 +501,72 @@ class TestUndefinedOperatorsAndResources:
         assert forms[0].objgen != forms[1].objgen
         assert forms[0].Resources.Font.F1.objgen == font_a.objgen
         assert forms[1].Resources.Font.F1.objgen == font_b.objgen
+
+    @pytest.mark.parametrize("cycle_length", [1, 2])
+    @pytest.mark.parametrize("indirect_resources", [False, True])
+    def test_shared_cyclic_form_resources_do_not_clone_indefinitely(
+        self, monkeypatch, cycle_length: int, indirect_resources: bool
+    ):
+        """A stamp reusing a cyclic Form graph must finish without losing resources."""
+        pdf = new_pdf()
+        forms = [pdf.make_stream(b"/CS0 cs /Bad ri") for _ in range(cycle_length)]
+        for index, form in enumerate(forms):
+            form[Name.Type] = Name.XObject
+            form[Name.Subtype] = Name.Form
+            form[Name.BBox] = Array([0, 0, 100, 100])
+            resources = Dictionary(
+                XObject=Dictionary(Next=forms[(index + 1) % cycle_length])
+            )
+            form[Name.Resources] = (
+                pdf.make_indirect(resources) if indirect_resources else resources
+            )
+
+        page = pdf.add_blank_page(page_size=(100, 100))
+        page.Resources = Dictionary(
+            ColorSpace=Dictionary(CS0=Name.DeviceRGB),
+            XObject=Dictionary(Fm=forms[0]),
+        )
+        page.Contents = pdf.make_stream(b"/Fm Do")
+        appearance = pdf.make_stream(b"/Fm Do")
+        appearance[Name.Type] = Name.XObject
+        appearance[Name.Subtype] = Name.Form
+        appearance[Name.BBox] = Array([0, 0, 100, 100])
+        appearance[Name.Resources] = Dictionary(
+            ColorSpace=Dictionary(CS0=Name.DeviceGray),
+            XObject=Dictionary(Fm=forms[0]),
+        )
+        page.Annots = Array(
+            [
+                pdf.make_indirect(
+                    Dictionary(
+                        Type=Name.Annot,
+                        Subtype=Name.Stamp,
+                        Rect=Array([0, 0, 100, 100]),
+                        AP=Dictionary(N=appearance),
+                    )
+                )
+            ]
+        )
+
+        clone_stream = rendering_intent._clone_stream
+        clone_count = 0
+
+        def bounded_clone(pdf, source):
+            nonlocal clone_count
+            clone_count += 1
+            assert clone_count <= 2 * cycle_length, "Resource cycle cloned repeatedly"
+            return clone_stream(pdf, source)
+
+        monkeypatch.setattr(rendering_intent, "_clone_stream", bounded_clone)
+        result = sanitize_rendering_intent(pdf)
+
+        original = page.Resources.XObject.Fm
+        cloned = page.Annots[0].AP.N.Resources.XObject.Fm
+        assert original.objgen != cloned.objgen
+        assert original.Resources.ColorSpace.CS0 == Name.DeviceRGB
+        assert cloned.Resources.ColorSpace.CS0 == Name.DeviceGray
+        assert result["ri_operators_fixed"] == cycle_length + clone_count
+        assert len(page.Annots) == 1
 
     @pytest.mark.parametrize("indirect_resources", [False, True])
     def test_1200_nested_forms_are_sanitized_without_recursion(
