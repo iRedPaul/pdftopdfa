@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.9.15] - 2026-09-10
+
+### Bug Fixes
+
+- Prevent indefinite cloning when sanitizing cyclic rendering-intent resources
+- Sanitize inherited CropBox values before OCR processing
+
 ## [0.9.14] - 2026-09-10
 
 ### Features
