@@ -2140,11 +2140,65 @@ class TestApplyOcr:
                 output.pages[0].Contents.read_bytes()
             )
 
-    def test_clipped_text_after_full_page_image_fails_closed(
+    @pytest.mark.parametrize("deskew", [False, True])
+    @pytest.mark.parametrize("form_text", [False, True])
+    @pytest.mark.parametrize("clipped", [False, True])
+    def test_preserves_digital_text_and_vectors_over_full_page_image(
         self,
         tmp_dir: Path,
         model_dirs: tuple[Path, Path],
         validate_models: MagicMock,
+        deskew: bool,
+        form_text: bool,
+        clipped: bool,
+    ) -> None:
+        input_path = tmp_dir / "digital-background.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(
+                pdf,
+                visible_text=not form_text,
+                visible_form_text=form_text,
+                vector=True,
+            )
+            page = pdf.pages[0]
+            if clipped:
+                page.Contents.write(
+                    page.Contents.read_bytes().replace(
+                        b"/HiddenText Do" if form_text else b"BT",
+                        b"0 0 100 100 re W n\n"
+                        + (b"/HiddenText Do" if form_text else b"BT"),
+                    )
+                )
+            pdf.save(input_path)
+
+        with patch("pdftopdfa.ocr.ocrmypdf.ocr") as mock_ocr:
+            apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+                deskew=deskew,
+            )
+
+        mock_ocr.assert_not_called()
+        with Pdf.open(input_path) as source, Pdf.open(output_path) as output:
+            assert source.pages[0].Contents.read_bytes() == (
+                output.pages[0].Contents.read_bytes()
+            )
+            for name, xobject in source.pages[0].Resources.XObject.items():
+                assert xobject.read_bytes() == (
+                    output.pages[0].Resources.XObject[name].read_bytes()
+                )
+
+    @pytest.mark.parametrize("deskew", [False, True])
+    def test_clipped_text_after_full_page_image_is_preserved(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        deskew: bool,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         input_path = tmp_dir / "clipped-text.pdf"
         output_path = tmp_dir / "output.pdf"
@@ -2157,26 +2211,29 @@ class TestApplyOcr:
             )
             pdf.save(input_path)
 
-        with (
-            patch("pdftopdfa.ocr.ocrmypdf.ocr") as mock_ocr,
-            pytest.raises(OCRError, match="ambiguous scan-like page"),
-        ):
+        with patch("pdftopdfa.ocr.ocrmypdf.ocr") as mock_ocr:
             apply_ocr(
                 input_path,
                 output_path,
                 detection_model_dir=model_dirs[0],
                 recognition_model_dir=model_dirs[1],
-                deskew=True,
+                deskew=deskew,
             )
 
         mock_ocr.assert_not_called()
-        assert not output_path.exists()
+        with Pdf.open(input_path) as source, Pdf.open(output_path) as output:
+            assert source.pages[0].Contents.read_bytes() == (
+                output.pages[0].Contents.read_bytes()
+            )
+        assert "OCR skipped for page(s) [1]" in caplog.text
 
+    @pytest.mark.parametrize("prior_ocr", [False, True])
     def test_manifest_failure_preserves_existing_output_atomically(
         self,
         tmp_dir: Path,
         model_dirs: tuple[Path, Path],
         validate_models: MagicMock,
+        prior_ocr: bool,
     ) -> None:
         input_path = tmp_dir / "input.pdf"
         output_path = tmp_dir / "output.pdf"
@@ -2190,7 +2247,7 @@ class TestApplyOcr:
         with (
             patch(
                 "pdftopdfa.ocr.ocrmypdf.ocr",
-                side_effect=_copy_ocr_input,
+                side_effect=PriorOcrFoundError() if prior_ocr else _copy_ocr_input,
             ),
             patch(
                 "pdftopdfa.ocr._write_ocr_document_manifest",
@@ -2732,35 +2789,55 @@ class TestApplyOcr:
         assert prepared_page_has_text == [False]
 
     @pytest.mark.parametrize("deskew", [False, True])
-    def test_ambiguous_scan_with_foreign_text_fails_closed(
+    @pytest.mark.parametrize("with_scan", [False, True])
+    def test_ambiguous_scan_is_preserved_while_other_pages_receive_ocr(
         self,
         tmp_dir: Path,
         model_dirs: tuple[Path, Path],
         validate_models: MagicMock,
         deskew: bool,
+        with_scan: bool,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         input_path = tmp_dir / "ambiguous-ocr-scan.pdf"
         output_path = tmp_dir / "output.pdf"
+        manifest_path = tmp_dir / "manifest.json"
         with Pdf.new() as pdf:
             _add_content_page(pdf, hidden_form_text=True, vector=True)
+            if with_scan:
+                _add_content_page(pdf)
             pdf.save(input_path)
 
-        with (
-            patch("pdftopdfa.ocr.ocrmypdf.ocr") as mock_ocr,
-            pytest.raises(OCRError, match="ambiguous scan-like page"),
-        ):
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr", side_effect=_copy_ocr_input
+        ) as mock_ocr:
             apply_ocr(
                 input_path,
                 output_path,
                 detection_model_dir=model_dirs[0],
                 recognition_model_dir=model_dirs[1],
                 deskew=deskew,
+                _manifest_output_path=manifest_path,
             )
 
-        mock_ocr.assert_not_called()
-        assert not output_path.exists()
+        if with_scan:
+            mock_ocr.assert_called_once()
+            assert mock_ocr.call_args.kwargs["pages"] == "2"
+            assert mock_ocr.call_args.kwargs["deskew"] is deskew
+        else:
+            mock_ocr.assert_not_called()
+        with Pdf.open(input_path) as source, Pdf.open(output_path) as output:
+            assert len(output.pages) == len(source.pages)
+            assert source.pages[0].Contents.read_bytes() == (
+                output.pages[0].Contents.read_bytes()
+            )
+            assert source.pages[0].Resources.XObject.HiddenText.read_bytes() == (
+                output.pages[0].Resources.XObject.HiddenText.read_bytes()
+            )
+        assert json.loads(manifest_path.read_text())["pages"] == []
+        assert "OCR skipped for page(s) [1]" in caplog.text
 
-    def test_prior_ocr_aborts_deskew_without_publishing_foreign_text(
+    def test_prior_ocr_preserves_original_text_before_deskew_preparation(
         self,
         tmp_dir: Path,
         model_dirs: tuple[Path, Path],
@@ -2772,12 +2849,9 @@ class TestApplyOcr:
             _add_content_page(pdf, hidden_form_text=True)
             pdf.save(input_path)
 
-        with (
-            patch(
-                "pdftopdfa.ocr.ocrmypdf.ocr",
-                side_effect=PriorOcrFoundError(),
-            ),
-            pytest.raises(OCRError, match="already contains an OCR text layer"),
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=PriorOcrFoundError(),
         ):
             apply_ocr(
                 input_path,
@@ -2787,9 +2861,9 @@ class TestApplyOcr:
                 deskew=True,
             )
 
-        assert not output_path.exists()
+        assert output_path.read_bytes() == input_path.read_bytes()
 
-    def test_prior_ocr_aborts_regular_run_and_preserves_atomic_targets(
+    def test_prior_ocr_publishes_original_pdf_and_empty_manifest_atomically(
         self,
         sample_pdf: Path,
         tmp_dir: Path,
@@ -2803,12 +2877,9 @@ class TestApplyOcr:
         output_path.write_bytes(output_sentinel)
         manifest_path.write_bytes(manifest_sentinel)
 
-        with (
-            patch(
-                "pdftopdfa.ocr.ocrmypdf.ocr",
-                side_effect=PriorOcrFoundError(),
-            ),
-            pytest.raises(OCRError, match="already contains an OCR text layer"),
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=PriorOcrFoundError(),
         ):
             apply_ocr(
                 sample_pdf,
@@ -2818,8 +2889,11 @@ class TestApplyOcr:
                 _manifest_output_path=manifest_path,
             )
 
-        assert output_path.read_bytes() == output_sentinel
-        assert manifest_path.read_bytes() == manifest_sentinel
+        assert output_path.read_bytes() == sample_pdf.read_bytes()
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["pages"] == []
+        with Pdf.open(sample_pdf) as pdf:
+            assert manifest["page_count"] == len(pdf.pages)
         assert not list(tmp_dir.glob(".*_ocr_*"))
 
     def test_deskew_handles_mixed_pdf_page_by_page_in_disjoint_calls(
@@ -2899,7 +2973,7 @@ class TestApplyOcr:
         assert redo_call.kwargs["deskew"] is False
         assert "skip_text" not in redo_call.kwargs
 
-    def test_prior_ocr_in_second_stage_does_not_publish_partial_result(
+    def test_prior_ocr_in_second_stage_discards_partial_output_and_manifest(
         self,
         tmp_dir: Path,
         model_dirs: tuple[Path, Path],
@@ -2926,7 +3000,9 @@ class TestApplyOcr:
             nonlocal calls
             calls += 1
             if calls == 1:
-                shutil.copy2(source, destination)
+                with Pdf.open(source) as pdf:
+                    pdf.docinfo["/Subject"] = "Partial OCR output"
+                    pdf.save(destination)
                 return
             raise PriorOcrFoundError()
 
@@ -2935,7 +3011,10 @@ class TestApplyOcr:
                 "pdftopdfa.ocr.ocrmypdf.ocr",
                 side_effect=copy_then_reject_prior_ocr,
             ) as mock_ocr,
-            pytest.raises(OCRError, match="already contains an OCR text layer"),
+            patch(
+                "pdftopdfa.ocr._read_ocr_run_sidecars",
+                return_value={0: {"partial": True}},
+            ),
         ):
             apply_ocr(
                 input_path,
@@ -2946,8 +3025,11 @@ class TestApplyOcr:
             )
 
         assert mock_ocr.call_count == 2
-        assert output_path.read_bytes() == output_sentinel
-        assert manifest_path.read_bytes() == manifest_sentinel
+        assert output_path.read_bytes() == input_path.read_bytes()
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["pages"] == []
+        with Pdf.open(input_path) as pdf:
+            assert manifest["page_count"] == len(pdf.pages)
         assert not list(tmp_dir.glob(".*_ocr_*"))
 
     def test_deskew_rejects_vector_and_small_image_pages(
@@ -4291,7 +4373,7 @@ class TestApplyOcr:
         assert kwargs["redo_ocr"] is True
         assert "skip_text" not in kwargs
 
-    def test_prior_ocr_aborts_force_without_publishing_foreign_form(
+    def test_prior_ocr_in_force_mode_preserves_existing_ocr_form(
         self,
         tmp_dir: Path,
         model_dirs: tuple[Path, Path],
@@ -4311,12 +4393,9 @@ class TestApplyOcr:
             page.obj[Name.Contents] = pdf.make_stream(b"/OCR-existing Do")
             pdf.save(input_path)
 
-        with (
-            patch(
-                "pdftopdfa.ocr.ocrmypdf.ocr",
-                side_effect=PriorOcrFoundError(),
-            ),
-            pytest.raises(OCRError, match="already contains an OCR text layer"),
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=PriorOcrFoundError(),
         ):
             apply_ocr(
                 input_path,
@@ -4326,7 +4405,7 @@ class TestApplyOcr:
                 force=True,
             )
 
-        assert not output_path.exists()
+        assert output_path.read_bytes() == input_path.read_bytes()
 
     def test_force_removes_only_invisible_text_from_existing_ocr_forms(
         self,

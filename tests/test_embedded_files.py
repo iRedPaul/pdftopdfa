@@ -629,7 +629,8 @@ class TestConvertNonCompliantEmbeddedFiles:
         with patch(_TRY_CONVERT, return_value=None):
             result = convert_to_pdfa(input_path, output_path, level="2b")
 
-        assert result.success is False
+        assert result.success is True
+        assert result.target_produced is False
         assert result.validation_failed is True
         assert any("attachment" in warning for warning in result.warnings)
         assert any("published despite" in warning for warning in result.warnings)

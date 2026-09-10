@@ -360,7 +360,6 @@ class _DeskewPlan:
     regular_ocr_pages: tuple[int, ...]
     redo_ocr_pages: tuple[int, ...]
     strip_text_pages: tuple[int, ...]
-    ambiguous_scan_pages: tuple[int, ...]
 
 
 def _object_key(value: "pikepdf.Object") -> _ObjectKey:
@@ -1138,12 +1137,17 @@ def _plan_deskew_ocr(
                 "Deskew skipped for %d annotated scan-like page(s)",
                 annotated_scan_pages,
             )
+        if ambiguous_scan_pages:
+            logger.warning(
+                "OCR skipped for page(s) %s: the existing text layer cannot be "
+                "safely replaced; original page content preserved",
+                ambiguous_scan_pages,
+            )
         return _DeskewPlan(
             tuple(deskew_pages),
             tuple(regular_ocr_pages),
             tuple(redo_ocr_pages),
             tuple(strip_text_pages),
-            tuple(ambiguous_scan_pages),
         )
     except Exception as exc:
         log_suppressed_error(
@@ -3095,12 +3099,6 @@ def apply_ocr(
             if plan is None:
                 run_ocr(ocr_input_path, staged_output_path)
             else:
-                if plan.ambiguous_scan_pages:
-                    raise OCRError(
-                        "OCR cannot safely replace an existing text layer on "
-                        "ambiguous scan-like page(s): "
-                        f"{list(plan.ambiguous_scan_pages)}"
-                    )
                 regular_pages = tuple(
                     sorted((*plan.regular_ocr_pages, *plan.deskew_pages))
                 )
@@ -3147,12 +3145,6 @@ def apply_ocr(
                     "identified safely"
                 )
                 run_ocr(ocr_input_path, staged_output_path)
-            elif plan.ambiguous_scan_pages:
-                raise OCRError(
-                    "OCR cannot safely replace an existing text layer on "
-                    "ambiguous scan-like page(s): "
-                    f"{list(plan.ambiguous_scan_pages)}"
-                )
             elif (
                 not plan.deskew_pages
                 and not plan.regular_ocr_pages
@@ -3232,11 +3224,25 @@ def apply_ocr(
     except EncryptedPdfError as e:
         raise OCRError(f"OCR failed: PDF is encrypted ({input_path})") from e
 
-    except PriorOcrFoundError as e:
-        raise OCRError(
-            "OCR failed: the selected page already contains an OCR text layer; "
-            "refusing to publish it as PaddleOCR output"
-        ) from e
+    except PriorOcrFoundError:
+        logger.warning(
+            "OCR skipped: an existing text layer could not be replaced; "
+            "discarding the OCR attempt and preserving the original PDF"
+        )
+        try:
+            shutil.copy2(input_path, staged_output_path)
+            if staged_manifest_path is not None:
+                _write_ocr_document_manifest(
+                    staged_manifest_path, staged_output_path, languages, {}, {}
+                )
+            staged_output_snapshot = staged_file_snapshot(staged_output_path)
+            if staged_manifest_path is not None:
+                staged_manifest_snapshot = staged_file_snapshot(staged_manifest_path)
+        except OSError as exc:
+            raise OCRError(
+                f"Could not preserve the original PDF after OCR: {exc}"
+            ) from exc
+        completed_successfully = True
 
     except MissingDependencyError as e:
         raise OCRError(f"OCR failed: {_format_ocr_exception(e)}") from e

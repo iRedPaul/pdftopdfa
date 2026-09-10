@@ -9,7 +9,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pikepdf
-import pytest
 from conftest import make_pdf_with_page, new_pdf, resolve
 from pikepdf import Array, Dictionary, Name, Pdf
 
@@ -19,7 +18,6 @@ from pdftopdfa.converter import (
     _restore_annotations_after_ocr,
     _strip_annotations_for_ocr,
 )
-from pdftopdfa.exceptions import OCRError
 
 _DETECTION_MODEL_DIR = Path("paddle-detection")
 _RECOGNITION_MODEL_DIR = Path("paddle-recognition")
@@ -676,7 +674,7 @@ class TestOcrAnnotationIntegration:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)
-    def test_page_count_mismatch_aborts_conversion(
+    def test_page_count_mismatch_preserves_original_with_annotations(
         self,
         mock_is_available: MagicMock,
         mock_apply_ocr: MagicMock,
@@ -703,17 +701,19 @@ class TestOcrAnnotationIntegration:
         mock_apply_ocr.side_effect = fake_apply_ocr
 
         output = tmp_dir / "mismatch_output.pdf"
-        with pytest.raises(OCRError, match="prevent annotation loss"):
-            convert_to_pdfa(
-                original,
-                output,
-                level="2b",
-                ocr_languages=["en"],
-                ocr_detection_model_dir=_DETECTION_MODEL_DIR,
-                ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
-            )
+        result = convert_to_pdfa(
+            original,
+            output,
+            level="2b",
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        )
 
-        assert not output.exists()
+        assert result.success and result.skipped
+        assert not result.target_produced
+        assert any("prevent annotation loss" in warning for warning in result.warnings)
+        assert output.read_bytes() == original.read_bytes()
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available", return_value=True)

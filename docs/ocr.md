@@ -507,8 +507,8 @@ When annotations are detected, the high-level conversion APIs try to remove
 them from a temporary OCR input so they are not rasterized. When that succeeds,
 they restore the original annotation arrays and AcroForm after OCR and verify
 the page and annotation counts. A stripping failure is logged and processing
-continues with the original input; a restoration failure aborts rather than
-silently dropping annotations. This preservation step is not part of the
+continues with the original input; a restoration failure discards the converted
+candidate and preserves the original PDF, including its annotations. This preservation step is not part of the
 lower-level `apply_ocr()` API. With `pdfa=False`, successfully restored
 annotations remain in the processed PDF. The subsequent PDF/A sanitization
 used by normal conversion can still flatten or remove annotations that are not
@@ -533,6 +533,12 @@ document-level already-compliant PDF/A skip path. Force mode additionally:
 Use `--allow-signature-invalidation` only when an unsigned OCR/PDF/A copy is
 intentional.
 
+If OCRmyPDF rejects an existing text layer during processing, the OCR attempt
+is discarded, a warning is logged, and the original PDF is preserved for the
+remaining conversion steps. This also applies to force mode. Any OCR manifest
+then contains no newly recognized pages; existing text is not reported as new
+OCR output.
+
 ## Deskew and Page Orientation
 
 `--deskew` and `--rotate-pages` are independent opt-in operations. Both enable
@@ -548,10 +554,11 @@ that native text while the internal engine recognizes the underlying scan.
 Text painted before a later full-page image is treated as occluded. Image
 coverage is intersected with the page, so off-page or tightly clipped images do
 not qualify. Unknown clipping, transparency, blend, optional-content, or
-overprint states fail closed. If such a page combines an apparent full-page scan
-with an existing text layer, OCR aborts instead of publishing text of uncertain
-provenance. This leaves ordinary digitally generated pages and pages with only
-decorative small images unchanged and handles mixed documents page by page.
+overprint states prevent text replacement. If such a page combines an apparent
+full-page scan with an existing text layer, OCR preserves that page and logs a
+warning. OCR continues on the other eligible pages. This leaves ordinary
+digitally generated pages and pages with only decorative small images unchanged
+and handles mixed documents page by page.
 Text that is provably non-painting from its render mode or alpha state is removed
 from a temporary page-local copy before a selected OCR run; clipping-only text
 is not assumed invisible because arbitrary clip geometry is ambiguous.

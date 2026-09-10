@@ -14,8 +14,9 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
+from functools import wraps
 from pathlib import Path
 from typing import Any, Literal
 
@@ -645,7 +646,9 @@ class ConversionResult:
     """Result of a PDF/A conversion.
 
     Attributes:
-        success: True only if processing and every requested validation succeeded.
+        success: True if processing produced an output, including an unchanged
+            copy or an explicitly requested non-conforming candidate. Check
+            target_produced and validation_failed for the conformance outcome.
         input_path: Path to the input PDF.
         output_path: Requested path for the output PDF.
         level: Requested level for a converted output, detected level for a
@@ -653,7 +656,8 @@ class ConversionResult:
             disabled or an unsupported input was copied unchanged.
         warnings: List of warnings during conversion.
         processing_time: Processing time in seconds.
-        error: Error message if success=False.
+        error: Error details when an output could not be produced or an explicitly
+            retained candidate failed validation.
         validation_failed: True if veraPDF reported non-conformance or could
             not complete, or if a preserved embedded PDF could not be
             converted.
@@ -1326,6 +1330,76 @@ def _restore_annotations_after_ocr(
                 pass
 
 
+def _preserve_input_on_failure(
+    convert: Callable[..., ConversionResult],
+) -> Callable[..., ConversionResult]:
+    """Keep document failures from aborting callers or discarding their input."""
+
+    @wraps(convert)
+    def convert_or_copy(
+        input_path: Path, output_path: Path, *args: Any, **kwargs: Any
+    ) -> ConversionResult:
+        started = time.perf_counter()
+        try:
+            result = convert(input_path, output_path, *args, **kwargs)
+            if result.published:
+                return replace(result, success=True)
+            reason = result.error or "Requested conversion target was not produced"
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            result = ConversionResult(
+                success=False,
+                input_path=input_path,
+                output_path=output_path,
+                level=None,
+                published=False,
+                target_produced=False,
+                pdfua_status=(
+                    PDFUAStatus.NOT_PRODUCED
+                    if kwargs.get("pdfua", False)
+                    else PDFUAStatus.NOT_REQUESTED
+                ),
+            )
+
+        try:
+            _copy_input_to_output(
+                input_path,
+                output_path,
+                allow_overwrite=kwargs.get("_allow_output_overwrite", True),
+            )
+        except Exception as exc:
+            error = f"{reason}; could not preserve original input: {exc}"
+            logger.error("%s: %s", input_path, error)
+            return replace(
+                result,
+                success=False,
+                error=error,
+                processing_time=time.perf_counter() - started,
+            )
+
+        warning = f"Conversion skipped: {reason}; original input copied unchanged"
+        logger.warning("%s: %s", input_path, warning)
+        return replace(
+            result,
+            success=True,
+            level=None,
+            warnings=[*result.warnings, warning],
+            error=None,
+            skipped=True,
+            published=True,
+            target_produced=False,
+            processing_time=time.perf_counter() - started,
+            pdfua_status=(
+                PDFUAStatus.NOT_PRODUCED
+                if kwargs.get("pdfua", False)
+                else PDFUAStatus.NOT_REQUESTED
+            ),
+        )
+
+    return convert_or_copy
+
+
+@_preserve_input_on_failure
 def convert_to_pdfa(
     input_path: Path,
     output_path: Path,
@@ -1408,10 +1482,9 @@ def convert_to_pdfa(
     Returns:
         ConversionResult with status and details.
 
-    Raises:
-        ConversionError: If conversion fails.
-        UnsupportedPDFError: If the PDF is not supported.
-        FontEmbeddingError: If fonts cannot be embedded.
+    Failed processing preserves the original input at the output path and returns
+    ``skipped=True``, ``level=None``, and ``target_produced=False`` with a warning.
+    If the input cannot be copied, a failed result is returned instead of raising.
     """
     ocr_requested, effective_ocr_languages = _validate_ocr_configuration(
         ocr_languages=ocr_languages,
@@ -2835,13 +2908,7 @@ def convert_files(
             )
             results.append(result)
 
-        except (
-            ConversionError,
-            UnsupportedPDFError,
-            FontEmbeddingError,
-            OCRError,
-            PermissionError,
-        ) as e:
+        except Exception as e:
             logger.error("Error for %s: %s", input_path.name, e)
             results.append(
                 ConversionResult(

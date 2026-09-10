@@ -143,10 +143,10 @@ omitted. Providing only one model directory is an error.
 | `0` | Success |
 | `1` | General error |
 | `2` | CLI usage or argument error, including a nonexistent input path |
-| `3` | Conversion failed |
-| `4` | Validation failed |
+| `3` | Processing and original-input preservation both failed |
+| `4` | Validation failed and no output was produced |
 | `5` | Permission error |
-| `6` | PDF/UA machine validation passed, but author review is required |
+| `6` | Author review is required and no output was published |
 
 ## Python API
 
@@ -154,36 +154,44 @@ omitted. Providing only one model directory is an error.
 
 ```python
 from pathlib import Path
-from pdftopdfa import PDFToPDFAError, PDFUAStatus, convert_to_pdfa
+from pdftopdfa import PDFUAStatus, convert_to_pdfa
 
-try:
-    result = convert_to_pdfa(
-        input_path=Path("input.pdf"),
-        output_path=Path("output.pdf"),
-        level="2a",
-        pdfua=True,
-        document_title="Annual report",
-        document_language="en-GB",
-    )
-except PDFToPDFAError as exc:
-    print(f"Conversion failed: {exc}")
+result = convert_to_pdfa(
+    input_path=Path("input.pdf"),
+    output_path=Path("output.pdf"),
+    level="2a",
+    pdfua=True,
+    document_title="Annual report",
+    document_language="en-GB",
+)
+if not result.success:
+    print(f"Could not write output: {result.error}")
+elif not result.target_produced:
+    print("Requested conformance was not produced", result.warnings)
+elif result.pdfua_status is PDFUAStatus.REVIEW_REQUIRED:
+    print("Machine checks passed; author review is still required")
 else:
-    if result.validation_failed:
-        print("Validation failed; no candidate was published")
-    elif result.pdfua_status is PDFUAStatus.REVIEW_REQUIRED:
-        print("Machine checks passed; author review is still required")
-    else:
-        print("Done")
+    print("Done")
 ```
 
-`convert_to_pdfa()` raises on conversion failure. If explicit validation fails,
-the default `publication_policy="validated"` leaves the staged candidate
-unpublished, preserves an existing destination, and returns `success=False`,
-`validation_failed=True`, `published=False`, and a validation error message.
-Set `publication_policy="always"` only to retain a known non-conforming review
-candidate; it remains `success=False` and `target_produced=False`.
-The batch APIs represent handled per-file failures with `success=False` and an
-`error` message so that later files can still be processed.
+`convert_to_pdfa()` catches per-document processing errors and copies the
+original input unchanged to the output. The result reports `success=True`,
+`skipped=True`, `level=None`, and `target_produced=False`, with the cause in
+`warnings`. An existing destination is replaced only when overwrite is allowed.
+This applies to every processing stage, including unexpected exceptions.
+If the fallback copy also fails, the function returns `success=False`,
+`published=False`, and an `error`; batch processing continues with later files.
+User cancellation is not caught.
+
+If validation fails, the default `publication_policy="validated"` withholds
+the rejected candidate and uses the same original-input fallback. Validation
+evidence and the rejected candidate's hash remain available in the result;
+that hash does not describe the unchanged output copy.
+`publication_policy="always"` retains the non-conforming candidate instead.
+In either case `validation_failed=True` and `target_produced=False` remain
+visible. `success` means an output was produced, not that it meets PDF/A or
+PDF/UA requirements. The CLI returns zero when an output is produced and prints
+any validation or author-review findings.
 
 Signature:
 
@@ -241,8 +249,8 @@ rules.
 Set `ocr_execution_provider="directml"` to use the project's supported
 DirectML configuration on Windows 11 after installing
 `pdftopdfa[directml]`. The same FP32 ONNX model directories are used for both
-providers. If DirectML is requested but unavailable, the call raises
-`OCRError` instead of falling back to CPU. Use `"directml:<index>"`, for
+providers. If DirectML is requested but unavailable, conversion preserves the
+original input with a warning; it does not switch to CPU. Use `"directml:<index>"`, for
 example `"directml:1"`, to pass a specific raw DXGI adapter index; see
 [docs/ocr.md](ocr.md#selecting-a-gpu).
 
@@ -267,8 +275,8 @@ maximum archival robustness. Set `preserve_stamps=True` or pass
 
 Missing normal appearances are generated for basic Square annotations, note and
 attachment icons, default Draft stamps, and supported form widgets. Other visible
-annotations without a usable normal appearance cause conversion to fail while
-preserving an existing destination. This prevents FreeText, highlights, ink, or
+annotations without a usable normal appearance cause the converted candidate
+to be rejected and the original input to be copied unchanged. This prevents FreeText, highlights, ink, or
 other annotations from silently disappearing. Save such PDFs with annotation
 appearances in the originating application before converting them.
 
@@ -291,7 +299,8 @@ identification, the required PDF/A extension schema, and a document-title
 fallback when the source has none. PDF/UA mode always runs veraPDF once for the
 selected PDF/A profile and once for `ua1`, even without `validate=True` or
 `--validate`. If veraPDF is unavailable or either profile fails, fail-closed
-publication withholds the candidate and reports `validation_failed`. Provide
+publication withholds the candidate, copies the original input, and reports
+`validation_failed` and `target_produced=False`. Provide
 `document_title` and `document_language` when source metadata is not
 authoritative; otherwise a filename-derived title or undetermined language is
 reported for author review. A converted PDF/A output has inherited PDF/UA
@@ -331,7 +340,8 @@ also causes machine validation to report the missing description.
 
 `PDFUAStatus.REVIEW_REQUIRED` means the PDF/A and PDF/UA-1 machine profiles
 passed but `review_findings` contains unresolved author decisions. The CLI
-returns exit code `6`. Neither that state nor
+reports the findings without a nonzero exit code when output was produced.
+Neither that state nor
 `PDFUAStatus.MACHINE_VALIDATED` is a human accessibility certification.
 Every newly converted PDF/UA candidate includes a `human_accessibility_review`
 finding because reading order, meaning, alternatives, contrast, and usability
@@ -474,7 +484,7 @@ the pages need OCR.
 
 | Field | Type | Description |
 |---|---|---|
-| `success` | `bool` | `True` only if processing and every requested validation succeeded; author review may still be required |
+| `success` | `bool` | `True` if an output was produced, including unchanged copies and explicitly requested non-conforming candidates; check `target_produced` and `validation_failed` for conformance |
 | `input_path` | `Path` | Input file path |
 | `output_path` | `Path` | Output file path |
 | `level` | `str \| None` | Requested level for converted output, detected level for a compliant skip, or `None` when no PDF/A level was produced or detected, such as a protected input copied unchanged or `pdfa=False` output |
@@ -534,7 +544,7 @@ OCR configuration is validated before input processing:
   `directml` or `directml:1` without both model-directory options raises a
   Click `UsageError`.
 - Providing only one model-directory option also raises `UsageError`.
-- The high-level Python APIs raise `ValueError` when only one model directory
+- Configuration checks reject requests when only one model directory
   is supplied, or when languages, OCR processing options, or
   a non-CPU `ocr_execution_provider` are supplied without the complete pair.
 - Figure text OCR requires PDF/A level `2a` or `3a`; other levels and
@@ -548,19 +558,21 @@ OCR configuration is validated before input processing:
 - Missing, structurally invalid, or incompatible model artifacts raise
   `OCRError`.
 
+These checks still run. `convert_to_pdfa()` handles their errors through the
+original-input fallback. Low-level helpers and batch-wide argument validation
+can still raise exceptions; the CLI still rejects invalid command syntax.
+
 Example:
 
 ```python
 from pathlib import Path
 from pdftopdfa import convert_to_pdfa
-from pdftopdfa.exceptions import ConversionError, UnsupportedPDFError
 
-try:
-    convert_to_pdfa(Path("input.pdf"), Path("output.pdf"))
-except UnsupportedPDFError:
-    print("Unsupported PDF")
-except ConversionError as exc:
-    print(f"Conversion failed: {exc}")
+result = convert_to_pdfa(Path("input.pdf"), Path("output.pdf"))
+if not result.success:
+    print(f"Could not write output: {result.error}")
+elif not result.target_produced:
+    print("Requested conformance was not produced", result.warnings)
 ```
 
 Encrypted PDFs, including those with an empty user password, are copied to the
@@ -577,10 +589,9 @@ Digitally signed PDFs are also copied unchanged by default, because OCR,
 metadata repair, font embedding, and PDF/A rewriting would invalidate the
 cryptographic signature. The result has `success=True`, `skipped=True`, and a
 warning, but the unchanged copy is not guaranteed to conform to the requested
-PDF/A level. Requested PDF/A validation withholds the unchanged input by default
-and records an incomplete validation. If PDF/UA was requested, the protected
-input is not published by default and likewise returns `success=False`, `published=False`,
-`target_produced=False`, and `pdfua_status="not_produced"`.
+PDF/A level. Requested validation records an incomplete validation while the
+original signed PDF is preserved. A requested PDF/UA target reports
+`target_produced=False` and `pdfua_status="not_produced"`.
 Use `--allow-signature-invalidation` or
 `allow_signature_invalidation=True` only when you intentionally want an
 unsigned converted copy. For signed archives, the recommended workflow is to
@@ -636,7 +647,7 @@ Notes:
 
 Repairs that cannot be made without changing how the document renders are
 reported as a conversion failure instead of being applied approximately. A
-`ConversionError` is raised when:
+The internal pipeline rejects the converted candidate when:
 
 - Optional content (layers) is malformed, cyclic, references unregistered
   groups, or has a default configuration whose visibility cannot be normalized
@@ -646,9 +657,9 @@ reported as a conversion failure instead of being applied approximately. A
   that is not two non-empty byte strings.
 - Level A semantic tagging cannot bind tags to page content safely.
 
-Earlier releases logged a warning in these cases and continued with a
-best-effort result. Nothing is published on failure: an existing destination
-keeps its previous contents and a new destination stays absent.
+The high-level converter catches these failures and copies the original input
+unchanged with a warning. It does not publish a partially modified candidate or
+claim that the original input meets the requested conformance level.
 
 ## Validation
 
@@ -660,13 +671,13 @@ versions reported by veraPDF's XML output are rejected as unsupported.
 - CLI: `pdftopdfa -v input.pdf`
 - API: pass `validate=True`
 
-If veraPDF reports non-conformance or cannot complete, the Python APIs return a
-result with `success=False` and `validation_failed=True`. For `validate=True`
-and all PDF/UA conversions, the default is fail-closed: the candidate remains
-unpublished and an existing destination is unchanged. The CLI exits with code
-`4`. Use `publication_policy="always"` or `--publish-noncompliant` to publish
-the failed candidate explicitly; the failure status is unchanged. A true
-conversion failure also publishes nothing.
+If veraPDF reports non-conformance or cannot complete, the result retains
+`validation_failed=True` and `target_produced=False`. By default the rejected
+candidate is withheld and the original input is copied unchanged. Use
+`publication_policy="always"` or `--publish-noncompliant` to retain the failed
+candidate instead. Both outcomes are reported with warnings and a zero CLI
+exit code when an output was produced. A processing failure uses the same
+original-input fallback.
 
 ## Environment Variables
 
