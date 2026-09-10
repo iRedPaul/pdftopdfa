@@ -836,6 +836,70 @@ class TestCliPermissionErrors:
         assert result.exit_code == EXIT_PERMISSION_ERROR
         assert "Access denied: read-only" in result.output
 
+    @pytest.mark.parametrize("directory", [False, True])
+    @pytest.mark.parametrize(
+        ("error_type", "expected_exit"),
+        [(PermissionError, EXIT_PERMISSION_ERROR), (OSError, EXIT_CONVERSION_FAILED)],
+    )
+    def test_fallback_copy_failure_keeps_error_category(
+        self,
+        runner: CliRunner,
+        sample_pdf: Path,
+        tmp_dir: Path,
+        directory: bool,
+        error_type: type[OSError],
+        expected_exit: int,
+    ) -> None:
+        from pdftopdfa.converter import _copy_input_to_output
+
+        input_dir = tmp_dir / "inputs"
+        input_dir.mkdir()
+        first = input_dir / "first.pdf"
+        first.write_bytes(sample_pdf.read_bytes())
+        output_dir = tmp_dir / "outputs"
+        output_dir.mkdir()
+        output = output_dir / ("first_pdfa.pdf" if directory else "output.pdf")
+        output.write_bytes(b"existing output")
+        if directory:
+            (input_dir / "second.pdf").write_bytes(sample_pdf.read_bytes())
+        report_path = tmp_dir / "audit.json"
+
+        def copy_or_fail(source, destination, **kwargs):
+            if source == first:
+                raise error_type("destination locked")
+            return _copy_input_to_output(source, destination, **kwargs)
+
+        with (
+            patch("pdftopdfa.converter.save_pdfa", side_effect=error_type("locked")),
+            patch(
+                "pdftopdfa.converter._copy_input_to_output", side_effect=copy_or_fail
+            ),
+        ):
+            result = runner.invoke(
+                main,
+                [
+                    str(input_dir if directory else first),
+                    str(output_dir if directory else output),
+                    "--force",
+                    "--audit-report",
+                    str(report_path),
+                ],
+            )
+
+        assert result.exit_code == expected_exit
+        assert "destination locked" in result.output
+        assert output.read_bytes() == b"existing output"
+        report = json.loads(report_path.read_text())
+        assert report["results"][0]["permission_error"] is (
+            error_type is PermissionError
+        )
+        if directory:
+            assert len(report["results"]) == 2
+            assert report["results"][1]["success"]
+            assert (
+                output_dir / "second_pdfa.pdf"
+            ).read_bytes() == sample_pdf.read_bytes()
+
 
 class TestCliForceOverwrite:
     """Tests for --force option."""

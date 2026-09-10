@@ -184,6 +184,8 @@ def test_failed_original_copy_returns_error_without_replacing_destination(
         result = convert_to_pdfa(sample_pdf, output)
 
     assert not result.success and not result.published and not result.target_produced
+    assert result.permission_error
+    assert result.to_dict()["permission_error"] is True
     assert "stage" in result.error and "destination locked" in result.error
     assert output.read_bytes() == b"previous output"
 
@@ -5681,6 +5683,8 @@ class TestConvertFiles:
         assert len(results) == 2
         assert results[0].success is False
         assert results[0].error == "Access denied"
+        assert results[0].permission_error
+        assert not results[1].permission_error
         assert results[1].success is True
         assert mock_convert_to_pdfa.call_count == 2
 

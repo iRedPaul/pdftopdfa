@@ -675,6 +675,7 @@ class ConversionResult:
         candidate_sha256: SHA-256 of the exact staged bytes submitted to
             validation, whether or not they were published.
         candidate_size: Size of that staged candidate in bytes.
+        permission_error: True if access permissions prevented producing output.
     """
 
     success: bool
@@ -696,6 +697,7 @@ class ConversionResult:
     metadata_sources: dict[str, str] = field(default_factory=dict)
     candidate_sha256: str | None = None
     candidate_size: int | None = None
+    permission_error: bool = False
 
     @property
     def review_required(self) -> bool:
@@ -713,6 +715,7 @@ class ConversionResult:
             "warnings": list(self.warnings),
             "processing_time": self.processing_time,
             "error": self.error,
+            "permission_error": self.permission_error,
             "validation_failed": self.validation_failed,
             "skipped": self.skipped,
             "published": self.published,
@@ -1379,6 +1382,7 @@ def _preserve_input_on_failure(
                 result,
                 success=False,
                 error=error,
+                permission_error=isinstance(exc, PermissionError),
                 processing_time=time.perf_counter() - started,
             )
 
@@ -2930,6 +2934,7 @@ def convert_files(
                     output_path=output_path,
                     level=level if pdfa else None,
                     error=str(e),
+                    permission_error=isinstance(e, PermissionError),
                     processing_time=0.0,
                     published=False,
                     target_produced=False,

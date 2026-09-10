@@ -765,6 +765,8 @@ def _convert_single_file(
     if audit_report is not None:
         _write_audit_report(audit_report, [result])
 
+    if result.permission_error:
+        return EXIT_PERMISSION_ERROR
     if result.pdfua_status is PDFUAStatus.REVIEW_REQUIRED:
         if quiet:
             click.echo(
@@ -970,6 +972,8 @@ def _convert_directory(
 
     if all(result.success and result.published for result in results):
         return EXIT_SUCCESS
+    if any(result.permission_error for result in results):
+        return EXIT_PERMISSION_ERROR
     if failed:
         if all(result.error == "Output file already exists" for result in failed):
             return EXIT_GENERAL_ERROR
