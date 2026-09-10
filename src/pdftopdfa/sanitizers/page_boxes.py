@@ -22,16 +22,17 @@ _MIN_PAGE_BOUNDARY_SIZE = 3.0
 _MAX_PAGE_BOUNDARY_SIZE = 14_400.0
 
 
-def _resolve_mediabox_from_parent(page_dict: dict) -> Array | None:
-    """Walk the /Parent chain to find an inherited /MediaBox.
+def _resolve_box_from_parent(page_dict: dict, box_name: Name) -> Array | None:
+    """Walk the /Parent chain to find an inherited page box.
 
     Includes cycle detection to avoid infinite loops.
 
     Args:
         page_dict: The page dictionary (pikepdf Dictionary).
+        box_name: The inheritable page box name.
 
     Returns:
-        The inherited MediaBox Array, or None if not found.
+        The inherited box, or None if not found.
     """
     visited: set[tuple[int, int]] = set()
     node = page_dict
@@ -55,11 +56,11 @@ def _resolve_mediabox_from_parent(page_dict: dict) -> Array | None:
         except Exception:
             pass  # already resolved
         try:
-            mb = parent.get(Name.MediaBox)
+            box = parent.get(box_name)
         except Exception:
-            mb = None
-        if mb is not None:
-            return mb
+            box = None
+        if box is not None:
+            return box
         node = parent
 
 
@@ -205,7 +206,7 @@ def sanitize_page_boxes(pdf: Pdf) -> dict[str, int]:
             mediabox = None
 
         if mediabox is None:
-            inherited = _resolve_mediabox_from_parent(page_dict)
+            inherited = _resolve_box_from_parent(page_dict, Name.MediaBox)
             if inherited is None:
                 logger.warning("Page %d: No MediaBox found, skipping", page_idx + 1)
                 continue
@@ -218,6 +219,10 @@ def sanitize_page_boxes(pdf: Pdf) -> dict[str, int]:
         if not _is_valid_box(mediabox):
             logger.warning("Page %d: Malformed MediaBox, skipping page", page_idx + 1)
             continue
+
+        inherited_cropbox = _resolve_box_from_parent(page_dict, Name.CropBox)
+        if page_dict.get(Name.CropBox) is None and inherited_cropbox is not None:
+            page_dict[Name.CropBox] = inherited_cropbox
 
         # Step 2b: Validate sub-box formats, remove malformed ones
         for box_name in _SUB_BOX_NAMES:
@@ -318,6 +323,10 @@ def sanitize_page_boxes(pdf: Pdf) -> dict[str, int]:
                     page_idx + 1,
                     box_name,
                 )
+
+        # Mask the inherited value if sanitization removed the local CropBox.
+        if inherited_cropbox is not None and page_dict.get(Name.CropBox) is None:
+            page_dict[Name.CropBox] = page_dict[Name.MediaBox]
 
         # Step 6: Ensure TrimBox or ArtBox
         try:

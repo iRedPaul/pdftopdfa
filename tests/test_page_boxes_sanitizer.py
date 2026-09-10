@@ -5,6 +5,7 @@
 """Tests for page box sanitization (MediaBox/CropBox/TrimBox/BleedBox/ArtBox)."""
 
 from collections.abc import Generator
+from io import BytesIO
 
 import pikepdf
 import pytest
@@ -16,7 +17,7 @@ from pdftopdfa.sanitizers.page_boxes import (
     _coords_equal,
     _is_valid_box,
     _normalize_box,
-    _resolve_mediabox_from_parent,
+    _resolve_box_from_parent,
     sanitize_page_boxes,
 )
 
@@ -94,6 +95,71 @@ class TestMediaBoxInheritance:
         assert result["mediabox_inherited"] == 0
         # TrimBox should NOT be added since the page was skipped
         assert result["trimbox_added"] == 0
+
+
+# ---------------------------------------------------------------------------
+# TestCropBoxInheritance
+# ---------------------------------------------------------------------------
+
+
+class TestCropBoxInheritance:
+    @pytest.mark.parametrize("nested", [False, True])
+    @pytest.mark.parametrize(
+        ("crop_box", "expected", "repair"),
+        [
+            ([-50, -50, 150, 150], [0, 0, 100, 100], "boxes_clipped"),
+            ([200, 200, 300, 300], [0, 0, 100, 100], "boxes_clipped"),
+            ([90, 90, 10, 10], [10, 10, 90, 90], "boxes_normalized"),
+            ([0, 0, 100], [0, 0, 100, 100], "malformed_boxes_removed"),
+            ([0, 0, 1, 1], [0, 0, 3, 3], "boxes_clipped"),
+            ([10, 10, 90, 90], [10, 10, 90, 90], None),
+        ],
+    )
+    def test_inherited_cropbox_sanitized(self, nested, crop_box, expected, repair):
+        pdf = new_pdf()
+        _make_page(pdf, MediaBox=Array([0, 0, 100, 100]))
+        _make_page(pdf, MediaBox=Array([0, 0, 80, 80]))
+        parent = pdf.Root.Pages
+        parent[Name.CropBox] = Array(crop_box)
+        if nested:
+            branch = pdf.make_indirect(
+                Dictionary(Type=Name.Pages, Parent=parent, Kids=parent.Kids, Count=2)
+            )
+            for page in pdf.pages:
+                page.obj[Name.Parent] = branch
+            parent[Name.Kids] = Array([branch])
+        assert Name.CropBox not in pdf.pages[0].obj
+
+        result = sanitize_page_boxes(pdf)
+
+        assert list(pdf.pages[0].cropbox) == expected
+        assert list(pdf.pages[0].obj.TrimBox) == expected
+        assert list(parent.CropBox) == crop_box
+        assert pdf.pages[1].cropbox[2] <= 80
+        assert pdf.pages[1].cropbox[3] <= 80
+        if repair is not None:
+            assert result[repair] > 0
+        assert sum(sanitize_page_boxes(pdf).values()) == 0
+        saved = BytesIO()
+        pdf.save(saved)
+        with Pdf.open(saved) as reopened:
+            assert list(reopened.pages[0].cropbox) == expected
+
+    def test_direct_cropbox_overrides_inherited(self):
+        pdf = new_pdf()
+        _make_page(
+            pdf,
+            MediaBox=Array([0, 0, 100, 100]),
+            CropBox=Array([10, 10, 90, 90]),
+        )
+        pdf.Root.Pages[Name.CropBox] = Array([0, 0, 100])
+
+        result = sanitize_page_boxes(pdf)
+
+        assert list(pdf.pages[0].cropbox) == [10, 10, 90, 90]
+        assert not any(
+            count for name, count in result.items() if name != "trimbox_added"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -565,4 +631,4 @@ class TestHelperFunctions:
 
     def test_resolve_mediabox_no_parent(self):
         d = Dictionary(Type=Name.Page)
-        assert _resolve_mediabox_from_parent(d) is None
+        assert _resolve_box_from_parent(d, Name.MediaBox) is None
