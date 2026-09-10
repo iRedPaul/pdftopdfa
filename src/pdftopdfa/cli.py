@@ -951,6 +951,8 @@ def _convert_directory(
             val_warnings = [
                 w for w in result.warnings if w.startswith(_VALIDATION_PREFIXES)
             ]
+            if not result.success and result.error:
+                val_warnings.insert(0, result.error)
             for w in val_warnings:
                 click.echo(
                     _encode_for_console(

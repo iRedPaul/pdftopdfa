@@ -2008,6 +2008,47 @@ class TestDirectoryValidationFailures:
         if quiet:
             assert "Summary:" not in result.output
 
+    @pytest.mark.parametrize("quiet", [False, True])
+    @patch("pdftopdfa.cli.convert_directory")
+    def test_validation_fallback_copy_failure_is_reported(
+        self,
+        mock_convert_dir: MagicMock,
+        runner: CliRunner,
+        tmp_dir: Path,
+        quiet: bool,
+    ) -> None:
+        """Failed original-input copies remain visible after validation fails."""
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir()
+        input_path = input_dir / "test.pdf"
+        input_path.write_bytes(b"%PDF-1.4 dummy")
+        error = (
+            "Validation failed; could not preserve original input: Permission denied"
+        )
+        mock_convert_dir.return_value = [
+            ConversionResult(
+                success=False,
+                input_path=input_path,
+                output_path=tmp_dir / "test_pdfa.pdf",
+                level=None,
+                warnings=["Validation: Rule 6.1.2 failed"],
+                error=error,
+                validation_failed=True,
+                published=False,
+            )
+        ]
+        arguments = [str(input_dir)]
+        if quiet:
+            arguments.append("--quiet")
+
+        result = runner.invoke(main, arguments)
+
+        assert result.exit_code == EXIT_VALIDATION_FAILED
+        assert f"test.pdf: {error}" in result.stderr
+        assert "Validation: Rule 6.1.2 failed" in result.stderr
+        if quiet:
+            assert "Summary:" not in result.output
+
     @patch("pdftopdfa.cli.convert_directory")
     def test_no_validation_failure_returns_success(
         self, mock_convert_dir, runner: CliRunner, tmp_dir: Path
