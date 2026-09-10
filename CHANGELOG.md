@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+## [0.9.14] - 2026-09-10
+
+### Features
+
+- Preserve original input PDFs when processing or validation prevents PDF/A target production
+
+### Changes
+
+- Report unchanged input copies while distinguishing target production, validation, and review outcomes
+- Require corpus conversions to produce the requested PDF/A target before reporting success
+
+### Bug Fixes
+
+- Preserve original PDFs when OCR replacement is unsafe and report permission failures with dedicated CLI exit codes
+
+### Documentation
+
+- Update conversion and OCR guidance for fallback copies, validation warnings, and PDF/UA behavior
+
 ## [0.9.13] - 2026-09-10
 
 ### Bug Fixes
