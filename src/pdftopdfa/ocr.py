@@ -58,6 +58,7 @@ from .orientation import (
     _effective_page_rotate,
     normalize_pdf_orientation,
 )
+from .sanitizers.page_boxes import sanitize_page_boxes
 from .staging import (
     StagedFileSnapshot,
     private_staging_directory,
@@ -2626,10 +2627,17 @@ def _preflight_ocr_input(
         page_dimensions = []
         non_whitespace_text = []
         scan_like_pages = []
-        with pikepdf.open(pdf_path) as pdf:
+        with (
+            TemporaryDirectory(prefix="pdftopdfa_ocr_preflight_") as temporary,
+            pikepdf.open(pdf_path) as pdf,
+        ):
             if not pdf.pages:
                 raise OCRError("OCR input contains no pages")
             _validate_ocr_content_work_budget(pdf, force=force)
+            repairs = sanitize_page_boxes(pdf)
+            if any(count for name, count in repairs.items() if name != "trimbox_added"):
+                pdf_path = Path(temporary) / "input.pdf"
+                pdf.save(pdf_path)
             for page_number, page in enumerate(pdf.pages, start=1):
                 media_box = _ocr_page_box_coordinates(
                     page.mediabox,
@@ -2707,7 +2715,7 @@ def _preflight_ocr_input(
                     )
                 )
 
-        pdfinfo = PdfInfo(pdf_path, max_workers=1)
+            pdfinfo = PdfInfo(pdf_path, max_workers=1)
         if len(pdfinfo.pages) != len(page_dimensions):
             raise OCRError("Page count changed during OCR resource preflight")
         raster_pages = []
@@ -3061,19 +3069,28 @@ def apply_ocr(
         if manifest_output_path is not None:
             manifest_temp = TemporaryDirectory(prefix="pdftopdfa_ocr_manifest_")
 
+        import pikepdf
+
+        with pikepdf.open(input_path) as pdf:
+            repairs = sanitize_page_boxes(pdf)
+            if any(count for name, count in repairs.items() if name != "trimbox_added"):
+                ocr_input_path = Path(output_staging.name) / "repaired_input.pdf"
+                pdf.save(ocr_input_path)
+
         if rotate_pages:
             orientation_temp = TemporaryDirectory(
                 prefix="pdftopdfa_paddle_orientation_"
             )
-            ocr_input_path = (
+            oriented_input = (
                 Path(orientation_temp.name) / f"{input_path.stem}_oriented.pdf"
             )
             orientation_started = time.perf_counter()
             normalize_pdf_orientation(
-                input_path,
                 ocr_input_path,
+                oriented_input,
                 execution_provider=ocr_execution_provider,
             )
+            ocr_input_path = oriented_input
             logger.info(
                 "Paddle orientation preflight completed in %.2fs",
                 time.perf_counter() - orientation_started,
