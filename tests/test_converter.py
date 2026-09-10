@@ -2597,6 +2597,11 @@ class TestConvertToPdfa:
         )
 
         assert result.pdfua_status is PDFUAStatus.VALIDATION_FAILED
+        assert any("Conversion target was not published" in w for w in result.warnings)
+        assert not any("output was not published" in w.lower() for w in result.warnings)
+        assert result.to_dict()["warnings"] == result.warnings
+        if preserve_input:
+            assert any("original input copied unchanged" in w for w in result.warnings)
         assert result.validation_failed
         assert result.candidate_sha256 is not None
         assert result.published is preserve_input
@@ -2629,7 +2634,7 @@ class TestConvertToPdfa:
 
         assert result.success is False
         assert result.validation_failed is True
-        assert result.error == "Validation failed; output was not published"
+        assert result.error == "Validation failed; conversion target was not published"
         assert result.published is False
         assert result.target_produced is False
         assert any("Validation: Rule 6.1.2 failed" in w for w in result.warnings)
@@ -2657,7 +2662,7 @@ class TestConvertToPdfa:
 
         assert result.success is False
         assert result.validation_failed is True
-        assert result.error == "Validation failed; output was not published"
+        assert result.error == "Validation failed; conversion target was not published"
         assert result.published is False
         assert "Validation: veraPDF could not run: veraPDF crashed" in result.warnings
         assert result.validation_results == (
@@ -3674,32 +3679,49 @@ class TestConvertToPdfa:
         assert output_path.read_bytes() == signed_input.read_bytes()
         mock_verapdf.assert_not_called()
 
+    @pytest.mark.parametrize("preserve_input", [False, True])
+    @pytest.mark.parametrize("pdfua", [False, True])
     @patch("pdftopdfa.converter.validate_with_verapdf")
-    def test_pdfua_signed_skip_preserves_existing_destination(
+    def test_signed_validation_skip_reports_publication_accurately(
         self,
         mock_verapdf: MagicMock,
         sample_pdf: Path,
         tmp_dir: Path,
+        preserve_input: bool,
+        pdfua: bool,
     ) -> None:
-        """A protected signed input cannot replace a canonical PDF/UA target."""
+        """Signed-input fallback warnings match the published original and audit."""
         signed_input = tmp_dir / "signed_input.pdf"
         _write_signed_pdf(sample_pdf, signed_input)
         output_path = tmp_dir / "output.pdf"
         output_path.write_bytes(b"approved output")
 
-        result = convert_to_pdfa.__wrapped__(
+        convert = convert_to_pdfa if preserve_input else convert_to_pdfa.__wrapped__
+        result = convert(
             signed_input,
             output_path,
             level="2a",
-            pdfua=True,
+            pdfua=pdfua,
+            validate=True,
         )
 
-        assert result.success is False
+        assert result.success is preserve_input
         assert result.skipped is True
-        assert result.published is False
+        assert result.published is preserve_input
         assert result.target_produced is False
-        assert result.pdfua_status is PDFUAStatus.NOT_PRODUCED
-        assert output_path.read_bytes() == b"approved output"
+        assert result.pdfua_status is (
+            PDFUAStatus.NOT_PRODUCED if pdfua else PDFUAStatus.NOT_REQUESTED
+        )
+        assert not any(
+            "signed input was not published" in w.lower() for w in result.warnings
+        )
+        assert not any("output was not published" in w.lower() for w in result.warnings)
+        assert result.to_dict()["warnings"] == result.warnings
+        if preserve_input:
+            assert any("original input copied unchanged" in w for w in result.warnings)
+        assert output_path.read_bytes() == (
+            signed_input.read_bytes() if preserve_input else b"approved output"
+        )
         mock_verapdf.assert_not_called()
 
     def test_signed_pdf_can_be_converted_with_explicit_invalidation(

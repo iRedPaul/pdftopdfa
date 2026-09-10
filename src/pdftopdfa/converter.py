@@ -437,9 +437,10 @@ _VALIDATION_PUBLICATION_WARNING = (
 )
 _VALIDATION_FAILURE_ERROR = "Validation failed; output candidate was published"
 _VALIDATION_WITHHELD_WARNING = (
-    "Output was not published because validation failed or could not complete"
+    "Conversion target was not published because validation failed "
+    "or could not complete"
 )
-_VALIDATION_WITHHELD_ERROR = "Validation failed; output was not published"
+_VALIDATION_WITHHELD_ERROR = "Validation failed; conversion target was not published"
 
 
 class PublicationPolicy(StrEnum):
@@ -1675,8 +1676,8 @@ def convert_to_pdfa(
                     )
                 elif pdfua:
                     signature_warnings.append(
-                        "Signed input was not published because the PDF/UA target "
-                        "could not be produced"
+                        "PDF/UA target could not be produced because conversion "
+                        "would invalidate a digital signature"
                     )
                 if validation_error is not None:
                     signature_warnings.append(
