@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.9.16] - 2026-09-18
+
+### Bug Fixes
+
+- Allow PDF/A-2b and PDF/A-3b conversion when ToUnicode generation fails
+
 ## [0.9.15] - 2026-09-10
 
 ### Bug Fixes
