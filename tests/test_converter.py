@@ -4512,6 +4512,47 @@ class TestConvertToPdfa:
         assert result.success is True
         assert output_path.exists()
 
+    @pytest.mark.parametrize("level", ["2b", "3b"])
+    def test_tounicode_failure_allows_level_b_conversion(
+        self, sample_pdf: Path, tmp_dir: Path, level: str
+    ) -> None:
+        warning = "Could not generate ToUnicode for TestFont"
+        output_path = tmp_dir / "output.pdf"
+        with patch(
+            "pdftopdfa.fonts.FontEmbedder.add_tounicode_to_embedded_fonts",
+            return_value=SimpleNamespace(
+                fonts_embedded=[], fonts_failed=["TestFont"], warnings=[warning]
+            ),
+        ) as add_tounicode:
+            result = convert_to_pdfa(sample_pdf, output_path, level=level)
+
+        add_tounicode.assert_called_once()
+        assert result.success and result.published and result.target_produced
+        assert not result.skipped
+        assert result.level == level
+        assert warning in result.warnings
+        assert output_path.exists()
+
+    @pytest.mark.parametrize("level", ["2a", "2u", "3a", "3u"])
+    def test_tounicode_failure_rejects_level_a_and_u_conversion(
+        self, sample_pdf: Path, tmp_dir: Path, level: str
+    ) -> None:
+        output_path = tmp_dir / "output.pdf"
+        with (
+            patch(
+                "pdftopdfa.fonts.FontEmbedder.add_tounicode_to_embedded_fonts",
+                return_value=SimpleNamespace(
+                    fonts_embedded=[], fonts_failed=["TestFont"], warnings=[]
+                ),
+            ),
+            pytest.raises(
+                ConversionError, match="Could not add ToUnicode mappings to: TestFont"
+            ),
+        ):
+            convert_to_pdfa.__wrapped__(sample_pdf, output_path, level=level)
+
+        assert not output_path.exists()
+
     @patch("pdftopdfa.converter.check_font_compliance")
     @patch("pdftopdfa.fonts.FontEmbedder")
     def test_font_progress_logs_are_debug_only(

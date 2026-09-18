@@ -2071,9 +2071,8 @@ def convert_to_pdfa(
             # prune cmap subtables.
             sanitize_truetype_encoding(pdf)
 
-            # 3.5. Unicode compliance — always add ToUnicode to all embedded
-            # fonts (ISO 19005-2/3, rule 6.2.11.7.2).  veraPDF requires
-            # explicit ToUnicode even when Unicode is theoretically derivable.
+            # 3.5. Attempt ToUnicode generation for all levels, but require
+            # success only for A and U (ISO 19005-2/3, rule 6.2.11.7.2).
             logger.debug("Adding ToUnicode to embedded fonts for PDF/A-%s", level)
             tounicode_result = embedder.add_tounicode_to_embedded_fonts()
 
@@ -2083,7 +2082,7 @@ def convert_to_pdfa(
                     ", ".join(tounicode_result.fonts_embedded),
                 )
 
-            if tounicode_result.fonts_failed:
+            if tounicode_result.fonts_failed and level not in {"2b", "3b"}:
                 raise ConversionError(
                     "Could not add ToUnicode mappings to: "
                     f"{', '.join(tounicode_result.fonts_failed)}. "

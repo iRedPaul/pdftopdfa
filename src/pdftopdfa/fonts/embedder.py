@@ -1416,7 +1416,7 @@ class FontEmbedder:
     def add_tounicode_to_embedded_fonts(self) -> EmbeddingResult:
         """Adds ToUnicode CMaps to embedded fonts lacking them.
 
-        For PDF/A-2/3 compliance (all levels, rule 6.2.11.7.2), all
+        For PDF/A-2/3 compliance (levels A and U, rule 6.2.11.7.2), all
         fonts must have Unicode mappings. This method adds ToUnicode
         CMaps to embedded fonts that don't have them.
 
