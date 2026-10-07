@@ -564,19 +564,57 @@ def _merge_resource_dictionaries(
     return merged
 
 
+_ResourceContext = dict[str, object]
+
+
+def _resource_context(
+    resources: Dictionary | None, fallback: _ResourceContext | None = None
+) -> _ResourceContext:
+    """Overlay resource names without copying inherited entries into the PDF."""
+    context = dict(fallback or {})
+    if not isinstance(resources, Dictionary):
+        return context
+    for category, value in resources.items():
+        if isinstance(value, Dictionary):
+            inherited = context.get(category)
+            entries = dict(inherited) if isinstance(inherited, dict) else {}
+            entries.update(value.items())
+            context[category] = entries
+        else:
+            context[category] = value
+    return context
+
+
 def _select_used_resources(
-    parent: Dictionary,
-    used: dict[str, set[str]],
+    parent: _ResourceContext,
+    used: dict[str, set[str]] | None,
     excluded_keys: frozenset[str],
 ) -> Dictionary:
-    """Copy only the parent resource entries that ``used`` names."""
+    """Copy used resources into independent category dictionaries.
+
+    Keep default color spaces even when they are selected indirectly by an
+    image, shading or named color space. They do not introduce graph cycles.
+    With an unreadable stream, retain every resource conservatively.
+    """
     selected = Dictionary()
-    for category, names in used.items():
+    names_by_category = (
+        {category: set(names) for category, names in used.items()}
+        if used is not None
+        else {str(category): set() for category in parent.keys()}
+    )
+    names_by_category.setdefault("/ColorSpace", set()).update(
+        {"/DefaultGray", "/DefaultRGB", "/DefaultCMYK"}
+    )
+    for category, names in names_by_category.items():
         if category in excluded_keys:
             continue
-        entries = _resolve_indirect(parent.get(category))
-        if not isinstance(entries, Dictionary):
+        entries = parent.get(category)
+        if not isinstance(entries, dict):
+            if used is None and entries is not None:
+                selected[category] = entries
             continue
+        if used is None:
+            names = set(entries.keys())
         picked = Dictionary()
         for name in sorted(names):
             if name in entries:
@@ -591,6 +629,7 @@ def _ensure_associated_resources(
     parent_resources,
     excluded_keys: frozenset[str] = frozenset(),
     content: list[Stream] | None = None,
+    resource_context: _ResourceContext | None = None,
 ) -> tuple[Dictionary | None, int, int]:
     """Ensure owner has explicit /Resources and merge inherited entries.
 
@@ -607,8 +646,10 @@ def _ensure_associated_resources(
     if content is None and isinstance(owner, Stream):
         content = [owner]
     used = used_resource_names(content) if content is not None else None
-    if used is not None and parent_resources is not None:
-        parent_resources = _select_used_resources(parent_resources, used, excluded_keys)
+    if used is not None or resource_context is not None:
+        if resource_context is None:
+            resource_context = _resource_context(parent_resources)
+        parent_resources = _select_used_resources(resource_context, used, excluded_keys)
 
     resources = owner.get("/Resources")
     resources = _resolve_indirect(resources) if resources is not None else None
@@ -891,20 +932,25 @@ def _ensure_explicit_resources_in_resource_graph(
     visited_fonts: set[tuple[int, int]],
     visited_patterns: set[tuple[int, int]],
     ambiguous_streams: set[_ObjectIdentity],
+    fallback_resources: _ResourceContext | None = None,
 ) -> tuple[int, int]:
     """Ensure explicit resources for nested content stream containers."""
     resources_added = 0
     resources_merged = 0
-    pending = [resources]
+    # An ancestor may still supply a name used only by a descendant. Keep
+    # that lookup context while materializing each owner's narrow resources.
+    pending = [(resources, fallback_resources)]
     processed_resources: set[tuple[int, int]] = set()
     processed_owners: set[tuple[int, int]] = set()
 
     while pending:
-        parent = _resolve_indirect(pending.pop())
+        parent, fallbacks = pending.pop()
+        parent = _resolve_indirect(parent)
         if not isinstance(parent, Dictionary):
             continue
         if not _visit_once(parent, processed_resources):
             continue
+        context = _resource_context(parent, fallbacks)
 
         for form in _iter_form_xobjects(parent, visited_forms):
             if not _visit_once(form, processed_owners):
@@ -917,12 +963,12 @@ def _ensure_explicit_resources_in_resource_graph(
                 added = merged = 0
             else:
                 form_resources, added, merged = _ensure_associated_resources(
-                    form, parent
+                    form, parent, resource_context=context
                 )
             resources_added += added
             resources_merged += merged
             if isinstance(form_resources, Dictionary):
-                pending.append(form_resources)
+                pending.append((form_resources, context))
 
         for _font_name, font in iter_type3_fonts(parent, visited_fonts):
             if not _visit_once(font, processed_owners):
@@ -938,11 +984,12 @@ def _ensure_explicit_resources_in_resource_graph(
                 parent,
                 excluded_keys=frozenset({"/Font"}),
                 content=glyphs,
+                resource_context=context,
             )
             resources_added += added
             resources_merged += merged
             if isinstance(font_resources, Dictionary):
-                pending.append(font_resources)
+                pending.append((font_resources, context))
 
         for pattern in _iter_tiling_patterns(parent, visited_patterns):
             if not _visit_once(pattern, processed_owners):
@@ -955,21 +1002,23 @@ def _ensure_explicit_resources_in_resource_graph(
                 added = merged = 0
             else:
                 pattern_resources, added, merged = _ensure_associated_resources(
-                    pattern, parent
+                    pattern, parent, resource_context=context
                 )
             resources_added += added
             resources_merged += merged
             if isinstance(pattern_resources, Dictionary):
-                pending.append(pattern_resources)
+                pending.append((pattern_resources, context))
 
         for group in _iter_soft_mask_groups(parent, visited_forms):
             if not _visit_once(group, processed_owners):
                 continue
-            group_resources, added, merged = _ensure_associated_resources(group, parent)
+            group_resources, added, merged = _ensure_associated_resources(
+                group, parent, resource_context=context
+            )
             resources_added += added
             resources_merged += merged
             if isinstance(group_resources, Dictionary):
-                pending.append(group_resources)
+                pending.append((group_resources, context))
 
     return resources_added, resources_merged
 
@@ -1063,6 +1112,7 @@ def _ensure_resources_in_ap_stream(
             visited_fonts,
             visited_patterns,
             ambiguous_streams,
+            fallback_resources=_resource_context(page_resources),
         )
         resources_added += add2
         resources_merged += merge2
@@ -1087,6 +1137,7 @@ def _ensure_resources_in_ap_stream(
                     visited_fonts,
                     visited_patterns,
                     ambiguous_streams,
+                    fallback_resources=_resource_context(page_resources),
                 )
                 resources_added += add2
                 resources_merged += merge2

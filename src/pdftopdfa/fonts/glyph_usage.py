@@ -244,24 +244,39 @@ _DEVICE_COLOR_SPACES = frozenset(
         "/DeviceRGB",
         "/DeviceCMYK",
         "/Pattern",
-        "/G",
-        "/RGB",
-        "/CMYK",
-        "/I",
-        "/Indexed",
     }
 )
+_DEFAULT_COLOR_SPACES = {
+    "/DeviceGray": "/DefaultGray",
+    "/DeviceRGB": "/DefaultRGB",
+    "/DeviceCMYK": "/DefaultCMYK",
+}
+_DEVICE_COLOR_OPERATORS = {
+    "g": "/DefaultGray",
+    "G": "/DefaultGray",
+    "rg": "/DefaultRGB",
+    "RG": "/DefaultRGB",
+    "k": "/DefaultCMYK",
+    "K": "/DefaultCMYK",
+}
+_INLINE_COLOR_SPACE_ALIASES = {
+    "/G": "/DeviceGray",
+    "/RGB": "/DeviceRGB",
+    "/CMYK": "/DeviceCMYK",
+}
 _NAMED_RESOURCE_OPERATORS = frozenset({"Tf", "Do", "gs", "sh"})
 
 
 def stream_uses_named_resources(
     stream: pikepdf.Stream, cache: dict[_ObjectKey, bool] | None = None
 ) -> bool:
-    """Return whether a content stream looks up any name in its resources.
+    """Return whether a content stream depends on its resource context.
 
     Streams that never do (plain path glyphs, most Type3 CharProcs) render
     the same in every resource context, so they never need per-context
-    copies. Any doubt (unreadable or unparsable data) answers True.
+    copies. Device color selections also look up the implicit DefaultGray,
+    DefaultRGB or DefaultCMYK resource. Any doubt (unreadable or unparsable
+    data) answers True.
     """
     key = _object_identity(stream)
     if cache is not None and key in cache:
@@ -274,24 +289,22 @@ def stream_uses_named_resources(
 
 def _scan_named_resources(stream: pikepdf.Stream) -> bool:
     try:
-        if b"/" not in stream.read_bytes():
-            return False  # no name operands at all
         for instruction in pikepdf.parse_content_stream(stream):
             if isinstance(instruction, pikepdf.ContentStreamInlineImage):
                 image = instruction.iimage.obj
                 space = image.get("/CS", image.get("/ColorSpace"))
-                if space is not None and not (
-                    isinstance(space, pikepdf.Name)
-                    and str(space) in _DEVICE_COLOR_SPACES
-                ):
+                if space is not None:
+                    # Even device spaces depend on contextual Default entries.
                     return True
                 continue
             operator = str(instruction.operator)
             operands = instruction.operands
             if operator in _NAMED_RESOURCE_OPERATORS:
                 return True
+            if operator in _DEVICE_COLOR_OPERATORS:
+                return True
             if operator in ("cs", "CS"):
-                if not operands or str(operands[0]) not in _DEVICE_COLOR_SPACES:
+                if not operands or str(operands[0]) != "/Pattern":
                     return True
             elif operator in ("scn", "SCN"):
                 if operands and isinstance(operands[-1], pikepdf.Name):
@@ -326,8 +339,6 @@ def used_resource_names(
     used: dict[str, set[str]] = defaultdict(set)
     for stream in streams:
         try:
-            if b"/" not in stream.read_bytes():
-                continue
             instructions = list(pikepdf.parse_content_stream(stream))
         except Exception:
             return None
@@ -336,18 +347,22 @@ def used_resource_names(
                 image = instruction.iimage.obj
                 space = image.get("/CS", image.get("/ColorSpace"))
                 if isinstance(space, pikepdf.Name):
-                    if str(space) not in _DEVICE_COLOR_SPACES:
-                        used["/ColorSpace"].add(str(space))
+                    name = _INLINE_COLOR_SPACE_ALIASES.get(str(space), str(space))
+                    used["/ColorSpace"].add(_DEFAULT_COLOR_SPACES.get(name, name))
                 elif space is not None:  # e.g. [/Indexed /CS0 ...]
                     return None
                 continue
             operator = str(instruction.operator)
             operands = instruction.operands
+            if operator in _DEVICE_COLOR_OPERATORS:
+                used["/ColorSpace"].add(_DEVICE_COLOR_OPERATORS[operator])
             category = _NAME_OPERATOR_CATEGORIES.get(operator)
             if category is not None:
                 if operands and isinstance(operands[0], pikepdf.Name):
                     name = str(operands[0])
-                    if category != "/ColorSpace" or name not in _DEVICE_COLOR_SPACES:
+                    if category == "/ColorSpace" and name in _DEFAULT_COLOR_SPACES:
+                        used[category].add(_DEFAULT_COLOR_SPACES[name])
+                    elif category != "/ColorSpace" or name not in _DEVICE_COLOR_SPACES:
                         used[category].add(name)
             elif operator in ("scn", "SCN"):
                 if operands and isinstance(operands[-1], pikepdf.Name):

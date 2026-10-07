@@ -1555,7 +1555,7 @@ class TestNameFreeStreamsAreNotCloned:
         [
             (b"0 0 m 1 1 l S", False),
             (b"0 0 d0 0 0 1 1 re f", False),
-            (b"/DeviceRGB cs 1 0 0 sc 0 0 1 1 re f", False),
+            (b"/DeviceRGB cs 1 0 0 sc 0 0 1 1 re f", True),
             (b"BI /W 1 /H 1 /IM true ID \x00 EI", False),
             (b"/CS0 cs 0 0 1 1 re f", True),
             (b"/GS0 gs", True),

@@ -500,8 +500,11 @@ def _extract_inline_image_payload(inline_image) -> bytes | None:
     return None
 
 
-# An /I or /Interpolate name token (not /IM etc.), or a hex-escaped name.
-_INLINE_INTERPOLATE_TOKEN_RE = re.compile(rb"/I(?:nterpolate)?(?=[\s()<>\[\]{}/%])|/#")
+# PDF whitespace includes NUL. A name may contain a hex escape anywhere,
+# so any '#' conservatively disables the byte-level shortcut.
+_INLINE_INTERPOLATE_TOKEN_RE = re.compile(
+    rb"/I(?:nterpolate)?(?=[\x00\s()<>\[\]{}/%])|#"
+)
 
 
 def _fix_inline_image_interpolate_in_stream(stream: Stream) -> int:
