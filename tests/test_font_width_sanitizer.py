@@ -4,6 +4,7 @@
 
 """Unit tests for sanitizers/font_widths.py (font width sanitizer)."""
 
+import logging
 from io import BytesIO
 from pathlib import Path
 
@@ -1385,8 +1386,9 @@ class TestMismatchRatioThreshold:
         tt_font.close()
 
         # Declare widths that are ALL very different from the font program.
-        # Codes 32-67: space(32), A(65), B(66), C(67) are mapped.
-        # All 4 comparable widths will mismatch → 100% ratio → still corrected.
+        # Codes 32-67: space(32), A(65), B(66), C(67) are mapped; the others
+        # fall back to the .notdef width.
+        # All 36 comparable widths will mismatch → 100% ratio → still corrected.
         num_chars = 67 - 32 + 1
         all_wrong_widths = [999] * num_chars
 
@@ -1402,6 +1404,30 @@ class TestMismatchRatioThreshold:
         result = sanitize_font_widths(pdf)
 
         assert result["simple_font_widths_fixed"] == 1
+
+    def test_mismatch_ratio_counts_notdef_fallback_codes(self, caplog) -> None:
+        """Codes resolved via the .notdef fallback count as comparable.
+
+        Otherwise the logged ratio exceeds 100% (e.g. "36/4 (900%)").
+        """
+        font_data, tt_font = _make_minimal_ttfont()
+        tt_font.close()
+
+        pdf = new_pdf()
+        font = _make_simple_font_with_widths(
+            pdf,
+            widths=[999] * (67 - 32 + 1),
+            font_data=font_data,
+        )
+        _build_pdf_with_font(pdf, font)
+        pdf = _roundtrip(pdf)
+
+        with caplog.at_level(logging.INFO, logger="pdftopdfa.sanitizers.font_widths"):
+            sanitize_font_widths(pdf)
+
+        assert any(
+            "36/36 widths mismatch (100%)" in r.getMessage() for r in caplog.records
+        )
 
     def test_low_mismatch_ratio_allows_correction(self) -> None:
         """When <80% of widths mismatch, correction proceeds normally."""

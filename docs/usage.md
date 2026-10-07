@@ -86,6 +86,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 
 - On Windows, `pdftopdfa` may automatically embed a conservative fixed allowlist of local fonts from `%WINDIR%\Fonts`.
 - A Windows system font is only used when the file path stays under `%WINDIR%\Fonts`, its actual PostScript name is allowlisted, and its `fsType` permits outline embedding.
+- Non-embedded Standard-14 fonts (Helvetica, Times, Courier, and their aliases) are replaced by Arial, Times New Roman, and Courier New, the fonts Windows PDF viewers display in their place, so the output keeps the original appearance.
 - If `fsType` disallows outline embedding, `pdftopdfa` falls back to the bundled replacement font path.
 - On macOS and Linux, system fonts are never auto-embedded.
 - `fsType` checks are a technical safeguard only and do not replace the rights holder's EULA or other license terms.

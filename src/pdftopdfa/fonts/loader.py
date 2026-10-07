@@ -18,6 +18,7 @@ from .constants import (
     CJK_FONT_INDEX,
     FALLBACK_FONT,
     FONT_REPLACEMENTS,
+    STANDARD_14_WINDOWS_EQUIVALENTS,
     WINDOWS_SYSTEM_FONT_POSTSCRIPT_NAMES,
     resolve_standard14_alias,
 )
@@ -329,9 +330,21 @@ class FontLoader:
 
     @classmethod
     def _normalize_font_lookup_name(cls, font_name: str) -> str:
-        """Normalize font names for exact-ish system lookup."""
-        normalized = font_name.lstrip("/").replace(" ", "").rstrip("*").lower()
-        return _WINDOWS_SYSTEM_FONT_ALIASES.get(normalized, normalized)
+        """Normalize font names for exact-ish system lookup.
+
+        Standard-14 names and their aliases resolve to the Windows font that
+        Windows PDF viewers display in their place.
+        """
+        stripped = font_name.lstrip("/").replace(" ", "").rstrip("*")
+        normalized = stripped.lower()
+        if normalized in _WINDOWS_SYSTEM_FONT_ALIASES:
+            return _WINDOWS_SYSTEM_FONT_ALIASES[normalized]
+        windows_equivalent = STANDARD_14_WINDOWS_EQUIVALENTS.get(
+            resolve_standard14_alias(stripped)
+        )
+        if windows_equivalent is not None:
+            return cls._normalize_system_postscript_name(windows_equivalent)
+        return normalized
 
     @staticmethod
     def _normalize_system_postscript_name(font_name: str) -> str:

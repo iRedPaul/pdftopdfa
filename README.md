@@ -396,6 +396,7 @@ image, table, and reusable `OCRSession` APIs.
 
 - On Windows, `pdftopdfa` may automatically embed a conservative fixed allowlist of local fonts from `%WINDIR%\Fonts`.
 - A Windows system font is only used when the installed file lives under `%WINDIR%\Fonts`, its actual PostScript name is allowlisted, and its OpenType `fsType` permits outline embedding.
+- On Windows, non-embedded Standard-14 fonts (Helvetica, Times, Courier, and their aliases) are replaced by Arial, Times New Roman, and Courier New, the fonts Windows PDF viewers display in their place, so the output keeps the original appearance. If one of them is unavailable, the bundled Liberation font is used.
 - On macOS and Linux, system fonts are never auto-embedded; bundled replacement fonts are used instead.
 - `fsType` checks are a technical safeguard only and do not replace the font vendor's EULA or other license terms.
 - For auditable deployments, keep the allowlist tied to reviewed target systems or golden images.
