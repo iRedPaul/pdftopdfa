@@ -27,7 +27,7 @@ classifiers = [
     "Topic :: Text Processing :: General",
 ]
 dependencies = [
-    "pikepdf>=10.9.1,<11",
+    "pikepdf>=10.14,<11",
     "lxml>=6.1.1",
     "click>=8.4.2",
     "colorama>=0.4.6",

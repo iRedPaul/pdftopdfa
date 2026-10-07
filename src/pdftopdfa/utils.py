@@ -10,7 +10,7 @@ import sys
 from collections.abc import Generator
 from typing import IO, Any
 
-from pikepdf import Array, Dictionary, Pdf
+from pikepdf import Array, Dictionary, Object, Pdf
 
 from .exceptions import ConversionError
 
@@ -217,6 +217,12 @@ def resolve_indirect(obj: Any) -> Any:
     Returns:
         The resolved object.
     """
+    # pikepdf resolves indirect references transparently and has no
+    # ``get_object`` method: on a pikepdf object the call below only fails
+    # (as a missing dictionary key), which costs ~6 us per call. Return
+    # pikepdf objects and None directly; keep the fallback for other types.
+    if obj is None or isinstance(obj, Object):
+        return obj
     try:
         return obj.get_object()
     except Exception:

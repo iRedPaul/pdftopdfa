@@ -1049,3 +1049,27 @@ class TestDeepResourceGraphTraversal:
         assert remove_forbidden_xobjects(pdf) == 1
         assert fix_bits_per_component(pdf)["invalid_bpc_fixed"] == 1
         assert int(image[Name.BitsPerComponent]) == 8
+
+
+def test_inline_interpolate_fix_skips_parse_for_image_masks(monkeypatch):
+    """/IM is not /I: bitmap glyph streams are not parsed for this fix."""
+    import pdftopdfa.sanitizers.xobjects as xobjects
+
+    pdf = pikepdf.new()
+    glyph = pdf.make_stream(
+        b"10 0 0 0 10 10 d1 BI /W 8 /H 1 /IM true /BPC 1 ID \x00 EI"
+    )
+    fixable = pdf.make_stream(b"BI /W 1 /H 1 /CS /G /BPC 8 /I true ID \x00 EI")
+    parsed = []
+    original = xobjects._parse_content_stream
+
+    def counting(stream, *args):
+        parsed.append(bytes(stream.read_bytes()))
+        return original(stream, *args)
+
+    monkeypatch.setattr(xobjects, "_parse_content_stream", counting)
+
+    assert xobjects._fix_inline_image_interpolate_in_stream(glyph) == 0
+    assert xobjects._fix_inline_image_interpolate_in_stream(fixable) == 1
+    assert not any(data.startswith(b"10 0 0 0") for data in parsed)
+    assert parsed  # the fixable stream was parsed

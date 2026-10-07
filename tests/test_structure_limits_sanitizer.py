@@ -708,3 +708,59 @@ endcidrange
             operand = Array([operand])
 
         assert _operands_contain_parse_placeholders(operand) is True
+
+
+def test_cid_overflow_check_skips_font_usage_without_overflowing_cmap(monkeypatch):
+    """Font usage (a full content parse) is collected only when needed."""
+    import pdftopdfa.sanitizers.structure_limits as structure_limits
+
+    pdf = new_pdf()
+    cmap = pdf.make_stream(
+        b"1 begincidchar\n<0001> 5\nendcidchar\n1 begincidrange\n"
+        b"<0000> <00ff> 10\nendcidrange\n"
+    )
+    font = pdf.make_indirect(
+        Dictionary(Type=Name.Font, Subtype=Name.Type0, BaseFont=Name.X, Encoding=cmap)
+    )
+    page = pdf.add_blank_page(page_size=(10, 10))
+    page.Resources = Dictionary(Font=Dictionary(F1=font))
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("font usage collected without CID overflow")
+
+    monkeypatch.setattr(structure_limits, "collect_font_usage", fail)
+    assert structure_limits._ensure_no_cid_overflow(pdf) == 0
+
+
+def test_clean_content_stream_is_not_reparsed(monkeypatch):
+    """A stream found clean is skipped when seen again with the same bytes."""
+    import pdftopdfa.sanitizers.structure_limits as structure_limits
+
+    pdf = new_pdf()
+    stream = pdf.make_stream(b"q 1 0 0 1 0 0 cm 0 0 m 5 5 l S Q % unique-7f3a")
+    stats = {
+        key: 0
+        for key in (
+            "strings_truncated",
+            "names_shortened",
+            "utf8_names_fixed",
+            "integers_clamped",
+            "reals_normalized",
+            "q_nesting_rebalanced",
+            "hex_odd_fixed",
+            "hex_invalid_fixed",
+        )
+    }
+    structure_limits._sanitize_content_stream(pdf, stream, stats, None, None)
+
+    parsed = []
+    original = structure_limits.pikepdf.parse_content_stream
+
+    def counting(*args, **kwargs):
+        parsed.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(structure_limits.pikepdf, "parse_content_stream", counting)
+    structure_limits._sanitize_content_stream(pdf, stream, stats, None, None)
+    assert parsed == []
+    assert not any(stats.values())

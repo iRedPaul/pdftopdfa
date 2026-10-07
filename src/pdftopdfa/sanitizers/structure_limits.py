@@ -18,6 +18,7 @@ import hashlib
 import logging
 import re
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -239,6 +240,14 @@ def _fix_odd_hex_string(value: pikepdf.String) -> pikepdf.String:
 
 def _sanitize_operand(value: Any, stats: dict[str, int]) -> tuple[Any, bool]:
     """Sanitize an operand in a parsed content stream instruction."""
+    # Fast path for the overwhelmingly common in-range numeric operands.
+    value_type = type(value)
+    if value_type is int:
+        if _INT_MIN <= value <= _INT_MAX:
+            return value, False
+    elif value_type is Decimal:
+        if value == 0 or _MIN_REAL_MAGNITUDE <= abs(value) <= _MAX_REAL_MAGNITUDE:
+            return value, False
     result = _resolve(value)
     changed = False
     pending: list[tuple[Any, Dictionary | Stream | Array | None, Any]] = [
@@ -654,6 +663,20 @@ def _content_bbox(owner: Dictionary | Stream) -> Array | None:
     return None
 
 
+# Digests of content streams already found to need no change. Whether a
+# stream needs changing depends only on its bytes (a stream that needs no
+# q/Q rewrap never uses resources or bbox), so identical bytes - the same
+# stream in the late second pass, or duplicate glyphs - can be skipped.
+_CLEAN_CONTENT_DIGESTS: OrderedDict[bytes, None] = OrderedDict()
+_CLEAN_CONTENT_DIGESTS_MAX = 200_000
+
+
+def _remember_clean_content(digest: bytes) -> None:
+    _CLEAN_CONTENT_DIGESTS[digest] = None
+    if len(_CLEAN_CONTENT_DIGESTS) > _CLEAN_CONTENT_DIGESTS_MAX:
+        _CLEAN_CONTENT_DIGESTS.popitem(last=False)
+
+
 def _sanitize_content_stream(
     pdf: Pdf,
     stream_obj: Stream,
@@ -668,6 +691,11 @@ def _sanitize_content_stream(
         log_suppressed_error(
             logger, e, "Skipping unreadable content stream %s: %s", stream_obj.objgen, e
         )
+        return
+
+    digest = hashlib.blake2b(raw, digest_size=16).digest()
+    if digest in _CLEAN_CONTENT_DIGESTS:
+        _CLEAN_CONTENT_DIGESTS.move_to_end(digest)
         return
 
     try:
@@ -749,6 +777,8 @@ def _sanitize_content_stream(
 
     if changed or odd_hex > 0 or invalid_hex > 0:
         stream_obj.write(pikepdf.unparse_content_stream(rewritten))
+    elif instructions or not raw.strip():
+        _remember_clean_content(digest)
 
 
 def _iter_owner_streams(owner: Any) -> list[Stream]:
@@ -1120,10 +1150,20 @@ def _ensure_no_cid_overflow(
     usage_cache: FontUsageCache | None = None,
 ) -> int:
     """Repair CMap CID overflows and raise on unparseable remaining ones."""
-    if usage_cache is not None:
-        font_usage = usage_cache.get()
-    else:
-        font_usage = collect_font_usage(pdf)
+    # Font usage is expensive (it parses every content stream) and only
+    # needed for CMaps that actually overflow, which is rare: collect lazily.
+    font_usage: dict | None = None
+
+    def get_font_usage() -> dict:
+        nonlocal font_usage
+        if font_usage is None:
+            font_usage = (
+                usage_cache.get()
+                if usage_cache is not None
+                else collect_font_usage(pdf)
+            )
+        return font_usage
+
     seen_fonts: set[tuple[int, int]] = set()
     repaired = 0
     for page in pdf.pages:
@@ -1144,9 +1184,11 @@ def _ensure_no_cid_overflow(
             encoding = _resolve(font.get("/Encoding"))
             if not isinstance(encoding, Stream):
                 continue
+            if not _cmap_has_cid_overflow(encoding):
+                continue  # nothing to repair, nothing to raise
 
             repaired_here, remaining_overflow = _repair_cid_overflow_entries(
-                encoding, font_usage.get(objgen, set())
+                encoding, get_font_usage().get(objgen, set())
             )
             repaired += repaired_here
             if repaired_here > 0:
@@ -1223,8 +1265,19 @@ def sanitize_structure_limits(
                 processed_streams.add(objgen)
             _sanitize_content_stream(pdf, stream, stats, resources, bbox)
 
+    walked: set = set()  # each stream is sanitized once, so walk once
     for page in pdf.pages:
-        for owner, resources in _iter_content_streams_with_resources(page):
+        for owner, resources in _iter_content_streams_with_resources(page, walked):
+            pending = []
+            for stream in _iter_owner_streams(owner):
+                objgen = _indirect_objgen(stream)
+                if objgen is not None:
+                    if objgen in processed_streams:
+                        continue
+                    processed_streams.add(objgen)
+                pending.append(stream)
+            if not pending:
+                continue
             resources = _resolve(resources)
             if not isinstance(resources, Dictionary):
                 resources = None
@@ -1234,12 +1287,7 @@ def sanitize_structure_limits(
                     bbox = Array(list(page.mediabox))
                 except Exception:
                     bbox = None
-            for stream in _iter_owner_streams(owner):
-                objgen = _indirect_objgen(stream)
-                if objgen is not None:
-                    if objgen in processed_streams:
-                        continue
-                    processed_streams.add(objgen)
+            for stream in pending:
                 _sanitize_content_stream(pdf, stream, stats, resources, bbox)
 
     # The passes above rewrite strings, names, operands and q/Q nesting in

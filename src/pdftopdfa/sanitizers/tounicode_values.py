@@ -28,6 +28,7 @@ from ..fonts.constants import UTF16_ENCODING_NAMES
 from ..fonts.glyph_usage import (
     _iter_content_streams_with_resources,
     _resolve_font_object,
+    iter_content_streams_with_resource_info,
 )
 from ..fonts.tounicode import (
     _is_invalid_unicode,
@@ -319,7 +320,14 @@ def _iter_fonts_from_effective_resources(
 ) -> Iterator[tuple[str, pikepdf.Object]]:
     """Yield fonts from every resource context reached by content traversal."""
     for page in pdf.pages:
-        for _owner, resources in _iter_content_streams_with_resources(page):
+        for (
+            _owner,
+            resources,
+            _key,
+            inherited,
+        ) in iter_content_streams_with_resource_info(page, resources_only=True):
+            if inherited:  # same resources object, fonts already yielded
+                continue
             resources = _resolve(resources)
             if not isinstance(resources, pikepdf.Dictionary):
                 continue
@@ -333,6 +341,10 @@ def _iter_fonts_from_effective_resources(
                     continue
                 if isinstance(font, pikepdf.Dictionary):
                     yield str(font_key), font
+
+
+# Operators the gap-filling usage scan acts on.
+_GAP_OPERATORS = "q Q Tf Tj TJ ' \""
 
 
 def fill_tounicode_gaps(pdf: Pdf) -> dict[str, int]:
@@ -529,12 +541,24 @@ def _collect_used_codes(
         ranges_by_font[key] = ranges
         return ranges
 
+    # Usage is aggregated for the whole document, so each (stream, resources)
+    # context is walked once, and each stream is parsed once.
+    walked: set = set()
+    parsed: dict = {}
     for page in pdf.pages:
-        for owner, resources in _iter_content_streams_with_resources(page):
-            try:
-                instructions = pikepdf.parse_content_stream(owner)
-            except Exception:
-                continue
+        for owner, resources in _iter_content_streams_with_resources(page, walked):
+            key = owner.objgen if isinstance(owner, Stream) else None
+            if key is not None and key in parsed:
+                instructions = parsed[key]
+            else:
+                try:
+                    instructions = list(
+                        pikepdf.parse_content_stream(owner, _GAP_OPERATORS)
+                    )
+                except Exception:
+                    continue
+                if key is not None:
+                    parsed[key] = instructions
 
             current: (
                 tuple[

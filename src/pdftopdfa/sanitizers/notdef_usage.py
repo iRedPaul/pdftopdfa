@@ -122,20 +122,28 @@ def sanitize_notdef_usage(pdf: Pdf) -> dict[str, int]:
     # Cache notdef codes per font objgen to avoid recomputation
     notdef_cache: dict[tuple[int, int], _NotdefCodes] = {}
     ambiguous_streams = find_ambiguous_resource_context_streams(pdf)
+    # Non-ambiguous streams have one resource context, so a stream reached
+    # again from another page (shared glyphs, forms) needs no second pass.
+    fixed_streams: set[tuple[int, int]] = set()
+    walked: set = set()
 
     for page_num, page in enumerate(pdf.pages, start=1):
         try:
-            for owner, resources in _iter_content_streams_with_resources(page):
-                font_map = _build_font_map(resources)
+            for owner, resources in _iter_content_streams_with_resources(page, walked):
                 if isinstance(owner, Stream):
                     objgen = owner.objgen
                     if objgen != (0, 0) and objgen in ambiguous_streams:
                         continue
-                    total_fixed += _fix_notdef_in_stream(owner, font_map, notdef_cache)
+                    if objgen in fixed_streams:
+                        continue
+                    fixed_streams.add(objgen)
+                    total_fixed += _fix_notdef_in_stream(
+                        owner, _build_font_map(resources), notdef_cache
+                    )
                 else:
                     total_fixed += _fix_notdef_in_page_contents(
                         owner,
-                        font_map,
+                        _build_font_map(resources),
                         notdef_cache,
                         ambiguous_streams,
                     )

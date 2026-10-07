@@ -19,7 +19,11 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..exceptions import ConversionError
-from ..fonts.glyph_usage import find_ambiguous_resource_context_streams
+from ..fonts.glyph_usage import (
+    find_ambiguous_resource_context_streams,
+    stream_uses_named_resources,
+    used_resource_names,
+)
 from ..utils import iter_type3_fonts, log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 
@@ -211,9 +215,63 @@ def _clone_stream(pdf: Pdf, source: Stream) -> Stream:
             if str(key) == "/Resources":
                 resources = _resolve_indirect(value)
                 if isinstance(resources, Dictionary):
-                    value = _clone_resources_for_context(resources)
+                    # Indirect, so the clone gets its own stable context key.
+                    value = pdf.make_indirect(_clone_resources_for_context(resources))
             clone[key] = value
     return clone
+
+
+def _iter_type3_font_slots(resources: Dictionary):
+    """Yield ``(container, slot, font)`` for Type3 fonts in ``resources``.
+
+    Like :func:`iter_type3_fonts`, but also returns where each font is
+    referenced (``/Font`` dictionary entry or ``/ExtGState`` ``/Font`` array)
+    so a per-context copy can be written back.
+    """
+    slots: list[tuple] = []
+    fonts = _resolve_indirect(resources.get("/Font"))
+    if isinstance(fonts, Dictionary):
+        slots.extend((fonts, name) for name in list(fonts.keys()))
+    states = _resolve_indirect(resources.get("/ExtGState"))
+    if isinstance(states, Dictionary):
+        for name in list(states.keys()):
+            state = _resolve_indirect(states[name])
+            if not isinstance(state, Dictionary):
+                continue
+            font_array = _resolve_indirect(state.get("/Font"))
+            if isinstance(font_array, Array) and len(font_array) == 2:
+                slots.append((font_array, 0))
+    for container, slot in slots:
+        font = _resolve_indirect(container[slot])
+        if isinstance(font, Dictionary) and str(font.get("/Subtype")) == "/Type3":
+            yield container, slot, font
+
+
+def _type3_glyphs_use_names(font: Dictionary, cache: dict) -> bool:
+    """Return whether any CharProc of ``font`` looks up a resource name."""
+    charprocs = _resolve_indirect(font.get("/CharProcs"))
+    if not isinstance(charprocs, Dictionary):
+        return False
+    return any(
+        isinstance(proc, Stream)
+        and ("/Resources" in proc or stream_uses_named_resources(proc, cache))
+        for _name, proc in charprocs.items()
+    )
+
+
+def _clone_type3_font(pdf: Pdf, font: Dictionary) -> Dictionary:
+    """Copy a Type3 font with its own ``/CharProcs`` dictionary.
+
+    Glyph streams and all other entries stay shared; the CharProcs that
+    actually need a different context are cloned afterwards by the normal
+    stream logic, into this copy's ``/CharProcs``.
+    """
+    clone = _clone_resources_shallow(font)
+    charprocs = _resolve_indirect(font.get("/CharProcs"))
+    if isinstance(charprocs, Dictionary):
+        # Indirect, so each copy's /CharProcs has its own identity.
+        clone[Name.CharProcs] = pdf.make_indirect(_clone_resources_shallow(charprocs))
+    return pdf.make_indirect(clone)
 
 
 def _clone_resource_context_streams(pdf: Pdf) -> int:
@@ -226,14 +284,23 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
     active: set[_ObjectIdentity] = set()
     processed_resources: set[tuple[int, int]] = set()
     processed_type3: set[tuple[_ObjectIdentity, _ObjectIdentity]] = set()
+    first_font_context: dict[_ObjectIdentity, _ObjectIdentity] = {}
+    first_charprocs_context: dict[_ObjectIdentity, _ObjectIdentity] = {}
+    uses_names: dict[_ObjectIdentity, bool] = {}
+    font_clones: dict[tuple[_ObjectIdentity, _ObjectIdentity], Dictionary] = {}
+    stream_clones: dict[tuple[_ObjectIdentity, _ObjectIdentity], Stream] = {}
     cloned = 0
 
-    def resource_tasks(resources) -> list[tuple]:
+    def resource_tasks(resources, resources_key) -> list[tuple]:
         resources = _resolve_indirect(resources)
         if not isinstance(resources, Dictionary):
             return []
         if not _visit_once(resources, processed_resources):
             return []
+        # The context key is fixed when the dictionary enters the traversal.
+        # Recomputing it later would see clones written into the dictionary
+        # and treat every sibling as being in a new context.
+        ctx = (resources, resources_key)
         discovered: list[tuple] = []
 
         xobjects = _resolve_indirect(resources.get("/XObject"))
@@ -244,7 +311,7 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
                     isinstance(candidate, Stream)
                     and str(candidate.get("/Subtype")) == "/Form"
                 ):
-                    discovered.append(("stream", xobjects, name, resources))
+                    discovered.append(("stream", xobjects, name, ctx))
 
         patterns = _resolve_indirect(resources.get("/Pattern"))
         if isinstance(patterns, Dictionary):
@@ -254,7 +321,7 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
                     isinstance(candidate, Stream)
                     and int(candidate.get("/PatternType", 0)) == 1
                 ):
-                    discovered.append(("stream", patterns, name, resources))
+                    discovered.append(("stream", patterns, name, ctx))
 
         extgstates = _resolve_indirect(resources.get("/ExtGState"))
         if isinstance(extgstates, Dictionary):
@@ -266,38 +333,74 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
                 if isinstance(smask, Dictionary) and isinstance(
                     _resolve_indirect(smask.get("/G")), Stream
                 ):
-                    discovered.append(("stream", smask, Name.G, resources))
+                    discovered.append(("stream", smask, Name.G, ctx))
 
-        for _font_name, font in iter_type3_fonts(resources, set()):
+        for font_container, font_slot, font in _iter_type3_font_slots(resources):
             font_resources = _resolve_indirect(font.get("/Resources"))
             if not isinstance(font_resources, Dictionary):
                 font_resources = resources
-            font_context = (
-                _object_identity(font),
-                _object_identity(font_resources),
-            )
+                font_resources_key = resources_key
+                # The CharProcs inherit this context, but /CharProcs belongs
+                # to the font, so a font shared between contexts needs its
+                # own copy before its CharProcs can be cloned per context.
+                # Different fonts may also share one /CharProcs dictionary,
+                # so its first context counts as well as the font's.
+                font_key = _object_identity(font)
+                font_moved = (
+                    first_font_context.setdefault(font_key, resources_key)
+                    != resources_key
+                )
+                charprocs_moved = False
+                font_charprocs = _resolve_indirect(font.get("/CharProcs"))
+                if isinstance(font_charprocs, Dictionary):
+                    charprocs_moved = (
+                        first_charprocs_context.setdefault(
+                            _object_identity(font_charprocs), resources_key
+                        )
+                        != resources_key
+                    )
+                if (font_moved or charprocs_moved) and _type3_glyphs_use_names(
+                    font, uses_names
+                ):
+                    clone_key = (font_key, resources_key)
+                    if clone_key not in font_clones:
+                        font_clones[clone_key] = _clone_type3_font(pdf, font)
+                    font = font_clones[clone_key]
+                    font_container[font_slot] = font
+                    first_font_context[_object_identity(font)] = resources_key
+                    copied_charprocs = _resolve_indirect(font.get("/CharProcs"))
+                    if isinstance(copied_charprocs, Dictionary):
+                        first_charprocs_context[_object_identity(copied_charprocs)] = (
+                            resources_key
+                        )
+            else:
+                font_resources_key = _object_identity(font_resources)
+            font_ctx = (font_resources, font_resources_key)
+            font_context = (_object_identity(font), font_resources_key)
             if font_context in processed_type3:
                 continue
             processed_type3.add(font_context)
             charprocs = _resolve_indirect(font.get("/CharProcs"))
             if isinstance(charprocs, Dictionary):
                 discovered.extend(
-                    ("stream", charprocs, char_name, font_resources)
+                    ("stream", charprocs, char_name, font_ctx)
                     for char_name in list(charprocs.keys())
                     if isinstance(_resolve_indirect(charprocs[char_name]), Stream)
                 )
             if font_resources is not resources:
-                discovered.append(("resources", font_resources, None, None))
+                discovered.append(
+                    ("resources", font_resources, None, font_resources_key)
+                )
         return discovered
 
-    def appearance_tasks(container, key, page_resources) -> list[tuple]:
+    def appearance_tasks(container, key, page_ctx) -> list[tuple]:
         entry = _resolve_indirect(container[key])
         if isinstance(entry, Stream):
-            return [("stream", container, key, page_resources)]
+            return [("stream", container, key, page_ctx)]
         if not isinstance(entry, Dictionary):
             return []
         return [
-            ("stream", entry, state, page_resources)
+            ("stream", entry, state, page_ctx)
             for state in list(entry.keys())
             if isinstance(_resolve_indirect(entry[state]), Stream)
         ]
@@ -306,22 +409,23 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
         page_dict = _resolve_indirect(page.obj)
         page_resources = _resolve_indirect(page_dict.get("/Resources"))
         if not isinstance(page_resources, Dictionary):
-            page_resources = _get_inherited_page_resources(page_dict)
+            page_resources = _get_inherited_page_resources(page_dict, pdf)
         if not isinstance(page_resources, Dictionary):
             page_resources = Dictionary()
+        page_ctx = (page_resources, _object_identity(page_resources))
 
         tasks: list[tuple] = []
         contents = _resolve_indirect(page_dict.get("/Contents"))
         if isinstance(contents, Stream):
-            tasks.append(("stream", page_dict, Name.Contents, page_resources))
+            tasks.append(("stream", page_dict, Name.Contents, page_ctx))
         elif isinstance(contents, Array):
             tasks.extend(
-                ("stream", contents, index, page_resources)
+                ("stream", contents, index, page_ctx)
                 for index in range(len(contents))
                 if isinstance(_resolve_indirect(contents[index]), Stream)
             )
 
-        tasks.append(("resources", page_resources, None, None))
+        tasks.append(("resources", page_resources, None, page_ctx[1]))
 
         annots = _resolve_indirect(page_dict.get("/Annots"))
         if isinstance(annots, Array):
@@ -334,16 +438,16 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
                     continue
                 for ap_key in (Name.N, Name.R, Name.D):
                     if ap_key in ap:
-                        tasks.extend(appearance_tasks(ap, ap_key, page_resources))
+                        tasks.extend(appearance_tasks(ap, ap_key, page_ctx))
 
         tasks.reverse()
         while tasks:
-            kind, container, key, parent_resources = tasks.pop()
+            kind, container, key, parent = tasks.pop()
             if kind == "exit":
                 active.discard(container)
                 continue
             if kind == "resources":
-                discovered = resource_tasks(container)
+                discovered = resource_tasks(container, parent)
                 tasks.extend(reversed(discovered))
                 continue
 
@@ -351,12 +455,30 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
             if not isinstance(stream, Stream):
                 continue
             stream_key = _stream_identity(stream)
-            context_key = _object_identity(parent_resources)
+            _, context_key = parent
             if stream_key in active or (stream_key, context_key) in processed:
                 continue
 
             prior_context = first_context.setdefault(stream_key, context_key)
+            if (
+                prior_context != context_key
+                and "/Resources" not in stream
+                and not stream_uses_named_resources(stream, uses_names)
+            ):
+                # Looks up no resource names: identical in every context.
+                processed.add((stream_key, context_key))
+                continue
             if prior_context != context_key:
+                # Resource dictionaries with equal content are one context.
+                # Reuse the clone already made for this source and context,
+                # so such dictionaries receive identical writes and stay equal;
+                # a second clone would make them differ and leave anything
+                # they still share (a Type3 font, say) in two contexts.
+                existing = stream_clones.get((stream_key, context_key))
+                if existing is not None:
+                    container[key] = existing
+                    continue
+                source_key = stream_key
                 # Cloned resources can still point back to the source stream.
                 active.add(stream_key)
                 tasks.append(("exit", stream_key, None, None))
@@ -364,18 +486,20 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
                 container[key] = stream
                 stream_key = _stream_identity(stream)
                 first_context[stream_key] = context_key
+                stream_clones[(source_key, context_key)] = stream
                 cloned += 1
 
             processed.add((stream_key, context_key))
             active.add(stream_key)
             tasks.append(("exit", stream_key, None, None))
             own_resources = _resolve_indirect(stream.get("/Resources"))
-            nested_resources = (
-                own_resources
-                if isinstance(own_resources, Dictionary)
-                else parent_resources
-            )
-            tasks.append(("resources", nested_resources, None, None))
+            # A stream without its own /Resources inherits the parent's, whose
+            # entries are already queued in this same context; expanding the
+            # parent again would only re-queue its children.
+            if isinstance(own_resources, Dictionary):
+                tasks.append(
+                    ("resources", own_resources, None, _object_identity(own_resources))
+                )
 
     return cloned
 
@@ -440,15 +564,92 @@ def _merge_resource_dictionaries(
     return merged
 
 
+_ResourceContext = dict[str, object]
+
+
+def _resource_context(
+    resources: Dictionary | None, fallback: _ResourceContext | None = None
+) -> _ResourceContext:
+    """Overlay resource names without copying inherited entries into the PDF."""
+    context = dict(fallback or {})
+    if not isinstance(resources, Dictionary):
+        return context
+    for category, value in resources.items():
+        if isinstance(value, Dictionary):
+            inherited = context.get(category)
+            entries = dict(inherited) if isinstance(inherited, dict) else {}
+            entries.update(value.items())
+            context[category] = entries
+        else:
+            context[category] = value
+    return context
+
+
+def _select_used_resources(
+    parent: _ResourceContext,
+    used: dict[str, set[str]] | None,
+    excluded_keys: frozenset[str],
+) -> Dictionary:
+    """Copy used resources into independent category dictionaries.
+
+    Keep default color spaces even when they are selected indirectly by an
+    image, shading or named color space. They do not introduce graph cycles.
+    With an unreadable stream, retain every resource conservatively.
+    """
+    selected = Dictionary()
+    names_by_category = (
+        {category: set(names) for category, names in used.items()}
+        if used is not None
+        else {str(category): set() for category in parent.keys()}
+    )
+    names_by_category.setdefault("/ColorSpace", set()).update(
+        {"/DefaultGray", "/DefaultRGB", "/DefaultCMYK"}
+    )
+    for category, names in names_by_category.items():
+        if category in excluded_keys:
+            continue
+        entries = parent.get(category)
+        if not isinstance(entries, dict):
+            if used is None and entries is not None:
+                selected[category] = entries
+            continue
+        if used is None:
+            names = set(entries.keys())
+        picked = Dictionary()
+        for name in sorted(names):
+            if name in entries:
+                picked[name] = entries[name]
+        if len(picked):
+            selected[category] = picked
+    return selected
+
+
 def _ensure_associated_resources(
     owner: Dictionary | Stream,
     parent_resources,
     excluded_keys: frozenset[str] = frozenset(),
+    content: list[Stream] | None = None,
+    resource_context: _ResourceContext | None = None,
 ) -> tuple[Dictionary | None, int, int]:
-    """Ensure owner has explicit /Resources and merge inherited entries."""
+    """Ensure owner has explicit /Resources and merge inherited entries.
+
+    ``content`` lists the owner's content streams (the stream itself, or a
+    Type3 font's CharProcs). When it can be scanned, only the resource names
+    it actually uses are inherited. Copying the whole parent dictionary can
+    make a resource contain itself (a Type3 font inheriting the page's
+    /XObject, whose Form in turn inherited the page's /Font), which viewers
+    such as Acrobat reject.
+    """
     parent_resources = _resolve_indirect(parent_resources)
     if not isinstance(parent_resources, Dictionary):
         parent_resources = None
+    if content is None and isinstance(owner, Stream):
+        content = [owner]
+    used = used_resource_names(content) if content is not None else None
+    if used is not None or resource_context is not None:
+        if resource_context is None:
+            resource_context = _resource_context(parent_resources)
+        parent_resources = _select_used_resources(resource_context, used, excluded_keys)
 
     resources = owner.get("/Resources")
     resources = _resolve_indirect(resources) if resources is not None else None
@@ -471,8 +672,13 @@ def _ensure_associated_resources(
     return resources, 0, merged
 
 
-def _get_inherited_page_resources(page_dict: Dictionary):
-    """Return inherited page resources from the page tree, if present."""
+def _get_inherited_page_resources(page_dict: Dictionary, pdf: Pdf | None = None):
+    """Return inherited page resources from the page tree, if present.
+
+    With ``pdf``, a direct inherited dictionary is made indirect in place on
+    its page-tree node, so every page inheriting it shares one stable
+    resource-context identity.
+    """
     seen: set[tuple[int, int]] = set()
     parent = _resolve_indirect(page_dict.get("/Parent"))
     while isinstance(parent, Dictionary):
@@ -483,7 +689,15 @@ def _get_inherited_page_resources(page_dict: Dictionary):
             seen.add(objgen)
         parent_resources = parent.get("/Resources")
         if parent_resources is not None:
-            return _resolve_indirect(parent_resources)
+            resolved = _resolve_indirect(parent_resources)
+            if (
+                pdf is not None
+                and isinstance(resolved, Dictionary)
+                and resolved.objgen == (0, 0)
+            ):
+                resolved = pdf.make_indirect(resolved)
+                parent[Name.Resources] = resolved
+            return resolved
         parent = _resolve_indirect(parent.get("/Parent"))
     return None
 
@@ -718,20 +932,25 @@ def _ensure_explicit_resources_in_resource_graph(
     visited_fonts: set[tuple[int, int]],
     visited_patterns: set[tuple[int, int]],
     ambiguous_streams: set[_ObjectIdentity],
+    fallback_resources: _ResourceContext | None = None,
 ) -> tuple[int, int]:
     """Ensure explicit resources for nested content stream containers."""
     resources_added = 0
     resources_merged = 0
-    pending = [resources]
+    # An ancestor may still supply a name used only by a descendant. Keep
+    # that lookup context while materializing each owner's narrow resources.
+    pending = [(resources, fallback_resources)]
     processed_resources: set[tuple[int, int]] = set()
     processed_owners: set[tuple[int, int]] = set()
 
     while pending:
-        parent = _resolve_indirect(pending.pop())
+        parent, fallbacks = pending.pop()
+        parent = _resolve_indirect(parent)
         if not isinstance(parent, Dictionary):
             continue
         if not _visit_once(parent, processed_resources):
             continue
+        context = _resource_context(parent, fallbacks)
 
         for form in _iter_form_xobjects(parent, visited_forms):
             if not _visit_once(form, processed_owners):
@@ -744,25 +963,33 @@ def _ensure_explicit_resources_in_resource_graph(
                 added = merged = 0
             else:
                 form_resources, added, merged = _ensure_associated_resources(
-                    form, parent
+                    form, parent, resource_context=context
                 )
             resources_added += added
             resources_merged += merged
             if isinstance(form_resources, Dictionary):
-                pending.append(form_resources)
+                pending.append((form_resources, context))
 
         for _font_name, font in iter_type3_fonts(parent, visited_fonts):
             if not _visit_once(font, processed_owners):
                 continue
+            charprocs = _resolve_indirect(font.get("/CharProcs"))
+            glyphs = (
+                [proc for _n, proc in charprocs.items() if isinstance(proc, Stream)]
+                if isinstance(charprocs, Dictionary)
+                else []
+            )
             font_resources, added, merged = _ensure_associated_resources(
                 font,
                 parent,
                 excluded_keys=frozenset({"/Font"}),
+                content=glyphs,
+                resource_context=context,
             )
             resources_added += added
             resources_merged += merged
             if isinstance(font_resources, Dictionary):
-                pending.append(font_resources)
+                pending.append((font_resources, context))
 
         for pattern in _iter_tiling_patterns(parent, visited_patterns):
             if not _visit_once(pattern, processed_owners):
@@ -775,21 +1002,23 @@ def _ensure_explicit_resources_in_resource_graph(
                 added = merged = 0
             else:
                 pattern_resources, added, merged = _ensure_associated_resources(
-                    pattern, parent
+                    pattern, parent, resource_context=context
                 )
             resources_added += added
             resources_merged += merged
             if isinstance(pattern_resources, Dictionary):
-                pending.append(pattern_resources)
+                pending.append((pattern_resources, context))
 
         for group in _iter_soft_mask_groups(parent, visited_forms):
             if not _visit_once(group, processed_owners):
                 continue
-            group_resources, added, merged = _ensure_associated_resources(group, parent)
+            group_resources, added, merged = _ensure_associated_resources(
+                group, parent, resource_context=context
+            )
             resources_added += added
             resources_merged += merged
             if isinstance(group_resources, Dictionary):
-                pending.append(group_resources)
+                pending.append((group_resources, context))
 
     return resources_added, resources_merged
 
@@ -883,6 +1112,7 @@ def _ensure_resources_in_ap_stream(
             visited_fonts,
             visited_patterns,
             ambiguous_streams,
+            fallback_resources=_resource_context(page_resources),
         )
         resources_added += add2
         resources_merged += merge2
@@ -907,6 +1137,7 @@ def _ensure_resources_in_ap_stream(
                     visited_fonts,
                     visited_patterns,
                     ambiguous_streams,
+                    fallback_resources=_resource_context(page_resources),
                 )
                 resources_added += add2
                 resources_merged += merge2

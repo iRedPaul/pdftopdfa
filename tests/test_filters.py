@@ -857,3 +857,21 @@ class TestMalformedUtf8Names:
         func = globals()[func_name]
         assert func(pdf) == 0
         assert "Error processing object" not in caplog.text
+
+
+def test_inline_filter_sanitizer_skips_parse_without_filter_key(monkeypatch):
+    """Inline images without /F or /Filter need no parse at all."""
+    import pdftopdfa.sanitizers.filters as filters
+
+    pdf = pikepdf.new()
+    glyph = pdf.make_stream(
+        b"10 0 0 0 10 10 d1 BI /W 8 /H 1 /IM true /BPC 1 ID \x00 EI"
+    )
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("stream parsed although it has no /Filter")
+
+    monkeypatch.setattr(filters, "parse_content_stream", fail)
+    assert filters._sanitize_inline_images_in_stream(
+        glyph, convert_lzw=True, remove_crypt=True, sanitize_nonstandard=True
+    ) == (False, False, False)

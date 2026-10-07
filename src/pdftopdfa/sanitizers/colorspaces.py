@@ -17,7 +17,9 @@ from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
 
 from ..color_profile import get_cmyk_profile, get_gray_profile, get_srgb_profile
 from ..exceptions import ConversionError
-from ..fonts.glyph_usage import _iter_content_streams_with_resources
+from ..fonts.glyph_usage import (
+    iter_content_streams_with_resource_info,
+)
 from ..utils import iter_type3_fonts as _iter_type3_fonts
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
@@ -543,7 +545,14 @@ def validate_embedded_icc_profiles(
                                     ap_entry, visited, ap_loc, validate_icc_stream
                                 )
 
-            for owner, nested_resources in _iter_content_streams_with_resources(page):
+            for (
+                owner,
+                nested_resources,
+                _key,
+                inherited,
+            ) in iter_content_streams_with_resource_info(page, resources_only=True):
+                if inherited:  # same resources object as already validated
+                    continue
                 owner = _resolve_indirect(owner)
                 owner_objgen = getattr(owner, "objgen", (0, 0))
                 nested_loc = (
@@ -1112,7 +1121,14 @@ def sanitize_special_colorspace_consistency(pdf: Pdf) -> tuple[int, int]:
                             colorants_added += a
                             separations_normalized += b
 
-            for _owner, nested_resources in _iter_content_streams_with_resources(page):
+            for (
+                _owner,
+                nested_resources,
+                _key,
+                inherited,
+            ) in iter_content_streams_with_resource_info(page, resources_only=True):
+                if inherited:
+                    continue
                 a, b = _sanitize_special_colorspaces_in_resources(
                     nested_resources,
                     canonical_by_name,

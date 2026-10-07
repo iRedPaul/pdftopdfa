@@ -5,13 +5,16 @@
 """XObject handling for PDF/A compliance."""
 
 import logging
+import re
 
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 from pikepdf import parse_content_stream as _parse_content_stream
 from pikepdf import unparse_content_stream as _unparse_content_stream
 
-from ..fonts.glyph_usage import _iter_content_streams_with_resources
+from ..fonts.glyph_usage import (
+    iter_content_streams_with_resource_info,
+)
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 from .base import FORBIDDEN_XOBJECT_SUBTYPES
@@ -259,7 +262,14 @@ def remove_forbidden_xobjects(pdf: Pdf) -> int:
             )
 
     for page in pdf.pages:
-        for _owner, resources in _iter_content_streams_with_resources(page):
+        for (
+            _owner,
+            resources,
+            _key,
+            inherited,
+        ) in iter_content_streams_with_resource_info(page, resources_only=True):
+            if inherited:  # same resources object as already handled
+                continue
             resources = _resolve_indirect(resources)
             if not isinstance(resources, Dictionary):
                 continue
@@ -490,8 +500,25 @@ def _extract_inline_image_payload(inline_image) -> bytes | None:
     return None
 
 
+# PDF whitespace includes NUL. A name may contain a hex escape anywhere,
+# so any '#' conservatively disables the byte-level shortcut.
+_INLINE_INTERPOLATE_TOKEN_RE = re.compile(
+    rb"/I(?:nterpolate)?(?=[\x00\s()<>\[\]{}/%])|#"
+)
+
+
 def _fix_inline_image_interpolate_in_stream(stream: Stream) -> int:
     """Set /I or /Interpolate to false in inline images of one content stream."""
+    # Skip the full parse when the raw bytes cannot hold an inline image
+    # with an /I or /Interpolate key (e.g. bitmap glyphs with only /IM).
+    try:
+        data = stream.read_bytes()
+    except Exception:
+        data = None
+    if data is not None and (
+        b"BI" not in data or _INLINE_INTERPOLATE_TOKEN_RE.search(data) is None
+    ):
+        return 0
     try:
         instructions = list(_parse_content_stream(stream))
     except Exception:
@@ -645,15 +672,21 @@ def fix_image_interpolate(pdf: Pdf) -> int:
                 logger, e, "Error checking /Interpolate on page %d: %s", page_num, e
             )
 
+    walked: set = set()  # streams are fixed once, so walk them once
     for page in pdf.pages:
-        for owner, resources in _iter_content_streams_with_resources(page):
+        for (
+            owner,
+            resources,
+            _key,
+            inherited,
+        ) in iter_content_streams_with_resource_info(page, walked):
             owner = _resolve_indirect(owner)
             resources = _resolve_indirect(resources)
             if isinstance(owner, Stream):
                 fixed_count += _fix_inline_interpolate_in_stream_once(
                     owner, visited_inline_streams
                 )
-            if not isinstance(resources, Dictionary):
+            if inherited or not isinstance(resources, Dictionary):
                 continue
             xobjects = _resolve_indirect(resources.get("/XObject"))
             if isinstance(xobjects, Dictionary):
@@ -1132,7 +1165,14 @@ def fix_bits_per_component(pdf: Pdf) -> dict[str, int]:
             )
 
     for page in pdf.pages:
-        for _owner, resources in _iter_content_streams_with_resources(page):
+        for (
+            _owner,
+            resources,
+            _key,
+            inherited,
+        ) in iter_content_streams_with_resource_info(page, resources_only=True):
+            if inherited:
+                continue
             resources = _resolve_indirect(resources)
             if not isinstance(resources, Dictionary):
                 continue

@@ -377,6 +377,18 @@ def _sanitize_inline_images_in_stream(
     sanitize_nonstandard: bool = False,
 ) -> tuple[bool, bool, bool]:
     """Sanitize inline-image filters inside one content stream."""
+    # Only inline images with a /Filter (abbreviated /F) can need changes.
+    # Most streams, including bitmap Type3 glyphs, have none: skip the full
+    # parse when the raw bytes cannot contain one. "/#" covers names spelled
+    # with hex escapes, which are parsed conservatively.
+    try:
+        data = stream.read_bytes()
+    except Exception:
+        data = None
+    if data is not None and (
+        b"BI" not in data or (b"/F" not in data and b"/#" not in data)
+    ):
+        return False, False, False
     try:
         with warnings.catch_warnings():
             warnings.filterwarnings(

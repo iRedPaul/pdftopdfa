@@ -906,3 +906,187 @@ class TestFontUsageCache:
         cache.invalidate()
         assert cache.get()[font.objgen] == {66}
         assert cache.get(require_resolved_font=True)[font.objgen] == {66}
+
+
+def test_find_ambiguous_scales_with_resourceless_forms_in_direct_resources():
+    """Direct parent resources are serialized/expanded once, not per child."""
+    from pdftopdfa.fonts import glyph_usage
+
+    pdf = new_pdf()
+    forms = {}
+    for index in range(300):
+        form = pdf.make_stream(b"")
+        form[Name.Type] = Name.XObject
+        form[Name.Subtype] = Name.Form
+        form[Name.BBox] = Array([0, 0, 1, 1])
+        forms[f"/F{index}"] = form
+    page = pdf.add_blank_page(page_size=(10, 10))
+    page.Resources = Dictionary(XObject=Dictionary(forms))
+
+    calls = 0
+    original = glyph_usage._object_identity
+
+    def counting(obj):
+        nonlocal calls
+        calls += 1
+        return original(obj)
+
+    glyph_usage._object_identity = counting
+    try:
+        contexts = list(_iter_content_streams_with_resources(page))
+        assert glyph_usage.find_ambiguous_resource_context_streams(pdf) == set()
+    finally:
+        glyph_usage._object_identity = original
+
+    assert len(contexts) == 301  # page + 300 forms
+    assert calls < 10 * len(forms)  # was ~N^2 serializations of the dict
+
+
+def test_collect_font_usage_parses_shared_stream_once_per_collection(monkeypatch):
+    """A form shared by pages is parsed once, but resolved per context."""
+    from pdftopdfa.fonts import glyph_usage
+
+    pdf = new_pdf()
+    form = pdf.make_stream(b"BT /F1 1 Tf (ab) Tj ET")
+    form[Name.Type] = Name.XObject
+    form[Name.Subtype] = Name.Form
+    form[Name.BBox] = Array([0, 0, 1, 1])
+    fonts = []
+    for base in (Name.Helvetica, Name.Courier):
+        font = pdf.make_indirect(
+            Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=base)
+        )
+        fonts.append(font)
+        page = pdf.add_blank_page(page_size=(10, 10))
+        page.Resources = Dictionary(
+            Font=Dictionary(F1=font), XObject=Dictionary(Fm=form)
+        )
+
+    parsed = []
+    original = pikepdf.parse_content_stream
+
+    def counting(target, *args):
+        if isinstance(target, pikepdf.Stream) and target.objgen == form.objgen:
+            parsed.append(target.objgen)
+        return original(target, *args)
+
+    monkeypatch.setattr(glyph_usage.pikepdf, "parse_content_stream", counting)
+    usage = collect_font_usage(pdf)
+
+    assert len(parsed) == 1
+    for font in fonts:  # the shared form still counts for each page's font
+        assert usage[font.objgen] == {ord("a"), ord("b")}
+
+
+def test_resource_info_flags_owners_that_reuse_parent_resources():
+    """Resourceless forms and CharProcs report their parent's resources."""
+    from pdftopdfa.fonts.glyph_usage import iter_content_streams_with_resource_info
+
+    pdf = new_pdf()
+    plain = pdf.make_stream(b"0 0 m 1 1 l S")
+    own = pdf.make_stream(b"0 0 m 1 1 l S")
+    for form in (plain, own):
+        form[Name.Type] = Name.XObject
+        form[Name.Subtype] = Name.Form
+        form[Name.BBox] = Array([0, 0, 1, 1])
+    own[Name.Resources] = Dictionary()
+    glyph = pdf.make_stream(b"0 0 d0")
+    font = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type3,
+            CharProcs=Dictionary(a=glyph),
+            FontBBox=Array([0, 0, 1, 1]),
+            FontMatrix=Array([1, 0, 0, 1, 0, 0]),
+        )
+    )
+    page = pdf.add_blank_page(page_size=(10, 10))
+    page.Resources = Dictionary(
+        XObject=Dictionary(P=plain, O=own), Font=Dictionary(T=font)
+    )
+
+    flags = {
+        owner.objgen: inherited
+        for owner, _res, _key, inherited in iter_content_streams_with_resource_info(
+            page
+        )
+        if isinstance(owner, pikepdf.Stream)
+    }
+
+    assert flags == {plain.objgen: True, own.objgen: False, glyph.objgen: True}
+
+
+def test_resources_only_walk_skips_streams_reusing_parent_resources():
+    from pdftopdfa.fonts.glyph_usage import iter_content_streams_with_resource_info
+
+    pdf = new_pdf()
+    glyph = pdf.make_stream(b"0 0 d0")
+    font = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type3,
+            CharProcs=Dictionary(a=glyph),
+            FontBBox=Array([0, 0, 1, 1]),
+            FontMatrix=Array([1, 0, 0, 1, 0, 0]),
+        )
+    )
+    page = pdf.add_blank_page(page_size=(10, 10))
+    page.Resources = Dictionary(Font=Dictionary(T=font))
+
+    full = [
+        o.objgen
+        for o, *_ in iter_content_streams_with_resource_info(page)
+        if isinstance(o, pikepdf.Stream)
+    ]
+    lean = [
+        o.objgen
+        for o, *_ in iter_content_streams_with_resource_info(page, resources_only=True)
+        if isinstance(o, pikepdf.Stream)
+    ]
+    assert glyph.objgen in full and glyph.objgen not in lean
+
+
+def test_unresolved_text_in_shared_form_reaches_every_calling_pages_fonts():
+    """The document-wide walk falls back to per-page for unresolved text."""
+    pdf = new_pdf()
+    form = pdf.make_stream(b"BT (ab) Tj ET")  # no Tf: font comes from caller
+    form[Name.Type] = Name.XObject
+    form[Name.Subtype] = Name.Form
+    form[Name.BBox] = Array([0, 0, 1, 1])
+    fonts = []
+    for base in (Name.Helvetica, Name.Courier):
+        font = pdf.make_indirect(
+            Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=base)
+        )
+        fonts.append(font)
+        page = pdf.add_blank_page(page_size=(10, 10))
+        page.Resources = Dictionary(
+            Font=Dictionary(F1=font), XObject=Dictionary(Fm=form)
+        )
+
+    usage = collect_font_usage(pdf)
+
+    for font in fonts:
+        assert {ord("a"), ord("b")} <= usage[font.objgen]
+
+
+def test_font_usage_cache_walks_once_for_both_variants(monkeypatch):
+    from pdftopdfa.fonts import glyph_usage
+
+    pdf = new_pdf()
+    pdf.add_blank_page(page_size=(10, 10))
+    calls = []
+    original = glyph_usage._collect_raw_font_usage
+
+    def counting(target):
+        calls.append(1)
+        return original(target)
+
+    monkeypatch.setattr(glyph_usage, "_collect_raw_font_usage", counting)
+    cache = FontUsageCache(pdf)
+    cache.get()
+    cache.get(require_resolved_font=True)
+    assert len(calls) == 1
+    cache.invalidate()
+    cache.get()
+    assert len(calls) == 2
