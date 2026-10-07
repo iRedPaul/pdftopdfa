@@ -25,6 +25,10 @@ from pdftopdfa.fonts import (
     check_font_compliance,
 )
 from pdftopdfa.fonts.analysis import is_font_embedded
+from pdftopdfa.fonts.constants import (
+    STANDARD_14_WINDOWS_EQUIVALENTS,
+    WINDOWS_SYSTEM_FONT_POSTSCRIPT_NAMES,
+)
 from pdftopdfa.fonts.embedder import (
     _UTF16_ENCODING_NAMES,
     _is_utf16_encoding,
@@ -480,6 +484,65 @@ class TestFontLoader:
             assert tt_font["name"].getDebugName(6) == postscript_name
         finally:
             tt_font.close()
+
+    @pytest.mark.parametrize(
+        ("requested_name", "postscript_name", "family_name", "style_name"),
+        [
+            ("Helvetica", "ArialMT", "Arial", "Regular"),
+            ("Helvetica-BoldOblique", "Arial-BoldItalicMT", "Arial", "Bold Italic"),
+            ("Times-Roman", "TimesNewRomanPSMT", "Times New Roman", "Regular"),
+            ("Times-Italic", "TimesNewRomanPS-ItalicMT", "Times New Roman", "Italic"),
+            ("Courier", "CourierNewPSMT", "Courier New", "Regular"),
+            ("Courier-Bold", "CourierNewPS-BoldMT", "Courier New", "Bold"),
+            ("CourierNew-Bold", "CourierNewPS-BoldMT", "Courier New", "Bold"),
+            ("Helv", "ArialMT", "Arial", "Regular"),
+        ],
+    )
+    def test_standard14_font_uses_windows_equivalent(
+        self,
+        tmp_path,
+        requested_name,
+        postscript_name,
+        family_name,
+        style_name,
+    ):
+        """Standard-14 fonts use the Windows font viewers display for them."""
+        _font_data, tt_font = self._load_policy_font(
+            tmp_path,
+            requested_name=requested_name,
+            postscript_name=postscript_name,
+            family_name=family_name,
+            style_name=style_name,
+            use_fallback=False,
+        )
+        try:
+            assert tt_font["name"].getDebugName(6) == postscript_name
+        finally:
+            tt_font.close()
+
+    def test_standard14_font_without_windows_equivalent_uses_bundled(self, tmp_path):
+        """A missing Windows equivalent falls back to the bundled replacement."""
+        windir = tmp_path / "Windows"
+        (windir / "Fonts").mkdir(parents=True)
+
+        loader = FontLoader({})
+        with (
+            patch.object(FontLoader, "_is_windows_platform", return_value=True),
+            patch.dict("os.environ", {"WINDIR": str(windir)}, clear=False),
+        ):
+            _font_data, tt_font = loader.load_replacement_font("Courier")
+
+        try:
+            assert tt_font["name"].getDebugName(1).startswith("Liberation Mono")
+        finally:
+            tt_font.close()
+
+    def test_standard14_windows_equivalents_are_allowlisted(self):
+        """Every Windows equivalent is an allowlisted Standard-14 replacement."""
+        assert set(STANDARD_14_WINDOWS_EQUIVALENTS) <= set(FONT_REPLACEMENTS)
+        assert set(STANDARD_14_WINDOWS_EQUIVALENTS.values()) <= (
+            WINDOWS_SYSTEM_FONT_POSTSCRIPT_NAMES
+        )
 
     def test_non_allowlisted_windows_font_is_ignored(self, tmp_path):
         """Non-allowlisted Windows fonts fall back to bundled replacements."""

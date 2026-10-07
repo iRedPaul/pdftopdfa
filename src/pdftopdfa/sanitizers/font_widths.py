@@ -1079,6 +1079,7 @@ def _fix_simple_font_widths(font: pikepdf.Object, font_name: str) -> bool:
                 # Code has an encoding entry but no glyph was found in
                 # the font program — use .notdef width as the expected
                 # width (matches veraPDF behaviour).
+                comparable += 1
                 declared = declared_widths[i]
                 if _width_outside_tolerance(declared, fallback_width):
                     corrected_widths[i] = _pdf_width_from_exact(fallback_width)

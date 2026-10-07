@@ -26,6 +26,24 @@ FONT_REPLACEMENTS = {
     "ZapfDingbats": "NotoSansSymbols2-Regular.ttf",
 }
 
+# Allowlisted Windows fonts that Windows PDF viewers substitute for
+# non-embedded Standard-14 fonts. Embedding them preserves the original
+# appearance; the bundled replacements above remain the fallback.
+STANDARD_14_WINDOWS_EQUIVALENTS = {
+    "Helvetica": "ArialMT",
+    "Helvetica-Bold": "Arial-BoldMT",
+    "Helvetica-Oblique": "Arial-ItalicMT",
+    "Helvetica-BoldOblique": "Arial-BoldItalicMT",
+    "Times-Roman": "TimesNewRomanPSMT",
+    "Times-Bold": "TimesNewRomanPS-BoldMT",
+    "Times-Italic": "TimesNewRomanPS-ItalicMT",
+    "Times-BoldItalic": "TimesNewRomanPS-BoldItalicMT",
+    "Courier": "CourierNewPSMT",
+    "Courier-Bold": "CourierNewPS-BoldMT",
+    "Courier-Oblique": "CourierNewPS-ItalicMT",
+    "Courier-BoldOblique": "CourierNewPS-BoldItalicMT",
+}
+
 # Common aliases that should resolve to a Standard-14 replacement.
 STANDARD_14_ALIASES: dict[str, str] = {
     # Common PDF form resource abbreviations
