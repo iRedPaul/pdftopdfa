@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.9.19] - 2026-10-07
+
+### Changes
+
+- Use Windows equivalents for non-embedded Standard-14 fonts
+- Improve conversion performance by skipping unnecessary PDF processing
+
+### Bug Fixes
+
+- Preserve inherited resources and inline image settings across shared streams
+- Prevent conversion hangs on shared PDF streams
+
 ## [0.9.18] - 2026-10-02
 
 ### Features
