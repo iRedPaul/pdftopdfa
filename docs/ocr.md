@@ -217,7 +217,9 @@ pdftopdfa -l 3a --pdfua --ocr-figure-text \
 ```
 
 The converter extracts eligible direct Image XObjects and reuses one
-`OCRSession` across all candidates in the document. Non-empty OCR lines are
+`OCRSession` across all candidates in the document. Palette samples above the
+highest index of the palette (`hival`) take the color of that index, as pdf.js
+and MuPDF render them. Non-empty OCR lines are
 whitespace-normalized and joined in recognition order. The result is accepted
 only when every non-empty line has confidence of at least `0.90`; an empty or
 less-confident result marks the Figure as a `Layout` artifact and reports that

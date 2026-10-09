@@ -113,8 +113,8 @@ _FIGURE_OCR_MIN_CONFIDENCE = 0.90
 # unless an RGB image is converted in place. pikepdf extracts Indexed images
 # with a CMYK base as CMYK images, so no "P" image is expanded to CMYK.
 _FIGURE_OCR_COMPOSITE_BYTES_PER_PIXEL = {"1": 7, "L": 6, "P": 7, "RGB": 5, "CMYK": 9}
-# The number of colour components a /Matte array must supply for each mode, and
-# the Pillow mode matching each ICC profile colour space.
+# The number of colour components that a /Matte array or a palette entry has in
+# each mode, and the Pillow mode matching each ICC profile colour space.
 _FIGURE_OCR_MATTE_COMPONENTS = {"L": 1, "RGB": 3, "CMYK": 4}
 _FIGURE_OCR_ICC_MODES = {"GRAY": "L", "RGB ": "RGB", "CMYK": "CMYK"}
 # Device colour spaces with the /Default colour space resource that remaps
@@ -383,6 +383,52 @@ def _decode_figure_ocr_image(
     return image
 
 
+@contextmanager
+def _figure_ocr_clamped_palette_image(
+    pdf_image: pikepdf.PdfImage,
+) -> Iterator[pikepdf.PdfImage]:
+    """Yield *pdf_image*, or a copy that expands samples above hival to entry hival.
+
+    pdf.js and MuPDF render palette indices beyond hival as entry hival, while
+    pikepdf leaves them out of range: they turn black or, packed into a PNG
+    with fewer bits, wrap to other entries. The copy, in a scratch PDF, pads
+    the lookup table with entry hival up to 2 ** BitsPerComponent entries.
+    """
+    palette = pdf_image.palette
+    components = (
+        None
+        if palette is None
+        else _FIGURE_OCR_MATTE_COMPONENTS.get(palette.base_colorspace)
+    )
+    if palette is None or components is None or pdf_image.bits_per_component > 8:
+        # pikepdf rejects these palettes when it extracts the image.
+        yield pdf_image
+        return
+    hival = pdf_image.obj["/ColorSpace"][2]
+    if not isinstance(hival, int) or hival < 0:
+        raise ValueError("Indexed hival is not a palette index")
+    entries = 1 << pdf_image.bits_per_component
+    if hival + 1 >= entries:
+        yield pdf_image
+        return
+    lookup = palette.palette[: (hival + 1) * components]
+    if len(lookup) != (hival + 1) * components:
+        raise ValueError("Indexed lookup table is shorter than hival")
+    padding = lookup[-components:] * (entries - 1 - hival)
+    with pikepdf.Pdf.new() as scratch:
+        # Stream data is copied lazily, when pikepdf reads the copy.
+        copy = scratch.copy_foreign(pdf_image.obj)
+        copy["/ColorSpace"] = pikepdf.Array(
+            [
+                pikepdf.Name.Indexed,
+                copy["/ColorSpace"][1],
+                entries - 1,
+                pikepdf.String(lookup + padding),
+            ]
+        )
+        yield pikepdf.PdfImage(copy)
+
+
 def _figure_ocr_base_color_space(image: pikepdf.Stream) -> object:
     """Return the /ColorSpace of *image*, or the base of an Indexed one."""
     color_space = image.get("/ColorSpace")
@@ -551,7 +597,8 @@ def _extract_figure_ocr_image(
 ) -> Path | None:
     """Extract *image* for OCR as it appears in front of a white background.
 
-    An image with a soft mask is composited with the /SMask opacity, resampled
+    Palette samples above hival take the colour of entry hival. An image
+    with a soft mask is composited with the /SMask opacity, resampled
     to the image size, after the /Decode arrays of image and mask are applied
     and /Matte pre-blending is undone. ICCBased colours, and device colours
     with a *device_profile*, are converted to sRGB before compositing, with the
@@ -570,13 +617,14 @@ def _extract_figure_ocr_image(
         _check_figure_ocr_icc_range(_figure_ocr_base_color_space(image))
     # A soft-masked image is extracted with raw samples and decoded below,
     # because pikepdf leaves /Decode unapplied for some codecs and palettes.
-    source_path = Path(
-        pdf_image.extract_to(
-            fileprefix=str(fileprefix),
-            apply_decode_array=soft_mask is None,
-            apply_mask=False,
+    with _figure_ocr_clamped_palette_image(pdf_image) as extracted_image:
+        source_path = Path(
+            extracted_image.extract_to(
+                fileprefix=str(fileprefix),
+                apply_decode_array=soft_mask is None,
+                apply_mask=False,
+            )
         )
-    )
     with Image.open(source_path) as source:
         if source.size != size:
             return None

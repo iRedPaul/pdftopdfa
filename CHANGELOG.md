@@ -11,6 +11,7 @@
 
 - Keep the widths of WinAnsi non-breaking spaces and soft hyphens consistent with the embedded font program (rule 6.2.11.5)
 - Treat every image decoding failure during figure OCR, including a failed memory allocation, as ineligible instead of aborting the conversion
+- Give figure OCR palette samples above the highest palette index (`hival`) the color of that index, as pdf.js and MuPDF render them, instead of black or another palette entry
 
 ## [0.9.19] - 2026-10-07
 

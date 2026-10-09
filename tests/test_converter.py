@@ -1287,6 +1287,73 @@ def test_figure_text_recognizer_expands_cmyk_palette_from_lookup(
 
 
 @pytest.mark.parametrize(
+    ("bits_per_component", "hival", "indices"),
+    [
+        (8, 2, [0, 2, 3, 255]),
+        (4, 5, [0, 5, 6, 15]),
+        (2, 2, [0, 1, 2, 3]),
+        # A sample of 1 is out of range of a one-entry 1-bit palette.
+        (1, 0, [0, 1, 1, 0]),
+    ],
+)
+@pytest.mark.parametrize("base_mode", ["L", "RGB", "CMYK"])
+@pytest.mark.parametrize("soft_masked", [False, True])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_clamps_palette_indices_to_hival(
+    mock_session_class: MagicMock,
+    soft_masked: bool,
+    base_mode: str,
+    bits_per_component: int,
+    hival: int,
+    indices: list[int],
+) -> None:
+    components = len(base_mode)
+    lookup = bytes(
+        40 + 30 * entry + 20 * component
+        for entry in range(hival + 1)
+        for component in range(components)
+    )
+    # The whole image, so opaque images are submitted as RGB crops too.
+    whole = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+
+    def submitted(samples: list[int]) -> np.ndarray:
+        with Pdf.new() as pdf:
+            _add_pdfa_output_intent(pdf, get_cmyk_profile(), 4)
+            size = (len(samples), 1)
+            image = _flate_image(
+                pdf,
+                Image.new("L", size),
+                ColorSpace=Array(
+                    [
+                        Name.Indexed,
+                        _DEVICE_COLOR_SPACES[base_mode],
+                        hival,
+                        pikepdf.String(lookup),
+                    ]
+                ),
+                **(
+                    {"SMask": _flate_image(pdf, Image.new("L", size, 255))}
+                    if soft_masked
+                    else {}
+                ),
+            )
+            bits = np.unpackbits(np.array(samples, dtype=np.uint8)[:, None], axis=1)
+            image.write(
+                zlib.compress(np.packbits(bits[:, 8 - bits_per_component :])),
+                filter=Name.FlateDecode,
+            )
+            image["/BitsPerComponent"] = bits_per_component
+            [result] = _figure_ocr_submissions(mock_session_class, pdf, image, (whole,))
+        return result
+
+    clamped = [min(index, hival) for index in indices]
+    expected = submitted(clamped)
+    # Each palette entry used has its own colour.
+    assert len({tuple(pixel) for pixel in expected[0]}) == len(set(clamped))
+    assert (submitted(indices) == expected).all()
+
+
+@pytest.mark.parametrize(
     ("mode", "color", "output_intent", "components"),
     [
         ("L", 90, get_gray_profile, 1),
