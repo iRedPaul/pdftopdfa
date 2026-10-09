@@ -223,11 +223,20 @@ only when every non-empty line has confidence of at least `0.90`; an empty or
 less-confident result marks the Figure as a `Layout` artifact and reports that
 decision for manual review.
 
+Images with a soft mask (`/SMask`) are composited in front of white before
+recognition, so OCR sees their visible appearance. The soft mask's `/Decode`
+array and `/Matte` pre-blending are honored, and a soft mask with its own
+resolution is resampled to the image size. Soft-masked images follow the same
+rule as opaque images: accepted text becomes `ActualText`, and a Figure without
+accepted text becomes a `Layout` artifact. Images whose soft mask cannot be
+decoded are reported for manual review instead.
+
 Accepted text is written as `ActualText`, because it replaces text visibly
 contained in the image rather than describing all visual meaning. Every
 generated value is still reported as requiring author review. Inline images,
-Form XObjects, masks, diagrams without recognizable text, and authoritative
-visual descriptions remain outside this automatic step.
+Form XObjects, stencil images, images with `/Mask` or JPEG 2000 `/SMaskInData`
+transparency, diagrams without recognizable text, and authoritative visual
+descriptions remain outside this automatic step.
 
 The Python equivalent is `ocr_figure_text=True`. The flag requires both OCR
 model directories and level `"2a"` or `"3a"` on `convert_to_pdfa()`,

@@ -9,6 +9,8 @@ from __future__ import annotations
 import zlib
 from copy import deepcopy
 from io import BytesIO
+from pathlib import Path
+from unittest.mock import patch
 
 import pikepdf
 import pytest
@@ -17,6 +19,7 @@ from pikepdf import Array, Dictionary, Name, NumberTree, String
 
 import pdftopdfa.digital_layout as digital_layout
 import pdftopdfa.tagging as tagging
+from pdftopdfa.converter import _figure_text_recognizer
 from pdftopdfa.exceptions import ConversionError
 from pdftopdfa.tagging import (
     _existing_structure_elements,
@@ -974,6 +977,80 @@ def test_rejected_figure_preserves_other_author_structure() -> None:
     assert len(parent_array) == 1
     assert parent_array[0].objgen == described.objgen
     assert result["semantic_ocr_figure_artifacts"] == 1
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("preserved", [False, True])
+@pytest.mark.parametrize(
+    ("recognized", "expected_actual_text"),
+    [([], None), ([("Logo text", 0.99)], "Logo text")],
+)
+def test_soft_masked_image_figure_follows_ocr_figure_rule(
+    nested: bool,
+    preserved: bool,
+    recognized: list[tuple[str, float]],
+    expected_actual_text: str | None,
+) -> None:
+    pdf = pikepdf.Pdf.new()
+    image = _image(pdf, b"\xff\x00\x00" * 4)
+    image["/Width"] = 2
+    image["/Height"] = 2
+    # A soft mask with its own resolution leaves intrinsic visibility
+    # unclassified; Figure OCR composites it with the image instead.
+    image["/SMask"] = _image(pdf, b"\xff", color_space=Name.DeviceGray)
+    content = b"q 100 0 0 80 50 100 cm /Im Do Q"
+    resources = Dictionary(XObject=Dictionary(Im=image))
+    if nested:
+        form = _form(pdf, content, resources)
+        content = b"/Fm Do"
+        resources = Dictionary(XObject=Dictionary(Fm=form))
+    if preserved:
+        content = b"/Figure <</MCID 0>> BDC " + content + b" EMC"
+    page = _page(pdf, content, resources, size=(400, 300))
+    if preserved:
+        _install_figure_structure(pdf, page)
+
+    with patch("pdftopdfa.ocr.OCRSession") as session_class:
+        session = session_class.return_value.__enter__.return_value
+        session.recognize_image.return_value = recognized
+        with _figure_text_recognizer(
+            enabled=True,
+            detection_model_dir=Path("paddle-detection"),
+            recognition_model_dir=Path("paddle-recognition"),
+            ocr_execution_provider="cpu",
+            ocr_languages=["en"],
+        ) as recognize:
+            result = ensure_logical_structure(
+                pdf,
+                semantic=True,
+                preflight=False,
+                _figure_text_recognizer=recognize,
+            )
+
+    assert session.recognize_image.call_count == 1
+    assert result["structure_preserved"] is preserved
+    figures = [
+        item for item in _structure_objects(pdf) if item.get("/S") == Name.Figure
+    ]
+    if expected_actual_text is None:
+        markers = _marked_content(page)
+        markers.extend(
+            marker
+            for item in pdf.objects
+            if isinstance(item, pikepdf.Stream) and item.get("/Subtype") == Name.Form
+            for marker in _marked_content(item)
+        )
+        assert not figures
+        assert ("/Artifact", "/Layout", None, None) in markers
+        assert result["semantic_ocr_figure_artifacts"] == 1
+        assert result["semantic_ocr_figure_text_review_required"] == 0
+    else:
+        assert [str(figure["/ActualText"]) for figure in figures] == [
+            expected_actual_text
+        ]
+        assert result["semantic_ocr_figure_artifacts"] == 0
+        assert result["semantic_ocr_figure_text_review_required"] == 1
+    assert result["semantic_alternatives_review_required"] == 0
 
 
 def test_ocr_ineligible_figure_remains_structured_for_manual_review() -> None:

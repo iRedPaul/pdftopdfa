@@ -2,9 +2,15 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Run figure OCR on images with a soft mask (`/SMask`) by compositing them in front of white, honoring the soft mask's `/Decode`, `/Matte` pre-blending, and a resolution that differs from the image
+- Apply the figure OCR rule to soft-masked images as well: confidently recognized text becomes review-required `ActualText`, and Figures without accepted text become review-required Layout artifacts; stencil images, `/Mask`, and JPEG 2000 `/SMaskInData` remain ineligible
+
 ### Bug Fixes
 
 - Keep the widths of WinAnsi non-breaking spaces and soft hyphens consistent with the embedded font program (rule 6.2.11.5)
+- Treat every image decoding failure during figure OCR as ineligible instead of aborting the conversion
 
 ## [0.9.19] - 2026-10-07
 

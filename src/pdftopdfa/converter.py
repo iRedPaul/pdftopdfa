@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
 from functools import wraps
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 # Third Party
 import pikepdf
@@ -78,6 +78,9 @@ from .utils import (
 from .validator import detect_iso_standards, detect_pdfa_level
 from .verapdf import VeraPDFResult, validate_with_verapdf
 
+if TYPE_CHECKING:
+    from PIL import Image
+
 logger = logging.getLogger(__name__)
 
 
@@ -102,6 +105,11 @@ class _AnnotationRestoreResult:
 _CONFORMANCE_RANK = {"b": 0, "u": 1, "a": 2}
 _FIGURE_OCR_MAX_PIXELS = 100_000_000
 _FIGURE_OCR_MIN_CONFIDENCE = 0.90
+# Pillow modes of extracted base images that can be composited against white,
+# and the number of colour components a /Matte array must supply for each.
+_FIGURE_OCR_COMPOSITE_MODES = frozenset({"1", "L", "P", "RGB", "CMYK"})
+_FIGURE_OCR_MATTE_COMPONENTS = {"L": 1, "RGB": 3, "CMYK": 4}
+_FIGURE_OCR_MATTE_STRIP_PIXELS = 1 << 20
 
 
 def _validate_ocr_configuration(
@@ -164,6 +172,140 @@ def _accepted_figure_ocr_text(results: list[tuple[str, float]]) -> str | None:
     return " ".join(lines) or None
 
 
+def _figure_ocr_size_allowed(width: object, height: object) -> bool:
+    return (
+        isinstance(width, int)
+        and not isinstance(width, bool)
+        and width > 0
+        and isinstance(height, int)
+        and not isinstance(height, bool)
+        and height > 0
+        and width * height <= _FIGURE_OCR_MAX_PIXELS
+    )
+
+
+def _pdf_numbers(value: object, count: int, name: str) -> tuple[float, ...]:
+    if not isinstance(value, pikepdf.Array) or len(value) != count:
+        raise ValueError(f"{name} must be an array of {count} numbers")
+    try:
+        return tuple(float(item) for item in value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an array of {count} numbers") from exc
+
+
+def _figure_ocr_soft_mask_alpha(
+    soft_mask: pikepdf.Stream, size: tuple[int, int]
+) -> "Image.Image":
+    """Return the decoded opacity of an image /SMask as an ``L`` band of *size*."""
+    import numpy as np
+    from PIL import Image
+
+    if (
+        bool(soft_mask.get("/ImageMask", False))
+        or soft_mask.get("/ColorSpace") != pikepdf.Name.DeviceGray
+    ):
+        raise ValueError("/SMask is not a DeviceGray image")
+    decode = soft_mask.get("/Decode")
+    low, high = (
+        (0.0, 1.0) if decode is None else _pdf_numbers(decode, 2, "/SMask /Decode")
+    )
+    # /Decode is applied here in one place, because pikepdf skips it for some
+    # codecs (DCT, JPX) and only supports inversion for 1- and 16-bit samples.
+    with pikepdf.PdfImage(soft_mask).as_pil_image(
+        apply_decode_array=False, apply_mask=False
+    ) as raw:
+        if raw.mode == "I;16":
+            samples = Image.fromarray((np.asarray(raw) >> 8).astype(np.uint8))
+        elif raw.mode in {"1", "L"}:
+            samples = raw.convert("L")
+        else:
+            raise ValueError(f"unsupported /SMask image mode {raw.mode}")
+    alpha = samples.point(
+        [
+            round(min(max(low + (high - low) * value / 255, 0.0), 1.0) * 255)
+            for value in range(256)
+        ]
+    )
+    if alpha.size != size:
+        alpha = alpha.resize(size, Image.Resampling.BILINEAR)
+    return alpha
+
+
+def _unpremultiply_figure_ocr_image(
+    image: "Image.Image", alpha: "Image.Image", matte: object
+) -> "Image.Image":
+    """Undo /Matte pre-blending in the colour space of the parent image.
+
+    ISO 32000-2, 11.6.5.3: stored components are ``c' = m + a * (c - m)``.
+    """
+    import numpy as np
+    from PIL import Image
+
+    if image.mode == "1":
+        image = image.convert("L")
+    components = _FIGURE_OCR_MATTE_COMPONENTS.get(image.mode)
+    if components is None:
+        raise ValueError(f"/Matte is unsupported for {image.mode} images")
+    matte_values = np.array(
+        _pdf_numbers(matte, components, "/SMask /Matte"), dtype=np.float32
+    )
+    if ((matte_values < 0) | (matte_values > 1)).any():
+        raise ValueError("/SMask /Matte components must be within 0..1")
+    matte_values *= 255
+    colors = np.asarray(image).reshape(image.height, image.width, components)
+    opacity = np.asarray(alpha)
+    straight = np.empty_like(colors)
+    rows = max(1, _FIGURE_OCR_MATTE_STRIP_PIXELS // image.width)
+    for top in range(0, image.height, rows):
+        strip = slice(top, top + rows)
+        stored = colors[strip].astype(np.float32)
+        # Fully transparent samples are composited to white whatever their
+        # colour, so clamping their opacity only avoids a division by zero.
+        strip_opacity = np.maximum(opacity[strip, :, None], 1) / np.float32(255)
+        recovered = matte_values + (stored - matte_values) / strip_opacity
+        straight[strip] = np.rint(np.clip(recovered, 0, 255)).astype(np.uint8)
+    return Image.frombytes(image.mode, image.size, straight.tobytes())
+
+
+def _extract_figure_ocr_image(
+    image: pikepdf.Stream, fileprefix: Path, size: tuple[int, int]
+) -> Path | None:
+    """Extract *image* for OCR as it appears in front of a white background.
+
+    An image with a soft mask is composited with the /SMask opacity, resampled
+    to the image size, with /Decode applied and /Matte pre-blending undone.
+    Returns None when the decoded image does not have the declared size.
+    """
+    from PIL import Image
+
+    source_path = Path(
+        pikepdf.PdfImage(image).extract_to(fileprefix=str(fileprefix), apply_mask=False)
+    )
+    soft_mask = image.get("/SMask")
+    with Image.open(source_path) as source:
+        if source.size != size:
+            return None
+        if soft_mask is None:
+            return source_path
+        if source.mode not in _FIGURE_OCR_COMPOSITE_MODES:
+            raise ValueError(f"unsupported soft-masked image mode {source.mode}")
+        alpha = _figure_ocr_soft_mask_alpha(soft_mask, size)
+        visible = source
+        matte = soft_mask.get("/Matte")
+        if matte is not None:
+            # A /Matte soft mask must match the parent image dimensions.
+            if (soft_mask.get("/Width"), soft_mask.get("/Height")) != size:
+                raise ValueError("/SMask with /Matte does not match the image size")
+            visible = _unpremultiply_figure_ocr_image(source, alpha, matte)
+        composite = Image.composite(
+            visible.convert("RGB"), Image.new("RGB", size, "white"), alpha
+        )
+    composite_path = fileprefix.with_name(f"{fileprefix.name}-composite.png")
+    composite.save(composite_path)
+    source_path.unlink(missing_ok=True)
+    return composite_path
+
+
 @contextmanager
 def _figure_text_recognizer(
     *,
@@ -179,6 +321,16 @@ def _figure_text_recognizer(
     ]
     | None
 ]:
+    """Yield a cached Figure OCR callback, or None when disabled.
+
+    The callback returns accepted text, None when OCR found no sufficiently
+    confident text, or ``INELIGIBLE`` for images it cannot evaluate. Images
+    with a soft mask (/SMask) are composited in front of white first, so the
+    visible appearance is recognized and they follow the same rule as opaque
+    images: accepted text becomes review-required ``ActualText``, while None
+    turns the Figure into a Layout artifact. Stencil images, /Mask entries,
+    and JPEG 2000 /SMaskInData remain ineligible.
+    """
     if not enabled:
         yield None
         return
@@ -212,18 +364,30 @@ def _figure_text_recognizer(
                 return cache[key]
             width = image.get("/Width")
             height = image.get("/Height")
+            soft_mask = image.get("/SMask")
             if (
+                # A stencil mask paints the current fill colour; it has no
+                # image samples that could carry text.
                 bool(image.get("/ImageMask", False))
+                # Colour-key ranges compare stored samples before /Decode and
+                # codec colour handling, which the extracted image no longer
+                # exposes exactly (lossy DCT, expanded palettes, rescaled
+                # sub-byte samples). Explicit stencil /Mask streams have
+                # inverted polarity and no verified decoding path here.
                 or image.get("/Mask") is not None
-                or image.get("/SMask") is not None
+                # JPEG 2000 alpha may be premultiplied (/SMaskInData 2), which
+                # Pillow does not report.
                 or bool(image.get("/SMaskInData", False))
-                or not isinstance(width, int)
-                or isinstance(width, bool)
-                or width <= 0
-                or not isinstance(height, int)
-                or isinstance(height, bool)
-                or height <= 0
-                or width * height > _FIGURE_OCR_MAX_PIXELS
+                or not _figure_ocr_size_allowed(width, height)
+                or (
+                    soft_mask is not None
+                    and (
+                        not isinstance(soft_mask, pikepdf.Stream)
+                        or not _figure_ocr_size_allowed(
+                            soft_mask.get("/Width"), soft_mask.get("/Height")
+                        )
+                    )
+                )
             ):
                 cache[key] = _FigureOCRStatus.INELIGIBLE
                 return _FigureOCRStatus.INELIGIBLE
@@ -232,17 +396,11 @@ def _figure_text_recognizer(
                 from PIL import Image, ImageDraw
 
                 if image_key not in extracted_image_paths:
-                    extracted = pikepdf.PdfImage(image).extract_to(
-                        fileprefix=str(
-                            output_dir / f"image-{len(extracted_image_paths)}"
-                        )
+                    extracted_image_paths[image_key] = _extract_figure_ocr_image(
+                        image,
+                        output_dir / f"image-{len(extracted_image_paths)}",
+                        (width, height),
                     )
-                    source_path = Path(extracted)
-                    with Image.open(source_path) as source:
-                        if source.size != (width, height):
-                            extracted_image_paths[image_key] = None
-                        else:
-                            extracted_image_paths[image_key] = source_path
                 input_path = extracted_image_paths[image_key]
                 if input_path is None:
                     cache[key] = _FigureOCRStatus.INELIGIBLE
@@ -278,10 +436,10 @@ def _figure_text_recognizer(
                         visible.save(crop_path)
             except (
                 Image.DecompressionBombError,
+                NotImplementedError,
                 OSError,
                 ValueError,
-                pikepdf.PdfError,
-                pikepdf.UnsupportedImageTypeError,
+                pikepdf.PikepdfError,
             ) as exc:
                 if image_key not in extracted_image_paths:
                     extracted_image_paths[image_key] = None
@@ -1485,7 +1643,9 @@ def convert_to_pdfa(
         ocr_layout: If True, order OCR lines by detected page columns.
         ocr_figure_text: If True, recognize otherwise undescribed direct image
             Figures, use sufficiently confident text as ``ActualText``, and
-            mark OCR-rejected Figures as Layout artifacts.
+            mark OCR-rejected Figures as Layout artifacts. Images with a soft
+            mask (``/SMask``) are recognized as composited in front of white
+            and follow the same rule.
         convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
@@ -2821,7 +2981,8 @@ def convert_files(
         ocr_layout: If True, order OCR lines by detected page columns.
         ocr_figure_text: If True, generate review-required ``ActualText`` from
             sufficiently confident OCR of otherwise undescribed image Figures
-            and mark OCR-rejected Figures as Layout artifacts.
+            and mark OCR-rejected Figures as Layout artifacts. Soft-masked
+            images follow the same rule.
         force_overwrite: If True, existing output files are overwritten.
             If False, existing outputs are skipped with an error result.
         preserve_stamps: If True, known proprietary stamp annotations are
@@ -3017,7 +3178,8 @@ def convert_directory(
         ocr_layout: If True, order OCR lines by detected page columns.
         ocr_figure_text: If True, generate review-required ``ActualText`` from
             sufficiently confident OCR of otherwise undescribed image Figures
-            and mark OCR-rejected Figures as Layout artifacts.
+            and mark OCR-rejected Figures as Layout artifacts. Soft-masked
+            images follow the same rule.
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
             flattened into page content.

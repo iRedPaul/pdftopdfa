@@ -11,14 +11,16 @@ import os
 import subprocess
 import sys
 import threading
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pikepdf
 import pytest
 from pikepdf import Array, Dictionary, Name, Pdf
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw
 
 from pdftopdfa.converter import (
     ConversionResult,
@@ -28,6 +30,7 @@ from pdftopdfa.converter import (
     _accepted_figure_ocr_text,
     _compare_pdfa_levels,
     _ensure_binary_comment,
+    _extract_figure_ocr_image,
     _figure_text_recognizer,
     _truncate_trailing_data,
     _verify_file_structure,
@@ -534,16 +537,38 @@ def test_figure_text_recognizer_skips_masked_and_oversized_images(
     _mock_session_class: MagicMock,
 ) -> None:
     with Pdf.new() as pdf:
-        masked = pdf.make_stream(b"masked")
-        soft_masked = pdf.make_stream(b"soft-masked")
+        stencil = pdf.make_stream(b"stencil")
+        color_keyed = pdf.make_stream(b"color-keyed")
+        explicit_masked = pdf.make_stream(b"explicit-masked")
         alpha = pdf.make_stream(b"alpha")
         oversized = pdf.make_stream(b"oversized")
-        for image in (masked, soft_masked, alpha, oversized):
-            image["/Width"] = 10
-            image["/Height"] = 10
-        masked["/Mask"] = Array([0, 0])
-        soft_masked["/SMask"] = pdf.make_stream(b"mask")
+        oversized_soft_mask = pdf.make_stream(b"oversized-soft-mask")
+        invalid_soft_mask = pdf.make_stream(b"invalid-soft-mask")
+        ineligible = (
+            stencil,
+            color_keyed,
+            explicit_masked,
+            alpha,
+            oversized,
+            oversized_soft_mask,
+            invalid_soft_mask,
+        )
+        for image in ineligible:
+            image["/Width"] = 9
+            image["/Height"] = 11
+        oversized["/Width"] = 10
+        oversized["/Height"] = 10
+        stencil["/ImageMask"] = True
+        color_keyed["/Mask"] = Array([0, 0])
+        explicit_mask = pdf.make_stream(b"mask")
+        explicit_mask["/ImageMask"] = True
+        explicit_masked["/Mask"] = explicit_mask
         alpha["/SMaskInData"] = 1
+        soft_mask = pdf.make_stream(b"soft-mask")
+        soft_mask["/Width"] = 10
+        soft_mask["/Height"] = 10
+        oversized_soft_mask["/SMask"] = soft_mask
+        invalid_soft_mask["/SMask"] = Dictionary(Width=1, Height=1)
 
         with _figure_text_recognizer(
             enabled=True,
@@ -553,12 +578,209 @@ def test_figure_text_recognizer_skips_masked_and_oversized_images(
             ocr_languages=["en"],
         ) as recognize:
             assert recognize is not None
-            assert recognize(masked) is _FigureOCRStatus.INELIGIBLE
-            assert recognize(soft_masked) is _FigureOCRStatus.INELIGIBLE
-            assert recognize(alpha) is _FigureOCRStatus.INELIGIBLE
-            assert recognize(oversized) is _FigureOCRStatus.INELIGIBLE
+            for image in ineligible:
+                assert recognize(image) is _FigureOCRStatus.INELIGIBLE
 
     mock_pdf_image.assert_not_called()
+
+
+def _flate_image(pdf: Pdf, image: Image.Image, **entries: object) -> pikepdf.Stream:
+    """Return a Flate-encoded 8-bit Image XObject holding the samples of *image*."""
+    stream = pdf.make_stream(zlib.compress(image.tobytes()))
+    stream["/Type"] = Name.XObject
+    stream["/Subtype"] = Name.Image
+    stream["/Width"] = image.width
+    stream["/Height"] = image.height
+    stream["/ColorSpace"] = Name.DeviceGray if image.mode == "L" else Name.DeviceRGB
+    stream["/BitsPerComponent"] = 8
+    stream["/Filter"] = Name.FlateDecode
+    for key, value in entries.items():
+        stream[f"/{key}"] = value
+    return stream
+
+
+def _figure_ocr_submissions(
+    mock_session_class: MagicMock,
+    image: pikepdf.Stream,
+    crop_polygons: tuple[tuple[tuple[float, float], ...] | None, ...] = (None,),
+) -> list[np.ndarray]:
+    """Recognize *image* once per crop and return the pixels passed to OCR."""
+    submitted: list[np.ndarray] = []
+
+    def inspect(path: Path, **_kwargs: object) -> list[tuple[str, float]]:
+        with Image.open(path) as candidate:
+            assert candidate.mode == "RGB"
+            submitted.append(np.asarray(candidate))
+        return [("Visible", 0.99)]
+
+    session = mock_session_class.return_value.__enter__.return_value
+    session.recognize_image.side_effect = inspect
+    with _figure_text_recognizer(
+        enabled=True,
+        detection_model_dir=_DETECTION_MODEL_DIR,
+        recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        ocr_execution_provider="cpu",
+        ocr_languages=["en"],
+    ) as recognize:
+        assert recognize is not None
+        for crop_polygon in crop_polygons:
+            assert recognize(image, crop_polygon) == "Visible"
+    return submitted
+
+
+@pytest.mark.parametrize("inverted_decode", [False, True])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_composites_soft_mask_over_white(
+    mock_session_class: MagicMock,
+    inverted_decode: bool,
+) -> None:
+    opacity = Image.new("L", (60, 20), 0)
+    ImageDraw.Draw(opacity).text((4, 4), "OCR", fill=255)
+    opacity = opacity.point(lambda value: 255 if value >= 128 else 0)
+    with Pdf.new() as pdf:
+        if inverted_decode:
+            soft_mask = _flate_image(
+                pdf, ImageChops.invert(opacity), Decode=Array([1, 0])
+            )
+        else:
+            soft_mask = _flate_image(pdf, opacity)
+        # The base image is uniformly black: the text exists only in the mask.
+        image = _flate_image(
+            pdf, Image.new("RGB", opacity.size, "black"), SMask=soft_mask
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, image)
+
+    opaque = np.asarray(opacity) == 255
+    assert opaque.any()
+    assert not opaque.all()
+    assert submitted.shape == (20, 60, 3)
+    assert (submitted[opaque] == 0).all()
+    assert (submitted[~opaque] == 255).all()
+
+
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_crops_composited_soft_mask_image(
+    mock_session_class: MagicMock,
+) -> None:
+    opacity = Image.new("L", (40, 10), 0)
+    opacity.paste(255, (0, 0, 20, 10))
+    left = ((0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0))
+    right = ((0.5, 0.0), (1.0, 0.0), (1.0, 1.0), (0.5, 1.0))
+    with (
+        Pdf.new() as pdf,
+        patch(
+            "pdftopdfa.converter._extract_figure_ocr_image",
+            wraps=_extract_figure_ocr_image,
+        ) as extract,
+    ):
+        image = _flate_image(
+            pdf,
+            Image.new("RGB", opacity.size, "blue"),
+            SMask=_flate_image(pdf, opacity),
+        )
+        left_crop, right_crop = _figure_ocr_submissions(
+            mock_session_class, image, (left, right)
+        )
+
+    assert extract.call_count == 1
+    assert left_crop.shape == right_crop.shape == (10, 20, 3)
+    assert (left_crop == (0, 0, 255)).all()
+    assert (right_crop == 255).all()
+
+
+@pytest.mark.parametrize("mask_size", [(4, 2), (160, 80)])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_resamples_soft_mask_to_image_size(
+    mock_session_class: MagicMock,
+    mask_size: tuple[int, int],
+) -> None:
+    opacity = Image.new("L", mask_size, 0)
+    opacity.paste(255, (0, 0, mask_size[0] // 2, mask_size[1]))
+    with Pdf.new() as pdf:
+        image = _flate_image(
+            pdf,
+            Image.new("RGB", (40, 20), "black"),
+            SMask=_flate_image(pdf, opacity),
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, image)
+
+    assert submitted.shape == (20, 40, 3)
+    assert (submitted[:, :15] == 0).all()
+    assert (submitted[:, 25:] == 255).all()
+
+
+@pytest.mark.parametrize("matte", [(0, 0, 0), (1, 1, 1), (0.5, 0.25, 1)])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_undoes_soft_mask_matte(
+    mock_session_class: MagicMock,
+    matte: tuple[float, float, float],
+) -> None:
+    color = np.array([32.0, 128.0, 224.0])
+    alphas = np.array([255.0, 191.0, 128.0, 64.0, 0.0])
+    opacity = alphas[:, None] / 255
+    matte_color = np.array(matte) * 255
+    # ISO 32000-2, 11.6.5.3: the stored image is pre-blended with the matte.
+    stored = matte_color + opacity * (color - matte_color)
+    expected = opacity * color + (1 - opacity) * 255
+    with Pdf.new() as pdf:
+        soft_mask = _flate_image(
+            pdf,
+            Image.fromarray(alphas[None].astype(np.uint8)),
+            Matte=Array(matte),
+        )
+        image = _flate_image(
+            pdf,
+            Image.fromarray(np.rint(stored)[None].astype(np.uint8)),
+            SMask=soft_mask,
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, image)
+
+    assert np.abs(submitted[0].astype(float) - expected).max() <= 1.5
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["color_space", "decode", "matte_components", "matte_size", "corrupt_data"],
+)
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_rejects_unusable_soft_masks(
+    mock_session_class: MagicMock,
+    defect: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = mock_session_class.return_value.__enter__.return_value
+    with Pdf.new() as pdf:
+        soft_mask = _flate_image(pdf, Image.new("L", (4, 4), 255))
+        if defect == "color_space":
+            soft_mask["/ColorSpace"] = Name.DeviceRGB
+        elif defect == "decode":
+            soft_mask["/Decode"] = Array([0, 1, 0])
+        elif defect == "matte_components":
+            soft_mask["/Matte"] = Array([0, 0])
+        elif defect == "matte_size":
+            soft_mask = _flate_image(
+                pdf, Image.new("L", (2, 2), 255), Matte=Array([0, 0, 0])
+            )
+        else:
+            soft_mask.write(b"not Flate data", filter=Name.FlateDecode)
+        image = _flate_image(pdf, Image.new("RGB", (4, 4), "black"), SMask=soft_mask)
+
+        with (
+            caplog.at_level(logging.WARNING, logger="pdftopdfa.converter"),
+            _figure_text_recognizer(
+                enabled=True,
+                detection_model_dir=_DETECTION_MODEL_DIR,
+                recognition_model_dir=_RECOGNITION_MODEL_DIR,
+                ocr_execution_provider="cpu",
+                ocr_languages=["en"],
+            ) as recognize,
+        ):
+            assert recognize is not None
+            assert recognize(image) is _FigureOCRStatus.INELIGIBLE
+            assert recognize(image) is _FigureOCRStatus.INELIGIBLE
+
+    session.recognize_image.assert_not_called()
+    assert caplog.text.count("Could not extract Figure image for OCR") == 1
 
 
 def _windows_dacl_sddl(path: Path) -> str:
