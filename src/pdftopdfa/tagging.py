@@ -55,9 +55,10 @@ _PREFLIGHT_MEMORY_LIMIT = 16 * 1024 * 1024
 _TEXT_SHOW_OPERAND_COUNTS = {"Tj": 1, "TJ": 1, "'": 1, '"': 3}
 _ObjectKey = tuple[int, int]
 type _FigureClipPolygon = tuple[tuple[float, float], ...]
-# The image, its visible clip, and the resources of the content stream that
-# paints it, whose /Default colour spaces remap device colours.
-type _FigureSourceImage = tuple[Stream, _FigureClipPolygon, Dictionary | None]
+# The image, its visible clip, the resources of the content stream that paints
+# it, whose /Default colour spaces remap device colours, and the rendering
+# intent of the graphics state that paints it.
+type _FigureSourceImage = tuple[Stream, _FigureClipPolygon, Dictionary | None, str]
 
 
 class _FigureOCRStatus(Enum):
@@ -65,7 +66,7 @@ class _FigureOCRStatus(Enum):
 
 
 type _FigureTextRecognizer = Callable[
-    [Stream, _FigureClipPolygon, Dictionary | None],
+    [Stream, _FigureClipPolygon, Dictionary | None, str],
     str | None | _FigureOCRStatus,
 ]
 _PAINTING_OPERATORS = frozenset(
@@ -7704,6 +7705,7 @@ def _digital_semantic_inputs(
                         source_image,
                         crop_polygon,
                         source_image_resources,
+                        span.entry_state.rendering_intent,
                     )
             page_spans.append(
                 SemanticSpan(
@@ -8579,7 +8581,14 @@ def _requires_existing_image_visibility_rebuild(
                         and crop_polygon is not None
                         and span.entry_state.fill_alpha == 1.0
                     ):
-                        images.append((image, crop_polygon, effective_resources))
+                        images.append(
+                            (
+                                image,
+                                crop_polygon,
+                                effective_resources,
+                                span.entry_state.rendering_intent,
+                            )
+                        )
                         has_other = False
                     else:
                         has_other = True

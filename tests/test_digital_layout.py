@@ -1984,6 +1984,42 @@ def test_explicit_parallelogram_clip_is_exact_for_image() -> None:
     assert span.final_paint_uncertain is False
 
 
+def test_image_records_rendering_intent_of_graphics_state() -> None:
+    pdf = pikepdf.Pdf.new()
+    image = _image(pdf, b"\xff")
+    form = _form(pdf, b"/Im Do", Dictionary(XObject=Dictionary(Im=image)))
+    _page(
+        pdf,
+        (
+            b"/Perceptual ri /Im Do "
+            b"q /Saturated gs /Im Do /Fm Do Q "
+            b"q /Unknown ri /Im Do Q "
+            b"/Im Do"
+        ),
+        Dictionary(
+            ExtGState=Dictionary(Saturated=Dictionary(RI=Name.Saturation)),
+            XObject=Dictionary(Im=image, Fm=form),
+        ),
+    )
+
+    perceptual, saturated, invocation, unknown, restored = extract_digital_layout(pdf)[
+        0
+    ].spans
+    [inherited] = invocation.children
+
+    assert [
+        span.entry_state.rendering_intent
+        for span in (perceptual, saturated, inherited, unknown, restored)
+    ] == [
+        "/Perceptual",
+        "/Saturation",
+        "/Saturation",
+        # An unrecognized intent renders as RelativeColorimetric.
+        "/RelativeColorimetric",
+        "/Perceptual",
+    ]
+
+
 def test_form_records_and_restores_complex_final_paint_state() -> None:
     pdf = pikepdf.Pdf.new()
     form = _form(pdf, b"q Q", Dictionary())

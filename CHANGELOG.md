@@ -4,7 +4,7 @@
 
 ### Changes
 
-- Run figure OCR on images with a soft mask (`/SMask`) by compositing them in front of white, honoring the `/Decode` arrays of image and soft mask, `/Matte` pre-blending, and a soft-mask resolution that differs from the image (scaled without smoothing unless `/Interpolate` is set), and converting ICC-based image colors to sRGB with the image's rendering intent first; device colors are converted through the `/Default` color space of the painting resources or the PDF/A OutputIntent profile
+- Run figure OCR on images with a soft mask (`/SMask`) by compositing them in front of white, honoring the `/Decode` arrays of image and soft mask, `/Matte` pre-blending (for palette images on the color of the matte index), and a soft-mask resolution that differs from the image (scaled without smoothing unless `/Interpolate` is set), and converting ICC-based image colors to sRGB first with the image's `/Intent` or, without one, the rendering intent of the painting graphics state (`ri` or ExtGState `/RI`); device colors are converted through the `/Default` color space of the painting resources or the PDF/A OutputIntent profile
 - Apply the figure OCR rule to soft-masked images as well: confidently recognized text becomes review-required `ActualText`, and Figures without accepted text become review-required Layout artifacts; stencil images, `/Mask`, JPEG 2000 `/SMaskInData`, and DeviceCMYK images without a CMYK profile remain ineligible
 
 ### Bug Fixes
