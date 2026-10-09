@@ -2195,6 +2195,138 @@ class TestSymbolicTrueTypeWithoutEncoding:
         )
 
 
+def _make_ttfont_with_empty_nbsp_glyphs() -> bytes:
+    """Creates a TrueType font whose U+00A0/U+00AD glyphs have zero width.
+
+    Subset fonts often keep empty ``uni00A0``/``uni00AD`` glyphs next to
+    the real ``space``/``hyphen`` glyphs.
+    """
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.ttLib.tables._g_l_y_f import Glyph
+
+    glyph_widths = {
+        ".notdef": 500,
+        "space": 250,
+        "hyphen": 333,
+        "uni00A0": 0,
+        "uni00AD": 0,
+    }
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder(list(glyph_widths))
+    fb.setupCharacterMap(
+        {0x20: "space", 0x2D: "hyphen", 0xA0: "uni00A0", 0xAD: "uni00AD"}
+    )
+    fb.setupGlyf({name: Glyph() for name in glyph_widths})
+    fb.setupHorizontalMetrics(
+        {name: (width, 0) for name, width in glyph_widths.items()}
+    )
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({"familyName": "TestFont", "styleName": "Regular"})
+    fb.setupOS2(sTypoAscender=800, sTypoDescender=-200, sCapHeight=700)
+    fb.setupPost()
+    fb.setupHead(unitsPerEm=1000)
+
+    buf = BytesIO()
+    fb.font.save(buf)
+    return buf.getvalue()
+
+
+class TestWinAnsiAlternateCodes:
+    """WinAnsi codes 0xA0/0xAD are checked against ``space``/``hyphen``.
+
+    ISO 32000 Annex D encodes these glyph names a second time at 0xA0 and
+    0xAD, and veraPDF reads their widths from those glyphs rather than from
+    the U+00A0/U+00AD glyphs of the font program.
+    """
+
+    @staticmethod
+    def _sanitized_widths(
+        encoding: pikepdf.Object,
+        width_160: int,
+        width_173: int,
+        font_data: bytes | None = None,
+    ) -> tuple[int, list[int]]:
+        pdf = new_pdf()
+        # Codes 161-172 have no glyph and fall back to the .notdef width.
+        widths = [width_160] + [500] * 12 + [width_173]
+        font = _make_simple_font_with_widths(
+            pdf,
+            widths=widths,
+            first_char=160,
+            last_char=173,
+            font_data=font_data or _make_ttfont_with_empty_nbsp_glyphs(),
+        )
+        font[Name.Encoding] = encoding
+        _build_pdf_with_font(pdf, font)
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_font_widths(pdf)
+
+        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
+        return (
+            result["simple_font_widths_fixed"],
+            [int(w) for w in resolve(font_obj.Widths)],
+        )
+
+    @pytest.mark.parametrize(
+        "encoding",
+        [
+            Name.WinAnsiEncoding,
+            Dictionary(
+                Type=Name.Encoding,
+                BaseEncoding=Name.WinAnsiEncoding,
+                Differences=Array([65, Name("/A")]),
+            ),
+        ],
+        ids=["name", "base-encoding"],
+    )
+    def test_space_and_hyphen_widths_not_replaced_by_empty_glyphs(
+        self, encoding: pikepdf.Object
+    ) -> None:
+        """Widths matching space/hyphen are kept for codes 160 and 173."""
+        fixed, widths = self._sanitized_widths(encoding, 250, 333)
+
+        assert fixed == 0
+        assert (widths[0], widths[-1]) == (250, 333)
+
+    def test_unicode_glyph_widths_corrected_to_space_and_hyphen(self) -> None:
+        """Widths taken from the U+00A0/U+00AD glyphs are corrected."""
+        fixed, widths = self._sanitized_widths(Name.WinAnsiEncoding, 0, 0)
+
+        assert fixed == 1
+        assert (widths[0], widths[-1]) == (250, 333)
+
+    def test_differences_select_unicode_glyphs(self) -> None:
+        """Explicit /Differences names still select the U+00A0/U+00AD glyphs."""
+        encoding = Dictionary(
+            Type=Name.Encoding,
+            BaseEncoding=Name.WinAnsiEncoding,
+            Differences=Array([160, Name("/nbspace"), 173, Name("/sfthyphen")]),
+        )
+
+        fixed, widths = self._sanitized_widths(encoding, 250, 333)
+
+        assert fixed == 1
+        assert (widths[0], widths[-1]) == (0, 0)
+
+    def test_unresolvable_differences_do_not_inherit_space_width(self) -> None:
+        """A /Differences name without Unicode value does not select space."""
+        font_data, tt_font = _make_minimal_ttfont(
+            glyph_widths={".notdef": 500, "space": 250, "hyphen": 333}
+        )
+        tt_font.close()
+        encoding = Dictionary(
+            Type=Name.Encoding,
+            BaseEncoding=Name.WinAnsiEncoding,
+            Differences=Array([160, Name("/.notdef")]),
+        )
+
+        fixed, widths = self._sanitized_widths(encoding, 250, 333, font_data)
+
+        assert fixed == 1
+        assert (widths[0], widths[-1]) == (500, 333)
+
+
 class TestType1ProgramEncoding:
     """Type1 widths follow the embedded program's matrix and Encoding."""
 
