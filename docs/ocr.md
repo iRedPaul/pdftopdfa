@@ -236,9 +236,12 @@ base of a palette, are converted the same way through the `/DefaultGray`,
 `/DefaultRGB`, or `/DefaultCMYK` color space of the resources that paint the
 image or, without one, through the PDF/A OutputIntent profile with the same
 number of components.
-Compositing works in horizontal strips, so it needs little memory beyond the
-decoded image and its opacity. Soft-masked images follow the same rule as
-opaque images: accepted text becomes `ActualText`, and a Figure without
+Compositing works in tiles, so it needs little memory beyond the decoded
+image, its opacity, and the RGB composite. Together these may take at most
+400 MB, as much as one decoded RGB or CMYK image at the 100-megapixel limit;
+larger soft-masked images (above about 44 megapixels for CMYK, 67 for gray, and
+80 for RGB) are reported for manual review. Soft-masked images follow the same
+rule as opaque images: accepted text becomes `ActualText`, and a Figure without
 accepted text becomes a `Layout` artifact. Images that cannot be decoded
 unambiguously are reported for manual review instead: JPEG or palette images
 with a remapping `/Decode` array, DeviceCMYK images without a CMYK profile, and

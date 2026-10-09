@@ -107,9 +107,13 @@ _CONFORMANCE_RANK = {"b": 0, "u": 1, "a": 2}
 _FIGURE_OCR_MAX_PIXELS = 100_000_000
 _FIGURE_OCR_MIN_CONFIDENCE = 0.90
 # Pillow modes of extracted base images that can be composited against white,
-# the number of colour components a /Matte array must supply for each, and the
-# Pillow mode matching each ICC profile colour space.
-_FIGURE_OCR_COMPOSITE_MODES = frozenset({"1", "L", "P", "RGB", "CMYK"})
+# each with an upper bound of the bytes per pixel that its composite keeps alive
+# at once: the decoded image (four bytes per pixel for RGB and CMYK), a bilevel
+# or palette image expanded to one byte, the alpha band, and the RGB composite
+# unless an RGB image is converted in place.
+_FIGURE_OCR_COMPOSITE_BYTES_PER_PIXEL = {"1": 7, "L": 6, "P": 7, "RGB": 5, "CMYK": 9}
+# The number of colour components a /Matte array must supply for each mode, and
+# the Pillow mode matching each ICC profile colour space.
 _FIGURE_OCR_MATTE_COMPONENTS = {"L": 1, "RGB": 3, "CMYK": 4}
 _FIGURE_OCR_ICC_MODES = {"GRAY": "L", "RGB ": "RGB", "CMYK": "CMYK"}
 # Device colour spaces with the /Default colour space resource that remaps
@@ -126,9 +130,12 @@ _FIGURE_OCR_RENDERING_INTENTS = {
     "/Saturation": "SATURATION",
     "/Perceptual": "PERCEPTUAL",
 }
-# Soft-mask compositing works on horizontal strips of at most this many pixels,
-# so it needs no full-size temporary planes beyond the decoded image and alpha.
-_FIGURE_OCR_COMPOSITE_STRIP_PIXELS = 1 << 20
+# Soft-mask compositing works on tiles of at most this many pixels, so it needs
+# no full-size temporary planes beyond the decoded image, alpha, and composite.
+_FIGURE_OCR_COMPOSITE_TILE_PIXELS = 1 << 20
+# Those planes may take at most as much memory as one decoded four-byte image
+# at the pixel limit, which extracting such an image needs anyway.
+_FIGURE_OCR_COMPOSITE_MAX_BYTES = 4 * _FIGURE_OCR_MAX_PIXELS
 
 
 def _validate_ocr_configuration(
@@ -243,7 +250,10 @@ def _figure_ocr_soft_mask_alpha(
         apply_decode_array=False, apply_mask=False
     ) as raw:
         if raw.mode == "I;16":
-            alpha = Image.fromarray((np.asarray(raw) >> 8).astype(np.uint8)).point(lut)
+            alpha = Image.new("L", raw.size)
+            for box in _figure_ocr_tiles(raw.size):
+                high_bytes = (np.asarray(raw.crop(box)) >> 8).astype(np.uint8)
+                alpha.paste(Image.fromarray(high_bytes).point(lut), box)
         elif raw.mode in {"1", "L"}:
             alpha = (raw if raw.mode == "L" else raw.convert("L")).point(lut)
         else:
@@ -260,11 +270,14 @@ def _figure_ocr_soft_mask_alpha(
     return alpha
 
 
-def _figure_ocr_strips(size: tuple[int, int]) -> Iterator[tuple[int, int, int, int]]:
+def _figure_ocr_tiles(size: tuple[int, int]) -> Iterator[tuple[int, int, int, int]]:
+    """Yield boxes of at most _FIGURE_OCR_COMPOSITE_TILE_PIXELS covering *size*."""
     width, height = size
-    rows = max(1, _FIGURE_OCR_COMPOSITE_STRIP_PIXELS // width)
+    tile_width = min(width, _FIGURE_OCR_COMPOSITE_TILE_PIXELS)
+    rows = max(1, _FIGURE_OCR_COMPOSITE_TILE_PIXELS // tile_width)
     for top in range(0, height, rows):
-        yield 0, top, width, min(top + rows, height)
+        for left in range(0, width, tile_width):
+            yield left, top, min(left + tile_width, width), min(top + rows, height)
 
 
 def _figure_ocr_palette_matte(
@@ -324,10 +337,10 @@ def _unpremultiply_figure_ocr_image(
     if ((matte_values < 0) | (matte_values > 1)).any():
         raise ValueError("/SMask /Matte components must be within 0..1")
     matte_values *= 255
-    for box in _figure_ocr_strips(image.size):
-        strip_size = (box[2] - box[0], box[3] - box[1])
+    for box in _figure_ocr_tiles(image.size):
+        tile_size = (box[2] - box[0], box[3] - box[1])
         stored = np.asarray(image.crop(box), dtype=np.float32).reshape(
-            strip_size[1], strip_size[0], components
+            tile_size[1], tile_size[0], components
         )
         # Fully transparent samples are composited to white whatever their
         # colour, so clamping their opacity only avoids a division by zero.
@@ -336,7 +349,7 @@ def _unpremultiply_figure_ocr_image(
         )
         recovered = matte_values + (stored - matte_values) / opacity
         straight = np.rint(np.clip(recovered, 0, 255)).astype(np.uint8)
-        image.paste(Image.frombytes(image.mode, strip_size, straight.tobytes()), box)
+        image.paste(Image.frombytes(image.mode, tile_size, straight.tobytes()), box)
     return image
 
 
@@ -364,7 +377,7 @@ def _decode_figure_ocr_image(
     lut = _figure_ocr_decode_lut(
         [(values[index], values[index + 1]) for index in range(0, len(values), 2)]
     )
-    for box in _figure_ocr_strips(image.size):
+    for box in _figure_ocr_tiles(image.size):
         image.paste(image.crop(box).point(lut), box)
     return image
 
@@ -461,7 +474,7 @@ def _figure_ocr_rgb_image(
 
     *intent* is the rendering intent in effect; an unrecognized one selects
     RelativeColorimetric (ISO 32000-2, 8.6.5.8). An RGB image is converted in
-    place, strip by strip.
+    place, tile by tile.
     """
     from PIL import Image, ImageCms
 
@@ -488,7 +501,7 @@ def _figure_ocr_rgb_image(
         ],
     )
     rgb = image if mode == "RGB" else Image.new("RGB", image.size)
-    for box in _figure_ocr_strips(image.size):
+    for box in _figure_ocr_tiles(image.size):
         rgb.paste(ImageCms.applyTransform(image.crop(box), transform), box)
     return rgb
 
@@ -507,10 +520,11 @@ def _extract_figure_ocr_image(
     and /Matte pre-blending is undone. ICCBased colours, and device colours
     with a *device_profile*, are converted to sRGB before compositing, with the
     image's /Intent or, without one, the *rendering_intent* of the graphics
-    state that paints it (ISO 32000-2, 8.9.5). The composite is built in place,
-    strip by strip, so it adds no full-size temporary planes beyond the decoded
-    image and its alpha. Returns None when the decoded image does not have the
-    declared size.
+    state that paints it (ISO 32000-2, 8.9.5). The composite is built tile by
+    tile, so it adds no full-size temporary planes beyond the decoded image, its
+    alpha, and the RGB composite, and an image whose planes would exceed
+    _FIGURE_OCR_COMPOSITE_MAX_BYTES is rejected before they are allocated.
+    Returns None when the decoded image does not have the declared size.
     """
     from PIL import Image, ImageChops
 
@@ -530,9 +544,15 @@ def _extract_figure_ocr_image(
             return None
         if soft_mask is None:
             return source_path
-        if source.mode not in _FIGURE_OCR_COMPOSITE_MODES:
+        bytes_per_pixel = _FIGURE_OCR_COMPOSITE_BYTES_PER_PIXEL.get(source.mode)
+        if bytes_per_pixel is None:
             raise ValueError(f"unsupported soft-masked image mode {source.mode}")
+        # Image.open() has read only the header so far.
+        if size[0] * size[1] * bytes_per_pixel > _FIGURE_OCR_COMPOSITE_MAX_BYTES:
+            raise ValueError("soft-masked image is too large to composite")
         alpha = _figure_ocr_soft_mask_alpha(soft_mask, size)
+        # Loading on the first paste() would briefly hold a second full plane.
+        source.load()
         visible = _decode_figure_ocr_image(source, pdf_image, image.get("/Decode"))
         matte = soft_mask.get("/Matte")
         if matte is not None:
@@ -548,7 +568,7 @@ def _extract_figure_ocr_image(
             pdf_image.icc if device_profile is None else device_profile,
             image.get("/Intent", pikepdf.Name(rendering_intent)),
         )
-        for box in _figure_ocr_strips(size):
+        for box in _figure_ocr_tiles(size):
             visible.paste((255, 255, 255), box, ImageChops.invert(alpha.crop(box)))
         composite_path = fileprefix.with_name(f"{fileprefix.name}-composite.png")
         visible.save(composite_path)
@@ -589,8 +609,9 @@ def _figure_text_recognizer(
     ``ActualText``, while None turns the Figure into a Layout artifact. Their
     device colours are converted through the /Default colour space of the
     resources or the PDF/A OutputIntent profile; DeviceCMYK samples without
-    either are ineligible. Stencil images, /Mask entries, and JPEG 2000
-    /SMaskInData remain ineligible.
+    either are ineligible, as are soft-masked images whose composite would
+    exceed _FIGURE_OCR_COMPOSITE_MAX_BYTES. Stencil images, /Mask entries, and
+    JPEG 2000 /SMaskInData remain ineligible.
     """
     if not enabled:
         yield None
@@ -715,6 +736,9 @@ def _figure_text_recognizer(
             except (
                 Image.DecompressionBombError,
                 ImageCms.PyCMSError,
+                # A failed allocation leaves the memory free; the image stays
+                # undescribed for manual review.
+                MemoryError,
                 NotImplementedError,
                 OSError,
                 ValueError,

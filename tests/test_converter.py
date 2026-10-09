@@ -38,6 +38,8 @@ from pdftopdfa.converter import (
     _compare_pdfa_levels,
     _ensure_binary_comment,
     _extract_figure_ocr_image,
+    _figure_ocr_soft_mask_alpha,
+    _figure_ocr_tiles,
     _figure_text_recognizer,
     _truncate_trailing_data,
     _verify_file_structure,
@@ -691,13 +693,135 @@ def _figure_ocr_submissions(
     return submitted
 
 
+@pytest.mark.parametrize("size", [(60, 20), (20, 1), (3, 5), (7, 2), (1, 1)])
+@patch("pdftopdfa.converter._FIGURE_OCR_COMPOSITE_TILE_PIXELS", 7)
+def test_figure_ocr_tiles_cover_image_in_bounded_tiles(size: tuple[int, int]) -> None:
+    covered = np.zeros((size[1], size[0]), dtype=int)
+    for left, top, right, bottom in _figure_ocr_tiles(size):
+        # Tiles stay bounded even when one row is wider than the limit.
+        assert 0 < (right - left) * (bottom - top) <= 7
+        covered[top:bottom, left:right] += 1
+
+    assert (covered == 1).all()
+
+
+@patch("pdftopdfa.converter._FIGURE_OCR_COMPOSITE_TILE_PIXELS", 3)
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_composites_16_bit_soft_mask(
+    mock_session_class: MagicMock,
+) -> None:
+    # The high byte of each 16-bit sample is the 8-bit opacity.
+    samples = np.tile(np.array([0xFF00, 0xFFFF, 0x8000, 0x00FF], dtype=">u2"), (4, 1))
+    with Pdf.new() as pdf:
+        soft_mask = _flate_image(pdf, Image.new("L", (4, 4)))
+        soft_mask.write(zlib.compress(samples.tobytes()), filter=Name.FlateDecode)
+        soft_mask["/BitsPerComponent"] = 16
+        image = _flate_image(pdf, Image.new("RGB", (4, 4), "black"), SMask=soft_mask)
+        [submitted] = _figure_ocr_submissions(mock_session_class, pdf, image)
+
+    assert (submitted[..., 0] == [0, 0, 127, 255]).all()
+
+
+@pytest.mark.parametrize(("mode", "color"), [("L", 0), ("RGB", "black"), ("CMYK", 0)])
+@pytest.mark.parametrize("over_budget", [False, True])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_limits_soft_mask_composite_memory(
+    mock_session_class: MagicMock,
+    mode: str,
+    color: int | str,
+    over_budget: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = mock_session_class.return_value.__enter__.return_value
+    session.recognize_image.return_value = [("Visible", 0.99)]
+    budget = 16 * {"L": 6, "RGB": 5, "CMYK": 9}[mode]
+    monkeypatch.setattr(
+        "pdftopdfa.converter._FIGURE_OCR_COMPOSITE_MAX_BYTES",
+        budget - 1 if over_budget else budget,
+    )
+    with (
+        Pdf.new() as pdf,
+        patch(
+            "pdftopdfa.converter._figure_ocr_soft_mask_alpha",
+            wraps=_figure_ocr_soft_mask_alpha,
+        ) as soft_mask_alpha,
+    ):
+        _add_pdfa_output_intent(pdf, get_cmyk_profile(), 4)
+        image = _flate_image(
+            pdf,
+            Image.new(mode, (4, 4), color),
+            SMask=_flate_image(pdf, Image.new("L", (4, 4), 255)),
+        )
+        with (
+            caplog.at_level(logging.WARNING, logger="pdftopdfa.converter"),
+            _figure_text_recognizer(
+                enabled=True,
+                pdf=pdf,
+                detection_model_dir=_DETECTION_MODEL_DIR,
+                recognition_model_dir=_RECOGNITION_MODEL_DIR,
+                ocr_execution_provider="cpu",
+                ocr_languages=["en"],
+            ) as recognize,
+        ):
+            assert recognize is not None
+            result = recognize(image, None, None, "/RelativeColorimetric")
+
+    if over_budget:
+        assert result is _FigureOCRStatus.INELIGIBLE
+        assert "too large to composite" in caplog.text
+        # The budget is checked before the composite planes are allocated.
+        soft_mask_alpha.assert_not_called()
+        session.recognize_image.assert_not_called()
+    else:
+        assert result == "Visible"
+
+
+@patch("pdftopdfa.converter._extract_figure_ocr_image", side_effect=MemoryError)
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_treats_failed_allocation_as_ineligible(
+    mock_session_class: MagicMock,
+    extract: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = mock_session_class.return_value.__enter__.return_value
+    with Pdf.new() as pdf:
+        image = _flate_image(pdf, Image.new("RGB", (4, 4), "black"))
+        with (
+            caplog.at_level(logging.WARNING, logger="pdftopdfa.converter"),
+            _figure_text_recognizer(
+                enabled=True,
+                pdf=pdf,
+                detection_model_dir=_DETECTION_MODEL_DIR,
+                recognition_model_dir=_RECOGNITION_MODEL_DIR,
+                ocr_execution_provider="cpu",
+                ocr_languages=["en"],
+            ) as recognize,
+        ):
+            assert recognize is not None
+            for _attempt in range(2):
+                assert (
+                    recognize(image, None, None, "/RelativeColorimetric")
+                    is _FigureOCRStatus.INELIGIBLE
+                )
+
+    assert extract.call_count == 1
+    session.recognize_image.assert_not_called()
+    assert caplog.text.count("Could not extract Figure image for OCR") == 1
+
+
+@pytest.mark.parametrize("tile_pixels", [3 * 60, 7])
 @pytest.mark.parametrize("inverted_decode", [False, True])
-@patch("pdftopdfa.converter._FIGURE_OCR_COMPOSITE_STRIP_PIXELS", 3 * 60)
 @patch("pdftopdfa.ocr.OCRSession")
 def test_figure_text_recognizer_composites_soft_mask_over_white(
     mock_session_class: MagicMock,
     inverted_decode: bool,
+    tile_pixels: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "pdftopdfa.converter._FIGURE_OCR_COMPOSITE_TILE_PIXELS", tile_pixels
+    )
     opacity = Image.new("L", (60, 20), 0)
     ImageDraw.Draw(opacity).text((4, 4), "OCR", fill=255)
     opacity = opacity.point(lambda value: 255 if value >= 128 else 0)
@@ -783,13 +907,18 @@ def test_figure_text_recognizer_resamples_soft_mask_to_image_size(
         assert (submitted[:, 20:] == 255).all()
 
 
+@pytest.mark.parametrize("tile_pixels", [4, 1])
 @pytest.mark.parametrize("matte", [(0, 0, 0), (1, 1, 1), (0.5, 0.25, 1)])
-@patch("pdftopdfa.converter._FIGURE_OCR_COMPOSITE_STRIP_PIXELS", 4)
 @patch("pdftopdfa.ocr.OCRSession")
 def test_figure_text_recognizer_undoes_soft_mask_matte(
     mock_session_class: MagicMock,
     matte: tuple[float, float, float],
+    tile_pixels: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "pdftopdfa.converter._FIGURE_OCR_COMPOSITE_TILE_PIXELS", tile_pixels
+    )
     color = np.array([32.0, 128.0, 224.0])
     alphas = np.repeat([[255.0], [191.0], [128.0], [64.0], [0.0]], 2, axis=1)
     opacity = alphas[..., None] / 255
@@ -823,14 +952,19 @@ def test_figure_text_recognizer_undoes_soft_mask_matte(
         (get_cmyk_profile, "CMYK", (255, 0, 0, 0)),
     ],
 )
-@patch("pdftopdfa.converter._FIGURE_OCR_COMPOSITE_STRIP_PIXELS", 8)
+@pytest.mark.parametrize("tile_pixels", [8, 3])
 @patch("pdftopdfa.ocr.OCRSession")
 def test_figure_text_recognizer_converts_icc_colours_before_compositing(
     mock_session_class: MagicMock,
     profile: Callable[[], bytes],
     mode: str,
     color: int | tuple[int, ...],
+    tile_pixels: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "pdftopdfa.converter._FIGURE_OCR_COMPOSITE_TILE_PIXELS", tile_pixels
+    )
     profile_bytes = profile()
     expected = ImageCms.profileToProfile(
         Image.new(mode, (1, 1), color),
@@ -871,7 +1005,7 @@ def test_figure_text_recognizer_converts_icc_colours_before_compositing(
         ("CMYK", (0, 0, 0, 0), [0, 1, 0, 1, 0, 1, 1, 0], (0, 0, 0, 255)),
     ],
 )
-@patch("pdftopdfa.converter._FIGURE_OCR_COMPOSITE_STRIP_PIXELS", 8)
+@pytest.mark.parametrize("tile_pixels", [8, 3])
 @patch("pdftopdfa.ocr.OCRSession")
 def test_figure_text_recognizer_applies_image_decode_before_compositing(
     mock_session_class: MagicMock,
@@ -879,7 +1013,12 @@ def test_figure_text_recognizer_applies_image_decode_before_compositing(
     color: int | tuple[int, ...],
     decode: list[float],
     expected: tuple[int, ...],
+    tile_pixels: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "pdftopdfa.converter._FIGURE_OCR_COMPOSITE_TILE_PIXELS", tile_pixels
+    )
     if mode == "CMYK":
         # Decoded DeviceCMYK samples are shown through the CMYK OutputIntent.
         expected = _cmyk_srgb(expected)
@@ -1042,7 +1181,7 @@ def test_figure_text_recognizer_uses_effective_rendering_intent(
 @pytest.mark.parametrize(
     "source", ["output_intent", "default_color_space", "indexed_output_intent"]
 )
-@patch("pdftopdfa.converter._FIGURE_OCR_COMPOSITE_STRIP_PIXELS", 8)
+@patch("pdftopdfa.converter._FIGURE_OCR_COMPOSITE_TILE_PIXELS", 8)
 @patch("pdftopdfa.ocr.OCRSession")
 def test_figure_text_recognizer_converts_device_cmyk_through_its_profile(
     mock_session_class: MagicMock,
