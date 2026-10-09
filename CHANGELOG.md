@@ -4,7 +4,7 @@
 
 ### Changes
 
-- Run figure OCR on images with a soft mask (`/SMask`) by compositing them in front of white, honoring the soft mask's `/Decode`, `/Matte` pre-blending, and a resolution that differs from the image
+- Run figure OCR on images with a soft mask (`/SMask`) by compositing them in front of white, honoring the soft mask's `/Decode`, `/Matte` pre-blending, and a resolution that differs from the image (scaled without smoothing unless `/Interpolate` is set), and converting ICC-based image colors to sRGB first
 - Apply the figure OCR rule to soft-masked images as well: confidently recognized text becomes review-required `ActualText`, and Figures without accepted text become review-required Layout artifacts; stencil images, `/Mask`, and JPEG 2000 `/SMaskInData` remain ineligible
 
 ### Bug Fixes

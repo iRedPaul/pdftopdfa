@@ -226,7 +226,10 @@ decision for manual review.
 Images with a soft mask (`/SMask`) are composited in front of white before
 recognition, so OCR sees their visible appearance. The soft mask's `/Decode`
 array and `/Matte` pre-blending are honored, and a soft mask with its own
-resolution is resampled to the image size. Soft-masked images follow the same
+resolution is scaled to the image size, without smoothing unless it sets
+`/Interpolate`. ICC-based image colors are converted to sRGB before
+compositing. Compositing works in horizontal strips, so it needs little memory
+beyond the decoded image and its opacity. Soft-masked images follow the same
 rule as opaque images: accepted text becomes `ActualText`, and a Figure without
 accepted text becomes a `Layout` artifact. Images whose soft mask cannot be
 decoded are reported for manual review instead.

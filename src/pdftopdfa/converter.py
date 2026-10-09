@@ -79,7 +79,7 @@ from .validator import detect_iso_standards, detect_pdfa_level
 from .verapdf import VeraPDFResult, validate_with_verapdf
 
 if TYPE_CHECKING:
-    from PIL import Image
+    from PIL import Image, ImageCms
 
 logger = logging.getLogger(__name__)
 
@@ -106,10 +106,14 @@ _CONFORMANCE_RANK = {"b": 0, "u": 1, "a": 2}
 _FIGURE_OCR_MAX_PIXELS = 100_000_000
 _FIGURE_OCR_MIN_CONFIDENCE = 0.90
 # Pillow modes of extracted base images that can be composited against white,
-# and the number of colour components a /Matte array must supply for each.
+# the number of colour components a /Matte array must supply for each, and the
+# Pillow mode matching each ICC profile colour space.
 _FIGURE_OCR_COMPOSITE_MODES = frozenset({"1", "L", "P", "RGB", "CMYK"})
 _FIGURE_OCR_MATTE_COMPONENTS = {"L": 1, "RGB": 3, "CMYK": 4}
-_FIGURE_OCR_MATTE_STRIP_PIXELS = 1 << 20
+_FIGURE_OCR_ICC_MODES = {"GRAY": "L", "RGB ": "RGB", "CMYK": "CMYK"}
+# Soft-mask compositing works on horizontal strips of at most this many pixels,
+# so it needs no full-size temporary planes beyond the decoded image and alpha.
+_FIGURE_OCR_COMPOSITE_STRIP_PIXELS = 1 << 20
 
 
 def _validate_ocr_configuration(
@@ -209,32 +213,44 @@ def _figure_ocr_soft_mask_alpha(
     low, high = (
         (0.0, 1.0) if decode is None else _pdf_numbers(decode, 2, "/SMask /Decode")
     )
+    lut = [
+        round(min(max(low + (high - low) * value / 255, 0.0), 1.0) * 255)
+        for value in range(256)
+    ]
     # /Decode is applied here in one place, because pikepdf skips it for some
     # codecs (DCT, JPX) and only supports inversion for 1- and 16-bit samples.
     with pikepdf.PdfImage(soft_mask).as_pil_image(
         apply_decode_array=False, apply_mask=False
     ) as raw:
         if raw.mode == "I;16":
-            samples = Image.fromarray((np.asarray(raw) >> 8).astype(np.uint8))
+            alpha = Image.fromarray((np.asarray(raw) >> 8).astype(np.uint8)).point(lut)
         elif raw.mode in {"1", "L"}:
-            samples = raw.convert("L")
+            alpha = (raw if raw.mode == "L" else raw.convert("L")).point(lut)
         else:
             raise ValueError(f"unsupported /SMask image mode {raw.mode}")
-    alpha = samples.point(
-        [
-            round(min(max(low + (high - low) * value / 255, 0.0), 1.0) * 255)
-            for value in range(256)
-        ]
-    )
     if alpha.size != size:
-        alpha = alpha.resize(size, Image.Resampling.BILINEAR)
+        # Image samples are only smoothed when the image requests it with
+        # /Interpolate (ISO 32000-2, 8.9.5.3).
+        alpha = alpha.resize(
+            size,
+            Image.Resampling.BILINEAR
+            if bool(soft_mask.get("/Interpolate", False))
+            else Image.Resampling.NEAREST,
+        )
     return alpha
+
+
+def _figure_ocr_strips(size: tuple[int, int]) -> Iterator[tuple[int, int, int, int]]:
+    width, height = size
+    rows = max(1, _FIGURE_OCR_COMPOSITE_STRIP_PIXELS // width)
+    for top in range(0, height, rows):
+        yield 0, top, width, min(top + rows, height)
 
 
 def _unpremultiply_figure_ocr_image(
     image: "Image.Image", alpha: "Image.Image", matte: object
 ) -> "Image.Image":
-    """Undo /Matte pre-blending in the colour space of the parent image.
+    """Undo /Matte pre-blending in place, in the colour space of the image.
 
     ISO 32000-2, 11.6.5.3: stored components are ``c' = m + a * (c - m)``.
     """
@@ -252,19 +268,52 @@ def _unpremultiply_figure_ocr_image(
     if ((matte_values < 0) | (matte_values > 1)).any():
         raise ValueError("/SMask /Matte components must be within 0..1")
     matte_values *= 255
-    colors = np.asarray(image).reshape(image.height, image.width, components)
-    opacity = np.asarray(alpha)
-    straight = np.empty_like(colors)
-    rows = max(1, _FIGURE_OCR_MATTE_STRIP_PIXELS // image.width)
-    for top in range(0, image.height, rows):
-        strip = slice(top, top + rows)
-        stored = colors[strip].astype(np.float32)
+    for box in _figure_ocr_strips(image.size):
+        strip_size = (box[2] - box[0], box[3] - box[1])
+        stored = np.asarray(image.crop(box), dtype=np.float32).reshape(
+            strip_size[1], strip_size[0], components
+        )
         # Fully transparent samples are composited to white whatever their
         # colour, so clamping their opacity only avoids a division by zero.
-        strip_opacity = np.maximum(opacity[strip, :, None], 1) / np.float32(255)
-        recovered = matte_values + (stored - matte_values) / strip_opacity
-        straight[strip] = np.rint(np.clip(recovered, 0, 255)).astype(np.uint8)
-    return Image.frombytes(image.mode, image.size, straight.tobytes())
+        opacity = np.maximum(np.asarray(alpha.crop(box)), 1)[..., None] / np.float32(
+            255
+        )
+        recovered = matte_values + (stored - matte_values) / opacity
+        straight = np.rint(np.clip(recovered, 0, 255)).astype(np.uint8)
+        image.paste(Image.frombytes(image.mode, strip_size, straight.tobytes()), box)
+    return image
+
+
+def _figure_ocr_rgb_image(
+    image: "Image.Image", profile: "ImageCms.ImageCmsProfile | None"
+) -> "Image.Image":
+    """Return *image* as RGB, mapping ICCBased colours to sRGB.
+
+    An RGB image is converted in place, strip by strip.
+    """
+    from PIL import Image, ImageCms
+
+    if profile is None:
+        return image if image.mode == "RGB" else image.convert("RGB")
+    mode = _FIGURE_OCR_ICC_MODES.get(profile.profile.xcolor_space)
+    if mode is None:
+        raise ValueError("unsupported ICC profile colour space")
+    if image.mode in {"1", "P"}:
+        # Expand bilevel and palette samples into the profile's colour space.
+        image = image.convert(mode)
+    if image.mode != mode:
+        raise ValueError(f"ICC profile does not describe a {image.mode} image")
+    transform = ImageCms.buildTransform(
+        profile,
+        ImageCms.createProfile("sRGB"),
+        mode,
+        "RGB",
+        renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,
+    )
+    rgb = image if mode == "RGB" else Image.new("RGB", image.size)
+    for box in _figure_ocr_strips(image.size):
+        rgb.paste(ImageCms.applyTransform(image.crop(box), transform), box)
+    return rgb
 
 
 def _extract_figure_ocr_image(
@@ -274,12 +323,16 @@ def _extract_figure_ocr_image(
 
     An image with a soft mask is composited with the /SMask opacity, resampled
     to the image size, with /Decode applied and /Matte pre-blending undone.
-    Returns None when the decoded image does not have the declared size.
+    ICCBased colours are converted to sRGB before compositing. The composite
+    is built in place, strip by strip, so it adds no full-size temporary planes
+    beyond the decoded image and its alpha. Returns None when the decoded image
+    does not have the declared size.
     """
-    from PIL import Image
+    from PIL import Image, ImageChops
 
+    pdf_image = pikepdf.PdfImage(image)
     source_path = Path(
-        pikepdf.PdfImage(image).extract_to(fileprefix=str(fileprefix), apply_mask=False)
+        pdf_image.extract_to(fileprefix=str(fileprefix), apply_mask=False)
     )
     soft_mask = image.get("/SMask")
     with Image.open(source_path) as source:
@@ -296,12 +349,12 @@ def _extract_figure_ocr_image(
             # A /Matte soft mask must match the parent image dimensions.
             if (soft_mask.get("/Width"), soft_mask.get("/Height")) != size:
                 raise ValueError("/SMask with /Matte does not match the image size")
-            visible = _unpremultiply_figure_ocr_image(source, alpha, matte)
-        composite = Image.composite(
-            visible.convert("RGB"), Image.new("RGB", size, "white"), alpha
-        )
-    composite_path = fileprefix.with_name(f"{fileprefix.name}-composite.png")
-    composite.save(composite_path)
+            visible = _unpremultiply_figure_ocr_image(visible, alpha, matte)
+        visible = _figure_ocr_rgb_image(visible, pdf_image.icc)
+        for box in _figure_ocr_strips(size):
+            visible.paste((255, 255, 255), box, ImageChops.invert(alpha.crop(box)))
+        composite_path = fileprefix.with_name(f"{fileprefix.name}-composite.png")
+        visible.save(composite_path)
     source_path.unlink(missing_ok=True)
     return composite_path
 
@@ -393,7 +446,7 @@ def _figure_text_recognizer(
                 return _FigureOCRStatus.INELIGIBLE
             crop_path = None
             try:
-                from PIL import Image, ImageDraw
+                from PIL import Image, ImageCms, ImageDraw
 
                 if image_key not in extracted_image_paths:
                     extracted_image_paths[image_key] = _extract_figure_ocr_image(
@@ -436,6 +489,7 @@ def _figure_text_recognizer(
                         visible.save(crop_path)
             except (
                 Image.DecompressionBombError,
+                ImageCms.PyCMSError,
                 NotImplementedError,
                 OSError,
                 ValueError,
