@@ -24,6 +24,7 @@ from ..fonts.glyph_usage import (
     collect_font_usage,
 )
 from ..fonts.tounicode import (
+    apply_differences_to_mapping,
     generate_tounicode_for_macroman,
     generate_tounicode_for_standard_encoding,
     generate_tounicode_for_winansi,
@@ -577,6 +578,24 @@ def _get_missing_width(font: pikepdf.Object, tt_font) -> float | None:
     return None
 
 
+def _generate_winansi_width_mapping() -> dict[int, int]:
+    """Builds the WinAnsi code-to-Unicode mapping used for width lookup.
+
+    ISO 32000 Annex D encodes ``space`` a second time at 0xA0 and ``hyphen``
+    at 0xAD.  veraPDF resolves those codes through these glyph names, so the
+    font-program width comes from U+0020/U+002D rather than from the CP1252
+    code points U+00A0/U+00AD, whose glyphs may be empty in subset fonts.
+    """
+    from fontTools.agl import AGL2UV
+
+    from ..fonts.subsetter import _WINANSI_GLYPH_NAME_OVERRIDES
+
+    code_to_unicode = generate_tounicode_for_winansi()
+    for code, glyph_name in _WINANSI_GLYPH_NAME_OVERRIDES.items():
+        code_to_unicode[code] = AGL2UV[glyph_name]
+    return code_to_unicode
+
+
 def _get_encoding_mapping(font: pikepdf.Object) -> dict[int, int] | None:
     """Builds a code-to-Unicode mapping from the font's encoding.
 
@@ -598,7 +617,7 @@ def _get_encoding_mapping(font: pikepdf.Object) -> dict[int, int] | None:
         if subtype_str == "/TrueType":
             if is_symbolic_font(font):
                 return None
-            return generate_tounicode_for_winansi()
+            return _generate_winansi_width_mapping()
         if subtype_str in ("/Type1", "/MMType1"):
             return None
         return generate_tounicode_for_standard_encoding()
@@ -608,15 +627,24 @@ def _get_encoding_mapping(font: pikepdf.Object) -> dict[int, int] | None:
     if isinstance(encoding, Name):
         enc_name = _safe_str(encoding)
         if enc_name == "/WinAnsiEncoding":
-            return generate_tounicode_for_winansi()
+            return _generate_winansi_width_mapping()
         elif enc_name == "/MacRomanEncoding":
             return generate_tounicode_for_macroman()
         elif enc_name == "/StandardEncoding":
             return generate_tounicode_for_standard_encoding()
         else:
-            return generate_tounicode_for_winansi()
+            return _generate_winansi_width_mapping()
 
     if isinstance(encoding, Dictionary):
+        base = encoding.get("/BaseEncoding")
+        if base is not None and _safe_str(base) == "/WinAnsiEncoding":
+            code_to_unicode = _generate_winansi_width_mapping()
+            differences = encoding.get("/Differences")
+            if differences is not None:
+                code_to_unicode = apply_differences_to_mapping(
+                    code_to_unicode, differences
+                )
+            return code_to_unicode
         return generate_tounicode_from_encoding_dict(encoding)
 
     return None

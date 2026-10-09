@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- Keep the widths of WinAnsi non-breaking spaces and soft hyphens consistent with the embedded font program (rule 6.2.11.5)
+
 ## [0.9.19] - 2026-10-07
 
 ### Changes
