@@ -2244,6 +2244,7 @@ class TestWinAnsiAlternateCodes:
         encoding: pikepdf.Object,
         width_160: int,
         width_173: int,
+        font_data: bytes | None = None,
     ) -> tuple[int, list[int]]:
         pdf = new_pdf()
         # Codes 161-172 have no glyph and fall back to the .notdef width.
@@ -2253,7 +2254,7 @@ class TestWinAnsiAlternateCodes:
             widths=widths,
             first_char=160,
             last_char=173,
-            font_data=_make_ttfont_with_empty_nbsp_glyphs(),
+            font_data=font_data or _make_ttfont_with_empty_nbsp_glyphs(),
         )
         font[Name.Encoding] = encoding
         _build_pdf_with_font(pdf, font)
@@ -2307,6 +2308,23 @@ class TestWinAnsiAlternateCodes:
 
         assert fixed == 1
         assert (widths[0], widths[-1]) == (0, 0)
+
+    def test_unresolvable_differences_do_not_inherit_space_width(self) -> None:
+        """A /Differences name without Unicode value does not select space."""
+        font_data, tt_font = _make_minimal_ttfont(
+            glyph_widths={".notdef": 500, "space": 250, "hyphen": 333}
+        )
+        tt_font.close()
+        encoding = Dictionary(
+            Type=Name.Encoding,
+            BaseEncoding=Name.WinAnsiEncoding,
+            Differences=Array([160, Name("/.notdef")]),
+        )
+
+        fixed, widths = self._sanitized_widths(encoding, 250, 333, font_data)
+
+        assert fixed == 1
+        assert (widths[0], widths[-1]) == (500, 333)
 
 
 class TestType1ProgramEncoding:

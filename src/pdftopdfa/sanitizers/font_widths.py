@@ -11,7 +11,7 @@ This module validates and corrects widths for already-embedded fonts.
 
 import io
 import logging
-from collections.abc import Iterator
+from collections.abc import Container, Iterator
 
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf
@@ -578,13 +578,20 @@ def _get_missing_width(font: pikepdf.Object, tt_font) -> float | None:
     return None
 
 
-def _generate_winansi_width_mapping() -> dict[int, int]:
+def _generate_winansi_width_mapping(
+    overridden_codes: Container[int] = (),
+) -> dict[int, int]:
     """Builds the WinAnsi code-to-Unicode mapping used for width lookup.
 
     ISO 32000 Annex D encodes ``space`` a second time at 0xA0 and ``hyphen``
     at 0xAD.  veraPDF resolves those codes through these glyph names, so the
     font-program width comes from U+0020/U+002D rather than from the CP1252
     code points U+00A0/U+00AD, whose glyphs may be empty in subset fonts.
+
+    Codes in ``overridden_codes`` are redefined by ``/Differences`` and do not
+    take a glyph name from WinAnsi, so they keep their CP1252 value.  A
+    Differences name without a Unicode value (e.g. ``/.notdef``) thus never
+    picks up the ``space``/``hyphen`` width.
     """
     from fontTools.agl import AGL2UV
 
@@ -592,7 +599,8 @@ def _generate_winansi_width_mapping() -> dict[int, int]:
 
     code_to_unicode = generate_tounicode_for_winansi()
     for code, glyph_name in _WINANSI_GLYPH_NAME_OVERRIDES.items():
-        code_to_unicode[code] = AGL2UV[glyph_name]
+        if code not in overridden_codes:
+            code_to_unicode[code] = AGL2UV[glyph_name]
     return code_to_unicode
 
 
@@ -638,7 +646,11 @@ def _get_encoding_mapping(font: pikepdf.Object) -> dict[int, int] | None:
     if isinstance(encoding, Dictionary):
         base = encoding.get("/BaseEncoding")
         if base is not None and _safe_str(base) == "/WinAnsiEncoding":
-            code_to_unicode = _generate_winansi_width_mapping()
+            from ..fonts.subsetter import _resolve_explicit_encoding_differences
+
+            code_to_unicode = _generate_winansi_width_mapping(
+                _resolve_explicit_encoding_differences(font)
+            )
             differences = encoding.get("/Differences")
             if differences is not None:
                 code_to_unicode = apply_differences_to_mapping(
