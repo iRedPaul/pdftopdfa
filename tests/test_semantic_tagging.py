@@ -19,6 +19,7 @@ from pikepdf import Array, Dictionary, Name, NumberTree, String
 
 import pdftopdfa.digital_layout as digital_layout
 import pdftopdfa.tagging as tagging
+from pdftopdfa.color_profile import get_cmyk_profile
 from pdftopdfa.converter import _figure_text_recognizer
 from pdftopdfa.exceptions import ConversionError
 from pdftopdfa.tagging import (
@@ -765,13 +766,16 @@ def test_direct_image_figure_uses_review_required_ocr_actualtext(
     )
     seen: list[tuple[int, int]] = []
     seen_crops: list[tuple[tuple[float, float], ...]] = []
+    seen_resources: list[Dictionary | None] = []
 
     def recognize(
         candidate: pikepdf.Stream,
         crop_polygon: tuple[tuple[float, float], ...],
+        resources: Dictionary | None,
     ) -> str | None:
         seen.append(candidate.objgen)
         seen_crops.append(crop_polygon)
+        seen_resources.append(resources)
         return recognized
 
     result = ensure_logical_structure(
@@ -785,6 +789,9 @@ def test_direct_image_figure_uses_review_required_ocr_actualtext(
         item for item in _structure_objects(pdf) if item.get("/S") == Name.Figure
     ]
     assert seen == [image.objgen]
+    [resources] = seen_resources
+    assert isinstance(resources, Dictionary)
+    assert resources["/XObject"]["/Im"].objgen == image.objgen
     assert min(x for x, _y in seen_crops[0]) == pytest.approx(0.0)
     assert max(x for x, _y in seen_crops[0]) == pytest.approx(0.5)
     assert min(y for _x, y in seen_crops[0]) == pytest.approx(0.0)
@@ -827,12 +834,15 @@ def test_preserved_direct_image_figure_uses_ocr_actualtext(nested: bool) -> None
     )
     root = _install_figure_structure(pdf, page)
     seen: list[tuple[int, int]] = []
+    seen_resources: list[Dictionary | None] = []
 
     def recognize(
         candidate: pikepdf.Stream,
         _crop_polygon: tuple[tuple[float, float], ...],
+        resources: Dictionary | None,
     ) -> str | None:
         seen.append(candidate.objgen)
+        seen_resources.append(resources)
         return "Existing Figure text"
 
     result = ensure_logical_structure(
@@ -848,6 +858,10 @@ def test_preserved_direct_image_figure_uses_ocr_actualtext(nested: bool) -> None
     assert result["structure_preserved"] is True
     assert pdf.Root["/StructTreeRoot"].objgen == root.objgen
     assert seen == [image.objgen]
+    # The image is resolved from, and painted with, the innermost resources.
+    [painting_resources] = seen_resources
+    assert isinstance(painting_resources, Dictionary)
+    assert painting_resources["/XObject"]["/Im"].objgen == image.objgen
     assert str(figure["/ActualText"]) == "Existing Figure text"
     assert result["semantic_alternatives_review_required"] == 0
     assert result["semantic_ocr_figure_text_review_required"] == 1
@@ -878,7 +892,7 @@ def test_preserved_direct_image_figure_rejected_by_ocr_becomes_artifact(
         pdf,
         semantic=True,
         preflight=False,
-        _figure_text_recognizer=lambda _image, _crop: None,
+        _figure_text_recognizer=lambda _image, _crop, _resources: None,
     )
 
     assert result["structure_preserved"] is True
@@ -951,6 +965,7 @@ def test_rejected_figure_preserves_other_author_structure() -> None:
     def recognize(
         candidate: pikepdf.Stream,
         _crop_polygon: tuple[tuple[float, float], ...],
+        _resources: Dictionary | None,
     ) -> None:
         seen.append(candidate.objgen)
 
@@ -992,14 +1007,21 @@ def test_soft_masked_image_figure_follows_ocr_figure_rule(
     expected_actual_text: str | None,
 ) -> None:
     pdf = pikepdf.Pdf.new()
-    image = _image(pdf, b"\xff\x00\x00" * 4)
+    image = _image(pdf, b"\x00\xff\xff\x00" * 4, color_space=Name.DeviceCMYK)
     image["/Width"] = 2
     image["/Height"] = 2
     # A soft mask with its own resolution leaves intrinsic visibility
     # unclassified; Figure OCR composites it with the image instead.
     image["/SMask"] = _image(pdf, b"\xff", color_space=Name.DeviceGray)
     content = b"q 100 0 0 80 50 100 cm /Im Do Q"
-    resources = Dictionary(XObject=Dictionary(Im=image))
+    cmyk_profile = pdf.make_stream(get_cmyk_profile())
+    cmyk_profile["/N"] = 4
+    # Without a CMYK OutputIntent, only the /DefaultCMYK of the resources that
+    # paint the image defines its DeviceCMYK samples.
+    resources = Dictionary(
+        XObject=Dictionary(Im=image),
+        ColorSpace=Dictionary(DefaultCMYK=Array([Name.ICCBased, cmyk_profile])),
+    )
     if nested:
         form = _form(pdf, content, resources)
         content = b"/Fm Do"
@@ -1015,6 +1037,7 @@ def test_soft_masked_image_figure_follows_ocr_figure_rule(
         session.recognize_image.return_value = recognized
         with _figure_text_recognizer(
             enabled=True,
+            pdf=pdf,
             detection_model_dir=Path("paddle-detection"),
             recognition_model_dir=Path("paddle-recognition"),
             ocr_execution_provider="cpu",
@@ -1067,7 +1090,9 @@ def test_ocr_ineligible_figure_remains_structured_for_manual_review() -> None:
         pdf,
         semantic=True,
         preflight=False,
-        _figure_text_recognizer=(lambda _image, _crop: _FigureOCRStatus.INELIGIBLE),
+        _figure_text_recognizer=(
+            lambda _image, _crop, _resources: _FigureOCRStatus.INELIGIBLE
+        ),
     )
 
     assert "/Figure" in _roles(pdf)
@@ -1093,6 +1118,7 @@ def test_existing_image_actualtext_skips_figure_ocr() -> None:
     def recognize(
         _candidate: pikepdf.Stream,
         _crop_polygon: tuple[tuple[float, float], ...],
+        _resources: Dictionary | None,
     ) -> str | None:
         raise AssertionError("OCR must not replace existing ActualText")
 
@@ -1132,6 +1158,7 @@ def test_described_nested_figure_is_not_replaced_by_parent_figure_ocr() -> None:
     def recognize(
         _candidate: pikepdf.Stream,
         _crop_polygon: tuple[tuple[float, float], ...],
+        _resources: Dictionary | None,
     ) -> str | None:
         raise AssertionError("OCR must not replace a nested Figure description")
 
@@ -1165,6 +1192,7 @@ def test_translucent_direct_image_figure_skips_ocr_actualtext() -> None:
     def recognize(
         _candidate: pikepdf.Stream,
         _crop_polygon: tuple[tuple[float, float], ...],
+        _resources: Dictionary | None,
     ) -> str | None:
         raise AssertionError("OCR must not inspect a translucent image invocation")
 
@@ -1205,6 +1233,7 @@ def test_redo_ocr_text_overlapping_logo_artifacts_redundant_figure() -> None:
     def recognize(
         _candidate: pikepdf.Stream,
         _crop_polygon: tuple[tuple[float, float], ...],
+        _resources: Dictionary | None,
     ) -> str | None:
         raise AssertionError("OCR text must not be duplicated on its source Figure")
 

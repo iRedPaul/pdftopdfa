@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
 from functools import wraps
+from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -111,6 +112,13 @@ _FIGURE_OCR_MIN_CONFIDENCE = 0.90
 _FIGURE_OCR_COMPOSITE_MODES = frozenset({"1", "L", "P", "RGB", "CMYK"})
 _FIGURE_OCR_MATTE_COMPONENTS = {"L": 1, "RGB": 3, "CMYK": 4}
 _FIGURE_OCR_ICC_MODES = {"GRAY": "L", "RGB ": "RGB", "CMYK": "CMYK"}
+# Device colour spaces with the /Default colour space resource that remaps
+# them and their number of components (ISO 32000-2, 8.6.5.6).
+_FIGURE_OCR_DEVICE_SPACES = {
+    "/DeviceGray": ("/DefaultGray", 1),
+    "/DeviceRGB": ("/DefaultRGB", 3),
+    "/DeviceCMYK": ("/DefaultCMYK", 4),
+}
 # Pillow ImageCms intents for the PDF rendering intents (ISO 32000-2, 8.6.5.8).
 _FIGURE_OCR_RENDERING_INTENTS = {
     "/AbsoluteColorimetric": "ABSOLUTE_COLORIMETRIC",
@@ -325,12 +333,95 @@ def _decode_figure_ocr_image(
     return image
 
 
+def _figure_ocr_device_space(image: pikepdf.Stream) -> tuple[str, int] | None:
+    """Return the /Default resource name and component count of device colours.
+
+    The base of an Indexed colour space is remapped like a device colour space
+    used directly (ISO 32000-2, 8.6.5.6).
+    """
+    color_space = image.get("/ColorSpace")
+    if (
+        isinstance(color_space, pikepdf.Array)
+        and len(color_space) == 4
+        and color_space[0] == pikepdf.Name.Indexed
+    ):
+        color_space = color_space[1]
+    if not isinstance(color_space, pikepdf.Name):
+        return None
+    return _FIGURE_OCR_DEVICE_SPACES.get(str(color_space))
+
+
+def _figure_ocr_default_color_space(image: pikepdf.Stream, resources: object) -> object:
+    """Return the /Default colour space that *resources* set for *image*."""
+    device_space = _figure_ocr_device_space(image)
+    color_spaces = (
+        resources.get("/ColorSpace")
+        if isinstance(resources, pikepdf.Dictionary)
+        else None
+    )
+    if device_space is None or not isinstance(color_spaces, pikepdf.Dictionary):
+        return None
+    return color_spaces.get(device_space[0])
+
+
+def _figure_ocr_device_profile(
+    pdf: pikepdf.Pdf, image: pikepdf.Stream, default_space: object
+) -> "ImageCms.ImageCmsProfile | None":
+    """Return the ICC profile that defines the device colours of *image*.
+
+    A /Default colour space of the painting resources takes precedence
+    (ISO 32000-2, 8.6.5.6); otherwise the profile of the PDF/A OutputIntent
+    applies when it has the same number of components. Without either,
+    DeviceGray and DeviceRGB samples are used as they are, while DeviceCMYK
+    samples have no defined appearance.
+    """
+    from PIL import ImageCms
+
+    device_space = _figure_ocr_device_space(image)
+    if device_space is None:
+        return None
+    default_name, components = device_space
+    if default_space is not None:
+        if not (
+            isinstance(default_space, pikepdf.Array)
+            and len(default_space) == 2
+            and default_space[0] == pikepdf.Name.ICCBased
+        ):
+            raise ValueError(f"unsupported {default_name} colour space")
+        profile = default_space[1]
+    else:
+        profile = None
+        output_intents = pdf.Root.get("/OutputIntents")
+        for intent in (
+            output_intents if isinstance(output_intents, pikepdf.Array) else ()
+        ):
+            candidate = (
+                intent.get("/DestOutputProfile")
+                if isinstance(intent, pikepdf.Dictionary)
+                and intent.get("/S") == pikepdf.Name.GTS_PDFA1
+                else None
+            )
+            if (
+                isinstance(candidate, pikepdf.Stream)
+                and candidate.get("/N") == components
+            ):
+                profile = candidate
+                break
+        if profile is None:
+            if components == 4:
+                raise ValueError("DeviceCMYK image without a CMYK output profile")
+            return None
+    if not isinstance(profile, pikepdf.Stream) or profile.get("/N") != components:
+        raise ValueError(f"{default_name} does not match the image colour space")
+    return ImageCms.ImageCmsProfile(BytesIO(profile.read_bytes()))
+
+
 def _figure_ocr_rgb_image(
     image: "Image.Image",
     profile: "ImageCms.ImageCmsProfile | None",
     intent: object,
 ) -> "Image.Image":
-    """Return *image* as RGB, mapping ICCBased colours to sRGB.
+    """Return *image* as RGB, mapping colours described by *profile* to sRGB.
 
     The image's /Intent selects the rendering intent; without a recognized one,
     the PDF default RelativeColorimetric applies (ISO 32000-2, 8.6.5.8). A
@@ -368,17 +459,20 @@ def _figure_ocr_rgb_image(
 
 
 def _extract_figure_ocr_image(
-    image: pikepdf.Stream, fileprefix: Path, size: tuple[int, int]
+    image: pikepdf.Stream,
+    fileprefix: Path,
+    size: tuple[int, int],
+    device_profile: "ImageCms.ImageCmsProfile | None" = None,
 ) -> Path | None:
     """Extract *image* for OCR as it appears in front of a white background.
 
     An image with a soft mask is composited with the /SMask opacity, resampled
     to the image size, after the /Decode arrays of image and mask are applied
-    and /Matte pre-blending is undone. ICCBased colours are converted to sRGB
-    with the image's rendering intent before compositing. The composite
-    is built in place, strip by strip, so it adds no full-size temporary planes
-    beyond the decoded image and its alpha. Returns None when the decoded image
-    does not have the declared size.
+    and /Matte pre-blending is undone. ICCBased colours, and device colours
+    with a *device_profile*, are converted to sRGB with the image's rendering
+    intent before compositing. The composite is built in place, strip by strip,
+    so it adds no full-size temporary planes beyond the decoded image and its
+    alpha. Returns None when the decoded image does not have the declared size.
     """
     from PIL import Image, ImageChops
 
@@ -404,11 +498,16 @@ def _extract_figure_ocr_image(
         visible = _decode_figure_ocr_image(source, pdf_image, image.get("/Decode"))
         matte = soft_mask.get("/Matte")
         if matte is not None:
-            # A /Matte soft mask must match the parent image dimensions.
+            # A /Matte soft mask must match the parent image dimensions
+            # (ISO 32000-2, 11.6.5.3).
             if (soft_mask.get("/Width"), soft_mask.get("/Height")) != size:
                 raise ValueError("/SMask with /Matte does not match the image size")
             visible = _unpremultiply_figure_ocr_image(visible, alpha, matte)
-        visible = _figure_ocr_rgb_image(visible, pdf_image.icc, image.get("/Intent"))
+        visible = _figure_ocr_rgb_image(
+            visible,
+            pdf_image.icc if device_profile is None else device_profile,
+            image.get("/Intent"),
+        )
         for box in _figure_ocr_strips(size):
             visible.paste((255, 255, 255), box, ImageChops.invert(alpha.crop(box)))
         composite_path = fileprefix.with_name(f"{fileprefix.name}-composite.png")
@@ -421,26 +520,35 @@ def _extract_figure_ocr_image(
 def _figure_text_recognizer(
     *,
     enabled: bool,
+    pdf: pikepdf.Pdf,
     detection_model_dir: Path | None,
     recognition_model_dir: Path | None,
     ocr_execution_provider: str,
     ocr_languages: list[str],
 ) -> Iterator[
     Callable[
-        [pikepdf.Stream, tuple[tuple[float, float], ...] | None],
+        [
+            pikepdf.Stream,
+            tuple[tuple[float, float], ...] | None,
+            pikepdf.Dictionary | None,
+        ],
         str | None | _FigureOCRStatus,
     ]
     | None
 ]:
-    """Yield a cached Figure OCR callback, or None when disabled.
+    """Yield a cached Figure OCR callback for images of *pdf*, or None.
 
-    The callback returns accepted text, None when OCR found no sufficiently
-    confident text, or ``INELIGIBLE`` for images it cannot evaluate. Images
-    with a soft mask (/SMask) are composited in front of white first, so the
-    visible appearance is recognized and they follow the same rule as opaque
-    images: accepted text becomes review-required ``ActualText``, while None
-    turns the Figure into a Layout artifact. Stencil images, /Mask entries,
-    and JPEG 2000 /SMaskInData remain ineligible.
+    The callback takes an image, its visible clip, and the resources of the
+    content stream that paints it. It returns accepted text, None when OCR
+    found no sufficiently confident text, or ``INELIGIBLE`` for images it
+    cannot evaluate. Images with a soft mask (/SMask) are composited in front
+    of white first, so the visible appearance is recognized and they follow
+    the same rule as opaque images: accepted text becomes review-required
+    ``ActualText``, while None turns the Figure into a Layout artifact. Their
+    device colours are converted through the /Default colour space of the
+    resources or the PDF/A OutputIntent profile; DeviceCMYK samples without
+    either are ineligible. Stencil images, /Mask entries, and JPEG 2000
+    /SMaskInData remain ineligible.
     """
     if not enabled:
         yield None
@@ -465,17 +573,27 @@ def _figure_text_recognizer(
         def recognize(
             image: pikepdf.Stream,
             crop_polygon: tuple[tuple[float, float], ...] | None = None,
+            resources: pikepdf.Dictionary | None = None,
         ) -> str | None:
             objgen = image.objgen
-            image_key = (
+            image_key: tuple[object, ...] = (
                 ("indirect", *objgen) if objgen != (0, 0) else ("direct", id(image))
             )
+            soft_mask = image.get("/SMask")
+            # The composite of a soft-masked image depends on the /Default
+            # colour space of the resources that paint it.
+            default_space = (
+                None
+                if soft_mask is None
+                else _figure_ocr_default_color_space(image, resources)
+            )
+            if default_space is not None:
+                image_key = (*image_key, pikepdf.Array([default_space]).unparse())
             key = (*image_key, crop_polygon)
             if key in cache:
                 return cache[key]
             width = image.get("/Width")
             height = image.get("/Height")
-            soft_mask = image.get("/SMask")
             if (
                 # A stencil mask paints the current fill colour; it has no
                 # image samples that could carry text.
@@ -511,6 +629,9 @@ def _figure_text_recognizer(
                         image,
                         output_dir / f"image-{len(extracted_image_paths)}",
                         (width, height),
+                        None
+                        if soft_mask is None
+                        else _figure_ocr_device_profile(pdf, image, default_space),
                     )
                 input_path = extracted_image_paths[image_key]
                 if input_path is None:
@@ -2517,6 +2638,7 @@ def convert_to_pdfa(
             # output, so a partially built structure tree never reaches disk.
             with _figure_text_recognizer(
                 enabled=ocr_figure_text,
+                pdf=pdf,
                 detection_model_dir=ocr_detection_model_dir,
                 recognition_model_dir=ocr_recognition_model_dir,
                 ocr_execution_provider=ocr_execution_provider,

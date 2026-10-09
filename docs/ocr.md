@@ -228,13 +228,18 @@ recognition, so OCR sees their visible appearance. The `/Decode` arrays of
 image and soft mask and `/Matte` pre-blending are honored, and a soft mask with
 its own resolution is scaled to the image size, without smoothing unless it
 sets `/Interpolate`. ICC-based image colors are converted to sRGB with the
-image's `/Intent` (RelativeColorimetric by default) before compositing.
+image's `/Intent` (RelativeColorimetric by default) before compositing. Device
+colors, including the base of a palette, are converted the same way through the
+`/DefaultGray`, `/DefaultRGB`, or `/DefaultCMYK` color space of the resources
+that paint the image or, without one, through the PDF/A OutputIntent profile
+with the same number of components.
 Compositing works in horizontal strips, so it needs little memory beyond the
 decoded image and its opacity. Soft-masked images follow the same rule as
 opaque images: accepted text becomes `ActualText`, and a Figure without
 accepted text becomes a `Layout` artifact. Images that cannot be decoded
-unambiguously, such as JPEG or palette images with a remapping `/Decode` array,
-are reported for manual review instead.
+unambiguously are reported for manual review instead: JPEG or palette images
+with a remapping `/Decode` array, DeviceCMYK images without a CMYK profile, and
+images whose default color space is not ICC-based.
 
 Accepted text is written as `ActualText`, because it replaces text visibly
 contained in the image rather than describing all visual meaning. Every

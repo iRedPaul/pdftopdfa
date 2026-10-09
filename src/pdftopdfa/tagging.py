@@ -55,7 +55,9 @@ _PREFLIGHT_MEMORY_LIMIT = 16 * 1024 * 1024
 _TEXT_SHOW_OPERAND_COUNTS = {"Tj": 1, "TJ": 1, "'": 1, '"': 3}
 _ObjectKey = tuple[int, int]
 type _FigureClipPolygon = tuple[tuple[float, float], ...]
-type _FigureSourceImage = tuple[Stream, _FigureClipPolygon]
+# The image, its visible clip, and the resources of the content stream that
+# paints it, whose /Default colour spaces remap device colours.
+type _FigureSourceImage = tuple[Stream, _FigureClipPolygon, Dictionary | None]
 
 
 class _FigureOCRStatus(Enum):
@@ -63,7 +65,7 @@ class _FigureOCRStatus(Enum):
 
 
 type _FigureTextRecognizer = Callable[
-    [Stream, _FigureClipPolygon],
+    [Stream, _FigureClipPolygon, Dictionary | None],
     str | None | _FigureOCRStatus,
 ]
 _PAINTING_OPERATORS = frozenset(
@@ -7591,6 +7593,7 @@ def _digital_semantic_inputs(
             source_actual_text: str | None,
             source_alt_text: str | None = None,
             source_image: Stream | None = None,
+            source_image_resources: Dictionary | None = None,
             source_bbox: tuple[float, float, float, float] | None = None,
             text_override: str | None = None,
             kind_override=None,
@@ -7697,7 +7700,11 @@ def _digital_semantic_inputs(
             ):
                 crop_polygon = _image_clip_polygon(span)
                 if crop_polygon is not None:
-                    source_images[span_id] = source_image, crop_polygon
+                    source_images[span_id] = (
+                        source_image,
+                        crop_polygon,
+                        source_image_resources,
+                    )
             page_spans.append(
                 SemanticSpan(
                     span_id,
@@ -7932,6 +7939,7 @@ def _digital_semantic_inputs(
                         if isinstance(child, DirectXObjectSpan)
                         else None
                     ),
+                    source_image_resources=effective_resources,
                 ):
                     invocation_span_ids.add(child_span_id)
 
@@ -8033,6 +8041,7 @@ def _digital_semantic_inputs(
                         if isinstance(span, DirectXObjectSpan)
                         else None
                     ),
+                    source_image_resources=resources,
                 )
                 if len(page_spans) > spans_before and (
                     isinstance(span, DirectTextSpan)
@@ -8570,7 +8579,7 @@ def _requires_existing_image_visibility_rebuild(
                         and crop_polygon is not None
                         and span.entry_state.fill_alpha == 1.0
                     ):
-                        images.append((image, crop_polygon))
+                        images.append((image, crop_polygon, effective_resources))
                         has_other = False
                     else:
                         has_other = True
