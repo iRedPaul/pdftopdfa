@@ -110,7 +110,8 @@ _FIGURE_OCR_MIN_CONFIDENCE = 0.90
 # each with an upper bound of the bytes per pixel that its composite keeps alive
 # at once: the decoded image (four bytes per pixel for RGB and CMYK), a bilevel
 # or palette image expanded to one byte, the alpha band, and the RGB composite
-# unless an RGB image is converted in place.
+# unless an RGB image is converted in place. pikepdf extracts Indexed images
+# with a CMYK base as CMYK images, so no "P" image is expanded to CMYK.
 _FIGURE_OCR_COMPOSITE_BYTES_PER_PIXEL = {"1": 7, "L": 6, "P": 7, "RGB": 5, "CMYK": 9}
 # The number of colour components a /Matte array must supply for each mode, and
 # the Pillow mode matching each ICC profile colour space.
@@ -382,19 +383,51 @@ def _decode_figure_ocr_image(
     return image
 
 
-def _figure_ocr_device_space(image: pikepdf.Stream) -> tuple[str, int] | None:
-    """Return the /Default resource name and component count of device colours.
-
-    The base of an Indexed colour space is remapped like a device colour space
-    used directly (ISO 32000-2, 8.6.5.6).
-    """
+def _figure_ocr_base_color_space(image: pikepdf.Stream) -> object:
+    """Return the /ColorSpace of *image*, or the base of an Indexed one."""
     color_space = image.get("/ColorSpace")
     if (
         isinstance(color_space, pikepdf.Array)
         and len(color_space) == 4
         and color_space[0] == pikepdf.Name.Indexed
     ):
-        color_space = color_space[1]
+        return color_space[1]
+    return color_space
+
+
+def _check_figure_ocr_icc_range(color_space: object) -> None:
+    """Reject an ICCBased colour space whose /Range is not 0..1 per component.
+
+    Its components lie within /Range (ISO 32000-2, 8.6.5.5): image samples
+    decode to it by default (8.9.5.2) and palette entries map into it
+    (8.6.6.3). Extracted samples are instead passed to the profile as 0..1.
+    """
+    if not (
+        isinstance(color_space, pikepdf.Array)
+        and len(color_space) == 2
+        and color_space[0] == pikepdf.Name.ICCBased
+        and isinstance(color_space[1], pikepdf.Stream)
+    ):
+        return
+    value_range = color_space[1].get("/Range")
+    if value_range is None:
+        return
+    components = color_space[1].get("/N")
+    if (
+        not isinstance(components, int)
+        or _pdf_numbers(value_range, 2 * components, "/ICCBased /Range")
+        != (0.0, 1.0) * components
+    ):
+        raise ValueError("unsupported /ICCBased /Range")
+
+
+def _figure_ocr_device_space(image: pikepdf.Stream) -> tuple[str, int] | None:
+    """Return the /Default resource name and component count of device colours.
+
+    The base of an Indexed colour space is remapped like a device colour space
+    used directly (ISO 32000-2, 8.6.5.6).
+    """
+    color_space = _figure_ocr_base_color_space(image)
     if not isinstance(color_space, pikepdf.Name):
         return None
     return _FIGURE_OCR_DEVICE_SPACES.get(str(color_space))
@@ -437,6 +470,7 @@ def _figure_ocr_device_profile(
             and default_space[0] == pikepdf.Name.ICCBased
         ):
             raise ValueError(f"unsupported {default_name} colour space")
+        _check_figure_ocr_icc_range(default_space)
         profile = default_space[1]
     else:
         profile = None
@@ -485,6 +519,8 @@ def _figure_ocr_rgb_image(
         raise ValueError("unsupported ICC profile colour space")
     if image.mode in {"1", "P"}:
         # Expand bilevel and palette samples into the profile's colour space.
+        # pikepdf already expands CMYK palettes from their lookup bytes into
+        # CMYK images, so "P" images have gray or RGB palettes.
         image = image.convert(mode)
     if image.mode != mode:
         raise ValueError(f"ICC profile does not describe a {image.mode} image")
@@ -530,6 +566,8 @@ def _extract_figure_ocr_image(
 
     pdf_image = pikepdf.PdfImage(image)
     soft_mask = image.get("/SMask")
+    if soft_mask is not None:
+        _check_figure_ocr_icc_range(_figure_ocr_base_color_space(image))
     # A soft-masked image is extracted with raw samples and decoded below,
     # because pikepdf leaves /Decode unapplied for some codecs and palettes.
     source_path = Path(
@@ -609,8 +647,9 @@ def _figure_text_recognizer(
     ``ActualText``, while None turns the Figure into a Layout artifact. Their
     device colours are converted through the /Default colour space of the
     resources or the PDF/A OutputIntent profile; DeviceCMYK samples without
-    either are ineligible, as are soft-masked images whose composite would
-    exceed _FIGURE_OCR_COMPOSITE_MAX_BYTES. Stencil images, /Mask entries, and
+    either are ineligible, as are soft-masked images with an ICCBased /Range
+    other than 0..1 or whose composite would exceed
+    _FIGURE_OCR_COMPOSITE_MAX_BYTES. Stencil images, /Mask entries, and
     JPEG 2000 /SMaskInData remain ineligible.
     """
     if not enabled:

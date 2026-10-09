@@ -722,7 +722,9 @@ def test_figure_text_recognizer_composites_16_bit_soft_mask(
     assert (submitted[..., 0] == [0, 0, 127, 255]).all()
 
 
-@pytest.mark.parametrize(("mode", "color"), [("L", 0), ("RGB", "black"), ("CMYK", 0)])
+@pytest.mark.parametrize(
+    ("mode", "color"), [("L", 0), ("RGB", "black"), ("CMYK", 0), ("P", 0)]
+)
 @pytest.mark.parametrize("over_budget", [False, True])
 @patch("pdftopdfa.ocr.OCRSession")
 def test_figure_text_recognizer_limits_soft_mask_composite_memory(
@@ -735,7 +737,8 @@ def test_figure_text_recognizer_limits_soft_mask_composite_memory(
 ) -> None:
     session = mock_session_class.return_value.__enter__.return_value
     session.recognize_image.return_value = [("Visible", 0.99)]
-    budget = 16 * {"L": 6, "RGB": 5, "CMYK": 9}[mode]
+    # pikepdf expands a CMYK palette into a CMYK image before compositing.
+    budget = 16 * {"L": 6, "RGB": 5, "CMYK": 9, "P": 9}[mode]
     monkeypatch.setattr(
         "pdftopdfa.converter._FIGURE_OCR_COMPOSITE_MAX_BYTES",
         budget - 1 if over_budget else budget,
@@ -750,9 +753,13 @@ def test_figure_text_recognizer_limits_soft_mask_composite_memory(
         _add_pdfa_output_intent(pdf, get_cmyk_profile(), 4)
         image = _flate_image(
             pdf,
-            Image.new(mode, (4, 4), color),
+            Image.new("L" if mode == "P" else mode, (4, 4), color),
             SMask=_flate_image(pdf, Image.new("L", (4, 4), 255)),
         )
+        if mode == "P":
+            image["/ColorSpace"] = Array(
+                [Name.Indexed, Name.DeviceCMYK, 0, pikepdf.String(bytes(4))]
+            )
         with (
             caplog.at_level(logging.WARNING, logger="pdftopdfa.converter"),
             _figure_text_recognizer(
@@ -953,6 +960,7 @@ def test_figure_text_recognizer_undoes_soft_mask_matte(
     ],
 )
 @pytest.mark.parametrize("tile_pixels", [8, 3])
+@pytest.mark.parametrize("explicit_range", [False, True])
 @patch("pdftopdfa.ocr.OCRSession")
 def test_figure_text_recognizer_converts_icc_colours_before_compositing(
     mock_session_class: MagicMock,
@@ -960,6 +968,7 @@ def test_figure_text_recognizer_converts_icc_colours_before_compositing(
     mode: str,
     color: int | tuple[int, ...],
     tile_pixels: int,
+    explicit_range: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -983,6 +992,8 @@ def test_figure_text_recognizer_converts_icc_colours_before_compositing(
     with Pdf.new() as pdf:
         icc = pdf.make_stream(profile_bytes)
         icc["/N"] = len(Image.new(mode, (1, 1)).getbands())
+        if explicit_range:
+            icc["/Range"] = Array([0, 1] * icc["/N"])
         image = _flate_image(
             pdf,
             Image.new(mode, opacity.size, color),
@@ -1230,6 +1241,51 @@ def test_figure_text_recognizer_converts_device_cmyk_through_its_profile(
     assert (submitted[:, 2:] == 255).all()
 
 
+@pytest.mark.parametrize("bits_per_component", [8, 1])
+@pytest.mark.parametrize("icc_based", [False, True])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_expands_cmyk_palette_from_lookup(
+    mock_session_class: MagicMock,
+    bits_per_component: int,
+    icc_based: bool,
+) -> None:
+    k_black = (0, 0, 0, 255)
+    rich_black = (255, 255, 255, 255)
+    expected = np.array([_cmyk_srgb(k_black), _cmyk_srgb(rich_black)])
+    # Both inks look alike without a profile, so they must reach the CMYK
+    # profile as the components of the lookup table.
+    unprofiled = [
+        Image.new("CMYK", (1, 1), ink).convert("RGB").getpixel((0, 0))
+        for ink in (k_black, rich_black)
+    ]
+    assert unprofiled[0] == unprofiled[1]
+    assert (expected[0] != expected[1]).any()
+    indices = np.array([[0, 1]], dtype=np.uint8)
+    samples = (
+        Image.fromarray(indices * 255).convert("1")
+        if bits_per_component == 1
+        else Image.fromarray(indices)
+    )
+    with Pdf.new() as pdf:
+        _add_pdfa_output_intent(pdf, get_cmyk_profile(), 4)
+        base: object = Name.DeviceCMYK
+        if icc_based:
+            icc = pdf.make_stream(get_cmyk_profile())
+            icc["/N"] = 4
+            base = Array([Name.ICCBased, icc])
+        image = _flate_image(
+            pdf,
+            samples,
+            ColorSpace=Array(
+                [Name.Indexed, base, 1, pikepdf.String(bytes(k_black + rich_black))]
+            ),
+            SMask=_flate_image(pdf, Image.new("L", samples.size, 255)),
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, pdf, image)
+
+    assert (submitted.reshape(2, 3) == expected).all()
+
+
 @pytest.mark.parametrize(
     ("mode", "color", "output_intent", "components"),
     [
@@ -1335,6 +1391,9 @@ def _jpeg_image(pdf: Pdf, image: Image.Image, **entries: object) -> pikepdf.Stre
         "palette_matte_components",
         "palette_matte_index",
         "palette_matte_fraction",
+        "icc_range",
+        "indexed_icc_range",
+        "default_icc_range",
     ],
 )
 @patch("pdftopdfa.ocr.OCRSession")
@@ -1372,6 +1431,10 @@ def test_figure_text_recognizer_rejects_unusable_soft_masks(
                     )
                 )
             )
+        elif defect == "default_icc_range":
+            # Remapped DeviceRGB components are clipped to the /Range.
+            resources = _icc_resources(pdf, "/DefaultRGB", get_srgb_profile(), 3)
+            resources["/ColorSpace"]["/DefaultRGB"][1]["/Range"] = Array([0, 0.5] * 3)
         elif defect == "default_components":
             # /DefaultCMYK takes precedence over the CMYK OutputIntent.
             _add_pdfa_output_intent(pdf, get_cmyk_profile(), 4)
@@ -1407,6 +1470,18 @@ def test_figure_text_recognizer_rejects_unusable_soft_masks(
             image = _jpeg_image(
                 pdf, base, Decode=Array([1, 0, 1, 0, 1, 0]), SMask=soft_mask
             )
+        elif defect in {"icc_range", "indexed_icc_range"}:
+            # Samples and palette entries decode to the /Range of the profile.
+            icc = pdf.make_stream(get_srgb_profile())
+            icc["/N"] = 3
+            icc["/Range"] = Array([0, 0.5] * 3)
+            color_space = Array([Name.ICCBased, icc])
+            if defect == "indexed_icc_range":
+                base = Image.new("L", (4, 4), 0)
+                color_space = Array(
+                    [Name.Indexed, color_space, 0, pikepdf.String(bytes(3))]
+                )
+            image = _flate_image(pdf, base, ColorSpace=color_space, SMask=soft_mask)
         elif defect == "indexed_image_decode":
             image = _flate_image(
                 pdf,

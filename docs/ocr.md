@@ -244,8 +244,9 @@ larger soft-masked images (above about 44 megapixels for CMYK, 67 for gray, and
 rule as opaque images: accepted text becomes `ActualText`, and a Figure without
 accepted text becomes a `Layout` artifact. Images that cannot be decoded
 unambiguously are reported for manual review instead: JPEG or palette images
-with a remapping `/Decode` array, DeviceCMYK images without a CMYK profile, and
-images whose default color space is not ICC-based.
+with a remapping `/Decode` array, DeviceCMYK images without a CMYK profile,
+images whose default color space is not ICC-based, and ICC-based color spaces
+whose `/Range` is not 0 to 1.
 
 Accepted text is written as `ActualText`, because it replaces text visibly
 contained in the image rather than describing all visual meaning. Every
