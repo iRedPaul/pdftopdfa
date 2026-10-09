@@ -224,15 +224,17 @@ less-confident result marks the Figure as a `Layout` artifact and reports that
 decision for manual review.
 
 Images with a soft mask (`/SMask`) are composited in front of white before
-recognition, so OCR sees their visible appearance. The soft mask's `/Decode`
-array and `/Matte` pre-blending are honored, and a soft mask with its own
-resolution is scaled to the image size, without smoothing unless it sets
-`/Interpolate`. ICC-based image colors are converted to sRGB before
-compositing. Compositing works in horizontal strips, so it needs little memory
-beyond the decoded image and its opacity. Soft-masked images follow the same
-rule as opaque images: accepted text becomes `ActualText`, and a Figure without
-accepted text becomes a `Layout` artifact. Images whose soft mask cannot be
-decoded are reported for manual review instead.
+recognition, so OCR sees their visible appearance. The `/Decode` arrays of
+image and soft mask and `/Matte` pre-blending are honored, and a soft mask with
+its own resolution is scaled to the image size, without smoothing unless it
+sets `/Interpolate`. ICC-based image colors are converted to sRGB with the
+image's `/Intent` (RelativeColorimetric by default) before compositing.
+Compositing works in horizontal strips, so it needs little memory beyond the
+decoded image and its opacity. Soft-masked images follow the same rule as
+opaque images: accepted text becomes `ActualText`, and a Figure without
+accepted text becomes a `Layout` artifact. Images that cannot be decoded
+unambiguously, such as JPEG or palette images with a remapping `/Decode` array,
+are reported for manual review instead.
 
 Accepted text is written as `ActualText`, because it replaces text visibly
 contained in the image rather than describing all visual meaning. Every

@@ -591,15 +591,23 @@ def test_figure_text_recognizer_skips_masked_and_oversized_images(
     mock_pdf_image.assert_not_called()
 
 
+_DEVICE_COLOR_SPACES = {
+    "1": Name.DeviceGray,
+    "L": Name.DeviceGray,
+    "RGB": Name.DeviceRGB,
+    "CMYK": Name.DeviceCMYK,
+}
+
+
 def _flate_image(pdf: Pdf, image: Image.Image, **entries: object) -> pikepdf.Stream:
-    """Return a Flate-encoded 8-bit Image XObject holding the samples of *image*."""
+    """Return a Flate-encoded Image XObject holding the samples of *image*."""
     stream = pdf.make_stream(zlib.compress(image.tobytes()))
     stream["/Type"] = Name.XObject
     stream["/Subtype"] = Name.Image
     stream["/Width"] = image.width
     stream["/Height"] = image.height
-    stream["/ColorSpace"] = Name.DeviceGray if image.mode == "L" else Name.DeviceRGB
-    stream["/BitsPerComponent"] = 8
+    stream["/ColorSpace"] = _DEVICE_COLOR_SPACES[image.mode]
+    stream["/BitsPerComponent"] = 1 if image.mode == "1" else 8
     stream["/Filter"] = Name.FlateDecode
     for key, value in entries.items():
         stream[f"/{key}"] = value
@@ -806,8 +814,141 @@ def test_figure_text_recognizer_converts_icc_colours_before_compositing(
 
 
 @pytest.mark.parametrize(
+    ("mode", "color", "decode", "expected"),
+    [
+        ("L", 255, [1, 0], (0, 0, 0)),
+        ("L", 255, [0, 0.5], (128, 128, 128)),
+        ("1", 1, [1, 0], (0, 0, 0)),
+        ("RGB", (0, 0, 0), [1, 0, 0, 1, 0, 1], (255, 0, 0)),
+        ("CMYK", (0, 0, 0, 0), [0, 1, 0, 1, 0, 1, 1, 0], (0, 0, 0)),
+    ],
+)
+@patch("pdftopdfa.converter._FIGURE_OCR_COMPOSITE_STRIP_PIXELS", 8)
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_applies_image_decode_before_compositing(
+    mock_session_class: MagicMock,
+    mode: str,
+    color: int | tuple[int, ...],
+    decode: list[float],
+    expected: tuple[int, int, int],
+) -> None:
+    opacity = Image.new("L", (4, 4), 0)
+    opacity.paste(255, (0, 0, 2, 4))
+    with Pdf.new() as pdf:
+        image = _flate_image(
+            pdf,
+            Image.new(mode, opacity.size, color),
+            Decode=Array(decode),
+            SMask=_flate_image(pdf, opacity),
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, image)
+
+    assert (submitted[:, :2] == expected).all()
+    assert (submitted[:, 2:] == 255).all()
+
+
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_decodes_image_before_undoing_matte(
+    mock_session_class: MagicMock,
+) -> None:
+    gray = 64.0
+    alphas = np.array([[255.0, 128.0]])
+    # The black-matted components are stored inverted, through /Decode [1 0].
+    stored = alphas / 255 * gray
+    expected = alphas / 255 * gray + (1 - alphas / 255) * 255
+    with Pdf.new() as pdf:
+        image = _flate_image(
+            pdf,
+            Image.fromarray(np.rint(255 - stored).astype(np.uint8)),
+            Decode=Array([1, 0]),
+            SMask=_flate_image(
+                pdf,
+                Image.fromarray(alphas.astype(np.uint8)),
+                Matte=Array([0]),
+            ),
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, image)
+
+    assert np.abs(submitted[..., 0].astype(float) - expected).max() <= 1.5
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        None,
+        "/RelativeColorimetric",
+        "/AbsoluteColorimetric",
+        "/Perceptual",
+        "/Saturation",
+        "/Unknown",
+    ],
+)
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_uses_image_rendering_intent(
+    mock_session_class: MagicMock,
+    intent: str | None,
+) -> None:
+    profile = ImageCms.ImageCmsProfile(BytesIO(get_cmyk_profile()))
+
+    def converted(rendering_intent: ImageCms.Intent) -> tuple[int, ...]:
+        return ImageCms.profileToProfile(
+            Image.new("CMYK", (1, 1), (0, 0, 0, 255)),
+            profile,
+            ImageCms.createProfile("sRGB"),
+            renderingIntent=rendering_intent,
+            outputMode="RGB",
+        ).getpixel((0, 0))
+
+    rendering_intent = {
+        "/AbsoluteColorimetric": ImageCms.Intent.ABSOLUTE_COLORIMETRIC,
+        "/Perceptual": ImageCms.Intent.PERCEPTUAL,
+        "/Saturation": ImageCms.Intent.SATURATION,
+    }.get(intent or "", ImageCms.Intent.RELATIVE_COLORIMETRIC)
+    expected = converted(rendering_intent)
+    # The profile renders black differently under each intent.
+    assert (expected != converted(ImageCms.Intent.RELATIVE_COLORIMETRIC)) == (
+        rendering_intent != ImageCms.Intent.RELATIVE_COLORIMETRIC
+    )
+    opacity = Image.new("L", (4, 4), 0)
+    opacity.paste(255, (0, 0, 2, 4))
+    entries = {} if intent is None else {"Intent": Name(intent)}
+    with Pdf.new() as pdf:
+        icc = pdf.make_stream(get_cmyk_profile())
+        icc["/N"] = 4
+        image = _flate_image(
+            pdf,
+            Image.new("CMYK", opacity.size, (0, 0, 0, 255)),
+            ColorSpace=Array([Name.ICCBased, icc]),
+            SMask=_flate_image(pdf, opacity),
+            **entries,
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, image)
+
+    assert (submitted[:, :2] == expected).all()
+    assert (submitted[:, 2:] == 255).all()
+
+
+def _jpeg_image(pdf: Pdf, image: Image.Image, **entries: object) -> pikepdf.Stream:
+    """Return a DCT-encoded Image XObject holding *image*."""
+    data = BytesIO()
+    image.save(data, "JPEG", quality=95)
+    stream = _flate_image(pdf, image, **entries)
+    stream.write(data.getvalue(), filter=Name.DCTDecode)
+    return stream
+
+
+@pytest.mark.parametrize(
     "defect",
-    ["color_space", "decode", "matte_components", "matte_size", "corrupt_data"],
+    [
+        "color_space",
+        "decode",
+        "matte_components",
+        "matte_size",
+        "corrupt_data",
+        "image_decode_length",
+        "jpeg_image_decode",
+        "indexed_image_decode",
+    ],
 )
 @patch("pdftopdfa.ocr.OCRSession")
 def test_figure_text_recognizer_rejects_unusable_soft_masks(
@@ -828,9 +969,32 @@ def test_figure_text_recognizer_rejects_unusable_soft_masks(
             soft_mask = _flate_image(
                 pdf, Image.new("L", (2, 2), 255), Matte=Array([0, 0, 0])
             )
-        else:
+        elif defect == "corrupt_data":
             soft_mask.write(b"not Flate data", filter=Name.FlateDecode)
-        image = _flate_image(pdf, Image.new("RGB", (4, 4), "black"), SMask=soft_mask)
+        base = Image.new("RGB", (4, 4), "black")
+        if defect == "jpeg_image_decode":
+            image = _jpeg_image(
+                pdf, base, Decode=Array([1, 0, 1, 0, 1, 0]), SMask=soft_mask
+            )
+        elif defect == "indexed_image_decode":
+            image = _flate_image(
+                pdf,
+                Image.new("L", (4, 4), 1),
+                ColorSpace=Array(
+                    [
+                        Name.Indexed,
+                        Name.DeviceRGB,
+                        1,
+                        pikepdf.String(bytes([0, 0, 0, 255, 255, 255])),
+                    ]
+                ),
+                Decode=Array([1, 0]),
+                SMask=soft_mask,
+            )
+        else:
+            image = _flate_image(pdf, base, SMask=soft_mask)
+            if defect == "image_decode_length":
+                image["/Decode"] = Array([1, 0])
 
         with (
             caplog.at_level(logging.WARNING, logger="pdftopdfa.converter"),

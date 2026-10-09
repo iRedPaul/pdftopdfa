@@ -111,6 +111,13 @@ _FIGURE_OCR_MIN_CONFIDENCE = 0.90
 _FIGURE_OCR_COMPOSITE_MODES = frozenset({"1", "L", "P", "RGB", "CMYK"})
 _FIGURE_OCR_MATTE_COMPONENTS = {"L": 1, "RGB": 3, "CMYK": 4}
 _FIGURE_OCR_ICC_MODES = {"GRAY": "L", "RGB ": "RGB", "CMYK": "CMYK"}
+# Pillow ImageCms intents for the PDF rendering intents (ISO 32000-2, 8.6.5.8).
+_FIGURE_OCR_RENDERING_INTENTS = {
+    "/AbsoluteColorimetric": "ABSOLUTE_COLORIMETRIC",
+    "/RelativeColorimetric": "RELATIVE_COLORIMETRIC",
+    "/Saturation": "SATURATION",
+    "/Perceptual": "PERCEPTUAL",
+}
 # Soft-mask compositing works on horizontal strips of at most this many pixels,
 # so it needs no full-size temporary planes beyond the decoded image and alpha.
 _FIGURE_OCR_COMPOSITE_STRIP_PIXELS = 1 << 20
@@ -197,6 +204,15 @@ def _pdf_numbers(value: object, count: int, name: str) -> tuple[float, ...]:
         raise ValueError(f"{name} must be an array of {count} numbers") from exc
 
 
+def _figure_ocr_decode_lut(pairs: list[tuple[float, float]]) -> list[int]:
+    """Return a Pillow ``point`` table mapping 8-bit samples through /Decode."""
+    return [
+        round(min(max(low + (high - low) * value / 255, 0.0), 1.0) * 255)
+        for low, high in pairs
+        for value in range(256)
+    ]
+
+
 def _figure_ocr_soft_mask_alpha(
     soft_mask: pikepdf.Stream, size: tuple[int, int]
 ) -> "Image.Image":
@@ -210,13 +226,9 @@ def _figure_ocr_soft_mask_alpha(
     ):
         raise ValueError("/SMask is not a DeviceGray image")
     decode = soft_mask.get("/Decode")
-    low, high = (
-        (0.0, 1.0) if decode is None else _pdf_numbers(decode, 2, "/SMask /Decode")
+    lut = _figure_ocr_decode_lut(
+        [(0.0, 1.0) if decode is None else _pdf_numbers(decode, 2, "/SMask /Decode")]
     )
-    lut = [
-        round(min(max(low + (high - low) * value / 255, 0.0), 1.0) * 255)
-        for value in range(256)
-    ]
     # /Decode is applied here in one place, because pikepdf skips it for some
     # codecs (DCT, JPX) and only supports inversion for 1- and 16-bit samples.
     with pikepdf.PdfImage(soft_mask).as_pil_image(
@@ -284,12 +296,46 @@ def _unpremultiply_figure_ocr_image(
     return image
 
 
+def _decode_figure_ocr_image(
+    image: "Image.Image", pdf_image: pikepdf.PdfImage, decode: object
+) -> "Image.Image":
+    """Apply an image's /Decode array in place to its raw extracted samples."""
+    if decode is None:
+        return image
+    if pdf_image.indexed:
+        values = _pdf_numbers(decode, 2, "/Decode")
+        identity: tuple[float, ...] = (0.0, (1 << pdf_image.bits_per_component) - 1)
+    else:
+        bands = len(image.getbands())
+        values = _pdf_numbers(decode, 2 * bands, "/Decode")
+        identity = (0.0, 1.0) * bands
+    if values == identity:
+        return image
+    if pdf_image.indexed or {"/DCTDecode", "/JPXDecode"} & set(pdf_image.filters):
+        # A remapped palette index, or JPEG samples whose codec may already
+        # have inverted them (Adobe APP14), have no unambiguous appearance.
+        raise ValueError("unsupported /Decode array for a soft-masked image")
+    if image.mode == "1":
+        image = image.convert("L")
+    lut = _figure_ocr_decode_lut(
+        [(values[index], values[index + 1]) for index in range(0, len(values), 2)]
+    )
+    for box in _figure_ocr_strips(image.size):
+        image.paste(image.crop(box).point(lut), box)
+    return image
+
+
 def _figure_ocr_rgb_image(
-    image: "Image.Image", profile: "ImageCms.ImageCmsProfile | None"
+    image: "Image.Image",
+    profile: "ImageCms.ImageCmsProfile | None",
+    intent: object,
 ) -> "Image.Image":
     """Return *image* as RGB, mapping ICCBased colours to sRGB.
 
-    An RGB image is converted in place, strip by strip.
+    The image's /Intent selects the rendering intent; without a recognized one,
+    the PDF default RelativeColorimetric applies (ISO 32000-2, 8.6.5.8). A
+    content-stream ``ri`` operator is not tracked. An RGB image is converted in
+    place, strip by strip.
     """
     from PIL import Image, ImageCms
 
@@ -308,7 +354,12 @@ def _figure_ocr_rgb_image(
         ImageCms.createProfile("sRGB"),
         mode,
         "RGB",
-        renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,
+        renderingIntent=ImageCms.Intent[
+            _FIGURE_OCR_RENDERING_INTENTS.get(
+                str(intent) if isinstance(intent, pikepdf.Name) else "",
+                "RELATIVE_COLORIMETRIC",
+            )
+        ],
     )
     rgb = image if mode == "RGB" else Image.new("RGB", image.size)
     for box in _figure_ocr_strips(image.size):
@@ -322,8 +373,9 @@ def _extract_figure_ocr_image(
     """Extract *image* for OCR as it appears in front of a white background.
 
     An image with a soft mask is composited with the /SMask opacity, resampled
-    to the image size, with /Decode applied and /Matte pre-blending undone.
-    ICCBased colours are converted to sRGB before compositing. The composite
+    to the image size, after the /Decode arrays of image and mask are applied
+    and /Matte pre-blending is undone. ICCBased colours are converted to sRGB
+    with the image's rendering intent before compositing. The composite
     is built in place, strip by strip, so it adds no full-size temporary planes
     beyond the decoded image and its alpha. Returns None when the decoded image
     does not have the declared size.
@@ -331,10 +383,16 @@ def _extract_figure_ocr_image(
     from PIL import Image, ImageChops
 
     pdf_image = pikepdf.PdfImage(image)
-    source_path = Path(
-        pdf_image.extract_to(fileprefix=str(fileprefix), apply_mask=False)
-    )
     soft_mask = image.get("/SMask")
+    # A soft-masked image is extracted with raw samples and decoded below,
+    # because pikepdf leaves /Decode unapplied for some codecs and palettes.
+    source_path = Path(
+        pdf_image.extract_to(
+            fileprefix=str(fileprefix),
+            apply_decode_array=soft_mask is None,
+            apply_mask=False,
+        )
+    )
     with Image.open(source_path) as source:
         if source.size != size:
             return None
@@ -343,14 +401,14 @@ def _extract_figure_ocr_image(
         if source.mode not in _FIGURE_OCR_COMPOSITE_MODES:
             raise ValueError(f"unsupported soft-masked image mode {source.mode}")
         alpha = _figure_ocr_soft_mask_alpha(soft_mask, size)
-        visible = source
+        visible = _decode_figure_ocr_image(source, pdf_image, image.get("/Decode"))
         matte = soft_mask.get("/Matte")
         if matte is not None:
             # A /Matte soft mask must match the parent image dimensions.
             if (soft_mask.get("/Width"), soft_mask.get("/Height")) != size:
                 raise ValueError("/SMask with /Matte does not match the image size")
             visible = _unpremultiply_figure_ocr_image(visible, alpha, matte)
-        visible = _figure_ocr_rgb_image(visible, pdf_image.icc)
+        visible = _figure_ocr_rgb_image(visible, pdf_image.icc, image.get("/Intent"))
         for box in _figure_ocr_strips(size):
             visible.paste((255, 255, 255), box, ImageChops.invert(alpha.crop(box)))
         composite_path = fileprefix.with_name(f"{fileprefix.name}-composite.png")
