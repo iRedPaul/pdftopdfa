@@ -217,17 +217,45 @@ pdftopdfa -l 3a --pdfua --ocr-figure-text \
 ```
 
 The converter extracts eligible direct Image XObjects and reuses one
-`OCRSession` across all candidates in the document. Non-empty OCR lines are
+`OCRSession` across all candidates in the document. Palette samples above the
+highest index of the palette (`hival`) take the color of that index, as pdf.js
+and MuPDF render them. Non-empty OCR lines are
 whitespace-normalized and joined in recognition order. The result is accepted
 only when every non-empty line has confidence of at least `0.90`; an empty or
 less-confident result marks the Figure as a `Layout` artifact and reports that
 decision for manual review.
 
+Images with a soft mask (`/SMask`) are composited in front of white before
+recognition, so OCR sees their visible appearance. The `/Decode` arrays of
+image and soft mask and `/Matte` pre-blending are honored, and a soft mask with
+its own resolution is scaled to the image size, without smoothing unless it
+sets `/Interpolate`. The `/Matte` of a palette image is a palette index, so
+pre-blending is undone on the palette colors. ICC-based image colors are
+converted to sRGB before compositing, with the image's `/Intent` or, without
+one, the rendering intent of the graphics state that paints it (`ri` or
+ExtGState `/RI`, RelativeColorimetric by default). Device colors, including the
+base of a palette, are converted the same way through the `/DefaultGray`,
+`/DefaultRGB`, or `/DefaultCMYK` color space of the resources that paint the
+image or, without one, through the PDF/A OutputIntent profile with the same
+number of components.
+Compositing works in tiles, so it needs little memory beyond the decoded
+image, its opacity, and the RGB composite. Together these may take at most
+400 MB, as much as one decoded RGB or CMYK image at the 100-megapixel limit;
+larger soft-masked images (above about 44 megapixels for CMYK, 67 for gray, and
+80 for RGB) are reported for manual review. Soft-masked images follow the same
+rule as opaque images: accepted text becomes `ActualText`, and a Figure without
+accepted text becomes a `Layout` artifact. Images that cannot be decoded
+unambiguously are reported for manual review instead: JPEG or palette images
+with a remapping `/Decode` array, DeviceCMYK images without a CMYK profile,
+images whose default color space is not ICC-based, and ICC-based color spaces
+whose `/Range` is not 0 to 1.
+
 Accepted text is written as `ActualText`, because it replaces text visibly
 contained in the image rather than describing all visual meaning. Every
 generated value is still reported as requiring author review. Inline images,
-Form XObjects, masks, diagrams without recognizable text, and authoritative
-visual descriptions remain outside this automatic step.
+Form XObjects, stencil images, images with `/Mask` or JPEG 2000 `/SMaskInData`
+transparency, diagrams without recognizable text, and authoritative visual
+descriptions remain outside this automatic step.
 
 The Python equivalent is `ocr_figure_text=True`. The flag requires both OCR
 model directories and level `"2a"` or `"3a"` on `convert_to_pdfa()`,

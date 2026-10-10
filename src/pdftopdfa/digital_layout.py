@@ -134,6 +134,9 @@ _TEXT_BASE14_FONTS = frozenset(
     }
 )
 _CID_FALLBACK = re.compile(r"(?:\(cid:[0-9]+\))+")
+_RENDERING_INTENTS = frozenset(
+    {"AbsoluteColorimetric", "RelativeColorimetric", "Saturation", "Perceptual"}
+)
 
 
 class _NonRectangularClipError(PDFInterpreterError):
@@ -162,6 +165,19 @@ class InvocationPaintState:
     blend_mode_complex: bool = False
     text_render_mode: int = 0
     clip_visibility_uncertain: bool = False
+    rendering_intent: str = "/RelativeColorimetric"
+
+
+def _rendering_intent(value: object) -> str:
+    """Return the PDF name of the rendering intent set by an ``ri`` or /RI value.
+
+    An unrecognized intent renders as RelativeColorimetric (ISO 32000-2, 8.6.5.8).
+    """
+    try:
+        name = literal_name(value)
+    except Exception:
+        return "/RelativeColorimetric"
+    return f"/{name}" if name in _RENDERING_INTENTS else "/RelativeColorimetric"
 
 
 def _polygon_area(polygon: ClipPolygon) -> float:
@@ -1888,6 +1904,12 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
         super().do_k(c, m, y, k)
         self._paint_state = replace(self._paint_state, fill_color_complex=False)
 
+    def do_ri(self, intent: PDFStackT) -> None:
+        self._paint_state = replace(
+            self._paint_state, rendering_intent=_rendering_intent(intent)
+        )
+        super().do_ri(intent)
+
     def do_gs(self, name: PDFStackT) -> None:
         try:
             resource_name = literal_name(name)
@@ -2014,6 +2036,10 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
                 blend_mode_complex=any(
                     value not in {"Normal", "Compatible"} for value in blend_modes
                 ),
+            )
+        if "RI" in parameters:
+            state = replace(
+                state, rendering_intent=_rendering_intent(resolve1(parameters["RI"]))
             )
         self._paint_state = state
 

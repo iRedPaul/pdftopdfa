@@ -55,7 +55,10 @@ _PREFLIGHT_MEMORY_LIMIT = 16 * 1024 * 1024
 _TEXT_SHOW_OPERAND_COUNTS = {"Tj": 1, "TJ": 1, "'": 1, '"': 3}
 _ObjectKey = tuple[int, int]
 type _FigureClipPolygon = tuple[tuple[float, float], ...]
-type _FigureSourceImage = tuple[Stream, _FigureClipPolygon]
+# The image, its visible clip, the resources of the content stream that paints
+# it, whose /Default colour spaces remap device colours, and the rendering
+# intent of the graphics state that paints it.
+type _FigureSourceImage = tuple[Stream, _FigureClipPolygon, Dictionary | None, str]
 
 
 class _FigureOCRStatus(Enum):
@@ -63,7 +66,7 @@ class _FigureOCRStatus(Enum):
 
 
 type _FigureTextRecognizer = Callable[
-    [Stream, _FigureClipPolygon],
+    [Stream, _FigureClipPolygon, Dictionary | None, str],
     str | None | _FigureOCRStatus,
 ]
 _PAINTING_OPERATORS = frozenset(
@@ -4494,6 +4497,25 @@ def _image_clip_polygon(span: object) -> _FigureClipPolygon | None:
     return _normalize_polygon(clamped) or None
 
 
+def _figure_ocr_resolves_visibility(span: object, image: object) -> bool:
+    """Return whether Figure OCR may evaluate an image despite its uncertainty.
+
+    Intrinsic visibility is only classified for simple, same-sized soft masks.
+    Figure OCR composites an image with its /SMask by itself and reports images
+    it cannot composite as ineligible, so a soft-masked image whose remaining
+    uncertainty is purely intrinsic is still offered to it.
+    """
+    from .digital_layout import DirectXObjectSpan
+
+    if not isinstance(span, DirectXObjectSpan):
+        return False
+    return not span.intrinsic_visibility_uncertain or (
+        not span.non_intrinsic_visibility_uncertain
+        and isinstance(image, Stream)
+        and image.get("/SMask") is not None
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _MarkedVectorScope:
     marked_content_index: int
@@ -7572,6 +7594,7 @@ def _digital_semantic_inputs(
             source_actual_text: str | None,
             source_alt_text: str | None = None,
             source_image: Stream | None = None,
+            source_image_resources: Dictionary | None = None,
             source_bbox: tuple[float, float, float, float] | None = None,
             text_override: str | None = None,
             kind_override=None,
@@ -7669,8 +7692,7 @@ def _digital_semantic_inputs(
                 source_alt_texts[span_id] = source_alt_text
             if (
                 source_image is not None
-                and isinstance(span, DirectXObjectSpan)
-                and not span.intrinsic_visibility_uncertain
+                and _figure_ocr_resolves_visibility(span, source_image)
                 and span.entry_state.fill_alpha == 1.0
                 and not (
                     style_override is not None
@@ -7679,7 +7701,12 @@ def _digital_semantic_inputs(
             ):
                 crop_polygon = _image_clip_polygon(span)
                 if crop_polygon is not None:
-                    source_images[span_id] = source_image, crop_polygon
+                    source_images[span_id] = (
+                        source_image,
+                        crop_polygon,
+                        source_image_resources,
+                        span.entry_state.rendering_intent,
+                    )
             page_spans.append(
                 SemanticSpan(
                     span_id,
@@ -7914,6 +7941,7 @@ def _digital_semantic_inputs(
                         if isinstance(child, DirectXObjectSpan)
                         else None
                     ),
+                    source_image_resources=effective_resources,
                 ):
                     invocation_span_ids.add(child_span_id)
 
@@ -8015,6 +8043,7 @@ def _digital_semantic_inputs(
                         if isinstance(span, DirectXObjectSpan)
                         else None
                     ),
+                    source_image_resources=resources,
                 )
                 if len(page_spans) > spans_before and (
                     isinstance(span, DirectTextSpan)
@@ -8534,7 +8563,9 @@ def _requires_existing_image_visibility_rebuild(
                 uncertain = span.intrinsic_visibility_uncertain
                 images = []
                 has_other = span.final_paint_uncertain or uncertain
-                if not has_other and isinstance(effective_resources, Dictionary):
+                if (not has_other or uncertain) and isinstance(
+                    effective_resources, Dictionary
+                ):
                     xobjects = resolve_indirect(effective_resources.get("/XObject"))
                     image = (
                         resolve_indirect(xobjects.get(Name(f"/{span.resource_name}")))
@@ -8546,10 +8577,19 @@ def _requires_existing_image_visibility_rebuild(
                     if (
                         isinstance(image, Stream)
                         and resolve_indirect(image.get("/Subtype")) == Name.Image
+                        and _figure_ocr_resolves_visibility(span, image)
                         and crop_polygon is not None
                         and span.entry_state.fill_alpha == 1.0
                     ):
-                        images.append((image, crop_polygon))
+                        images.append(
+                            (
+                                image,
+                                crop_polygon,
+                                effective_resources,
+                                span.entry_state.rendering_intent,
+                            )
+                        )
+                        has_other = False
                     else:
                         has_other = True
             container_invisible = container_invisible or invisible

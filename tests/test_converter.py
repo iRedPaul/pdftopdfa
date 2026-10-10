@@ -11,15 +11,24 @@ import os
 import subprocess
 import sys
 import threading
+import zlib
+from collections.abc import Callable
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pikepdf
 import pytest
 from pikepdf import Array, Dictionary, Name, Pdf
-from PIL import Image
+from PIL import Image, ImageChops, ImageCms, ImageDraw
 
+from pdftopdfa.color_profile import (
+    get_cmyk_profile,
+    get_gray_profile,
+    get_srgb_profile,
+)
 from pdftopdfa.converter import (
     ConversionResult,
     PDFUAReviewFinding,
@@ -28,6 +37,9 @@ from pdftopdfa.converter import (
     _accepted_figure_ocr_text,
     _compare_pdfa_levels,
     _ensure_binary_comment,
+    _extract_figure_ocr_image,
+    _figure_ocr_soft_mask_alpha,
+    _figure_ocr_tiles,
     _figure_text_recognizer,
     _truncate_trailing_data,
     _verify_file_structure,
@@ -443,6 +455,7 @@ def test_figure_text_recognizer_reuses_one_session_and_cached_image_result(
             image["/Height"] = 10
         with _figure_text_recognizer(
             enabled=True,
+            pdf=pdf,
             detection_model_dir=_DETECTION_MODEL_DIR,
             recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_execution_provider="cpu",
@@ -509,6 +522,7 @@ def test_figure_text_recognizer_crops_each_image_invocation(
         image["/Height"] = 20
         with _figure_text_recognizer(
             enabled=True,
+            pdf=pdf,
             detection_model_dir=_DETECTION_MODEL_DIR,
             recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_execution_provider="cpu",
@@ -534,31 +548,1047 @@ def test_figure_text_recognizer_skips_masked_and_oversized_images(
     _mock_session_class: MagicMock,
 ) -> None:
     with Pdf.new() as pdf:
-        masked = pdf.make_stream(b"masked")
-        soft_masked = pdf.make_stream(b"soft-masked")
+        stencil = pdf.make_stream(b"stencil")
+        color_keyed = pdf.make_stream(b"color-keyed")
+        explicit_masked = pdf.make_stream(b"explicit-masked")
         alpha = pdf.make_stream(b"alpha")
         oversized = pdf.make_stream(b"oversized")
-        for image in (masked, soft_masked, alpha, oversized):
-            image["/Width"] = 10
-            image["/Height"] = 10
-        masked["/Mask"] = Array([0, 0])
-        soft_masked["/SMask"] = pdf.make_stream(b"mask")
+        oversized_soft_mask = pdf.make_stream(b"oversized-soft-mask")
+        invalid_soft_mask = pdf.make_stream(b"invalid-soft-mask")
+        ineligible = (
+            stencil,
+            color_keyed,
+            explicit_masked,
+            alpha,
+            oversized,
+            oversized_soft_mask,
+            invalid_soft_mask,
+        )
+        for image in ineligible:
+            image["/Width"] = 9
+            image["/Height"] = 11
+        oversized["/Width"] = 10
+        oversized["/Height"] = 10
+        stencil["/ImageMask"] = True
+        color_keyed["/Mask"] = Array([0, 0])
+        explicit_mask = pdf.make_stream(b"mask")
+        explicit_mask["/ImageMask"] = True
+        explicit_masked["/Mask"] = explicit_mask
         alpha["/SMaskInData"] = 1
+        soft_mask = pdf.make_stream(b"soft-mask")
+        soft_mask["/Width"] = 10
+        soft_mask["/Height"] = 10
+        oversized_soft_mask["/SMask"] = soft_mask
+        invalid_soft_mask["/SMask"] = Dictionary(Width=1, Height=1)
 
         with _figure_text_recognizer(
             enabled=True,
+            pdf=pdf,
             detection_model_dir=_DETECTION_MODEL_DIR,
             recognition_model_dir=_RECOGNITION_MODEL_DIR,
             ocr_execution_provider="cpu",
             ocr_languages=["en"],
         ) as recognize:
             assert recognize is not None
-            assert recognize(masked) is _FigureOCRStatus.INELIGIBLE
-            assert recognize(soft_masked) is _FigureOCRStatus.INELIGIBLE
-            assert recognize(alpha) is _FigureOCRStatus.INELIGIBLE
-            assert recognize(oversized) is _FigureOCRStatus.INELIGIBLE
+            for image in ineligible:
+                assert recognize(image) is _FigureOCRStatus.INELIGIBLE
 
     mock_pdf_image.assert_not_called()
+
+
+_DEVICE_COLOR_SPACES = {
+    "1": Name.DeviceGray,
+    "L": Name.DeviceGray,
+    "RGB": Name.DeviceRGB,
+    "CMYK": Name.DeviceCMYK,
+}
+
+
+def _flate_image(pdf: Pdf, image: Image.Image, **entries: object) -> pikepdf.Stream:
+    """Return a Flate-encoded Image XObject holding the samples of *image*."""
+    stream = pdf.make_stream(zlib.compress(image.tobytes()))
+    stream["/Type"] = Name.XObject
+    stream["/Subtype"] = Name.Image
+    stream["/Width"] = image.width
+    stream["/Height"] = image.height
+    stream["/ColorSpace"] = _DEVICE_COLOR_SPACES[image.mode]
+    stream["/BitsPerComponent"] = 1 if image.mode == "1" else 8
+    stream["/Filter"] = Name.FlateDecode
+    for key, value in entries.items():
+        stream[f"/{key}"] = value
+    return stream
+
+
+def _add_pdfa_output_intent(pdf: Pdf, profile: bytes, components: int) -> None:
+    """Give *pdf* a PDF/A OutputIntent with the ICC *profile*."""
+    icc = pdf.make_stream(profile)
+    icc["/N"] = components
+    pdf.Root["/OutputIntents"] = Array(
+        [
+            pdf.make_indirect(
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.GTS_PDFA1,
+                    OutputConditionIdentifier=pikepdf.String("Test"),
+                    DestOutputProfile=icc,
+                )
+            )
+        ]
+    )
+
+
+def _icc_resources(pdf: Pdf, key: str, profile: bytes, components: int) -> Dictionary:
+    """Return resources whose colour space *key* is ICCBased with *profile*."""
+    icc = pdf.make_stream(profile)
+    icc["/N"] = components
+    return Dictionary(ColorSpace=Dictionary({key: Array([Name.ICCBased, icc])}))
+
+
+def _cmyk_srgb(
+    color: tuple[int, int, int, int],
+    rendering_intent: ImageCms.Intent = ImageCms.Intent.RELATIVE_COLORIMETRIC,
+) -> tuple[int, ...]:
+    """Return *color* converted to sRGB through the bundled CMYK profile."""
+    return ImageCms.profileToProfile(
+        Image.new("CMYK", (1, 1), color),
+        ImageCms.ImageCmsProfile(BytesIO(get_cmyk_profile())),
+        ImageCms.createProfile("sRGB"),
+        renderingIntent=rendering_intent,
+        outputMode="RGB",
+    ).getpixel((0, 0))
+
+
+def _figure_ocr_submissions(
+    mock_session_class: MagicMock,
+    pdf: Pdf,
+    image: pikepdf.Stream,
+    crop_polygons: tuple[tuple[tuple[float, float], ...] | None, ...] = (None,),
+    resources: Dictionary | None = None,
+    rendering_intent: str = "/RelativeColorimetric",
+) -> list[np.ndarray]:
+    """Recognize *image* of *pdf* once per crop; return the pixels sent to OCR."""
+    submitted: list[np.ndarray] = []
+
+    def inspect(path: Path, **_kwargs: object) -> list[tuple[str, float]]:
+        with Image.open(path) as candidate:
+            assert candidate.mode == "RGB"
+            submitted.append(np.asarray(candidate))
+        return [("Visible", 0.99)]
+
+    session = mock_session_class.return_value.__enter__.return_value
+    session.recognize_image.side_effect = inspect
+    with _figure_text_recognizer(
+        enabled=True,
+        pdf=pdf,
+        detection_model_dir=_DETECTION_MODEL_DIR,
+        recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        ocr_execution_provider="cpu",
+        ocr_languages=["en"],
+    ) as recognize:
+        assert recognize is not None
+        for crop_polygon in crop_polygons:
+            assert (
+                recognize(image, crop_polygon, resources, rendering_intent) == "Visible"
+            )
+    return submitted
+
+
+@pytest.mark.parametrize("size", [(60, 20), (20, 1), (3, 5), (7, 2), (1, 1)])
+@patch("pdftopdfa.converter._FIGURE_OCR_COMPOSITE_TILE_PIXELS", 7)
+def test_figure_ocr_tiles_cover_image_in_bounded_tiles(size: tuple[int, int]) -> None:
+    covered = np.zeros((size[1], size[0]), dtype=int)
+    for left, top, right, bottom in _figure_ocr_tiles(size):
+        # Tiles stay bounded even when one row is wider than the limit.
+        assert 0 < (right - left) * (bottom - top) <= 7
+        covered[top:bottom, left:right] += 1
+
+    assert (covered == 1).all()
+
+
+@patch("pdftopdfa.converter._FIGURE_OCR_COMPOSITE_TILE_PIXELS", 3)
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_composites_16_bit_soft_mask(
+    mock_session_class: MagicMock,
+) -> None:
+    # The high byte of each 16-bit sample is the 8-bit opacity.
+    samples = np.tile(np.array([0xFF00, 0xFFFF, 0x8000, 0x00FF], dtype=">u2"), (4, 1))
+    with Pdf.new() as pdf:
+        soft_mask = _flate_image(pdf, Image.new("L", (4, 4)))
+        soft_mask.write(zlib.compress(samples.tobytes()), filter=Name.FlateDecode)
+        soft_mask["/BitsPerComponent"] = 16
+        image = _flate_image(pdf, Image.new("RGB", (4, 4), "black"), SMask=soft_mask)
+        [submitted] = _figure_ocr_submissions(mock_session_class, pdf, image)
+
+    assert (submitted[..., 0] == [0, 0, 127, 255]).all()
+
+
+@pytest.mark.parametrize(
+    ("mode", "color"), [("L", 0), ("RGB", "black"), ("CMYK", 0), ("P", 0)]
+)
+@pytest.mark.parametrize("over_budget", [False, True])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_limits_soft_mask_composite_memory(
+    mock_session_class: MagicMock,
+    mode: str,
+    color: int | str,
+    over_budget: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = mock_session_class.return_value.__enter__.return_value
+    session.recognize_image.return_value = [("Visible", 0.99)]
+    # pikepdf expands a CMYK palette into a CMYK image before compositing.
+    budget = 16 * {"L": 6, "RGB": 5, "CMYK": 9, "P": 9}[mode]
+    monkeypatch.setattr(
+        "pdftopdfa.converter._FIGURE_OCR_COMPOSITE_MAX_BYTES",
+        budget - 1 if over_budget else budget,
+    )
+    with (
+        Pdf.new() as pdf,
+        patch(
+            "pdftopdfa.converter._figure_ocr_soft_mask_alpha",
+            wraps=_figure_ocr_soft_mask_alpha,
+        ) as soft_mask_alpha,
+    ):
+        _add_pdfa_output_intent(pdf, get_cmyk_profile(), 4)
+        image = _flate_image(
+            pdf,
+            Image.new("L" if mode == "P" else mode, (4, 4), color),
+            SMask=_flate_image(pdf, Image.new("L", (4, 4), 255)),
+        )
+        if mode == "P":
+            image["/ColorSpace"] = Array(
+                [Name.Indexed, Name.DeviceCMYK, 0, pikepdf.String(bytes(4))]
+            )
+        with (
+            caplog.at_level(logging.WARNING, logger="pdftopdfa.converter"),
+            _figure_text_recognizer(
+                enabled=True,
+                pdf=pdf,
+                detection_model_dir=_DETECTION_MODEL_DIR,
+                recognition_model_dir=_RECOGNITION_MODEL_DIR,
+                ocr_execution_provider="cpu",
+                ocr_languages=["en"],
+            ) as recognize,
+        ):
+            assert recognize is not None
+            result = recognize(image, None, None, "/RelativeColorimetric")
+
+    if over_budget:
+        assert result is _FigureOCRStatus.INELIGIBLE
+        assert "too large to composite" in caplog.text
+        # The budget is checked before the composite planes are allocated.
+        soft_mask_alpha.assert_not_called()
+        session.recognize_image.assert_not_called()
+    else:
+        assert result == "Visible"
+
+
+@patch("pdftopdfa.converter._extract_figure_ocr_image", side_effect=MemoryError)
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_treats_failed_allocation_as_ineligible(
+    mock_session_class: MagicMock,
+    extract: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = mock_session_class.return_value.__enter__.return_value
+    with Pdf.new() as pdf:
+        image = _flate_image(pdf, Image.new("RGB", (4, 4), "black"))
+        with (
+            caplog.at_level(logging.WARNING, logger="pdftopdfa.converter"),
+            _figure_text_recognizer(
+                enabled=True,
+                pdf=pdf,
+                detection_model_dir=_DETECTION_MODEL_DIR,
+                recognition_model_dir=_RECOGNITION_MODEL_DIR,
+                ocr_execution_provider="cpu",
+                ocr_languages=["en"],
+            ) as recognize,
+        ):
+            assert recognize is not None
+            for _attempt in range(2):
+                assert (
+                    recognize(image, None, None, "/RelativeColorimetric")
+                    is _FigureOCRStatus.INELIGIBLE
+                )
+
+    assert extract.call_count == 1
+    session.recognize_image.assert_not_called()
+    assert caplog.text.count("Could not extract Figure image for OCR") == 1
+
+
+@pytest.mark.parametrize("tile_pixels", [3 * 60, 7])
+@pytest.mark.parametrize("inverted_decode", [False, True])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_composites_soft_mask_over_white(
+    mock_session_class: MagicMock,
+    inverted_decode: bool,
+    tile_pixels: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "pdftopdfa.converter._FIGURE_OCR_COMPOSITE_TILE_PIXELS", tile_pixels
+    )
+    opacity = Image.new("L", (60, 20), 0)
+    ImageDraw.Draw(opacity).text((4, 4), "OCR", fill=255)
+    opacity = opacity.point(lambda value: 255 if value >= 128 else 0)
+    with Pdf.new() as pdf:
+        if inverted_decode:
+            soft_mask = _flate_image(
+                pdf, ImageChops.invert(opacity), Decode=Array([1, 0])
+            )
+        else:
+            soft_mask = _flate_image(pdf, opacity)
+        # The base image is uniformly black: the text exists only in the mask.
+        image = _flate_image(
+            pdf, Image.new("RGB", opacity.size, "black"), SMask=soft_mask
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, pdf, image)
+
+    opaque = np.asarray(opacity) == 255
+    assert opaque.any()
+    assert not opaque.all()
+    assert submitted.shape == (20, 60, 3)
+    assert (submitted[opaque] == 0).all()
+    assert (submitted[~opaque] == 255).all()
+
+
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_crops_composited_soft_mask_image(
+    mock_session_class: MagicMock,
+) -> None:
+    opacity = Image.new("L", (40, 10), 0)
+    opacity.paste(255, (0, 0, 20, 10))
+    left = ((0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0))
+    right = ((0.5, 0.0), (1.0, 0.0), (1.0, 1.0), (0.5, 1.0))
+    with (
+        Pdf.new() as pdf,
+        patch(
+            "pdftopdfa.converter._extract_figure_ocr_image",
+            wraps=_extract_figure_ocr_image,
+        ) as extract,
+    ):
+        image = _flate_image(
+            pdf,
+            Image.new("RGB", opacity.size, "blue"),
+            SMask=_flate_image(pdf, opacity),
+        )
+        left_crop, right_crop = _figure_ocr_submissions(
+            mock_session_class, pdf, image, (left, right)
+        )
+
+    assert extract.call_count == 1
+    assert left_crop.shape == right_crop.shape == (10, 20, 3)
+    assert (left_crop == (0, 0, 255)).all()
+    assert (right_crop == 255).all()
+
+
+@pytest.mark.parametrize("interpolate", [False, True])
+@pytest.mark.parametrize("mask_size", [(4, 2), (160, 80)])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_resamples_soft_mask_to_image_size(
+    mock_session_class: MagicMock,
+    mask_size: tuple[int, int],
+    interpolate: bool,
+) -> None:
+    opacity = Image.new("L", mask_size, 0)
+    opacity.paste(255, (0, 0, mask_size[0] // 2, mask_size[1]))
+    entries = {"Interpolate": True} if interpolate else {}
+    with Pdf.new() as pdf:
+        image = _flate_image(
+            pdf,
+            Image.new("RGB", (40, 20), "black"),
+            SMask=_flate_image(pdf, opacity, **entries),
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, pdf, image)
+
+    assert submitted.shape == (20, 40, 3)
+    if interpolate:
+        edge = submitted[:, 15:25]
+        assert ((edge > 0) & (edge < 255)).any()
+        assert (submitted[:, :15] == 0).all()
+        assert (submitted[:, 25:] == 255).all()
+    else:
+        # Without /Interpolate, mask samples are scaled without smoothing.
+        assert (submitted[:, :20] == 0).all()
+        assert (submitted[:, 20:] == 255).all()
+
+
+@pytest.mark.parametrize("tile_pixels", [4, 1])
+@pytest.mark.parametrize("matte", [(0, 0, 0), (1, 1, 1), (0.5, 0.25, 1)])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_undoes_soft_mask_matte(
+    mock_session_class: MagicMock,
+    matte: tuple[float, float, float],
+    tile_pixels: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "pdftopdfa.converter._FIGURE_OCR_COMPOSITE_TILE_PIXELS", tile_pixels
+    )
+    color = np.array([32.0, 128.0, 224.0])
+    alphas = np.repeat([[255.0], [191.0], [128.0], [64.0], [0.0]], 2, axis=1)
+    opacity = alphas[..., None] / 255
+    matte_color = np.array(matte) * 255
+    # ISO 32000-2, 11.6.5.3: the stored image is pre-blended with the matte.
+    stored = matte_color + opacity * (color - matte_color)
+    expected = opacity * color + (1 - opacity) * 255
+    with Pdf.new() as pdf:
+        soft_mask = _flate_image(
+            pdf,
+            Image.fromarray(alphas.astype(np.uint8)),
+            Matte=Array(matte),
+        )
+        image = _flate_image(
+            pdf,
+            Image.fromarray(np.rint(stored).astype(np.uint8)),
+            SMask=soft_mask,
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, pdf, image)
+
+    assert submitted.shape == (5, 2, 3)
+    assert np.abs(submitted.astype(float) - expected).max() <= 1.5
+
+
+@pytest.mark.parametrize(
+    ("profile", "mode", "color"),
+    [
+        (get_srgb_profile, "RGB", (200, 30, 90)),
+        (get_gray_profile, "L", 90),
+        (get_cmyk_profile, "CMYK", (0, 0, 0, 255)),
+        (get_cmyk_profile, "CMYK", (255, 0, 0, 0)),
+    ],
+)
+@pytest.mark.parametrize("tile_pixels", [8, 3])
+@pytest.mark.parametrize("explicit_range", [False, True])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_converts_icc_colours_before_compositing(
+    mock_session_class: MagicMock,
+    profile: Callable[[], bytes],
+    mode: str,
+    color: int | tuple[int, ...],
+    tile_pixels: int,
+    explicit_range: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "pdftopdfa.converter._FIGURE_OCR_COMPOSITE_TILE_PIXELS", tile_pixels
+    )
+    profile_bytes = profile()
+    expected = ImageCms.profileToProfile(
+        Image.new(mode, (1, 1), color),
+        ImageCms.ImageCmsProfile(BytesIO(profile_bytes)),
+        ImageCms.createProfile("sRGB"),
+        renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,
+        outputMode="RGB",
+    ).getpixel((0, 0))
+    if mode == "CMYK":
+        # Pillow's profile-less CMYK conversion would show different colours.
+        assert expected != Image.new(mode, (1, 1), color).convert("RGB").getpixel(
+            (0, 0)
+        )
+    opacity = Image.new("L", (4, 4), 0)
+    opacity.paste(255, (0, 0, 2, 4))
+    with Pdf.new() as pdf:
+        icc = pdf.make_stream(profile_bytes)
+        icc["/N"] = len(Image.new(mode, (1, 1)).getbands())
+        if explicit_range:
+            icc["/Range"] = Array([0, 1] * icc["/N"])
+        image = _flate_image(
+            pdf,
+            Image.new(mode, opacity.size, color),
+            ColorSpace=Array([Name.ICCBased, icc]),
+            SMask=_flate_image(pdf, opacity),
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, pdf, image)
+
+    assert (submitted[:, :2] == expected).all()
+    assert (submitted[:, 2:] == 255).all()
+
+
+@pytest.mark.parametrize(
+    ("mode", "color", "decode", "expected"),
+    [
+        ("L", 255, [1, 0], (0, 0, 0)),
+        ("L", 255, [0, 0.5], (128, 128, 128)),
+        ("1", 1, [1, 0], (0, 0, 0)),
+        ("RGB", (0, 0, 0), [1, 0, 0, 1, 0, 1], (255, 0, 0)),
+        ("CMYK", (0, 0, 0, 0), [0, 1, 0, 1, 0, 1, 1, 0], (0, 0, 0, 255)),
+    ],
+)
+@pytest.mark.parametrize("tile_pixels", [8, 3])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_applies_image_decode_before_compositing(
+    mock_session_class: MagicMock,
+    mode: str,
+    color: int | tuple[int, ...],
+    decode: list[float],
+    expected: tuple[int, ...],
+    tile_pixels: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "pdftopdfa.converter._FIGURE_OCR_COMPOSITE_TILE_PIXELS", tile_pixels
+    )
+    if mode == "CMYK":
+        # Decoded DeviceCMYK samples are shown through the CMYK OutputIntent.
+        expected = _cmyk_srgb(expected)
+    opacity = Image.new("L", (4, 4), 0)
+    opacity.paste(255, (0, 0, 2, 4))
+    with Pdf.new() as pdf:
+        _add_pdfa_output_intent(pdf, get_cmyk_profile(), 4)
+        image = _flate_image(
+            pdf,
+            Image.new(mode, opacity.size, color),
+            Decode=Array(decode),
+            SMask=_flate_image(pdf, opacity),
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, pdf, image)
+
+    assert (submitted[:, :2] == expected).all()
+    assert (submitted[:, 2:] == 255).all()
+
+
+@pytest.mark.parametrize("base_mode", ["L", "RGB", "CMYK"])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_undoes_palette_matte(
+    mock_session_class: MagicMock,
+    base_mode: str,
+) -> None:
+    color = {
+        "L": [96.0],
+        "RGB": [200.0, 100.0, 50.0],
+        "CMYK": [40.0, 160.0, 0.0, 30.0],
+    }[base_mode]
+    matte_color = {
+        "L": [255.0],
+        "RGB": [0.0, 0.0, 255.0],
+        "CMYK": [0.0, 0.0, 0.0, 255.0],
+    }[base_mode]
+    alphas = np.array([[255.0, 128.0]])
+    opacity = alphas[..., None] / 255
+    # ISO 32000-2, 11.6.5.3: palette entry 0 is the matte colour; entry 1
+    # (opaque) and entry 2 (half opaque) hold the colour pre-blended with it.
+    stored = np.rint(
+        np.array(matte_color) + opacity * (np.array(color) - matte_color)
+    ).astype(np.uint8)
+    lookup = bytes(np.array(matte_color, dtype=np.uint8)) + stored.tobytes()
+    fill = tuple(int(value) for value in color)
+    straight = Image.new(base_mode, (1, 1), fill[0] if base_mode == "L" else fill)
+    if base_mode == "CMYK":
+        visible = np.array(_cmyk_srgb(straight.getpixel((0, 0))), dtype=float)
+    else:
+        visible = np.asarray(straight.convert("RGB"), dtype=float).reshape(3)
+    expected = opacity * visible + (1 - opacity) * 255
+    with Pdf.new() as pdf:
+        _add_pdfa_output_intent(pdf, get_cmyk_profile(), 4)
+        image = _flate_image(
+            pdf,
+            Image.fromarray(np.array([[1, 2]], dtype=np.uint8)),
+            ColorSpace=Array(
+                [
+                    Name.Indexed,
+                    _DEVICE_COLOR_SPACES[base_mode],
+                    2,
+                    pikepdf.String(lookup),
+                ]
+            ),
+            SMask=_flate_image(
+                pdf,
+                Image.fromarray(alphas.astype(np.uint8)),
+                Matte=Array([0]),
+            ),
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, pdf, image)
+
+    assert submitted.shape == (1, 2, 3)
+    assert np.abs(submitted.astype(float) - expected).max() <= 2
+
+
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_decodes_image_before_undoing_matte(
+    mock_session_class: MagicMock,
+) -> None:
+    gray = 64.0
+    alphas = np.array([[255.0, 128.0]])
+    # The black-matted components are stored inverted, through /Decode [1 0].
+    stored = alphas / 255 * gray
+    expected = alphas / 255 * gray + (1 - alphas / 255) * 255
+    with Pdf.new() as pdf:
+        image = _flate_image(
+            pdf,
+            Image.fromarray(np.rint(255 - stored).astype(np.uint8)),
+            Decode=Array([1, 0]),
+            SMask=_flate_image(
+                pdf,
+                Image.fromarray(alphas.astype(np.uint8)),
+                Matte=Array([0]),
+            ),
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, pdf, image)
+
+    assert np.abs(submitted[..., 0].astype(float) - expected).max() <= 1.5
+
+
+@pytest.mark.parametrize(
+    ("intent", "graphics_state_intent"),
+    [
+        (None, "/RelativeColorimetric"),
+        (None, "/Perceptual"),
+        (None, "/Saturation"),
+        (None, "/AbsoluteColorimetric"),
+        ("/RelativeColorimetric", "/Perceptual"),
+        ("/AbsoluteColorimetric", "/RelativeColorimetric"),
+        ("/Perceptual", "/RelativeColorimetric"),
+        ("/Saturation", "/RelativeColorimetric"),
+        # An unrecognized image /Intent selects RelativeColorimetric.
+        ("/Unknown", "/Perceptual"),
+    ],
+)
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_uses_effective_rendering_intent(
+    mock_session_class: MagicMock,
+    intent: str | None,
+    graphics_state_intent: str,
+) -> None:
+    black = (0, 0, 0, 255)
+    rendering_intent = {
+        "/AbsoluteColorimetric": ImageCms.Intent.ABSOLUTE_COLORIMETRIC,
+        "/Perceptual": ImageCms.Intent.PERCEPTUAL,
+        "/Saturation": ImageCms.Intent.SATURATION,
+    }.get(
+        graphics_state_intent if intent is None else intent,
+        ImageCms.Intent.RELATIVE_COLORIMETRIC,
+    )
+    expected = _cmyk_srgb(black, rendering_intent)
+    # The profile renders black differently under each intent.
+    assert (expected != _cmyk_srgb(black)) == (
+        rendering_intent != ImageCms.Intent.RELATIVE_COLORIMETRIC
+    )
+    opacity = Image.new("L", (4, 4), 0)
+    opacity.paste(255, (0, 0, 2, 4))
+    entries = {} if intent is None else {"Intent": Name(intent)}
+    with Pdf.new() as pdf:
+        icc = pdf.make_stream(get_cmyk_profile())
+        icc["/N"] = 4
+        image = _flate_image(
+            pdf,
+            Image.new("CMYK", opacity.size, black),
+            ColorSpace=Array([Name.ICCBased, icc]),
+            SMask=_flate_image(pdf, opacity),
+            **entries,
+        )
+        [submitted] = _figure_ocr_submissions(
+            mock_session_class,
+            pdf,
+            image,
+            rendering_intent=graphics_state_intent,
+        )
+
+    assert (submitted[:, :2] == expected).all()
+    assert (submitted[:, 2:] == 255).all()
+
+
+@pytest.mark.parametrize(
+    "source", ["output_intent", "default_color_space", "indexed_output_intent"]
+)
+@patch("pdftopdfa.converter._FIGURE_OCR_COMPOSITE_TILE_PIXELS", 8)
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_converts_device_cmyk_through_its_profile(
+    mock_session_class: MagicMock,
+    source: str,
+) -> None:
+    cyan = (255, 0, 0, 0)
+    expected = _cmyk_srgb(cyan)
+    # Pillow's profile-less CMYK conversion would show different colours.
+    assert expected != Image.new("CMYK", (1, 1), cyan).convert("RGB").getpixel((0, 0))
+    opacity = Image.new("L", (4, 4), 0)
+    opacity.paste(255, (0, 0, 2, 4))
+    resources = None
+    with Pdf.new() as pdf:
+        if source == "default_color_space":
+            # An RGB OutputIntent leaves DeviceCMYK to the /DefaultCMYK of the
+            # resources that paint the image.
+            _add_pdfa_output_intent(pdf, get_srgb_profile(), 3)
+            resources = _icc_resources(pdf, "/DefaultCMYK", get_cmyk_profile(), 4)
+        else:
+            _add_pdfa_output_intent(pdf, get_cmyk_profile(), 4)
+        if source == "indexed_output_intent":
+            image = _flate_image(
+                pdf,
+                Image.new("L", opacity.size, 1),
+                ColorSpace=Array(
+                    [
+                        Name.Indexed,
+                        Name.DeviceCMYK,
+                        1,
+                        pikepdf.String(bytes((0, 0, 0, 0, *cyan))),
+                    ]
+                ),
+                SMask=_flate_image(pdf, opacity),
+            )
+        else:
+            image = _flate_image(
+                pdf,
+                Image.new("CMYK", opacity.size, cyan),
+                SMask=_flate_image(pdf, opacity),
+            )
+        [submitted] = _figure_ocr_submissions(
+            mock_session_class, pdf, image, resources=resources
+        )
+
+    assert (submitted[:, :2] == expected).all()
+    assert (submitted[:, 2:] == 255).all()
+
+
+@pytest.mark.parametrize("bits_per_component", [8, 1])
+@pytest.mark.parametrize("icc_based", [False, True])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_expands_cmyk_palette_from_lookup(
+    mock_session_class: MagicMock,
+    bits_per_component: int,
+    icc_based: bool,
+) -> None:
+    k_black = (0, 0, 0, 255)
+    rich_black = (255, 255, 255, 255)
+    expected = np.array([_cmyk_srgb(k_black), _cmyk_srgb(rich_black)])
+    # Both inks look alike without a profile, so they must reach the CMYK
+    # profile as the components of the lookup table.
+    unprofiled = [
+        Image.new("CMYK", (1, 1), ink).convert("RGB").getpixel((0, 0))
+        for ink in (k_black, rich_black)
+    ]
+    assert unprofiled[0] == unprofiled[1]
+    assert (expected[0] != expected[1]).any()
+    indices = np.array([[0, 1]], dtype=np.uint8)
+    samples = (
+        Image.fromarray(indices * 255).convert("1")
+        if bits_per_component == 1
+        else Image.fromarray(indices)
+    )
+    with Pdf.new() as pdf:
+        _add_pdfa_output_intent(pdf, get_cmyk_profile(), 4)
+        base: object = Name.DeviceCMYK
+        if icc_based:
+            icc = pdf.make_stream(get_cmyk_profile())
+            icc["/N"] = 4
+            base = Array([Name.ICCBased, icc])
+        image = _flate_image(
+            pdf,
+            samples,
+            ColorSpace=Array(
+                [Name.Indexed, base, 1, pikepdf.String(bytes(k_black + rich_black))]
+            ),
+            SMask=_flate_image(pdf, Image.new("L", samples.size, 255)),
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, pdf, image)
+
+    assert (submitted.reshape(2, 3) == expected).all()
+
+
+@pytest.mark.parametrize(
+    ("bits_per_component", "hival", "indices"),
+    [
+        (8, 2, [0, 2, 3, 255]),
+        (4, 5, [0, 5, 6, 15]),
+        (2, 2, [0, 1, 2, 3]),
+        # A sample of 1 is out of range of a one-entry 1-bit palette.
+        (1, 0, [0, 1, 1, 0]),
+    ],
+)
+@pytest.mark.parametrize("base_mode", ["L", "RGB", "CMYK"])
+@pytest.mark.parametrize("soft_masked", [False, True])
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_clamps_palette_indices_to_hival(
+    mock_session_class: MagicMock,
+    soft_masked: bool,
+    base_mode: str,
+    bits_per_component: int,
+    hival: int,
+    indices: list[int],
+) -> None:
+    components = len(base_mode)
+    lookup = bytes(
+        40 + 30 * entry + 20 * component
+        for entry in range(hival + 1)
+        for component in range(components)
+    )
+    # The whole image, so opaque images are submitted as RGB crops too.
+    whole = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+
+    def submitted(samples: list[int]) -> np.ndarray:
+        with Pdf.new() as pdf:
+            _add_pdfa_output_intent(pdf, get_cmyk_profile(), 4)
+            size = (len(samples), 1)
+            image = _flate_image(
+                pdf,
+                Image.new("L", size),
+                ColorSpace=Array(
+                    [
+                        Name.Indexed,
+                        _DEVICE_COLOR_SPACES[base_mode],
+                        hival,
+                        pikepdf.String(lookup),
+                    ]
+                ),
+                **(
+                    {"SMask": _flate_image(pdf, Image.new("L", size, 255))}
+                    if soft_masked
+                    else {}
+                ),
+            )
+            bits = np.unpackbits(np.array(samples, dtype=np.uint8)[:, None], axis=1)
+            image.write(
+                zlib.compress(np.packbits(bits[:, 8 - bits_per_component :])),
+                filter=Name.FlateDecode,
+            )
+            image["/BitsPerComponent"] = bits_per_component
+            [result] = _figure_ocr_submissions(mock_session_class, pdf, image, (whole,))
+        return result
+
+    clamped = [min(index, hival) for index in indices]
+    expected = submitted(clamped)
+    # Each palette entry used has its own colour.
+    assert len({tuple(pixel) for pixel in expected[0]}) == len(set(clamped))
+    assert (submitted(indices) == expected).all()
+
+
+@pytest.mark.parametrize(
+    ("mode", "color", "output_intent", "components"),
+    [
+        ("L", 90, get_gray_profile, 1),
+        ("RGB", (200, 30, 90), get_srgb_profile, 3),
+        # A CMYK OutputIntent does not describe DeviceRGB samples.
+        ("RGB", (200, 30, 90), get_cmyk_profile, 4),
+    ],
+)
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_uses_matching_output_intent_for_device_colours(
+    mock_session_class: MagicMock,
+    mode: str,
+    color: int | tuple[int, ...],
+    output_intent: Callable[[], bytes],
+    components: int,
+) -> None:
+    sample = Image.new(mode, (1, 1), color)
+    if components == len(sample.getbands()):
+        sample = ImageCms.profileToProfile(
+            sample,
+            ImageCms.ImageCmsProfile(BytesIO(output_intent())),
+            ImageCms.createProfile("sRGB"),
+            renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,
+            outputMode="RGB",
+        )
+    expected = sample.convert("RGB").getpixel((0, 0))
+    opacity = Image.new("L", (4, 4), 0)
+    opacity.paste(255, (0, 0, 2, 4))
+    with Pdf.new() as pdf:
+        _add_pdfa_output_intent(pdf, output_intent(), components)
+        image = _flate_image(
+            pdf,
+            Image.new(mode, opacity.size, color),
+            SMask=_flate_image(pdf, opacity),
+        )
+        [submitted] = _figure_ocr_submissions(mock_session_class, pdf, image)
+
+    assert (submitted[:, :2] == expected).all()
+    assert (submitted[:, 2:] == 255).all()
+
+
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_keys_soft_masked_images_by_default_color_space(
+    mock_session_class: MagicMock,
+) -> None:
+    session = mock_session_class.return_value.__enter__.return_value
+    session.recognize_image.return_value = [("Visible", 0.99)]
+    with Pdf.new() as pdf:
+        defaults = _icc_resources(pdf, "/DefaultCMYK", get_cmyk_profile(), 4)
+        image = _flate_image(
+            pdf,
+            Image.new("CMYK", (4, 4), (255, 0, 0, 0)),
+            SMask=_flate_image(pdf, Image.new("L", (4, 4), 255)),
+        )
+        with _figure_text_recognizer(
+            enabled=True,
+            pdf=pdf,
+            detection_model_dir=_DETECTION_MODEL_DIR,
+            recognition_model_dir=_RECOGNITION_MODEL_DIR,
+            ocr_execution_provider="cpu",
+            ocr_languages=["en"],
+        ) as recognize:
+            assert recognize is not None
+            relative = "/RelativeColorimetric"
+            assert recognize(image, None, defaults, relative) == "Visible"
+            # Painted without /DefaultCMYK, the same samples have no defined
+            # appearance in a document without a CMYK OutputIntent.
+            assert (
+                recognize(image, None, Dictionary(), relative)
+                is _FigureOCRStatus.INELIGIBLE
+            )
+            assert recognize(image, None, defaults, relative) == "Visible"
+            # Another graphics-state rendering intent changes the composite.
+            assert recognize(image, None, defaults, "/Perceptual") == "Visible"
+
+    assert session.recognize_image.call_count == 2
+
+
+def _jpeg_image(pdf: Pdf, image: Image.Image, **entries: object) -> pikepdf.Stream:
+    """Return a DCT-encoded Image XObject holding *image*."""
+    data = BytesIO()
+    image.save(data, "JPEG", quality=95)
+    stream = _flate_image(pdf, image, **entries)
+    stream.write(data.getvalue(), filter=Name.DCTDecode)
+    return stream
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "color_space",
+        "decode",
+        "matte_components",
+        "matte_size",
+        "corrupt_data",
+        "image_decode_length",
+        "jpeg_image_decode",
+        "indexed_image_decode",
+        "cmyk_without_profile",
+        "default_color_space",
+        "default_components",
+        "palette_matte_components",
+        "palette_matte_index",
+        "palette_matte_fraction",
+        "icc_range",
+        "indexed_icc_range",
+        "default_icc_range",
+    ],
+)
+@patch("pdftopdfa.ocr.OCRSession")
+def test_figure_text_recognizer_rejects_unusable_soft_masks(
+    mock_session_class: MagicMock,
+    defect: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = mock_session_class.return_value.__enter__.return_value
+    with Pdf.new() as pdf:
+        soft_mask = _flate_image(pdf, Image.new("L", (4, 4), 255))
+        if defect == "color_space":
+            soft_mask["/ColorSpace"] = Name.DeviceRGB
+        elif defect == "decode":
+            soft_mask["/Decode"] = Array([0, 1, 0])
+        elif defect == "matte_components":
+            soft_mask["/Matte"] = Array([0, 0])
+        elif defect == "matte_size":
+            soft_mask = _flate_image(
+                pdf, Image.new("L", (2, 2), 255), Matte=Array([0, 0, 0])
+            )
+        elif defect == "corrupt_data":
+            soft_mask.write(b"not Flate data", filter=Name.FlateDecode)
+        base = Image.new("RGB", (4, 4), "black")
+        resources = None
+        if defect == "default_color_space":
+            # A CalRGB /DefaultRGB has no ICC profile to convert through.
+            resources = Dictionary(
+                ColorSpace=Dictionary(
+                    DefaultRGB=Array(
+                        [
+                            Name.CalRGB,
+                            Dictionary(WhitePoint=Array([0.9505, 1, 1.089])),
+                        ]
+                    )
+                )
+            )
+        elif defect == "default_icc_range":
+            # Remapped DeviceRGB components are clipped to the /Range.
+            resources = _icc_resources(pdf, "/DefaultRGB", get_srgb_profile(), 3)
+            resources["/ColorSpace"]["/DefaultRGB"][1]["/Range"] = Array([0, 0.5] * 3)
+        elif defect == "default_components":
+            # /DefaultCMYK takes precedence over the CMYK OutputIntent.
+            _add_pdfa_output_intent(pdf, get_cmyk_profile(), 4)
+            resources = _icc_resources(pdf, "/DefaultCMYK", get_srgb_profile(), 3)
+        if defect in {"cmyk_without_profile", "default_components"}:
+            base = Image.new("CMYK", (4, 4), (0, 0, 0, 255))
+        palette_mattes = {
+            # The /Matte of an Indexed image is one palette index.
+            "palette_matte_components": [0, 0, 0],
+            # The lookup string has a third entry, but hival ends at 1.
+            "palette_matte_index": [2],
+            "palette_matte_fraction": [0.5],
+        }
+        if defect in palette_mattes:
+            image = _flate_image(
+                pdf,
+                Image.new("L", (4, 4), 1),
+                ColorSpace=Array(
+                    [
+                        Name.Indexed,
+                        Name.DeviceRGB,
+                        1,
+                        pikepdf.String(bytes([0, 0, 0, 255, 255, 255, 9, 9, 9])),
+                    ]
+                ),
+                SMask=_flate_image(
+                    pdf,
+                    Image.new("L", (4, 4), 128),
+                    Matte=Array(palette_mattes[defect]),
+                ),
+            )
+        elif defect == "jpeg_image_decode":
+            image = _jpeg_image(
+                pdf, base, Decode=Array([1, 0, 1, 0, 1, 0]), SMask=soft_mask
+            )
+        elif defect in {"icc_range", "indexed_icc_range"}:
+            # Samples and palette entries decode to the /Range of the profile.
+            icc = pdf.make_stream(get_srgb_profile())
+            icc["/N"] = 3
+            icc["/Range"] = Array([0, 0.5] * 3)
+            color_space = Array([Name.ICCBased, icc])
+            if defect == "indexed_icc_range":
+                base = Image.new("L", (4, 4), 0)
+                color_space = Array(
+                    [Name.Indexed, color_space, 0, pikepdf.String(bytes(3))]
+                )
+            image = _flate_image(pdf, base, ColorSpace=color_space, SMask=soft_mask)
+        elif defect == "indexed_image_decode":
+            image = _flate_image(
+                pdf,
+                Image.new("L", (4, 4), 1),
+                ColorSpace=Array(
+                    [
+                        Name.Indexed,
+                        Name.DeviceRGB,
+                        1,
+                        pikepdf.String(bytes([0, 0, 0, 255, 255, 255])),
+                    ]
+                ),
+                Decode=Array([1, 0]),
+                SMask=soft_mask,
+            )
+        else:
+            image = _flate_image(pdf, base, SMask=soft_mask)
+            if defect == "image_decode_length":
+                image["/Decode"] = Array([1, 0])
+
+        with (
+            caplog.at_level(logging.WARNING, logger="pdftopdfa.converter"),
+            _figure_text_recognizer(
+                enabled=True,
+                pdf=pdf,
+                detection_model_dir=_DETECTION_MODEL_DIR,
+                recognition_model_dir=_RECOGNITION_MODEL_DIR,
+                ocr_execution_provider="cpu",
+                ocr_languages=["en"],
+            ) as recognize,
+        ):
+            assert recognize is not None
+            for _attempt in range(2):
+                assert (
+                    recognize(image, None, resources, "/RelativeColorimetric")
+                    is _FigureOCRStatus.INELIGIBLE
+                )
+
+    session.recognize_image.assert_not_called()
+    assert caplog.text.count("Could not extract Figure image for OCR") == 1
 
 
 def _windows_dacl_sddl(path: Path) -> str:
