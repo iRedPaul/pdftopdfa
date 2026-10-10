@@ -2,16 +2,22 @@
 
 ## [Unreleased]
 
+## [0.9.20] - 2026-10-10
+
+### Features
+
+- Add figure OCR support for soft-masked images with PDF color-space handling
+
 ### Changes
 
-- Run figure OCR on images with a soft mask (`/SMask`) by compositing them in front of white, honoring the `/Decode` arrays of image and soft mask, `/Matte` pre-blending (for palette images on the color of the matte index), and a soft-mask resolution that differs from the image (scaled without smoothing unless `/Interpolate` is set), and converting ICC-based image colors to sRGB first with the image's `/Intent` or, without one, the rendering intent of the painting graphics state (`ri` or ExtGState `/RI`); device colors are converted through the `/Default` color space of the painting resources or the PDF/A OutputIntent profile
-- Apply the figure OCR rule to soft-masked images as well: confidently recognized text becomes review-required `ActualText`, and Figures without accepted text become review-required Layout artifacts; stencil images, `/Mask`, JPEG 2000 `/SMaskInData`, DeviceCMYK images without a CMYK profile, ICC-based color spaces with a `/Range` other than 0 to 1, and soft-masked images whose composite would need more than 400 MB remain ineligible
+- Apply figure OCR review outcomes to soft-masked images, using review-required `ActualText` or Layout artifacts
+- Skip soft-masked images with unsupported masking, ICC ranges, unprofiled CMYK, or composites over 400 MB
 
 ### Bug Fixes
 
-- Keep the widths of WinAnsi non-breaking spaces and soft hyphens consistent with the embedded font program (rule 6.2.11.5)
-- Treat every image decoding failure during figure OCR, including a failed memory allocation, as ineligible instead of aborting the conversion
-- Give figure OCR palette samples above the highest palette index (`hival`) the color of that index, as pdf.js and MuPDF render them, instead of black or another palette entry
+- Honor image and soft-mask decode arrays, matte data, mask resolution, and rendering intent during figure OCR
+- Skip images that fail decoding or memory allocation, and clamp indexed samples above `hival`
+- Preserve WinAnsi non-breaking space and soft-hyphen widths from embedded font programs
 
 ## [0.9.19] - 2026-10-07
 
