@@ -652,7 +652,10 @@ The internal pipeline rejects the converted candidate when:
 
 - Optional content (layers) is malformed, cyclic, references unregistered
   groups, or has a default configuration whose visibility cannot be normalized
-  to `/BaseState /ON` without changing which layers are visible.
+  to `/BaseState /ON` without changing which layers are visible. Layers used
+  without a catalog `/OCProperties` entry are registered with every group
+  visible, unless a membership policy or visibility expression would then hide
+  content that viewers currently show.
 - The saved candidate fails post-save structure verification -- missing binary
   comment, wrong `%PDF-` header version, no `%%EOF` marker, or a trailer `/ID`
   that is not two non-empty byte strings.

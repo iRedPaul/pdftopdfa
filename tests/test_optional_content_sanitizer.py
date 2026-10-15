@@ -4,7 +4,7 @@
 
 """Tests for Optional Content (Layers) sanitization for PDF/A compliance."""
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from io import BytesIO
 
 import pikepdf
@@ -812,6 +812,7 @@ class TestIntegration:
         result = sanitize_for_pdfa(sample_pdf_obj, "3b")
 
         assert "oc_as_entries_removed" in result
+        assert "oc_properties_created" in result
         assert "oc_d_created" in result
         assert "oc_d_name_added" in result
         assert "oc_base_state_fixed" in result
@@ -1476,10 +1477,119 @@ class TestMissingOCGs:
         assert result["missing_ocgs_added"] == 200
         assert {item.objgen for item in pdf.Root.OCProperties.OCGs} == expected
 
-    def test_missing_ocproperties_with_controls_fails_atomically(self) -> None:
+    def test_missing_ocproperties_is_created_for_form_layer(self) -> None:
+        """A Form XObject layer without a catalog entry is registered as visible.
+
+        Matches embedded Illustrator artwork in LibreOffice exports: the form's
+        /Properties names an OCG, but the catalog has no /OCProperties.
+        """
         pdf = new_pdf()
-        ocg = pdf.make_indirect(Dictionary(Type=Name.OCG, Name="Layer"))
-        properties = Dictionary(MC0=ocg)
+        ocg = pdf.make_indirect(
+            Dictionary(
+                Type=Name.OCG,
+                Name="Ebene 1",
+                Intent=Array([Name.View, Name.Design]),
+            )
+        )
+        form = pdf.make_stream(b"/OC /MC0 BDC 0 0 10 10 re f EMC")
+        form["/Type"] = Name.XObject
+        form["/Subtype"] = Name.Form
+        form["/BBox"] = Array([0, 0, 10, 10])
+        form["/Resources"] = Dictionary(Properties=Dictionary(MC0=ocg))
+        pdf.pages.append(
+            pikepdf.Page(
+                Dictionary(
+                    Type=Name.Page,
+                    MediaBox=Array([0, 0, 100, 100]),
+                    Resources=Dictionary(XObject=Dictionary(Fm0=form)),
+                )
+            )
+        )
+
+        result = sanitize_optional_content(pdf)
+
+        assert result["properties_created"] is True
+        assert result["d_created"] is True
+        assert result["missing_ocgs_added"] == 1
+        buffer = BytesIO()
+        pdf.save(buffer)
+        with pikepdf.open(BytesIO(buffer.getvalue())) as reopened:
+            properties = reopened.Root.OCProperties
+            assert [str(item.Name) for item in properties.OCGs] == ["Ebene 1"]
+            layer = properties.OCGs[0]
+            form = reopened.pages[0].Resources.XObject.Fm0
+            assert form.Resources.Properties.MC0.objgen == layer.objgen
+            assert str(properties.D.Name) == "Default"
+            assert properties.D.BaseState == Name.ON
+            assert "/OFF" not in properties.D
+            assert "/AS" not in properties.D
+            assert [item.objgen for item in properties.D.Order] == [layer.objgen]
+            visibility = _default_optional_content_visibility(reopened)
+            assert visibility.is_visible(layer) is True
+
+    @pytest.mark.parametrize(
+        ("intent", "policy"),
+        [
+            (Name.View, Name.AnyOn),
+            (Name.View, Name.AllOn),
+            # A group outside the default /View intent has no visibility effect.
+            (Name.Design, Name.AllOff),
+        ],
+    )
+    def test_missing_ocproperties_is_created_for_visible_ocmd(
+        self,
+        intent: Name,
+        policy: Name,
+    ) -> None:
+        pdf = new_pdf()
+        ocg = pdf.make_indirect(Dictionary(Type=Name.OCG, Name="Layer", Intent=intent))
+        membership = Dictionary(Type=Name.OCMD, OCGs=Array([ocg]), P=policy)
+        pdf.pages.append(
+            pikepdf.Page(
+                Dictionary(
+                    Type=Name.Page,
+                    MediaBox=Array([0, 0, 100, 100]),
+                    Resources=Dictionary(Properties=Dictionary(MC0=membership)),
+                )
+            )
+        )
+
+        result = sanitize_optional_content(pdf)
+
+        assert result["properties_created"] is True
+        assert [item.objgen for item in pdf.Root.OCProperties.OCGs] == [ocg.objgen]
+        visibility = _default_optional_content_visibility(pdf)
+        assert visibility.is_visible(membership) is True
+
+    @pytest.mark.parametrize(
+        "make_membership",
+        [
+            pytest.param(
+                lambda ocg: Dictionary(
+                    Type=Name.OCMD, OCGs=Array([ocg]), P=Name.AllOff
+                ),
+                id="all-off",
+            ),
+            pytest.param(
+                lambda ocg: Dictionary(
+                    Type=Name.OCMD, OCGs=Array([ocg]), P=Name.AnyOff
+                ),
+                id="any-off",
+            ),
+            pytest.param(
+                lambda ocg: Dictionary(Type=Name.OCMD, VE=Array([Name.Not, ocg])),
+                id="not-expression",
+            ),
+        ],
+    )
+    def test_missing_ocproperties_that_would_hide_content_fails_atomically(
+        self,
+        make_membership: Callable[[Dictionary], Dictionary],
+    ) -> None:
+        """Content ignored without /OCProperties must not become hidden."""
+        pdf = new_pdf()
+        ocg = pdf.make_indirect(Dictionary(Type=Name.OCG))
+        properties = Dictionary(MC0=make_membership(ocg))
         page = pikepdf.Page(
             Dictionary(
                 Type=Name.Page,
@@ -1492,13 +1602,13 @@ class TestMissingOCGs:
         original_page_keys = set(page.obj.keys())
         original_object_count = len(pdf.objects)
 
-        with pytest.raises(ValueError, match="require a catalog /OCProperties"):
+        with pytest.raises(ValueError, match="would hide content"):
             sanitize_optional_content(pdf)
 
         assert set(pdf.Root.keys()) == original_root_keys
         assert "/OCProperties" not in pdf.Root
         assert set(page.obj.keys()) == original_page_keys
-        assert page.obj.Resources.Properties.MC0.objgen == ocg.objgen
+        assert "/Name" not in ocg
         assert len(pdf.objects) == original_object_count
 
 
