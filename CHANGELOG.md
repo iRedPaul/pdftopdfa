@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- Register layers that lack a catalog `/OCProperties` entry, such as embedded Illustrator artwork in LibreOffice exports, instead of skipping the conversion
+
 ## [0.9.20] - 2026-10-10
 
 ### Features

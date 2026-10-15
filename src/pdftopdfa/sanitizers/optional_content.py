@@ -110,9 +110,12 @@ class _DefaultOCVisibility:
     ``is_visible()`` is the internal API used by semantic tagging. It accepts an
     OCG or OCMD dictionary (direct or indirect), implements all four ``/P``
     policies, and gives a valid ``/VE`` expression precedence over ``/P``.
+
+    ``properties`` evaluates a planned ``/OCProperties`` dictionary instead of
+    the catalog entry, so a repair can be checked before it is written.
     """
 
-    def __init__(self, pdf: Pdf):
+    def __init__(self, pdf: Pdf, *, properties: Dictionary | None = None):
         self._enabled = False
         self._identities = _ObjectIdentities()
         self._states: dict[tuple[object, ...], bool] = {}
@@ -121,7 +124,9 @@ class _DefaultOCVisibility:
         self._expressions: dict[tuple[object, ...], bool | None] = {}
         self._work = 0
 
-        raw_properties = pdf.Root.get("/OCProperties")
+        raw_properties = (
+            pdf.Root.get("/OCProperties") if properties is None else properties
+        )
         if raw_properties is None:
             return
         properties = _resolve_indirect(raw_properties)
@@ -350,6 +355,7 @@ class _OptionalContentCollector:
         self._resource_limit = resource_limit
         self.identities = _ObjectIdentities()
         self.ocgs: dict[tuple[object, ...], Dictionary] = {}
+        self.ocmds: list[Dictionary] = []
         self.has_controls = False
         self._memberships: set[tuple[object, ...]] = set()
         self._expressions: set[tuple[object, ...]] = set()
@@ -392,6 +398,7 @@ class _OptionalContentCollector:
         if key in self._memberships:
             return
         self._memberships.add(key)
+        self.ocmds.append(membership)
 
         policy = _resolve_indirect(membership.get("/P", Name.AnyOn))
         if policy not in {Name.AllOn, Name.AnyOn, Name.AllOff, Name.AnyOff}:
@@ -545,6 +552,7 @@ class _OrderUpdate:
 @dataclass
 class _OptionalContentPlan:
     properties: Dictionary
+    properties_created: bool
     default: Dictionary
     default_created: bool
     ocgs_missing: bool
@@ -577,6 +585,7 @@ def sanitize_optional_content(pdf: Pdf) -> dict:
         Dictionary with keys:
         - as_entries_removed: Number of /AS entries removed from configs
         - ocgs_processed: Total number of OCGs processed
+        - properties_created: Whether a catalog /OCProperties was created
         - d_created: Whether a default configuration was created
         - d_name_added: Whether the default configuration gained a /Name
         - base_state_fixed: 1 if the default /BaseState was normalized to /ON
@@ -593,6 +602,7 @@ def sanitize_optional_content(pdf: Pdf) -> dict:
     result = {
         "as_entries_removed": 0,
         "ocgs_processed": 0,
+        "properties_created": False,
         "d_created": False,
         "d_name_added": False,
         "base_state_fixed": 0,
@@ -642,10 +652,14 @@ def sanitize_optional_content(pdf: Pdf) -> dict:
             for ocg in update.ocgs:
                 order.append(ocg)
 
+    if plan.properties_created:
+        pdf.Root["/OCProperties"] = plan.properties
+
     result.update(
         {
             "as_entries_removed": len(plan.as_configs),
             "ocgs_processed": len(plan.all_ocgs),
+            "properties_created": plan.properties_created,
             "d_created": plan.default_created,
             "d_name_added": plan.d_name_changed,
             "base_state_fixed": int(plan.normalize_default_base),
@@ -668,6 +682,7 @@ def sanitize_optional_content(pdf: Pdf) -> dict:
         + result["order_ocgs_added"]
         + int(result["d_name_added"])
         + int(result["d_created"])
+        + int(result["properties_created"])
     )
     if changes > 0:
         logger.info(
@@ -676,7 +691,7 @@ def sanitize_optional_content(pdf: Pdf) -> dict:
             "%d config names added, "
             "%d missing OCGs added, "
             "%d OCG names added, %d Order OCGs added, "
-            "D created: %s, D /Name added: %s",
+            "OCProperties created: %s, D created: %s, D /Name added: %s",
             result["as_entries_removed"],
             result["base_state_fixed"],
             result["default_intent_fixed"],
@@ -684,6 +699,7 @@ def sanitize_optional_content(pdf: Pdf) -> dict:
             result["missing_ocgs_added"],
             result["ocg_names_added"],
             result["order_ocgs_added"],
+            result["properties_created"],
             result["d_created"],
             result["d_name_added"],
         )
@@ -930,20 +946,43 @@ def _scan_optional_content(pdf: Pdf, collector: _OptionalContentCollector) -> No
                     scan_owner(resource)
 
 
+def _check_synthesized_visibility(
+    pdf: Pdf,
+    collector: _OptionalContentCollector,
+    ocgs: list[Dictionary],
+    default: Dictionary,
+) -> None:
+    """Reject a synthesized ``/OCProperties`` that would hide content.
+
+    Without ``/OCProperties`` consumers ignore optional-content controls and
+    render everything. Registering the groups under an all-``/ON`` default
+    keeps every OCG membership visible, but an OCMD with an ``/AllOff`` or
+    ``/AnyOff`` policy or a ``/Not`` expression would start hiding content.
+    """
+    planned = Dictionary(OCGs=Array(ocgs), D=default)
+    visibility = _DefaultOCVisibility(pdf, properties=planned)
+    if not all(visibility.is_visible(ocmd) for ocmd in collector.ocmds):
+        raise ValueError(
+            "Optional-content controls without a catalog /OCProperties entry "
+            "would hide content once registered"
+        )
+
+
 def _preflight_optional_content(pdf: Pdf) -> _OptionalContentPlan | None:
     collector = _OptionalContentCollector(resource_limit=_resource_budget(pdf))
     raw_properties = pdf.Root.get("/OCProperties")
-    if raw_properties is None:
+    properties_created = raw_properties is None
+    if properties_created:
         _scan_optional_content(pdf, collector)
-        if collector.has_controls:
-            raise ValueError(
-                "Optional-content controls require a catalog /OCProperties entry"
-            )
-        return None
-
-    properties = _resolve_indirect(raw_properties)
-    if not isinstance(properties, Dictionary):
-        raise ValueError("Optional-content properties are malformed")
+        if not collector.has_controls:
+            return None
+        # Controls without a catalog entry are registered in a synthesized
+        # /OCProperties, provided that keeps everything visible (see below).
+        properties = Dictionary()
+    else:
+        properties = _resolve_indirect(raw_properties)
+        if not isinstance(properties, Dictionary):
+            raise ValueError("Optional-content properties are malformed")
 
     ocgs_missing = "/OCGs" not in properties
     original_keys: set[tuple[object, ...]] = set()
@@ -983,7 +1022,8 @@ def _preflight_optional_content(pdf: Pdf) -> _OptionalContentPlan | None:
 
     _validate_configuration_aliases(default, configs)
 
-    _scan_optional_content(pdf, collector)
+    if not properties_created:
+        _scan_optional_content(pdf, collector)
     default_info = _validate_configuration(collector, default, is_default=True)
     config_infos = [
         _validate_configuration(collector, config, is_default=False)
@@ -1007,6 +1047,9 @@ def _preflight_optional_content(pdf: Pdf) -> _OptionalContentPlan | None:
             name = ""
         if not name:
             ocg_name_updates.append(ocg)
+
+    if properties_created:
+        _check_synthesized_visibility(pdf, collector, all_ocgs, default)
 
     base_state = _resolve_indirect(default.get("/BaseState", Name.ON))
     normalize_default_base = base_state == Name.OFF
@@ -1044,6 +1087,7 @@ def _preflight_optional_content(pdf: Pdf) -> _OptionalContentPlan | None:
 
     return _OptionalContentPlan(
         properties=properties,
+        properties_created=properties_created,
         default=default,
         default_created=default_created,
         ocgs_missing=ocgs_missing,

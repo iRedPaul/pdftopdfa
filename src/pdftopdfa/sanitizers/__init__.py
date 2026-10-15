@@ -294,6 +294,7 @@ def sanitize_for_pdfa(
             f"Optional content cannot be made PDF/A compliant: {exc}"
         ) from exc
     result["oc_as_entries_removed"] = oc_result.get("as_entries_removed", 0)
+    result["oc_properties_created"] = oc_result.get("properties_created", False)
     result["oc_d_created"] = oc_result.get("d_created", False)
     result["oc_d_name_added"] = oc_result.get("d_name_added", False)
     result["oc_base_state_fixed"] = oc_result.get("base_state_fixed", 0)
