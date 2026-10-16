@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+- Add supplementary OCR for pages that already contain text and paint a raster image, such as invoices on letterhead images: existing text is masked before recognition, and only the new text layer is added to otherwise unchanged pages
+
+### Bug Fixes
+
+- Convert PDFs whose pages combine a full-page image with an existing text layer instead of skipping the conversion with "OCR skipped: an existing text layer could not be replaced"
+
+### Documentation
+
+- Document supplementary OCR, its image size threshold, raster resolution, and its fillable-form and page-size limitations
+
 ## [0.9.21] - 2026-10-15
 
 ### Bug Fixes
