@@ -28,7 +28,7 @@ from ocrmypdf.builtin_plugins import pypdfium as pypdfium_rasterizer
 from ocrmypdf.helpers import Resolution
 from ocrmypdf.hocrtransform import Baseline, BoundingBox, OcrClass, OcrElement
 from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
-from PIL import Image
+from PIL import Image, ImageDraw
 from pydantic import BaseModel
 
 from ._ocr_runtime import _MODEL_FILENAMES as _MODEL_FILENAMES
@@ -95,6 +95,7 @@ class _PaddleOptions(BaseModel):
     execution_provider: str = "cpu"
     layout: bool = False
     manifest_dir: Path | None = None
+    mask_all_text: bool = False
 
 
 class _TesseractCompatibilityOptions(BaseModel):
@@ -2082,6 +2083,11 @@ def add_options(parser: Any) -> None:
         type=Path,
         help=SUPPRESS,
     )
+    parser.add_argument(
+        "--paddle-mask-all-text",
+        action="store_true",
+        help=SUPPRESS,
+    )
 
 
 def _physical_page_dimensions(input_file: Path, pageno: int) -> tuple[float, float]:
@@ -2154,9 +2160,40 @@ def rasterize_pdf_page(
     )
 
 
+def _mask_existing_text(page: PageContext, image: Image.Image) -> None:
+    """Blank every existing text area, including invisible text, in place.
+
+    OCRmyPDF's redo mode masks only visible text. Supplementary OCR also masks
+    invisible text so that existing text layers are not recognized twice.
+    """
+    try:
+        scale_x, scale_y = (float(value) / 72.0 for value in image.info["dpi"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise OCRError("OCR raster has no resolution for text masking") from exc
+    if not all(math.isfinite(scale) and scale > 0 for scale in (scale_x, scale_y)):
+        raise OCRError("OCR raster has an invalid resolution for text masking")
+
+    draw = ImageDraw.Draw(image)
+    for textarea in page.pageinfo.get_textareas(visible=None, corrupt=None) or ():
+        x0, y0, x1, y1 = (float(value) for value in textarea)
+        draw.rectangle(
+            (
+                x0 * scale_x,
+                image.height - y1 * scale_y,
+                x1 * scale_x,
+                image.height - y0 * scale_y,
+            ),
+            fill="white",
+        )
+
+
 @ocrmypdf.hookimpl
 def filter_ocr_image(page: PageContext, image: Image.Image) -> None:
-    """Record OCRmyPDF's coordinate DPI without modifying the OCR raster."""
+    """Record OCRmyPDF's coordinate DPI and apply supplementary text masking."""
+    paddle_options = getattr(getattr(page, "options", None), "paddle", None)
+    if bool(getattr(paddle_options, "mask_all_text", False)):
+        _mask_existing_text(page, image)
+
     coordinate_dpi = float(page.pageinfo.dpi.to_scalar())
     if not math.isfinite(coordinate_dpi) or coordinate_dpi <= 0:
         image_dpi = image.info.get("dpi", (600.0, 600.0))

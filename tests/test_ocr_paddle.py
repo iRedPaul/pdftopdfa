@@ -13,6 +13,7 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -2009,6 +2010,45 @@ def test_filter_ocr_image_supplies_dpi_for_vector_only_force_page(
 
     assert pageinfo.dpi.to_scalar() == 600.0
     assert ocr_paddle._coordinate_dpi_by_image == {page_image.resolve(): 600.0}
+
+
+@pytest.mark.parametrize("mask_all_text", [False, True])
+def test_filter_ocr_image_masks_existing_text_for_supplementary_ocr(
+    tmp_path: Path,
+    mask_all_text: bool,
+) -> None:
+    page_image = tmp_path / "supplementary.png"
+    Image.new("RGB", (200, 200), "black").save(page_image, dpi=(144, 144))
+    requested: list[tuple[object, object]] = []
+
+    class TextPageInfo:
+        dpi = Resolution(144.0, 144.0)
+
+        def get_textareas(
+            self,
+            visible: bool | None = None,
+            corrupt: bool | None = None,
+        ) -> Iterator[tuple[float, float, float, float]]:
+            requested.append((visible, corrupt))
+            return iter([(10.0, 20.0, 30.0, 40.0)])
+
+    page_context = SimpleNamespace(
+        pageinfo=TextPageInfo(),
+        options=SimpleNamespace(paddle=SimpleNamespace(mask_all_text=mask_all_text)),
+        get_path=lambda _name: page_image,
+    )
+    image = Image.new("RGB", (200, 200), "black")
+    image.info["dpi"] = (144.0, 144.0)
+
+    ocr_paddle.filter_ocr_image(page_context, image)
+
+    # The PDF box spans x 20-60 px and y 120-160 px in the top-left raster.
+    assert image.getpixel((40, 140)) == (
+        (255, 255, 255) if mask_all_text else (0, 0, 0)
+    )
+    assert image.getpixel((40, 100)) == (0, 0, 0)
+    assert image.getpixel((100, 140)) == (0, 0, 0)
+    assert requested == ([(None, None)] if mask_all_text else [])
 
 
 def test_high_native_dpi_is_capped_before_real_rasterization(

@@ -74,6 +74,13 @@ _PADDLE_OCR_PLUGIN = "pdftopdfa.ocr_paddle"
 _ROTATION_FIX_PLUGIN = "pdftopdfa.ocr_rotation_fix"
 _SCAN_IMAGE_AREA_RATIO = 0.8
 _FULL_PAGE_IMAGE_AREA_RATIO = 1.0
+# Images below either limit cannot carry legible text, so they do not trigger
+# supplementary OCR on pages that already contain text.
+_SUPPLEMENTARY_OCR_MIN_IMAGE_PIXELS = 16
+_SUPPLEMENTARY_OCR_MIN_IMAGE_POINTS = 8.0
+# Supplementary OCR reads images that carry their own resolution, so it skips
+# the 600 dpi oversampling; OCRmyPDF still raises text pages to 400 dpi.
+_SUPPLEMENTARY_OCR_RASTER_DPI = 300
 _OCR_MANIFEST_SCHEMA_VERSION = 1
 _OCR_PAGE_MANIFEST_TYPE = "pdftopdfa-ocr-page"
 _OCR_DOCUMENT_MANIFEST_TYPE = "pdftopdfa-ocr-document"
@@ -361,7 +368,24 @@ class _DeskewPlan:
     regular_ocr_pages: tuple[int, ...]
     redo_ocr_pages: tuple[int, ...]
     strip_text_pages: tuple[int, ...]
-    ambiguous_scan_pages: tuple[int, ...] = ()
+    supplementary_ocr_pages: tuple[int, ...]
+
+
+class _SupplementaryOcrLogFilter(logging.Filter):
+    """Hide OCRmyPDF's redo warning that tagged structure will be discarded.
+
+    Supplementary OCR keeps the original pages and their structure tree, so the
+    warning is misleading for this thread's run only.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._thread = threading.get_ident()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (
+            record.thread == self._thread and "structural markup" in record.getMessage()
+        )
 
 
 def _object_key(value: "pikepdf.Object") -> _ObjectKey:
@@ -1048,13 +1072,56 @@ def _page_paint_analysis(page: "pikepdf.Page") -> _PagePaintAnalysis:
     return analysis
 
 
+def _has_supplementary_ocr_image(page_info: Any) -> bool:
+    """Return whether a page paints a raster image large enough to hold text."""
+    for image in page_info.images:
+        try:
+            if not image.renderable:
+                continue
+            width = int(image.width)
+            height = int(image.height)
+            dpi_x = float(image.dpi.x)
+            dpi_y = float(image.dpi.y)
+        except (AttributeError, TypeError, ValueError, ArithmeticError):
+            continue
+        if not (
+            math.isfinite(dpi_x) and math.isfinite(dpi_y) and dpi_x > 0 and dpi_y > 0
+        ):
+            continue
+        if min(width, height) < _SUPPLEMENTARY_OCR_MIN_IMAGE_PIXELS:
+            continue
+        rendered_points = min(width / dpi_x, height / dpi_y) * 72
+        if rendered_points >= _SUPPLEMENTARY_OCR_MIN_IMAGE_POINTS:
+            return True
+    return False
+
+
+def _supplementary_raster_fits(page: "pikepdf.Page") -> bool:
+    """Return whether a page can be rasterized for supplementary OCR."""
+    try:
+        media_box = [float(value) for value in page.mediabox]
+        user_unit = float(page.obj.get("/UserUnit", 1.0))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    dimensions = (
+        (media_box[2] - media_box[0]) * user_unit,
+        (media_box[3] - media_box[1]) * user_unit,
+    )
+    if not all(math.isfinite(value) and value > 0 for value in dimensions):
+        return False
+    pixels = _ocr_raster_pixel_count(dimensions, _SUPPLEMENTARY_OCR_RASTER_DPI)
+    return pixels <= _OCR_MAX_PAGE_RASTER_PIXELS
+
+
 def _plan_deskew_ocr(
     pdf_path: Path,
     *,
     annotated_pages: frozenset[int] | None = None,
 ) -> _DeskewPlan | None:
-    """Return disjoint page sets for regular OCR and scan-only deskew OCR.
+    """Return disjoint page sets for regular, deskew, redo, and supplementary OCR.
 
+    Pages that already contain text but also paint a non-trivial raster image
+    receive supplementary OCR, which only adds text for areas without text.
     ``None`` indicates that inspection failed and deskewing should be disabled.
     """
     import pikepdf
@@ -1070,7 +1137,7 @@ def _plan_deskew_ocr(
             regular_ocr_pages = []
             redo_ocr_pages = []
             strip_text_pages = []
-            ambiguous_scan_pages = []
+            supplementary_ocr_pages = []
             annotated_scan_pages = 0
             for page_number, (page_info, page) in enumerate(
                 zip(pdfinfo.pages, pdf.pages, strict=True),
@@ -1086,6 +1153,9 @@ def _plan_deskew_ocr(
                 has_renderable_image = any(
                     image.renderable for image in page_info.images
                 )
+                needs_supplementary_ocr = (
+                    page_info.has_text and _has_supplementary_ocr_image(page_info)
+                )
                 full_page_image_event = max(
                     (
                         event
@@ -1095,10 +1165,10 @@ def _plan_deskew_ocr(
                     default=-1,
                 )
                 if not safe_raster_content or not has_renderable_image:
-                    if page_info.has_text and full_page_image_event >= 0:
-                        ambiguous_scan_pages.append(page_number)
-                    elif not page_info.has_text:
+                    if not page_info.has_text:
                         regular_ocr_pages.append(page_number)
+                    elif needs_supplementary_ocr:
+                        supplementary_ocr_pages.append(page_number)
                     continue
 
                 has_visible_text = any(
@@ -1126,12 +1196,39 @@ def _plan_deskew_ocr(
                         strip_text_pages.append(page_number)
                 elif not page_info.has_text and not has_visible_text:
                     regular_ocr_pages.append(page_number)
+                elif needs_supplementary_ocr:
+                    supplementary_ocr_pages.append(page_number)
+
+            if supplementary_ocr_pages and pdfinfo.has_acroform:
+                logger.warning(
+                    "Supplementary OCR skipped for page(s) %s: OCRmyPDF cannot "
+                    "add text to pages of a PDF with a fillable form",
+                    supplementary_ocr_pages,
+                )
+                supplementary_ocr_pages = []
+            oversized_pages = [
+                page_number
+                for page_number in supplementary_ocr_pages
+                if not _supplementary_raster_fits(pdf.pages[page_number - 1])
+            ]
+            if oversized_pages:
+                logger.warning(
+                    "Supplementary OCR skipped for page(s) %s: the page is too "
+                    "large to rasterize within the OCR pixel limit",
+                    oversized_pages,
+                )
+                supplementary_ocr_pages = [
+                    page_number
+                    for page_number in supplementary_ocr_pages
+                    if page_number not in oversized_pages
+                ]
 
         logger.info(
-            "OCR planning selected %d deskew and %d mixed-content redo page(s) "
-            "from %d page(s)",
+            "OCR planning selected %d deskew, %d mixed-content redo, and %d "
+            "supplementary page(s) from %d page(s)",
             len(deskew_pages),
             len(redo_ocr_pages),
+            len(supplementary_ocr_pages),
             len(pdfinfo),
         )
         if annotated_scan_pages:
@@ -1139,18 +1236,12 @@ def _plan_deskew_ocr(
                 "Deskew skipped for %d annotated scan-like page(s)",
                 annotated_scan_pages,
             )
-        if ambiguous_scan_pages:
-            logger.warning(
-                "OCR skipped for page(s) %s: the existing text layer cannot be "
-                "safely replaced; original page content preserved",
-                ambiguous_scan_pages,
-            )
         return _DeskewPlan(
             tuple(deskew_pages),
             tuple(regular_ocr_pages),
             tuple(redo_ocr_pages),
             tuple(strip_text_pages),
-            tuple(ambiguous_scan_pages),
+            tuple(supplementary_ocr_pages),
         )
     except Exception as exc:
         log_suppressed_error(
@@ -1317,6 +1408,124 @@ def _ocr_form_names(pdf_path: Path) -> list[frozenset[str]]:
                 else frozenset()
             )
         return names
+
+
+def _form_shows_text(form: "pikepdf.Object") -> bool:
+    """Return whether an OCR Form paints at least one text-show operator."""
+    import pikepdf
+
+    text_show_operators = frozenset({"Tj", "TJ", "'", '"'})
+    return any(
+        str(operator) in text_show_operators
+        for _operands, operator in pikepdf.parse_content_stream(form)
+    )
+
+
+def _ocr_layer_instructions(
+    page: "pikepdf.Page",
+    form_names: frozenset[str],
+) -> list[Any]:
+    """Return OCRmyPDF's ``q [cm] /Name Do Q`` invocations of *form_names*."""
+    import pikepdf
+
+    instructions = list(pikepdf.parse_content_stream(page))
+    layer: list[Any] = []
+    found: set[str] = set()
+    for index, (operands, operator) in enumerate(instructions):
+        if str(operator) != "Do" or len(operands) != 1:
+            continue
+        name = str(operands[0])
+        if name not in form_names:
+            continue
+        start = index - 1
+        if start >= 0 and str(instructions[start][1]) == "cm":
+            start -= 1
+        if (
+            name in found
+            or start < 0
+            or str(instructions[start][1]) != "q"
+            or index + 1 >= len(instructions)
+            or str(instructions[index + 1][1]) != "Q"
+        ):
+            raise OCRError(f"Unexpected invocation of OCR Form {name}")
+        found.add(name)
+        layer.extend(instructions[start : index + 2])
+    if found != form_names:
+        raise OCRError(
+            f"OCR Forms are not invoked by the page: {sorted(form_names - found)}"
+        )
+    return layer
+
+
+def _graft_supplementary_ocr(
+    base_path: Path,
+    ocr_path: Path,
+    output_path: Path,
+    pages: tuple[int, ...],
+) -> frozenset[int]:
+    """Add new OCR text Forms to otherwise unchanged base pages.
+
+    OCRmyPDF's redo mode also strips invisible text and discards the structure
+    tree. Supplementary OCR therefore takes only the new OCR Form and its
+    invocation from the OCR output, leaving all existing content in place.
+
+    Returns:
+        One-based page numbers that received a text-bearing OCR Form.
+    """
+    import pikepdf
+
+    grafted: set[int] = set()
+    try:
+        with (
+            pikepdf.open(base_path) as base,
+            pikepdf.open(ocr_path) as recognized,
+        ):
+            if len(base.pages) != len(recognized.pages):
+                raise OCRError("Supplementary OCR changed the page count")
+            for page_number in pages:
+                base_page = base.pages[page_number - 1]
+                ocr_page = recognized.pages[page_number - 1]
+                base_xobjects = base_page.resources.get("/XObject")
+                existing_names = (
+                    frozenset(str(name) for name in base_xobjects.keys())
+                    if base_xobjects is not None
+                    else frozenset()
+                )
+                ocr_xobjects = ocr_page.resources.get("/XObject")
+                if ocr_xobjects is None:
+                    continue
+                new_forms = {
+                    str(name): form
+                    for name, form in ocr_xobjects.items()
+                    if str(name).startswith("/OCR-")
+                    and str(name) not in existing_names
+                    and form.get("/Subtype") == pikepdf.Name.Form
+                }
+                if not any(_form_shows_text(form) for form in new_forms.values()):
+                    continue
+                layer = _ocr_layer_instructions(ocr_page, frozenset(new_forms))
+
+                resources = _private_resources(base_page.resources)
+                xobjects = resources.get("/XObject")
+                if xobjects is None:
+                    xobjects = pikepdf.Dictionary()
+                    resources[pikepdf.Name.XObject] = xobjects
+                for name, form in new_forms.items():
+                    xobjects[name] = base.copy_foreign(form)
+                base_page.obj[pikepdf.Name.Resources] = resources
+                base_page.contents_add(
+                    pikepdf.Stream(base, pikepdf.unparse_content_stream(layer)),
+                    prepend=True,
+                )
+                grafted.add(page_number)
+            base.save(output_path)
+    except OCRError:
+        raise
+    except Exception as exc:
+        raise OCRError(
+            f"Could not add the supplementary OCR text layer: {exc}"
+        ) from exc
+    return frozenset(grafted)
 
 
 def _strip_invisible_text_from_form(form: "pikepdf.Stream") -> bool:
@@ -2875,9 +3084,13 @@ def apply_ocr(
     """Performs OCR on a PDF.
 
     Uses PaddleOCR for recognition and OCRmyPDF for rasterization, text-layer
-    rendering, and PDF merging. Digital text pages are skipped unless
-    ``force=True``. Raster-dominant full-page scans with a visible native text
-    overlay are re-OCRed while retaining that native text.
+    rendering, and PDF merging. Pages that already contain text and paint a
+    raster image, such as a letterhead background, receive supplementary OCR:
+    all existing text areas are masked before recognition, and only the new
+    text layer is added to the otherwise unchanged page. Digital text pages
+    without such images are skipped unless ``force=True``. Raster-dominant
+    full-page scans with a visible native text overlay are re-OCRed while
+    retaining that native text.
 
     Args:
         input_path: Path to the input PDF.
@@ -3012,6 +3225,8 @@ def apply_ocr(
         pages: tuple[int, ...] | None = None,
         deskew_run: bool = False,
         redo: bool = False,
+        mask_all_text: bool = False,
+        oversample: int | None = None,
     ) -> None:
         nonlocal manifest_run_number
 
@@ -3020,7 +3235,7 @@ def apply_ocr(
             "pdf_renderer": "fpdf2",
             "rasterizer": "pypdfium",
             "output_type": "pdf",
-            "oversample": planned_oversample,
+            "oversample": planned_oversample if oversample is None else oversample,
             "max_image_mpixels": _OCR_MAX_PAGE_RASTER_PIXELS / 1_000_000,
             "optimize": 0,
             "jobs": 1,
@@ -3039,6 +3254,8 @@ def apply_ocr(
         if redo:
             ocr_kwargs.pop("skip_text", None)
             ocr_kwargs["redo_ocr"] = True
+        if mask_all_text:
+            ocr_kwargs["paddle_mask_all_text"] = True
 
         run_manifest_directory: Path | None = None
         if manifest_temp is not None:
@@ -3067,6 +3284,32 @@ def apply_ocr(
                     f"{sorted(duplicate_pages)}"
                 )
             manifest_pages.update(run_pages)
+
+    def run_supplementary_ocr(
+        source: Path,
+        destination: Path,
+        pages: tuple[int, ...],
+        work_directory: Path,
+    ) -> None:
+        recognized = work_directory / "supplementary_recognition.pdf"
+        pipeline_logger = logging.getLogger("ocrmypdf._pipeline")
+        log_filter = _SupplementaryOcrLogFilter()
+        pipeline_logger.addFilter(log_filter)
+        try:
+            run_ocr(
+                source,
+                recognized,
+                pages=pages,
+                redo=True,
+                mask_all_text=True,
+                oversample=_SUPPLEMENTARY_OCR_RASTER_DPI,
+            )
+        finally:
+            pipeline_logger.removeFilter(log_filter)
+        grafted = _graft_supplementary_ocr(source, recognized, destination, pages)
+        for page_number in pages:
+            if page_number not in grafted:
+                manifest_pages.pop(page_number - 1, None)
 
     try:
         if manifest_output_path is not None:
@@ -3115,120 +3358,73 @@ def apply_ocr(
 
         if force:
             run_ocr(ocr_input_path, staged_output_path, redo=True)
-        elif not deskew:
-            plan = _plan_deskew_ocr(
-                ocr_input_path,
-                annotated_pages=_annotated_pages,
-            )
-            if plan is None:
-                run_ocr(ocr_input_path, staged_output_path)
-            else:
-                regular_pages = tuple(
-                    sorted((*plan.regular_ocr_pages, *plan.deskew_pages))
-                )
-                if (regular_pages or plan.redo_ocr_pages) and pipeline_temp is None:
-                    pipeline_temp = TemporaryDirectory(prefix="pdftopdfa_paddle_ocr_")
-                current_input = ocr_input_path
-                if plan.strip_text_pages:
-                    prepared_input = Path(pipeline_temp.name) / "ocr_input.pdf"
-                    _prepare_deskew_input(
-                        current_input,
-                        prepared_input,
-                        plan.strip_text_pages,
-                    )
-                    current_input = prepared_input
-                if regular_pages:
-                    regular_output = (
-                        staged_output_path
-                        if not plan.redo_ocr_pages
-                        else Path(pipeline_temp.name) / "regular_ocr.pdf"
-                    )
-                    run_ocr(
-                        current_input,
-                        regular_output,
-                        pages=regular_pages,
-                    )
-                    current_input = regular_output
-                if plan.redo_ocr_pages:
-                    run_ocr(
-                        current_input,
-                        staged_output_path,
-                        pages=plan.redo_ocr_pages,
-                        redo=True,
-                    )
-                elif not regular_pages:
-                    if plan.ambiguous_scan_pages:
-                        raise PriorOcrFoundError()
-                    shutil.copy2(current_input, staged_output_path)
         else:
             plan = _plan_deskew_ocr(
                 ocr_input_path,
                 annotated_pages=_annotated_pages,
             )
             if plan is None:
-                logger.warning(
-                    "Deskew disabled because scan-like pages could not be "
-                    "identified safely"
-                )
-                run_ocr(ocr_input_path, staged_output_path)
-            elif (
-                not plan.deskew_pages
-                and not plan.regular_ocr_pages
-                and not plan.redo_ocr_pages
-            ):
-                if plan.ambiguous_scan_pages:
-                    raise PriorOcrFoundError()
-                shutil.copy2(ocr_input_path, staged_output_path)
-            else:
-                if pipeline_temp is None:
-                    pipeline_temp = TemporaryDirectory(
-                        prefix="pdftopdfa_paddle_deskew_"
+                if deskew:
+                    logger.warning(
+                        "Deskew disabled because scan-like pages could not be "
+                        "identified safely"
                     )
+                run_ocr(ocr_input_path, staged_output_path)
+            else:
+                if deskew:
+                    regular_pages = plan.regular_ocr_pages
+                    deskew_pages = plan.deskew_pages
+                else:
+                    regular_pages = tuple(
+                        sorted((*plan.regular_ocr_pages, *plan.deskew_pages))
+                    )
+                    deskew_pages = ()
+                # Disjoint page runs; each run's output feeds the next one.
+                runs = [
+                    (run_name, pages)
+                    for run_name, pages in (
+                        ("regular", regular_pages),
+                        ("deskew", deskew_pages),
+                        ("redo", plan.redo_ocr_pages),
+                        ("supplementary", plan.supplementary_ocr_pages),
+                    )
+                    if pages
+                ]
+                if (runs or plan.strip_text_pages) and pipeline_temp is None:
+                    pipeline_temp = TemporaryDirectory(prefix="pdftopdfa_paddle_ocr_")
                 current_input = ocr_input_path
-
                 if plan.strip_text_pages:
-                    prepared_input = Path(pipeline_temp.name) / "ocr_input.pdf"
+                    prepared_input = Path(pipeline_temp.name) / "stripped_input.pdf"
                     _prepare_deskew_input(
                         current_input,
                         prepared_input,
                         plan.strip_text_pages,
                     )
                     current_input = prepared_input
-
-                if plan.regular_ocr_pages:
-                    regular_output = (
+                if not runs:
+                    shutil.copy2(current_input, staged_output_path)
+                for run_index, (run_name, pages) in enumerate(runs):
+                    run_output = (
                         staged_output_path
-                        if not plan.deskew_pages and not plan.redo_ocr_pages
-                        else Path(pipeline_temp.name) / "regular_ocr.pdf"
+                        if run_index == len(runs) - 1
+                        else Path(pipeline_temp.name) / f"{run_name}_ocr.pdf"
                     )
-                    run_ocr(
-                        current_input,
-                        regular_output,
-                        pages=plan.regular_ocr_pages,
-                    )
-                    current_input = regular_output
-
-                if plan.deskew_pages:
-                    deskew_output = (
-                        staged_output_path
-                        if not plan.redo_ocr_pages
-                        else Path(pipeline_temp.name) / "deskew_ocr.pdf"
-                    )
-                    run_ocr(
-                        current_input,
-                        deskew_output,
-                        pages=plan.deskew_pages,
-                        deskew_run=True,
-                    )
-                    current_input = deskew_output
-
-                if plan.redo_ocr_pages:
-                    run_ocr(
-                        current_input,
-                        staged_output_path,
-                        pages=plan.redo_ocr_pages,
-                        redo=True,
-                    )
+                    if run_name == "supplementary":
+                        run_supplementary_ocr(
+                            current_input,
+                            run_output,
+                            pages,
+                            Path(pipeline_temp.name),
+                        )
+                    else:
+                        run_ocr(
+                            current_input,
+                            run_output,
+                            pages=pages,
+                            deskew_run=run_name == "deskew",
+                            redo=run_name == "redo",
+                        )
+                    current_input = run_output
 
         new_ocr_form_names = _finalize_ocr_output(
             staged_output_path,
