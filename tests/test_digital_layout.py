@@ -1868,6 +1868,35 @@ def test_curved_clip_containment_work_is_budgeted_per_document(
     assert second.spans[0].final_paint_uncertain is True
 
 
+def test_clip_regions_track_edge_count_without_rescanning() -> None:
+    identity = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    square = digital_layout._clip_region(
+        [("m", 0.0, 0.0), ("l", 1.0, 0.0), ("l", 1.0, 1.0), ("l", 0.0, 1.0), ("h",)],
+        identity,
+        even_odd=False,
+    )
+    assert square is not None
+    regions: digital_layout._ClipRegions | None = digital_layout._NO_CLIP_REGIONS
+    count = digital_layout._MAX_CLIP_REGION_EDGES // len(square.edges)
+    for _ in range(count):
+        regions = digital_layout._extend_clip_regions(regions, square)
+        assert regions is not None
+
+    assert len(regions.regions) == count
+    assert regions.edge_count == count * len(square.edges)
+    assert digital_layout._extend_clip_regions(regions, square) is None
+
+
+def test_inexact_clip_without_regions_is_never_proven() -> None:
+    from pdfminer.pdfinterp import PDFResourceManager
+
+    device = digital_layout._ProvenanceDevice(PDFResourceManager())
+    device._page_clip_containment_budget = 1_000
+    device.set_clip(None, None, digital_layout._NO_CLIP_REGIONS)
+
+    assert device._clip_regions_contain((0.0, 0.0, 1.0, 1.0)) is False
+
+
 def test_text_clip_keeps_curved_clip_containment_unproven() -> None:
     pdf = pikepdf.Pdf.new()
     _page(

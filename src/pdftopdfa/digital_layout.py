@@ -511,18 +511,27 @@ def _clip_region(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _ClipRegions:
+    """Clip regions bounding an inexact clip, with their total edge count."""
+
+    regions: tuple[_ClipRegion, ...]
+    edge_count: int
+
+
+_NO_CLIP_REGIONS = _ClipRegions((), 0)
+
+
 def _extend_clip_regions(
-    regions: tuple[_ClipRegion, ...] | None,
+    regions: _ClipRegions | None,
     region: _ClipRegion | None,
-) -> tuple[_ClipRegion, ...] | None:
+) -> _ClipRegions | None:
     if regions is None or region is None:
         return None
-    if (
-        sum(len(existing.edges) for existing in regions) + len(region.edges)
-        > _MAX_CLIP_REGION_EDGES
-    ):
+    edge_count = regions.edge_count + len(region.edges)
+    if edge_count > _MAX_CLIP_REGION_EDGES:
         return None
-    return (*regions, region)
+    return _ClipRegions((*regions.regions, region), edge_count)
 
 
 def _transform_polygon(polygon: ClipPolygon, matrix: Matrix) -> ClipPolygon:
@@ -1502,9 +1511,9 @@ class _ProvenanceDevice(PDFPageAggregator):
         self._clip_bbox: BBox | None = None
         self._clip_polygon: ClipPolygon | None = None
         # Regions that, with _clip_polygon, bound an inexact clip (None: unproven).
-        self._clip_regions: tuple[_ClipRegion, ...] | None = ()
+        self._clip_regions: _ClipRegions | None = _NO_CLIP_REGIONS
         self._clip_stack: list[
-            tuple[BBox | None, ClipPolygon | None, tuple[_ClipRegion, ...] | None]
+            tuple[BBox | None, ClipPolygon | None, _ClipRegions | None]
         ] = []
         self._text_clip_stack: list[BBox | None] = []
         self._xobject_stack: list[_XObjectContext] = []
@@ -1529,7 +1538,7 @@ class _ProvenanceDevice(PDFPageAggregator):
         self._direct_xobject_index = 0
         self._clip_bbox = None
         self._clip_polygon = _rect_polygon(ctm, page.cropbox)
-        self._clip_regions = ()
+        self._clip_regions = _NO_CLIP_REGIONS
         self._page_clip_containment_budget = _MAX_CLIP_CONTAINMENT_EDGE_TESTS_PER_PAGE
         self._clip_stack = []
         self._text_clip_stack = []
@@ -1542,18 +1551,19 @@ class _ProvenanceDevice(PDFPageAggregator):
         self,
         bbox: BBox | None,
         polygon: ClipPolygon | None,
-        regions: tuple[_ClipRegion, ...] | None,
+        regions: _ClipRegions | None,
     ) -> None:
         self._clip_bbox = bbox
         self._clip_polygon = polygon
         self._clip_regions = regions
 
     def _clip_regions_contain(self, bbox: BBox) -> bool:
-        if self._clip_regions is None:
+        regions = self._clip_regions
+        if regions is None or not regions.regions:
             return False
         # Every text-show operation may land here, so the edge scans are
         # budgeted; an exhausted budget leaves the clip uncertain.
-        cost = sum(len(region.edges) for region in self._clip_regions)
+        cost = regions.edge_count
         if (
             cost > self._page_clip_containment_budget
             or cost > self._document_clip_containment_budget
@@ -1561,10 +1571,14 @@ class _ProvenanceDevice(PDFPageAggregator):
             return False
         self._page_clip_containment_budget -= cost
         self._document_clip_containment_budget -= cost
-        return all(region.contains(bbox) for region in self._clip_regions)
+        return all(region.contains(bbox) for region in regions.regions)
 
     def _text_paint_bbox(self, run: TextRun) -> BBox | None:
-        """Return a device-space box enclosing the run's fill and stroke paint."""
+        """Return the run's device-space paint box, or ``None`` if it is unbounded.
+
+        Fill paint is modeled by the glyph layout boxes, as for exact clips and
+        the CropBox; a stroke widens them by its envelope.
+        """
 
         state = self._paint_state
         if run.render_mode not in {1, 2, 5, 6} or state.stroke_alpha <= 0:
@@ -1833,13 +1847,15 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
         self._clip_bbox = device._clip_bbox
         self._clip_polygon = device._clip_polygon
         self._clip_is_exact = not self._paint_state.clip_visibility_uncertain
-        self._clip_regions = () if self._clip_is_exact else device._clip_regions
+        self._clip_regions = (
+            _NO_CLIP_REGIONS if self._clip_is_exact else device._clip_regions
+        )
         self._clip_stack: list[
             tuple[
                 BBox | None,
                 ClipPolygon | None,
                 bool,
-                tuple[_ClipRegion, ...] | None,
+                _ClipRegions | None,
                 InvocationPaintState,
             ]
         ] = []
@@ -1946,7 +1962,7 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
         )
         if current_is_empty or pending_is_empty:
             self._clip_is_exact = True
-            self._clip_regions = ()
+            self._clip_regions = _NO_CLIP_REGIONS
             self._set_clip((0.0, 0.0, 0.0, 0.0), ())
         elif self._clip_is_exact and self._pending_clip_is_exact:
             polygon = _polygon_intersection(
