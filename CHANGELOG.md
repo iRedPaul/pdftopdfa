@@ -1,19 +1,26 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.22] - 2026-10-19
 
 ### Features
 
 - Add supplementary OCR for pages that already contain text and paint a raster image, such as invoices on letterhead images: existing text is masked before recognition, and only the new text layer is added to otherwise unchanged pages
 
+### Changes
+
+- Bound curved-clip containment work per page and document, and cache clip-region edge counts to avoid repeated scans
+
 ### Bug Fixes
 
 - Convert PDFs whose pages combine a full-page image with an existing text layer instead of skipping the conversion with "OCR skipped: an existing text layer could not be replaced"
 - Tag text inside curved clipping paths, such as rounded table or box borders in browser-generated PDFs, instead of skipping level A conversion because of uncertain final-paint visibility
+- Account for text strokes when checking curved-clip containment and retain uncertainty for text that may cross the clip
+- Scale supplementary OCR text masks correctly on shifted, rotated, and scaled pages, and remove stale Acrobat search indexes after adding OCR text
 
 ### Documentation
 
 - Document supplementary OCR, its image size threshold, raster resolution, and its fillable-form and page-size limitations
+- Document when text inside curved clipping paths can be tagged safely
 
 ## [0.9.21] - 2026-10-15
 
