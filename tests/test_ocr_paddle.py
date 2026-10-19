@@ -23,8 +23,9 @@ import numpy as np
 import pytest
 from ocrmypdf.helpers import Resolution
 from ocrmypdf.hocrtransform import Baseline, BoundingBox, OcrClass, OcrElement
+from ocrmypdf.pdfinfo import PdfInfo
 from pdfminer.high_level import extract_text
-from pikepdf import Dictionary, Name, Pdf, parse_content_stream
+from pikepdf import Array, Dictionary, Name, Pdf, parse_content_stream
 from PIL import Image, ImageDraw, ImageFont
 
 import pdftopdfa.ocr_paddle as ocr_paddle
@@ -2049,6 +2050,69 @@ def test_filter_ocr_image_masks_existing_text_for_supplementary_ocr(
     assert image.getpixel((40, 100)) == (0, 0, 0)
     assert image.getpixel((100, 140)) == (0, 0, 0)
     assert requested == ([(None, None)] if mask_all_text else [])
+
+
+@pytest.mark.parametrize(
+    ("origin", "rotate"),
+    [
+        ((0, 0), 0),
+        ((200, 300), 0),
+        ((-306, -396), 0),
+        ((0, 0), 90),
+        ((0, 0), 180),
+        ((200, 300), 270),
+    ],
+)
+def test_existing_text_mask_covers_rendered_text(
+    tmp_path: Path,
+    origin: tuple[int, int],
+    rotate: int,
+) -> None:
+    """Text areas share the raster's frame on shifted and rotated pages."""
+    input_path = tmp_path / "text.pdf"
+    raster_path = tmp_path / "text.png"
+    x0, y0 = origin
+    with Pdf.new() as pdf:
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.obj[Name.MediaBox] = Array([x0, y0, x0 + 612, y0 + 792])
+        if rotate:
+            page.obj[Name.Rotate] = rotate
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type1,
+            BaseFont=Name.Helvetica,
+            Encoding=Name.WinAnsiEncoding,
+        )
+        page.obj[Name.Resources] = Dictionary(Font=Dictionary(F1=font))
+        page.obj[Name.Contents] = pdf.make_stream(
+            f"BT /F1 36 Tf {x0 + 60} {y0 + 672} Td (Native text) Tj ET".encode()
+        )
+        pdf.save(input_path)
+
+    ocr_paddle.pypdfium_rasterizer.rasterize_pdf_page(
+        input_file=input_path,
+        output_file=raster_path,
+        raster_device="pnggray",
+        raster_dpi=Resolution(100.0, 100.0),
+        pageno=1,
+        page_dpi=Resolution(100.0, 100.0),
+        rotation=0,
+        filter_vector=False,
+        stop_on_soft_error=True,
+        options=None,
+        use_cropbox=False,
+    )
+    with Image.open(raster_path) as raster:
+        image = raster.convert("L")
+    image.info["dpi"] = (100.0, 100.0)
+    page_context = SimpleNamespace(
+        pageinfo=PdfInfo(input_path, detailed_analysis=True)[0]
+    )
+    assert image.getextrema()[0] < 128
+
+    ocr_paddle._mask_existing_text(page_context, image)
+
+    assert image.getextrema() == (255, 255)
 
 
 def test_high_native_dpi_is_capped_before_real_rasterization(

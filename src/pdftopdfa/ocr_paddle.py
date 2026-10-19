@@ -2165,6 +2165,11 @@ def _mask_existing_text(page: PageContext, image: Image.Image) -> None:
 
     OCRmyPDF's redo mode masks only visible text. Supplementary OCR also masks
     invisible text so that existing text layers are not recognized twice.
+
+    pdfminer reports text areas relative to the MediaBox origin with /Rotate
+    applied, which is the frame of the MediaBox raster. Supplementary runs
+    disable orientation correction and deskew, so only scaling and the y-axis
+    flip remain.
     """
     try:
         scale_x, scale_y = (float(value) / 72.0 for value in image.info["dpi"])
