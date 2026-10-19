@@ -5221,6 +5221,58 @@ class TestSupplementaryOcr:
         assert grafted == frozenset()
         assert _ocr_form_names(output_path) == [frozenset()]
 
+    @staticmethod
+    def _add_search_index(path: Path, *, other_piece_info: bool = False) -> None:
+        with Pdf.open(path, allow_overwriting_input=True) as pdf:
+            piece_info = Dictionary(SearchIndex=pdf.make_stream(b"stale index"))
+            if other_piece_info:
+                piece_info[Name("/Other")] = Dictionary(Private=Dictionary())
+            pdf.Root[Name.PieceInfo] = piece_info
+            pdf.save(path)
+
+    @pytest.mark.parametrize("other_piece_info", [False, True])
+    def test_graft_discards_stale_search_index(
+        self,
+        tmp_dir: Path,
+        other_piece_info: bool,
+    ) -> None:
+        base_path = tmp_dir / "base.pdf"
+        recognized_path = tmp_dir / "recognized.pdf"
+        output_path = tmp_dir / "output.pdf"
+        self._write_pages(base_path, 1)
+        self._add_search_index(base_path, other_piece_info=other_piece_info)
+        self._write_recognized(base_path, recognized_path)
+
+        grafted = _graft_supplementary_ocr(
+            base_path, recognized_path, output_path, (1,)
+        )
+
+        assert grafted == frozenset({1})
+        with Pdf.open(output_path) as pdf:
+            if other_piece_info:
+                assert set(pdf.Root.PieceInfo.keys()) == {"/Other"}
+            else:
+                assert "/PieceInfo" not in pdf.Root
+
+    def test_graft_keeps_search_index_without_new_text(self, tmp_dir: Path) -> None:
+        base_path = tmp_dir / "base.pdf"
+        recognized_path = tmp_dir / "recognized.pdf"
+        output_path = tmp_dir / "output.pdf"
+        self._write_pages(base_path, 1)
+        self._add_search_index(base_path)
+        with Pdf.open(base_path) as pdf:
+            _add_ocr_form(pdf, 0, "/OCR-new", [])
+            pdf.pages[0].contents_add(pdf.make_stream(b"q /OCR-new Do Q"), prepend=True)
+            pdf.save(recognized_path)
+
+        grafted = _graft_supplementary_ocr(
+            base_path, recognized_path, output_path, (1,)
+        )
+
+        assert grafted == frozenset()
+        with Pdf.open(output_path) as pdf:
+            assert "/SearchIndex" in pdf.Root.PieceInfo
+
     def test_graft_rejects_unexpected_layer_invocations(self, tmp_dir: Path) -> None:
         base_path = tmp_dir / "base.pdf"
         recognized_path = tmp_dir / "recognized.pdf"

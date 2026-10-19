@@ -1457,6 +1457,25 @@ def _ocr_layer_instructions(
     return layer
 
 
+def _discard_text_search_index(pdf: "pikepdf.Pdf") -> None:
+    """Drop Acrobat's embedded full-text index, which no longer matches the text.
+
+    OCRmyPDF discards ``/Root/PieceInfo/SearchIndex`` whenever it changes page
+    text. Supplementary OCR keeps the base catalog, so it must do the same.
+    """
+    import pikepdf
+
+    piece_info = pdf.Root.get("/PieceInfo")
+    if (
+        not isinstance(piece_info, pikepdf.Dictionary)
+        or "/SearchIndex" not in piece_info
+    ):
+        return
+    del piece_info["/SearchIndex"]
+    if not piece_info.keys():
+        del pdf.Root["/PieceInfo"]
+
+
 def _graft_supplementary_ocr(
     base_path: Path,
     ocr_path: Path,
@@ -1518,6 +1537,8 @@ def _graft_supplementary_ocr(
                     prepend=True,
                 )
                 grafted.add(page_number)
+            if grafted:
+                _discard_text_search_index(base)
             base.save(output_path)
     except OCRError:
         raise

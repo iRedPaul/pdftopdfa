@@ -2024,6 +2024,8 @@ def test_filter_ocr_image_masks_existing_text_for_supplementary_ocr(
 
     class TextPageInfo:
         dpi = Resolution(144.0, 144.0)
+        mediabox = (0.0, 0.0, 100.0, 100.0)
+        rotation = 0
 
         def get_textareas(
             self,
@@ -2053,22 +2055,25 @@ def test_filter_ocr_image_masks_existing_text_for_supplementary_ocr(
 
 
 @pytest.mark.parametrize(
-    ("origin", "rotate"),
+    ("origin", "rotate", "user_unit"),
     [
-        ((0, 0), 0),
-        ((200, 300), 0),
-        ((-306, -396), 0),
-        ((0, 0), 90),
-        ((0, 0), 180),
-        ((200, 300), 270),
+        ((0, 0), 0, 1.0),
+        ((200, 300), 0, 1.0),
+        ((-306, -396), 0, 1.0),
+        ((0, 0), 90, 1.0),
+        ((0, 0), 180, 1.0),
+        ((200, 300), 270, 1.0),
+        ((0, 0), 0, 2.0),
+        ((200, 300), 90, 0.5),
     ],
 )
 def test_existing_text_mask_covers_rendered_text(
     tmp_path: Path,
     origin: tuple[int, int],
     rotate: int,
+    user_unit: float,
 ) -> None:
-    """Text areas share the raster's frame on shifted and rotated pages."""
+    """Text areas share the raster's frame on shifted, rotated, scaled pages."""
     input_path = tmp_path / "text.pdf"
     raster_path = tmp_path / "text.png"
     x0, y0 = origin
@@ -2077,6 +2082,8 @@ def test_existing_text_mask_covers_rendered_text(
         page.obj[Name.MediaBox] = Array([x0, y0, x0 + 612, y0 + 792])
         if rotate:
             page.obj[Name.Rotate] = rotate
+        if user_unit != 1.0:
+            page.obj[Name.UserUnit] = user_unit
         font = Dictionary(
             Type=Name.Font,
             Subtype=Name.Type1,
@@ -2089,13 +2096,16 @@ def test_existing_text_mask_covers_rendered_text(
         )
         pdf.save(input_path)
 
+    # OCRmyPDF renders at the canvas DPI but records the page DPI, which
+    # includes /UserUnit, on the raster.
+    page_dpi = 100.0 * user_unit
     ocr_paddle.pypdfium_rasterizer.rasterize_pdf_page(
         input_file=input_path,
         output_file=raster_path,
         raster_device="pnggray",
         raster_dpi=Resolution(100.0, 100.0),
         pageno=1,
-        page_dpi=Resolution(100.0, 100.0),
+        page_dpi=Resolution(page_dpi, page_dpi),
         rotation=0,
         filter_vector=False,
         stop_on_soft_error=True,
@@ -2104,7 +2114,7 @@ def test_existing_text_mask_covers_rendered_text(
     )
     with Image.open(raster_path) as raster:
         image = raster.convert("L")
-    image.info["dpi"] = (100.0, 100.0)
+    image.info["dpi"] = (page_dpi, page_dpi)
     page_context = SimpleNamespace(
         pageinfo=PdfInfo(input_path, detailed_analysis=True)[0]
     )

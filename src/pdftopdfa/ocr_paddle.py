@@ -2169,14 +2169,21 @@ def _mask_existing_text(page: PageContext, image: Image.Image) -> None:
     pdfminer reports text areas relative to the MediaBox origin with /Rotate
     applied, which is the frame of the MediaBox raster. Supplementary runs
     disable orientation correction and deskew, so only scaling and the y-axis
-    flip remain.
+    flip remain. The scale comes from the raster size: the raster ignores
+    /UserUnit, but the DPI that OCRmyPDF records on it includes /UserUnit.
     """
     try:
-        scale_x, scale_y = (float(value) / 72.0 for value in image.info["dpi"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise OCRError("OCR raster has no resolution for text masking") from exc
-    if not all(math.isfinite(scale) and scale > 0 for scale in (scale_x, scale_y)):
-        raise OCRError("OCR raster has an invalid resolution for text masking")
+        x_min, y_min, x_max, y_max = (float(value) for value in page.pageinfo.mediabox)
+        rotation = int(page.pageinfo.rotation) % 360
+    except (TypeError, ValueError) as exc:
+        raise OCRError("OCR page has no MediaBox for text masking") from exc
+    page_width, page_height = x_max - x_min, y_max - y_min
+    if rotation in (90, 270):
+        page_width, page_height = page_height, page_width
+    if not all(math.isfinite(size) and size > 0 for size in (page_width, page_height)):
+        raise OCRError("OCR page has an invalid MediaBox for text masking")
+    scale_x = image.width / page_width
+    scale_y = image.height / page_height
 
     draw = ImageDraw.Draw(image)
     for textarea in page.pageinfo.get_textareas(visible=None, corrupt=None) or ():
