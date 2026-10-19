@@ -5741,6 +5741,52 @@ def test_described_vector_after_scoped_nonrectangular_clip_is_preserved() -> Non
     assert str(figure["/ActualText"]) == "Visible"
 
 
+_ROUNDED_CLIP_PATH = (
+    b"10 0 m 190 0 l 195.52 0 200 4.48 200 10 c 200 90 l "
+    b"200 95.52 195.52 100 190 100 c 10 100 l 4.48 100 0 95.52 0 90 c 0 10 l "
+    b"0 4.48 4.48 0 10 0 c h"
+)
+
+
+def test_text_inside_rounded_clip_is_tagged() -> None:
+    pdf = pikepdf.Pdf.new()
+    _page(
+        pdf,
+        (
+            b"q " + _ROUNDED_CLIP_PATH + b" W n 0.9 g 0 0 200 100 re f Q "
+            b"q " + _ROUNDED_CLIP_PATH + b" W n 0 g "
+            b"BT /F1 10 Tf 20 70 Td (Rounded table text.) Tj ET Q"
+        ),
+        Dictionary(Font=Dictionary(F1=_font(pdf))),
+        size=(200, 100),
+    )
+
+    result = ensure_logical_structure(pdf, semantic=True)
+
+    assert result["semantic_content_items"] == 1
+    assert "/P" in _roles(pdf)
+
+
+def test_text_crossing_rounded_clip_corner_fails_closed() -> None:
+    pdf = pikepdf.Pdf.new()
+    page = _page(
+        pdf,
+        (
+            b"q " + _ROUNDED_CLIP_PATH + b" W n "
+            b"BT /F1 10 Tf 2 4 Td (Corner text.) Tj ET Q"
+        ),
+        Dictionary(Font=Dictionary(F1=_font(pdf))),
+        size=(200, 100),
+    )
+    original = bytes(resolve_indirect(page.obj["/Contents"]).read_bytes())
+
+    with pytest.raises(ConversionError, match="uncertain final-paint visibility"):
+        ensure_logical_structure(pdf, semantic=True)
+
+    assert bytes(resolve_indirect(page.obj["/Contents"]).read_bytes()) == original
+    assert "/StructTreeRoot" not in pdf.Root
+
+
 @pytest.mark.parametrize("operator", [b"f", b"S"])
 def test_empty_described_vector_path_does_not_create_figure(operator: bytes) -> None:
     pdf = pikepdf.Pdf.new()

@@ -1676,6 +1676,326 @@ def test_propagates_retraced_degenerate_clip_uncertainty() -> None:
     assert span.final_paint_uncertain is True
 
 
+_ROUNDED_CLIP_PATH = (
+    b"10 0 m 90 0 l 95.52 0 100 4.48 100 10 c 100 40 l "
+    b"100 45.52 95.52 50 90 50 c 10 50 l 4.48 50 0 45.52 0 40 c 0 10 l "
+    b"0 4.48 4.48 0 10 0 c h"
+)
+
+
+def test_text_inside_rounded_clip_is_certain_but_corner_text_is_not() -> None:
+    pdf = pikepdf.Pdf.new()
+    _page(
+        pdf,
+        (
+            b"q " + _ROUNDED_CLIP_PATH + b" W n "
+            b"BT /F1 10 Tf 20 20 Td (Inside) Tj ET "
+            b"BT /F1 10 Tf 2 4 Td (Corner) Tj ET Q"
+        ),
+        Dictionary(Font=Dictionary(F1=_font(pdf))),
+    )
+
+    inside, corner = extract_digital_layout(pdf)[0].spans
+
+    assert isinstance(inside, DirectTextSpan)
+    assert isinstance(corner, DirectTextSpan)
+    assert inside.text == "Inside"
+    assert inside.final_paint_uncertain is False
+    assert inside.clip_bbox is None
+    assert corner.text == "Corner"
+    assert corner.final_paint_uncertain is True
+
+
+@pytest.mark.parametrize(("operator", "uncertain"), [(b"W", False), (b"W*", True)])
+def test_curved_clip_containment_honors_fill_rule(
+    operator: bytes,
+    uncertain: bool,
+) -> None:
+    pdf = pikepdf.Pdf.new()
+    _page(
+        pdf,
+        (
+            b"q " + _ROUNDED_CLIP_PATH + b" 30 15 40 20 re " + operator + b" n "
+            b"BT /F1 5 Tf 35 22 Td (Hole) Tj ET Q"
+        ),
+        Dictionary(Font=Dictionary(F1=_font(pdf))),
+    )
+
+    span = extract_digital_layout(pdf)[0].spans[0]
+
+    assert isinstance(span, DirectTextSpan)
+    assert span.final_paint_uncertain is uncertain
+
+
+def test_curved_clip_containment_propagates_into_form() -> None:
+    pdf = pikepdf.Pdf.new()
+    font = _font(pdf)
+    form = _form(
+        pdf,
+        b"BT /F1 10 Tf 20 20 Td (Inside) Tj ET BT /F1 10 Tf 2 4 Td (Corner) Tj ET",
+        Dictionary(Font=Dictionary(F1=font)),
+        bbox=(0, 0, 200, 100),
+    )
+    _page(
+        pdf,
+        b"q " + _ROUNDED_CLIP_PATH + b" W n /Fm Do Q",
+        Dictionary(Font=Dictionary(F1=font), XObject=Dictionary(Fm=form)),
+    )
+
+    form_span = extract_digital_layout(pdf)[0].spans[0]
+
+    assert isinstance(form_span, DirectXObjectSpan)
+    inside, corner = form_span.children
+    assert inside.final_paint_uncertain is False
+    assert corner.final_paint_uncertain is True
+
+
+_INSIDE_TEXT = b" BT /F1 10 Tf 20 20 Td (Inside) Tj ET"
+
+
+@pytest.mark.parametrize(
+    ("text", "uncertain"),
+    [
+        (b"40 w" + _INSIDE_TEXT, False),
+        (b"1 Tr 1 w 1 j" + _INSIDE_TEXT, False),
+        (b"1 Tr 40 w 1 j" + _INSIDE_TEXT, True),
+        (b"2 Tr 4 w" + _INSIDE_TEXT, True),
+        (b"2 Tr 4 w 1 j" + _INSIDE_TEXT, False),
+        (b"2 Tr 0 w" + _INSIDE_TEXT, True),
+        (
+            b"0.5 0 0 0.5 0 0 cm 1 Tr 40 w 1 j BT /F1 20 Tf 40 40 Td (Inside) Tj ET",
+            False,
+        ),
+    ],
+)
+def test_curved_clip_containment_includes_text_stroke(
+    text: bytes,
+    uncertain: bool,
+) -> None:
+    pdf = pikepdf.Pdf.new()
+    _page(
+        pdf,
+        b"q " + _ROUNDED_CLIP_PATH + b" W n " + text + b" Q",
+        Dictionary(Font=Dictionary(F1=_font(pdf))),
+    )
+
+    span = extract_digital_layout(pdf)[0].spans[0]
+
+    assert isinstance(span, DirectTextSpan)
+    assert span.text == "Inside"
+    assert span.final_paint_uncertain is uncertain
+
+
+def _rounded_clip_edge_count() -> int:
+    segments: list[tuple[object, ...]] = []
+    operands: list[float] = []
+    for token in _ROUNDED_CLIP_PATH.split():
+        try:
+            operands.append(float(token))
+        except ValueError:
+            segments.append((token.decode(), *operands))
+            operands = []
+    region = digital_layout._clip_region(
+        segments,
+        (1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+        even_odd=False,
+    )
+    assert region is not None
+    return len(region.edges)
+
+
+def test_curved_clip_containment_work_is_budgeted_per_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    contains = digital_layout._ClipRegion.contains
+
+    def counting_contains(
+        region: digital_layout._ClipRegion,
+        bbox: tuple[float, float, float, float],
+    ) -> bool:
+        nonlocal calls
+        calls += 1
+        return contains(region, bbox)
+
+    monkeypatch.setattr(digital_layout._ClipRegion, "contains", counting_contains)
+    monkeypatch.setattr(
+        digital_layout,
+        "_MAX_CLIP_CONTAINMENT_EDGE_TESTS_PER_PAGE",
+        2 * _rounded_clip_edge_count(),
+    )
+    pdf = pikepdf.Pdf.new()
+    _page(
+        pdf,
+        (
+            b"q "
+            + _ROUNDED_CLIP_PATH
+            + b" W n BT /F1 10 Tf 20 20 Td"
+            + b" () Tj" * 500
+            + b" ET Q"
+        ),
+        Dictionary(Font=Dictionary(F1=_font(pdf))),
+    )
+
+    spans = extract_digital_layout(pdf)[0].spans
+
+    assert len(spans) == 500
+    assert [span.final_paint_uncertain for span in spans[:3]] == [False, False, True]
+    assert all(span.final_paint_uncertain for span in spans[2:])
+    assert calls == 2
+
+
+def test_curved_clip_containment_work_is_budgeted_per_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        digital_layout,
+        "_MAX_CLIP_CONTAINMENT_EDGE_TESTS_PER_DOCUMENT",
+        _rounded_clip_edge_count(),
+    )
+    pdf = pikepdf.Pdf.new()
+    font = _font(pdf)
+    for _ in range(2):
+        _page(
+            pdf,
+            b"q " + _ROUNDED_CLIP_PATH + b" W n" + _INSIDE_TEXT + b" Q",
+            Dictionary(Font=Dictionary(F1=font)),
+        )
+
+    first, second = extract_digital_layout(pdf)
+
+    assert first.spans[0].final_paint_uncertain is False
+    assert second.spans[0].final_paint_uncertain is True
+
+
+def test_clip_regions_track_edge_count_without_rescanning() -> None:
+    identity = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    square = digital_layout._clip_region(
+        [("m", 0.0, 0.0), ("l", 1.0, 0.0), ("l", 1.0, 1.0), ("l", 0.0, 1.0), ("h",)],
+        identity,
+        even_odd=False,
+    )
+    assert square is not None
+    regions: digital_layout._ClipRegions | None = digital_layout._NO_CLIP_REGIONS
+    count = digital_layout._MAX_CLIP_REGION_EDGES // len(square.edges)
+    for _ in range(count):
+        regions = digital_layout._extend_clip_regions(regions, square)
+        assert regions is not None
+
+    assert len(regions.regions) == count
+    assert regions.edge_count == count * len(square.edges)
+    assert digital_layout._extend_clip_regions(regions, square) is None
+
+
+def test_inexact_clip_without_regions_is_never_proven() -> None:
+    from pdfminer.pdfinterp import PDFResourceManager
+
+    device = digital_layout._ProvenanceDevice(PDFResourceManager())
+    device._page_clip_containment_budget = 1_000
+    device.set_clip(None, None, digital_layout._NO_CLIP_REGIONS)
+
+    assert device._clip_regions_contain((0.0, 0.0, 1.0, 1.0)) is False
+
+
+def test_text_clip_keeps_curved_clip_containment_unproven() -> None:
+    pdf = pikepdf.Pdf.new()
+    _page(
+        pdf,
+        (
+            b"q " + _ROUNDED_CLIP_PATH + b" W n "
+            b"BT /F1 20 Tf 7 Tr 20 20 Td (X) Tj ET "
+            b"BT /F1 10 Tf 0 Tr 20 20 Td (Inside) Tj ET Q"
+        ),
+        Dictionary(Font=Dictionary(F1=_font(pdf))),
+    )
+
+    span = extract_digital_layout(pdf)[0].spans[-1]
+
+    assert isinstance(span, DirectTextSpan)
+    assert span.text == "Inside"
+    assert span.final_paint_uncertain is True
+
+
+def test_clip_region_never_accepts_box_outside_concave_curve() -> None:
+    # The top edge bows down to y=70 between two corners at y=100.
+    start, end = (100.0, 100.0), (0.0, 100.0)
+    first, second = (66.0, 60.0), (33.0, 60.0)
+    region = digital_layout._clip_region(
+        [
+            ("m", 0.0, 0.0),
+            ("l", 100.0, 0.0),
+            ("l", *start),
+            ("c", *first, *second, *end),
+        ],
+        (1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+        even_odd=False,
+    )
+    assert region is not None
+
+    def curve(t: float) -> tuple[float, float]:
+        s = 1 - t
+        return (
+            s**3 * start[0]
+            + 3 * s * s * t * first[0]
+            + 3 * s * t * t * second[0]
+            + t**3 * end[0],
+            s**3 * start[1]
+            + 3 * s * s * t * first[1]
+            + 3 * s * t * t * second[1]
+            + t**3 * end[1],
+        )
+
+    samples = [curve(step / 20_000) for step in range(20_001)]
+    accepted = 0
+    for left in range(0, 100, 3):
+        for tenth in range(600, 720):
+            top = tenth / 10
+            box = (float(left), top - 1.0, left + 2.0, top)
+            floor = min(y for x, y in samples if box[0] <= x <= box[2])
+            if region.contains(box):
+                accepted += 1
+                assert top < floor
+    assert accepted
+
+
+def test_clip_region_expands_v_and_y_curves_like_cubic_curves() -> None:
+    identity = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    shorthand = digital_layout._clip_region(
+        [("m", 0.0, 0.0), ("v", 10.0, 0.0, 10.0, 10.0), ("y", 0.0, 10.0, 0.0, 0.0)],
+        identity,
+        even_odd=False,
+    )
+    explicit = digital_layout._clip_region(
+        [
+            ("m", 0.0, 0.0),
+            ("c", 0.0, 0.0, 10.0, 0.0, 10.0, 10.0),
+            ("c", 0.0, 10.0, 0.0, 0.0, 0.0, 0.0),
+        ],
+        identity,
+        even_odd=False,
+    )
+
+    assert shorthand is not None
+    assert shorthand == explicit
+
+
+def test_clip_region_rejects_oversized_paths() -> None:
+    path: list[tuple[object, ...]] = [("m", 0.0, 0.0)]
+    path.extend(
+        ("l", float(index % 2), float(index))
+        for index in range(1, digital_layout._MAX_CLIP_REGION_EDGES + 2)
+    )
+
+    assert (
+        digital_layout._clip_region(
+            path,
+            (1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+            even_odd=False,
+        )
+        is None
+    )
+
+
 def test_large_translation_does_not_make_skewed_clip_rectangular() -> None:
     pdf = pikepdf.Pdf.new()
     _page(

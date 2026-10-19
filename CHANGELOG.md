@@ -9,6 +9,7 @@
 ### Bug Fixes
 
 - Convert PDFs whose pages combine a full-page image with an existing text layer instead of skipping the conversion with "OCR skipped: an existing text layer could not be replaced"
+- Tag text inside curved clipping paths, such as rounded table or box borders in browser-generated PDFs, instead of skipping level A conversion because of uncertain final-paint visibility
 
 ### Documentation
 
