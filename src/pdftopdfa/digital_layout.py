@@ -90,6 +90,8 @@ _DECODE_CHUNK_SIZE = 1024 * 1024
 _CLIP_CURVE_FLATTENING_TOLERANCE = 0.01
 _MAX_CLIP_CURVE_SEGMENTS = 16
 _MAX_CLIP_REGION_EDGES = 1_024
+_MAX_CLIP_CONTAINMENT_EDGE_TESTS_PER_PAGE = 1_048_576
+_MAX_CLIP_CONTAINMENT_EDGE_TESTS_PER_DOCUMENT = 8_388_608
 _DIRECT_TEXT_OPERAND_COUNTS = {"Tj": 1, "TJ": 1, "'": 1, '"': 3}
 _PATH_START_OPERATORS = frozenset({"m", "re"})
 _PATH_CONTINUATION_OPERATORS = frozenset({"l", "c", "v", "y", "h"})
@@ -1509,6 +1511,10 @@ class _ProvenanceDevice(PDFPageAggregator):
         self._next_entry_state: InvocationPaintState | None = None
         self._paint_state = InvocationPaintState()
         self.page_index: int | None = None
+        self._page_clip_containment_budget = 0
+        self._document_clip_containment_budget = (
+            _MAX_CLIP_CONTAINMENT_EDGE_TESTS_PER_DOCUMENT
+        )
 
     def _current_ctm(self) -> Matrix:
         if self.ctm is None:
@@ -1524,6 +1530,7 @@ class _ProvenanceDevice(PDFPageAggregator):
         self._clip_bbox = None
         self._clip_polygon = _rect_polygon(ctm, page.cropbox)
         self._clip_regions = ()
+        self._page_clip_containment_budget = _MAX_CLIP_CONTAINMENT_EDGE_TESTS_PER_PAGE
         self._clip_stack = []
         self._text_clip_stack = []
         self._next_entry_state = None
@@ -1542,9 +1549,45 @@ class _ProvenanceDevice(PDFPageAggregator):
         self._clip_regions = regions
 
     def _clip_regions_contain(self, bbox: BBox) -> bool:
-        return self._clip_regions is not None and all(
-            region.contains(bbox) for region in self._clip_regions
+        if self._clip_regions is None:
+            return False
+        # Every text-show operation may land here, so the edge scans are
+        # budgeted; an exhausted budget leaves the clip uncertain.
+        cost = sum(len(region.edges) for region in self._clip_regions)
+        if (
+            cost > self._page_clip_containment_budget
+            or cost > self._document_clip_containment_budget
+        ):
+            return False
+        self._page_clip_containment_budget -= cost
+        self._document_clip_containment_budget -= cost
+        return all(region.contains(bbox) for region in self._clip_regions)
+
+    def _text_paint_bbox(self, run: TextRun) -> BBox | None:
+        """Return a device-space box enclosing the run's fill and stroke paint."""
+
+        state = self._paint_state
+        if run.render_mode not in {1, 2, 5, 6} or state.stroke_alpha <= 0:
+            return run.bbox
+        if state.line_width <= 0:
+            # A zero-width stroke paints device pixels of unknown size.
+            return None
+        # Glyph outlines are closed, so joins bound the stroke; the cap factor
+        # only keeps the envelope conservative for unexpected open subpaths.
+        radius = (
+            state.line_width
+            / 2.0
+            * max(
+                state.miter_limit if state.line_join == 0 else 1.0,
+                sqrt(2.0) if state.line_cap == 2 else 1.0,
+            )
         )
+        # Stroke parameters are interpreted in user space, not text space.
+        a, b, c, d, _e, _f = self._current_ctm()
+        x_radius = radius * hypot(a, c)
+        y_radius = radius * hypot(b, d)
+        left, bottom, right, top = run.bbox
+        return left - x_radius, bottom - y_radius, right + x_radius, top + y_radius
 
     def set_next_entry_state(self, state: InvocationPaintState) -> None:
         if self._next_entry_state is not None:
@@ -1714,7 +1757,8 @@ class _ProvenanceDevice(PDFPageAggregator):
         if (
             run.final_paint_uncertain
             and self._paint_state.clip_visibility_uncertain
-            and self._clip_regions_contain(run.bbox)
+            and (paint_bbox := self._text_paint_bbox(run)) is not None
+            and self._clip_regions_contain(paint_bbox)
         ):
             # The inexact clip provably leaves the whole run unclipped.
             run = replace(
