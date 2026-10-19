@@ -544,10 +544,31 @@ When OCR is enabled, processing runs for the document:
 
 - Pages without meaningful text receive OCR; whitespace-only extracted text is
   treated as no text.
-- Digital pages with non-whitespace text are skipped. A conservatively
-  identified full-page scan with a visible native text overlay is instead
-  re-OCRed in a targeted run that retains the native text.
+- Pages with non-whitespace text that also paint a raster image receive
+  supplementary OCR, for example a digital invoice printed on a full-page
+  letterhead image. Images smaller than 16 pixels or 8 points on either side
+  cannot carry legible text and do not qualify.
+- Digital pages with non-whitespace text and no qualifying image are skipped. A
+  conservatively identified full-page scan with a visible native text overlay
+  is instead re-OCRed in a targeted run that retains the native text.
 - Mixed documents are handled page by page.
+
+Supplementary OCR is additive. Before recognition, every existing text area,
+visible or invisible, is masked in the OCR raster, so only text that is not yet
+present in the PDF is recognized. Only the resulting OCR text Form is then added
+to the otherwise unchanged page: native text, invisible text layers such as
+approval notes, vector content, and the document structure tree are retained.
+If recognition finds no new text, the page is left unchanged. Supplementary OCR
+is skipped with a warning for PDFs that still contain a fillable form, because
+OCRmyPDF cannot process such pages in this mode. The high-level conversion APIs
+remove the form from the temporary OCR input when possible.
+
+Because the images already carry their own resolution, supplementary OCR uses
+300 dpi instead of the 600 dpi oversampling used for scans; OCRmyPDF still
+renders pages with text at 400 dpi or the native image resolution, whichever is
+higher. Pages whose raster would exceed the OCR pixel limit at 300 dpi are
+skipped with a warning. Each affected page still adds a detection and
+recognition pass to the processing time.
 
 With deskew enabled, scan-like pages are selected separately as described
 below. An existing invisible OCR text layer does not exclude such a page.
@@ -604,16 +625,16 @@ Text painted before a later full-page image is treated as occluded. Image
 coverage is intersected with the page, so off-page or tightly clipped images do
 not qualify. Unknown clipping, transparency, blend, optional-content, or
 overprint states prevent text replacement. If such a page combines an apparent
-full-page scan with an existing text layer, OCR preserves that page and logs a
-warning. OCR continues on the other eligible pages. This leaves ordinary
-digitally generated pages and pages with only decorative small images unchanged
-and handles mixed documents page by page.
+full-page scan with an existing text layer, its existing text is never removed;
+it receives supplementary OCR instead, as described under page selection.
+Deskew never alters such pages. This leaves ordinary digitally generated pages
+geometrically unchanged and handles mixed documents page by page.
 Text that is provably non-painting from its render mode or alpha state is removed
 from a temporary page-local copy before a selected OCR run; clipping-only text
 is not assumed invisible because arbitrary clip geometry is ambiguous.
 
-Regular OCR pages, selected deskew pages, and mixed-content redo pages are
-OCRed in disjoint targeted page runs. No page receives OCR twice, and a pure
+Regular OCR pages, selected deskew pages, mixed-content redo pages, and
+supplementary OCR pages are OCRed in disjoint targeted page runs. No page receives OCR twice, and a pure
 scan needs only one run. Per-run Level-A sidecars are isolated and merged in
 physical page order.
 

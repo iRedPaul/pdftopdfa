@@ -45,6 +45,8 @@ from pdftopdfa.ocr import (
     _cleanup_ocr_resources,
     _finalize_ocr_output,
     _find_deskew_pages,
+    _graft_supplementary_ocr,
+    _has_supplementary_ocr_image,
     _image_color_space_marks,
     _ocr_form_names,
     _page_has_images,
@@ -110,6 +112,43 @@ def validate_models(model_dirs: tuple[Path, Path]):
 def _copy_ocr_input(input_path: Path, output_path: Path, **_kwargs: object) -> None:
     """Model OCRmyPDF's output contract in option-boundary tests."""
     shutil.copy2(input_path, output_path)
+
+
+def _make_text_ocr_form(pdf: Pdf, text: bytes) -> pikepdf.Stream:
+    """Return an invisible-text OCR Form like the fpdf2 renderer's output."""
+    form = pdf.make_stream(b"BT /F1 12 Tf 3 Tr 10 80 Td (" + text + b") Tj ET")
+    form[Name.Type] = Name.XObject
+    form[Name.Subtype] = Name.Form
+    form[Name.BBox] = pikepdf.Array([0, 0, 100, 100])
+    form[Name.Resources] = Dictionary(
+        Font=Dictionary(
+            F1=Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica)
+        )
+    )
+    return form
+
+
+def _simulate_destructive_redo_ocr(
+    input_path: Path, output_path: Path, **kwargs: object
+) -> None:
+    """Model OCRmyPDF redo output, which drops existing text and structure."""
+    if not kwargs.get("redo_ocr"):
+        shutil.copy2(input_path, output_path)
+        return
+    with Pdf.open(input_path) as pdf:
+        for page_number in str(kwargs["pages"]).split(","):
+            page = pdf.pages[int(page_number) - 1]
+            page.obj[Name.Contents] = pdf.make_stream(b"")
+            page.Resources.XObject["/OCR-supplement"] = _make_text_ocr_form(
+                pdf, b"Recognized letterhead"
+            )
+            page.contents_add(
+                pdf.make_stream(b"q 1 0 0 1 0 0 cm /OCR-supplement Do Q"),
+                prepend=True,
+            )
+        if Name.StructTreeRoot in pdf.Root:
+            del pdf.Root[Name.StructTreeRoot]
+        pdf.save(output_path)
 
 
 def _add_ocr_form(
@@ -622,18 +661,23 @@ def _add_content_page(
     pdf: Pdf,
     *,
     image_scale: int = 100,
+    image_pixels: int = 10,
     visible_text: bool = False,
     hidden_form_text: bool = False,
     visible_form_text: bool = False,
     vector: bool = False,
 ) -> None:
-    """Add a page with controlled raster, text, and vector content."""
+    """Add a page with controlled raster, text, and vector content.
+
+    The default 10 px image is too small to hold text; use ``image_pixels``
+    for a raster that qualifies for supplementary OCR.
+    """
     page = pdf.add_blank_page(page_size=(100, 100))
-    image = pdf.make_stream(bytes([128]) * 100)
+    image = pdf.make_stream(bytes([128]) * image_pixels * image_pixels)
     image[Name.Type] = Name.XObject
     image[Name.Subtype] = Name.Image
-    image[Name.Width] = 10
-    image[Name.Height] = 10
+    image[Name.Width] = image_pixels
+    image[Name.Height] = image_pixels
     image[Name.ColorSpace] = Name.DeviceGray
     image[Name.BitsPerComponent] = 8
 
@@ -2318,18 +2362,17 @@ class TestApplyOcr:
                 )
 
     @pytest.mark.parametrize("deskew", [False, True])
-    def test_clipped_text_after_full_page_image_is_preserved(
+    def test_clipped_text_after_full_page_image_receives_supplementary_ocr(
         self,
         tmp_dir: Path,
         model_dirs: tuple[Path, Path],
         validate_models: MagicMock,
         deskew: bool,
-        caplog: pytest.LogCaptureFixture,
     ) -> None:
         input_path = tmp_dir / "clipped-text.pdf"
         output_path = tmp_dir / "output.pdf"
         with Pdf.new() as pdf:
-            _add_content_page(pdf)
+            _add_content_page(pdf, image_pixels=100)
             pdf.pages[0].Contents.write(
                 b"q 100 0 0 100 0 0 cm /Im0 Do Q\n"
                 b"0 0 1 1 re W n\n"
@@ -2337,8 +2380,10 @@ class TestApplyOcr:
             )
             pdf.save(input_path)
 
-        with patch("pdftopdfa.ocr.ocrmypdf.ocr") as mock_ocr:
-            apply_ocr(
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr", side_effect=_copy_ocr_input
+        ) as mock_ocr:
+            result = apply_ocr(
                 input_path,
                 output_path,
                 detection_model_dir=model_dirs[0],
@@ -2346,12 +2391,18 @@ class TestApplyOcr:
                 deskew=deskew,
             )
 
-        mock_ocr.assert_not_called()
+        assert result == output_path
+        mock_ocr.assert_called_once()
+        kwargs = mock_ocr.call_args.kwargs
+        assert kwargs["pages"] == "1"
+        assert kwargs["redo_ocr"] is True
+        assert "skip_text" not in kwargs
+        assert kwargs["paddle_mask_all_text"] is True
+        assert kwargs["deskew"] is False
         with Pdf.open(input_path) as source, Pdf.open(output_path) as output:
             assert source.pages[0].Contents.read_bytes() == (
                 output.pages[0].Contents.read_bytes()
             )
-        assert "OCR skipped for page(s) [1]" in caplog.text
 
     @pytest.mark.parametrize("prior_ocr", [False, True])
     def test_manifest_failure_preserves_existing_output_atomically(
@@ -2916,26 +2967,34 @@ class TestApplyOcr:
 
     @pytest.mark.parametrize("deskew", [False, True])
     @pytest.mark.parametrize("with_scan", [False, True])
-    def test_ambiguous_scan_is_preserved_while_other_pages_receive_ocr(
+    def test_supplementary_ocr_adds_text_without_removing_existing_content(
         self,
         tmp_dir: Path,
         model_dirs: tuple[Path, Path],
         validate_models: MagicMock,
         deskew: bool,
         with_scan: bool,
-        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        input_path = tmp_dir / "ambiguous-ocr-scan.pdf"
+        input_path = tmp_dir / "letterhead.pdf"
         output_path = tmp_dir / "output.pdf"
-        manifest_path = tmp_dir / "manifest.json"
         with Pdf.new() as pdf:
-            _add_content_page(pdf, hidden_form_text=True, vector=True)
+            _add_content_page(
+                pdf,
+                image_pixels=100,
+                hidden_form_text=True,
+                vector=True,
+            )
             if with_scan:
                 _add_content_page(pdf)
+            pdf.Root[Name.StructTreeRoot] = pdf.make_indirect(
+                Dictionary(Type=Name.StructTreeRoot)
+            )
             pdf.save(input_path)
 
+        processed_pages: set[int] = set()
         with patch(
-            "pdftopdfa.ocr.ocrmypdf.ocr", side_effect=_copy_ocr_input
+            "pdftopdfa.ocr.ocrmypdf.ocr",
+            side_effect=_simulate_destructive_redo_ocr,
         ) as mock_ocr:
             result = apply_ocr(
                 input_path,
@@ -2943,32 +3002,107 @@ class TestApplyOcr:
                 detection_model_dir=model_dirs[0],
                 recognition_model_dir=model_dirs[1],
                 deskew=deskew,
-                _manifest_output_path=manifest_path,
+                _processed_pages=processed_pages,
             )
 
+        assert result == output_path
+        calls = mock_ocr.call_args_list
+        assert len(calls) == (2 if with_scan else 1)
         if with_scan:
-            assert result == output_path
-            mock_ocr.assert_called_once()
-            assert mock_ocr.call_args.kwargs["pages"] == "2"
-            assert mock_ocr.call_args.kwargs["deskew"] is deskew
-        else:
-            assert result is None
-            assert output_path.read_bytes() == input_path.read_bytes()
-            mock_ocr.assert_not_called()
+            assert calls[0].kwargs["pages"] == "2"
+            assert calls[0].kwargs["deskew"] is deskew
+            assert calls[0].kwargs["oversample"] == 600
+            assert "paddle_mask_all_text" not in calls[0].kwargs
+        supplementary_call = calls[-1]
+        assert supplementary_call.kwargs["pages"] == "1"
+        assert supplementary_call.kwargs["redo_ocr"] is True
+        assert supplementary_call.kwargs["paddle_mask_all_text"] is True
+        assert supplementary_call.kwargs["deskew"] is False
+        assert supplementary_call.kwargs["oversample"] == 300
+        assert processed_pages == {0}
         with Pdf.open(input_path) as source, Pdf.open(output_path) as output:
             assert len(output.pages) == len(source.pages)
+            assert "/StructTreeRoot" in output.Root
+            source_page = source.pages[0]
+            output_page = output.pages[0]
+            assert output_page.Contents[-1].read_bytes() == (
+                source_page.Contents.read_bytes()
+            )
+            assert b"/OCR-supplement Do" in output_page.Contents[0].read_bytes()
+            assert source_page.Resources.XObject.HiddenText.read_bytes() == (
+                output_page.Resources.XObject.HiddenText.read_bytes()
+            )
+            assert b"(Recognized letterhead)" in (
+                output_page.Resources.XObject["/OCR-supplement"].read_bytes()
+            )
+
+    def test_supplementary_ocr_is_skipped_for_fillable_forms(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        input_path = tmp_dir / "form.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, image_pixels=100, visible_text=True, vector=True)
+            field = pdf.make_indirect(Dictionary(FT=Name.Tx, T=pikepdf.String("f")))
+            pdf.Root[Name.AcroForm] = Dictionary(Fields=pikepdf.Array([field]))
+            pdf.save(input_path)
+
+        with patch("pdftopdfa.ocr.ocrmypdf.ocr") as mock_ocr:
+            result = apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+            )
+
+        assert result == output_path
+        mock_ocr.assert_not_called()
+        assert _ocr_form_names(output_path) == [frozenset()]
+        with Pdf.open(input_path) as source, Pdf.open(output_path) as output:
             assert source.pages[0].Contents.read_bytes() == (
                 output.pages[0].Contents.read_bytes()
             )
-            assert source.pages[0].Resources.XObject.HiddenText.read_bytes() == (
-                output.pages[0].Resources.XObject.HiddenText.read_bytes()
+        assert "Supplementary OCR skipped for page(s) [1]" in caplog.text
+
+    def test_supplementary_ocr_is_skipped_for_oversized_pages(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        input_path = tmp_dir / "poster.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(
+                pdf,
+                image_scale=50,
+                image_pixels=100,
+                visible_text=True,
             )
-        assert json.loads(manifest_path.read_text())["pages"] == []
-        assert "OCR skipped for page(s) [1]" in caplog.text
+            pdf.pages[0].obj[Name.UserUnit] = 100
+            pdf.save(input_path)
+
+        with patch("pdftopdfa.ocr.ocrmypdf.ocr") as mock_ocr:
+            result = apply_ocr(
+                input_path,
+                output_path,
+                detection_model_dir=model_dirs[0],
+                recognition_model_dir=model_dirs[1],
+            )
+
+        assert result == output_path
+        mock_ocr.assert_not_called()
+        assert _ocr_form_names(output_path) == [frozenset()]
+        assert "too large to rasterize" in caplog.text
 
     @pytest.mark.parametrize("deskew", [False, True])
     @pytest.mark.parametrize("pdfa", [False, True])
-    def test_all_ambiguous_conversion_reports_ocr_skipped(
+    def test_text_page_with_tiny_image_converts_without_ocr(
         self,
         tmp_dir: Path,
         model_dirs: tuple[Path, Path],
@@ -2995,11 +3129,16 @@ class TestApplyOcr:
             )
 
         mock_ocr.assert_not_called()
-        assert result.success and result.skipped and result.published
-        assert not result.target_produced
-        assert any("OCR skipped" in warning for warning in result.warnings)
+        assert result.success and not result.skipped and result.published
+        assert result.target_produced
+        assert result.level == ("3b" if pdfa else None)
+        assert "OCR skipped: all pages already contain text" in result.warnings
         assert not any("OCR performed" in warning for warning in result.warnings)
-        assert output_path.read_bytes() == input_path.read_bytes()
+        with Pdf.open(input_path) as source, Pdf.open(output_path) as output:
+            assert len(output.pages) == len(source.pages)
+            assert source.pages[0].Resources.XObject.HiddenText.read_bytes() == (
+                output.pages[0].Resources.XObject.HiddenText.read_bytes()
+            )
 
     def test_prior_ocr_preserves_original_text_before_deskew_preparation(
         self,
@@ -4955,4 +5094,192 @@ class TestVisiblePageRotationFix:
         with pikepdf.open(output_pdf) as pdf:
             assert [float(value) for value in pdf.pages[0].mediabox] == (
                 expected_mediabox
+            )
+
+
+def _image_info(
+    width: int,
+    height: int,
+    dpi: float,
+    *,
+    renderable: bool = True,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        width=width,
+        height=height,
+        dpi=SimpleNamespace(x=dpi, y=dpi),
+        renderable=renderable,
+    )
+
+
+class TestSupplementaryOcr:
+    """Supplementary OCR only adds text for raster images on text pages."""
+
+    @pytest.mark.parametrize(
+        ("image", "expected"),
+        [
+            (_image_info(100, 100, 72.0), True),
+            (_image_info(15, 400, 72.0), False),
+            (_image_info(100, 100, 1200.0), False),
+            (_image_info(100, 100, 72.0, renderable=False), False),
+            (_image_info(100, 100, 0.0), False),
+        ],
+    )
+    def test_tiny_or_unrenderable_images_do_not_qualify(
+        self,
+        image: SimpleNamespace,
+        expected: bool,
+    ) -> None:
+        page_info = SimpleNamespace(images=[image])
+
+        assert _has_supplementary_ocr_image(page_info) is expected
+
+    @staticmethod
+    def _write_pages(
+        path: Path,
+        page_count: int,
+        *,
+        shared_resources: bool = False,
+    ) -> None:
+        with Pdf.new() as pdf:
+            resources = pdf.make_indirect(Dictionary(XObject=Dictionary()))
+            for _ in range(page_count):
+                page = pdf.add_blank_page(page_size=(100, 100))
+                page.obj[Name.Resources] = (
+                    resources if shared_resources else Dictionary(XObject=Dictionary())
+                )
+                page.obj[Name.Contents] = pdf.make_stream(
+                    b"BT /F1 12 Tf 3 Tr 10 50 Td (Approved) Tj ET"
+                )
+            pdf.Root[Name.StructTreeRoot] = pdf.make_indirect(
+                Dictionary(Type=Name.StructTreeRoot)
+            )
+            pdf.save(path)
+
+    @staticmethod
+    def _write_recognized(
+        base_path: Path,
+        path: Path,
+        layer: bytes = b"q 1 0 0 1 0 0 cm /OCR-new Do Q",
+        text: bytes = b"Letterhead",
+    ) -> None:
+        with Pdf.open(base_path) as pdf:
+            page = pdf.pages[0]
+            page.obj[Name.Contents] = pdf.make_stream(b"")
+            page.obj[Name.Resources] = Dictionary(
+                XObject=Dictionary({"/OCR-new": _make_text_ocr_form(pdf, text)})
+            )
+            page.contents_add(pdf.make_stream(layer), prepend=True)
+            del pdf.Root[Name.StructTreeRoot]
+            pdf.save(path)
+
+    @pytest.mark.parametrize("shared_resources", [False, True])
+    def test_graft_adds_only_the_new_layer_to_unchanged_pages(
+        self,
+        tmp_dir: Path,
+        shared_resources: bool,
+    ) -> None:
+        base_path = tmp_dir / "base.pdf"
+        recognized_path = tmp_dir / "recognized.pdf"
+        output_path = tmp_dir / "output.pdf"
+        self._write_pages(base_path, 2, shared_resources=shared_resources)
+        self._write_recognized(base_path, recognized_path)
+
+        grafted = _graft_supplementary_ocr(
+            base_path, recognized_path, output_path, (1,)
+        )
+
+        assert grafted == frozenset({1})
+        assert _ocr_form_names(output_path) == [
+            frozenset({"/OCR-new"}),
+            frozenset(),
+        ]
+        with Pdf.open(output_path) as pdf:
+            assert "/StructTreeRoot" in pdf.Root
+            contents = pdf.pages[0].Contents
+            assert contents[0].read_bytes().split() == (
+                b"q 1 0 0 1 0 0 cm /OCR-new Do Q".split()
+            )
+            assert contents[1].read_bytes() == (
+                b"BT /F1 12 Tf 3 Tr 10 50 Td (Approved) Tj ET"
+            )
+
+    def test_graft_skips_layers_without_recognized_text(self, tmp_dir: Path) -> None:
+        base_path = tmp_dir / "base.pdf"
+        recognized_path = tmp_dir / "recognized.pdf"
+        output_path = tmp_dir / "output.pdf"
+        self._write_pages(base_path, 1)
+        with Pdf.open(base_path) as pdf:
+            _add_ocr_form(pdf, 0, "/OCR-new", [])
+            pdf.pages[0].contents_add(pdf.make_stream(b"q /OCR-new Do Q"), prepend=True)
+            pdf.save(recognized_path)
+
+        grafted = _graft_supplementary_ocr(
+            base_path, recognized_path, output_path, (1,)
+        )
+
+        assert grafted == frozenset()
+        assert _ocr_form_names(output_path) == [frozenset()]
+
+    @staticmethod
+    def _add_search_index(path: Path, *, other_piece_info: bool = False) -> None:
+        with Pdf.open(path, allow_overwriting_input=True) as pdf:
+            piece_info = Dictionary(SearchIndex=pdf.make_stream(b"stale index"))
+            if other_piece_info:
+                piece_info[Name("/Other")] = Dictionary(Private=Dictionary())
+            pdf.Root[Name.PieceInfo] = piece_info
+            pdf.save(path)
+
+    @pytest.mark.parametrize("other_piece_info", [False, True])
+    def test_graft_discards_stale_search_index(
+        self,
+        tmp_dir: Path,
+        other_piece_info: bool,
+    ) -> None:
+        base_path = tmp_dir / "base.pdf"
+        recognized_path = tmp_dir / "recognized.pdf"
+        output_path = tmp_dir / "output.pdf"
+        self._write_pages(base_path, 1)
+        self._add_search_index(base_path, other_piece_info=other_piece_info)
+        self._write_recognized(base_path, recognized_path)
+
+        grafted = _graft_supplementary_ocr(
+            base_path, recognized_path, output_path, (1,)
+        )
+
+        assert grafted == frozenset({1})
+        with Pdf.open(output_path) as pdf:
+            if other_piece_info:
+                assert set(pdf.Root.PieceInfo.keys()) == {"/Other"}
+            else:
+                assert "/PieceInfo" not in pdf.Root
+
+    def test_graft_keeps_search_index_without_new_text(self, tmp_dir: Path) -> None:
+        base_path = tmp_dir / "base.pdf"
+        recognized_path = tmp_dir / "recognized.pdf"
+        output_path = tmp_dir / "output.pdf"
+        self._write_pages(base_path, 1)
+        self._add_search_index(base_path)
+        with Pdf.open(base_path) as pdf:
+            _add_ocr_form(pdf, 0, "/OCR-new", [])
+            pdf.pages[0].contents_add(pdf.make_stream(b"q /OCR-new Do Q"), prepend=True)
+            pdf.save(recognized_path)
+
+        grafted = _graft_supplementary_ocr(
+            base_path, recognized_path, output_path, (1,)
+        )
+
+        assert grafted == frozenset()
+        with Pdf.open(output_path) as pdf:
+            assert "/SearchIndex" in pdf.Root.PieceInfo
+
+    def test_graft_rejects_unexpected_layer_invocations(self, tmp_dir: Path) -> None:
+        base_path = tmp_dir / "base.pdf"
+        recognized_path = tmp_dir / "recognized.pdf"
+        self._write_pages(base_path, 1)
+        self._write_recognized(base_path, recognized_path, layer=b"/OCR-new Do")
+
+        with pytest.raises(OCRError, match="Unexpected invocation"):
+            _graft_supplementary_ocr(
+                base_path, recognized_path, tmp_dir / "output.pdf", (1,)
             )
