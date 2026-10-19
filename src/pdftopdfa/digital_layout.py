@@ -13,7 +13,7 @@ from collections import Counter
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from io import BytesIO
-from math import hypot, isfinite, ulp
+from math import ceil, hypot, isfinite, sqrt, ulp
 from tempfile import SpooledTemporaryFile
 from typing import Literal, cast
 
@@ -87,6 +87,9 @@ _MAX_IMAGE_VISIBILITY_BYTES_PER_DOCUMENT = 512 * 1024 * 1024
 _MAX_IMAGE_VISIBILITY_SAMPLES_PER_DOCUMENT = 134_217_728
 _MAX_IMAGE_VISIBILITY_DECODES_PER_DOCUMENT = 4_096
 _DECODE_CHUNK_SIZE = 1024 * 1024
+_CLIP_CURVE_FLATTENING_TOLERANCE = 0.01
+_MAX_CLIP_CURVE_SEGMENTS = 16
+_MAX_CLIP_REGION_EDGES = 1_024
 _DIRECT_TEXT_OPERAND_COUNTS = {"Tj": 1, "TJ": 1, "'": 1, '"': 3}
 _PATH_START_OPERATORS = frozenset({"m", "re"})
 _PATH_CONTINUATION_OPERATORS = frozenset({"l", "c", "v", "y", "h"})
@@ -333,6 +336,191 @@ def _clip_bbox_to_polygon(bbox: BBox, polygon: ClipPolygon | None) -> BBox | Non
     )
     result = _polygon_bbox(intersection)
     return None if result == (0.0, 0.0, 0.0, 0.0) else result
+
+
+def _segment_meets_box(start: Point, end: Point, box: BBox) -> bool:
+    low = 0.0
+    high = 1.0
+    for origin, delta, minimum, maximum in (
+        (start[0], end[0] - start[0], box[0], box[2]),
+        (start[1], end[1] - start[1], box[1], box[3]),
+    ):
+        if delta == 0:
+            if origin < minimum or origin > maximum:
+                return False
+            continue
+        first = (minimum - origin) / delta
+        second = (maximum - origin) / delta
+        low = max(low, min(first, second))
+        high = min(high, max(first, second))
+        if low > high:
+            return False
+    return True
+
+
+@dataclass(frozen=True, slots=True)
+class _ClipRegion:
+    """Fill-rule region of a clipping path flattened with a proven error bound.
+
+    Each edge carries a margin no smaller than the distance between it and the
+    path piece it replaces, so points farther than every margin from the edges
+    have the same winding number for the flattened and the true path.
+    """
+
+    edges: tuple[tuple[Point, Point, float], ...]
+    even_odd: bool
+
+    def contains(self, bbox: BBox) -> bool:
+        left, bottom, right, top = bbox
+        x = (left + right) / 2
+        y = (bottom + top) / 2
+        winding = 0
+        for start, end, margin in self.edges:
+            if _segment_meets_box(
+                start,
+                end,
+                (left - margin, bottom - margin, right + margin, top + margin),
+            ):
+                return False
+            if (start[1] <= y) != (end[1] <= y) and start[0] + (y - start[1]) * (
+                end[0] - start[0]
+            ) / (end[1] - start[1]) > x:
+                winding += 1 if end[1] > start[1] else -1
+        return winding % 2 == 1 if self.even_odd else winding != 0
+
+
+def _clip_region(
+    path: list[tuple[object, ...]],
+    matrix: Matrix,
+    *,
+    even_odd: bool,
+) -> _ClipRegion | None:
+    """Flatten a clipping path in device space, or return ``None`` if unsupported.
+
+    A cubic Bezier segment deviates from its chord polyline over ``n`` uniform
+    parameter steps by at most ``max|B''| / (8 n**2)``, and
+    ``max|B''| <= 6 max(|P0 - 2 P1 + P2|, |P1 - 2 P2 + P3|)``.
+    """
+
+    edges: list[tuple[Point, Point, float]] = []
+    subpath_start: Point | None = None
+    current: Point | None = None
+
+    def close_subpath() -> None:
+        if current is not None and subpath_start is not None:
+            if current != subpath_start:
+                edges.append((current, subpath_start, 0.0))
+
+    for segment in path:
+        operator = segment[0]
+        values = segment[1:]
+        if len(values) % 2 or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not isfinite(value)
+            for value in values
+        ):
+            return None
+        points = [
+            apply_matrix_pt(matrix, (float(values[index]), float(values[index + 1])))
+            for index in range(0, len(values), 2)
+        ]
+        if any(not isfinite(value) for point in points for value in point):
+            return None
+        if operator == "m" and len(points) == 1:
+            close_subpath()
+            subpath_start = current = points[0]
+            continue
+        if current is None:
+            return None
+        if operator == "h" and not points:
+            close_subpath()
+            current = subpath_start
+            continue
+        if operator == "l" and len(points) == 1:
+            edges.append((current, points[0], 0.0))
+            current = points[0]
+        elif operator in {"c", "v", "y"} and len(points) == (
+            3 if operator == "c" else 2
+        ):
+            start = current
+            if operator == "c":
+                first, second, end = points
+            elif operator == "v":
+                first = start
+                second, end = points
+            else:
+                first, end = points
+                second = end
+            bound = 0.75 * max(
+                hypot(
+                    start[0] - 2 * first[0] + second[0],
+                    start[1] - 2 * first[1] + second[1],
+                ),
+                hypot(
+                    first[0] - 2 * second[0] + end[0],
+                    first[1] - 2 * second[1] + end[1],
+                ),
+            )
+            if not isfinite(bound):
+                return None
+            count = max(
+                1,
+                min(
+                    _MAX_CLIP_CURVE_SEGMENTS,
+                    ceil(sqrt(bound / _CLIP_CURVE_FLATTENING_TOLERANCE)),
+                ),
+            )
+            margin = bound / (count * count)
+            previous = start
+            for step in range(1, count + 1):
+                t = step / count
+                s = 1.0 - t
+                point = (
+                    end
+                    if step == count
+                    else (
+                        s * s * s * start[0]
+                        + 3 * s * s * t * first[0]
+                        + 3 * s * t * t * second[0]
+                        + t * t * t * end[0],
+                        s * s * s * start[1]
+                        + 3 * s * s * t * first[1]
+                        + 3 * s * t * t * second[1]
+                        + t * t * t * end[1],
+                    )
+                )
+                edges.append((previous, point, margin))
+                previous = point
+            current = end
+        else:
+            return None
+        if len(edges) > _MAX_CLIP_REGION_EDGES:
+            return None
+    close_subpath()
+    if not edges or len(edges) > _MAX_CLIP_REGION_EDGES:
+        return None
+    tolerance = _polygon_tolerance(
+        tuple(point for start, end, _margin in edges for point in (start, end))
+    )
+    return _ClipRegion(
+        tuple((start, end, margin + tolerance) for start, end, margin in edges),
+        even_odd,
+    )
+
+
+def _extend_clip_regions(
+    regions: tuple[_ClipRegion, ...] | None,
+    region: _ClipRegion | None,
+) -> tuple[_ClipRegion, ...] | None:
+    if regions is None or region is None:
+        return None
+    if (
+        sum(len(existing.edges) for existing in regions) + len(region.edges)
+        > _MAX_CLIP_REGION_EDGES
+    ):
+        return None
+    return (*regions, region)
 
 
 def _transform_polygon(polygon: ClipPolygon, matrix: Matrix) -> ClipPolygon:
@@ -1124,20 +1312,13 @@ def _font_size(
     return abs(float(textstate.fontsize)) * scale
 
 
-def _make_text_run(
-    textstate: PDFTextState,
+def _text_paint_uncertain(
+    render_mode: int,
     graphicstate: PDFGraphicState,
-    characters: tuple[LTChar, ...],
-    empty_bbox: BBox,
-    text_matrix: Matrix,
     paint_state: InvocationPaintState,
-) -> TextRun:
-    render_mode = int(textstate.render)
+) -> bool:
     uses_fill = render_mode in {0, 2, 4, 6}
     uses_stroke = render_mode in {1, 2, 5, 6}
-    transparent = (not uses_fill or paint_state.fill_alpha <= 0) and (
-        not uses_stroke or paint_state.stroke_alpha <= 0
-    )
 
     def device_cmyk_has_ink(*, stroke: bool) -> bool:
         color_space = graphicstate.scs if stroke else graphicstate.ncs
@@ -1182,9 +1363,25 @@ def _make_text_run(
     has_visible_channel = (uses_fill and paint_state.fill_alpha > 0) or (
         uses_stroke and paint_state.stroke_alpha > 0
     )
-    uncertain = (
-        (fill_uncertain or stroke_uncertain) and not proven_visible_channel
-    ) or (paint_state.clip_visibility_uncertain and has_visible_channel)
+    return ((fill_uncertain or stroke_uncertain) and not proven_visible_channel) or (
+        paint_state.clip_visibility_uncertain and has_visible_channel
+    )
+
+
+def _make_text_run(
+    textstate: PDFTextState,
+    graphicstate: PDFGraphicState,
+    characters: tuple[LTChar, ...],
+    empty_bbox: BBox,
+    text_matrix: Matrix,
+    paint_state: InvocationPaintState,
+) -> TextRun:
+    render_mode = int(textstate.render)
+    uses_fill = render_mode in {0, 2, 4, 6}
+    uses_stroke = render_mode in {1, 2, 5, 6}
+    transparent = (not uses_fill or paint_state.fill_alpha <= 0) and (
+        not uses_stroke or paint_state.stroke_alpha <= 0
+    )
     return TextRun(
         text="".join(character.get_text() for character in characters),
         bbox=(
@@ -1203,7 +1400,11 @@ def _make_text_run(
         font_size=_font_size(textstate, characters, text_matrix),
         render_mode=render_mode,
         invisible=render_mode in {3, 7} or transparent,
-        final_paint_uncertain=uncertain,
+        final_paint_uncertain=_text_paint_uncertain(
+            render_mode,
+            graphicstate,
+            paint_state,
+        ),
     )
 
 
@@ -1298,7 +1499,11 @@ class _ProvenanceDevice(PDFPageAggregator):
         self._ctm_stack: list[Matrix] = []
         self._clip_bbox: BBox | None = None
         self._clip_polygon: ClipPolygon | None = None
-        self._clip_stack: list[tuple[BBox | None, ClipPolygon | None]] = []
+        # Regions that, with _clip_polygon, bound an inexact clip (None: unproven).
+        self._clip_regions: tuple[_ClipRegion, ...] | None = ()
+        self._clip_stack: list[
+            tuple[BBox | None, ClipPolygon | None, tuple[_ClipRegion, ...] | None]
+        ] = []
         self._text_clip_stack: list[BBox | None] = []
         self._xobject_stack: list[_XObjectContext] = []
         self._next_entry_state: InvocationPaintState | None = None
@@ -1318,6 +1523,7 @@ class _ProvenanceDevice(PDFPageAggregator):
         self._direct_xobject_index = 0
         self._clip_bbox = None
         self._clip_polygon = _rect_polygon(ctm, page.cropbox)
+        self._clip_regions = ()
         self._clip_stack = []
         self._text_clip_stack = []
         self._next_entry_state = None
@@ -1329,9 +1535,16 @@ class _ProvenanceDevice(PDFPageAggregator):
         self,
         bbox: BBox | None,
         polygon: ClipPolygon | None,
+        regions: tuple[_ClipRegion, ...] | None,
     ) -> None:
         self._clip_bbox = bbox
         self._clip_polygon = polygon
+        self._clip_regions = regions
+
+    def _clip_regions_contain(self, bbox: BBox) -> bool:
+        return self._clip_regions is not None and all(
+            region.contains(bbox) for region in self._clip_regions
+        )
 
     def set_next_entry_state(self, state: InvocationPaintState) -> None:
         if self._next_entry_state is not None:
@@ -1372,7 +1585,9 @@ class _ProvenanceDevice(PDFPageAggregator):
         effective_matrix = mult_matrix(matrix, current_ctm)
         painted_polygon = _rect_polygon(effective_matrix, bbox)
         painted_bbox = _polygon_bbox(painted_polygon) or (0.0, 0.0, 0.0, 0.0)
-        self._clip_stack.append((self._clip_bbox, self._clip_polygon))
+        self._clip_stack.append(
+            (self._clip_bbox, self._clip_polygon, self._clip_regions)
+        )
         figure_polygon = _polygon_intersection(self._clip_polygon, painted_polygon)
         figure_clip = _polygon_bbox(figure_polygon)
         entry_state = self._next_entry_state or InvocationPaintState()
@@ -1428,7 +1643,11 @@ class _ProvenanceDevice(PDFPageAggregator):
         else:
             self._page_spans.append(invocation)
             self._direct_xobject_index += 1
-        self._clip_bbox, self._clip_polygon = self._clip_stack.pop()
+        (
+            self._clip_bbox,
+            self._clip_polygon,
+            self._clip_regions,
+        ) = self._clip_stack.pop()
 
     def render_image(self, name: str, stream: PDFStream) -> None:
         if not self._xobject_stack:
@@ -1492,6 +1711,20 @@ class _ProvenanceDevice(PDFPageAggregator):
             run, glyph_advance = fallback
             line_x, line_y = textstate.linematrix
             textstate.linematrix = (line_x + glyph_advance, line_y)
+        if (
+            run.final_paint_uncertain
+            and self._paint_state.clip_visibility_uncertain
+            and self._clip_regions_contain(run.bbox)
+        ):
+            # The inexact clip provably leaves the whole run unclipped.
+            run = replace(
+                run,
+                final_paint_uncertain=_text_paint_uncertain(
+                    run.render_mode,
+                    graphicstate,
+                    replace(self._paint_state, clip_visibility_uncertain=False),
+                ),
+            )
         has_text_glyphs = any(isinstance(item, bytes) and item for item in seq)
         if run.render_mode in {4, 5, 6, 7} and has_text_glyphs:
             if not self._text_clip_stack:
@@ -1556,11 +1789,13 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
         self._clip_bbox = device._clip_bbox
         self._clip_polygon = device._clip_polygon
         self._clip_is_exact = not self._paint_state.clip_visibility_uncertain
+        self._clip_regions = () if self._clip_is_exact else device._clip_regions
         self._clip_stack: list[
             tuple[
                 BBox | None,
                 ClipPolygon | None,
                 bool,
+                tuple[_ClipRegion, ...] | None,
                 InvocationPaintState,
             ]
         ] = []
@@ -1568,6 +1803,7 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
         self._pending_clip_bbox: BBox = (0.0, 0.0, 0.0, 0.0)
         self._pending_clip_polygon: ClipPolygon = ()
         self._pending_clip_is_exact = True
+        self._pending_clip_region: _ClipRegion | None = None
 
     def subinterp(self) -> PDFPageInterpreter:
         interpreter = cast(_ProvenanceInterpreter, super().subinterp())
@@ -1583,7 +1819,11 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
     ) -> None:
         self._clip_bbox = bbox
         self._clip_polygon = polygon
-        cast(_ProvenanceDevice, self.device).set_clip(bbox, polygon)
+        cast(_ProvenanceDevice, self.device).set_clip(
+            bbox,
+            polygon,
+            self._clip_regions,
+        )
 
     def _rectangular_clip_polygon(self) -> ClipPolygon:
         if not self.curpath:
@@ -1662,6 +1902,7 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
         )
         if current_is_empty or pending_is_empty:
             self._clip_is_exact = True
+            self._clip_regions = ()
             self._set_clip((0.0, 0.0, 0.0, 0.0), ())
         elif self._clip_is_exact and self._pending_clip_is_exact:
             polygon = _polygon_intersection(
@@ -1671,6 +1912,11 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
             self._set_clip(_polygon_bbox(polygon), polygon)
         else:
             self._clip_is_exact = False
+            self._clip_regions = _extend_clip_regions(
+                self._clip_regions,
+                self._pending_clip_region,
+            )
+            self._set_clip(self._clip_bbox, self._clip_polygon)
         self._clip_pending = False
 
     def _operation_paint_state(self) -> InvocationPaintState:
@@ -1685,6 +1931,7 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
                 self._clip_bbox,
                 self._clip_polygon,
                 self._clip_is_exact,
+                self._clip_regions,
                 self._paint_state,
             )
         )
@@ -1697,6 +1944,7 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
                 clip_bbox,
                 clip_polygon,
                 self._clip_is_exact,
+                self._clip_regions,
                 self._paint_state,
             ) = self._clip_stack.pop()
             self._set_clip(clip_bbox, clip_polygon)
@@ -1710,8 +1958,10 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
         text_clip_bbox = cast(_ProvenanceDevice, self.device).end_text_object()
         if text_clip_bbox is not None and self._clip_bbox != (0.0, 0.0, 0.0, 0.0):
             self._clip_is_exact = False
+            self._clip_regions = None
+            self._set_clip(self._clip_bbox, self._clip_polygon)
 
-    def do_W(self) -> None:  # noqa: N802
+    def _set_pending_clip(self, *, even_odd: bool) -> None:
         try:
             self._pending_clip_polygon = self._rectangular_clip_polygon()
             self._pending_clip_bbox = _polygon_bbox(self._pending_clip_polygon) or (
@@ -1723,10 +1973,18 @@ class _ProvenanceInterpreter(PDFPageInterpreter):
             self._pending_clip_is_exact = True
         except _NonRectangularClipError:
             self._pending_clip_is_exact = False
+        self._pending_clip_region = (
+            None
+            if self._clip_is_exact and self._pending_clip_is_exact
+            else _clip_region(self.curpath, self.ctm, even_odd=even_odd)
+        )
         self._clip_pending = True
 
+    def do_W(self) -> None:  # noqa: N802
+        self._set_pending_clip(even_odd=False)
+
     def do_W_a(self) -> None:  # noqa: N802
-        self.do_W()
+        self._set_pending_clip(even_odd=True)
 
     def do_n(self) -> None:
         self._commit_clip()

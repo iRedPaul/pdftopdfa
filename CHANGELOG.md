@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Bug Fixes
+
+- Tag text inside curved clipping paths, such as rounded table or box borders in browser-generated PDFs, instead of skipping level A conversion because of uncertain final-paint visibility
+
 ## [0.9.21] - 2026-10-15
 
 ### Bug Fixes
