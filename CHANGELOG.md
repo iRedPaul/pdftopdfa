@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.23] - 2026-10-20
 
 ### Bug Fixes
 
