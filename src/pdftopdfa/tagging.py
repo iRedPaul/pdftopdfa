@@ -6928,24 +6928,15 @@ def _direct_artifact_items(
                 )
                 # Unclassified Form paint whose geometry or final-paint visibility
                 # cannot be proven is never bound as a Figure; it becomes a Layout
-                # artifact and requests manual vector review instead.
+                # artifact and requests manual vector review instead. Shadings
+                # count as such because they have no exact painted geometry.
                 ambiguous_unclassified_form_paint = unclassified_form_paint and (
-                    fill_geometry_status is None
+                    operator_name == "sh"
+                    or fill_geometry_status is None
                     or stroke_state_uncertain
                     or fill_state_uncertain
                     or not clip_is_exact
                 )
-                if (
-                    operator_name == "sh"
-                    and not artifact_paint
-                    and scope_index is None
-                    and isinstance(owner, Stream)
-                    and resolve_indirect(owner.get("/Subtype")) == Name.Form
-                ):
-                    raise ConversionError(
-                        f"Cannot create semantic structure: {description} has "
-                        "unclassified Form shading without exact painted geometry"
-                    )
                 if not clip_is_exact and not artifact_paint and scope_index is not None:
                     raise ConversionError(
                         f"Cannot create semantic structure: {description} has "

@@ -7310,6 +7310,83 @@ def test_form_text_survives_ambiguous_vector_artifacting() -> None:
     assert "/Artifact" in next(stack for operator, stack in paints if operator == "f*")
 
 
+def _axial_shading(pdf: pikepdf.Pdf) -> pikepdf.Object:
+    function = pdf.make_indirect(
+        Dictionary(
+            FunctionType=2,
+            Domain=Array([0, 1]),
+            C0=Array([0, 0, 0]),
+            C1=Array([1, 1, 1]),
+            N=1,
+        )
+    )
+    return pdf.make_indirect(
+        Dictionary(
+            ShadingType=2,
+            ColorSpace=Name.DeviceRGB,
+            Coords=Array([0, 0, 1, 0]),
+            Function=function,
+            Extend=Array([True, True]),
+        )
+    )
+
+
+def test_unclassified_form_shading_becomes_layout_artifact() -> None:
+    pdf = pikepdf.Pdf.new()
+    form = _form(
+        pdf,
+        (
+            b"BT /F1 10 Tf 10 70 Td (Letterhead) Tj ET "
+            b"q 0 0 100 20 re W n 20 0 0 20 50 0 cm /Sh0 sh Q"
+        ),
+        Dictionary(
+            Font=Dictionary(F1=_font(pdf)),
+            Shading=Dictionary(Sh0=_axial_shading(pdf)),
+        ),
+        bbox=(0, 0, 100, 100),
+    )
+    page = _page(
+        pdf,
+        b"/Fm Do",
+        Dictionary(XObject=Dictionary(Fm=form)),
+        size=(100, 100),
+    )
+
+    result = ensure_logical_structure(pdf, semantic=True)
+
+    assert result["semantic_content_items"] == 1
+    assert result["semantic_vector_review_required"] == 1
+    assert "/P" in _roles(pdf)
+    assert "/Figure" not in _roles(pdf)
+    clone = _invoked_forms(page)[0]
+    paints = _marked_paint_stacks(clone)
+    assert "/Span" in next(stack for operator, stack in paints if operator == "Tj")
+    assert "/Artifact" in next(stack for operator, stack in paints if operator == "sh")
+
+
+def test_described_form_with_unclassified_shading_fails_atomically() -> None:
+    pdf = pikepdf.Pdf.new()
+    form = _form(
+        pdf,
+        b"q 0 0 100 20 re W n /Sh0 sh Q",
+        Dictionary(Shading=Dictionary(Sh0=_axial_shading(pdf))),
+        bbox=(0, 0, 100, 100),
+    )
+    page = _page(
+        pdf,
+        b"/Figure <</ActualText (Gradient bar)>> BDC /Fm Do EMC",
+        Dictionary(XObject=Dictionary(Fm=form)),
+        size=(100, 100),
+    )
+    original = bytes(page.obj["/Contents"].read_bytes())
+
+    with pytest.raises(ConversionError, match="described.*ambiguous path geometry"):
+        ensure_logical_structure(pdf, semantic=True)
+
+    assert bytes(page.obj["/Contents"].read_bytes()) == original
+    assert "/StructTreeRoot" not in pdf.Root
+
+
 def test_described_ambiguous_form_fill_still_fails_atomically() -> None:
     pdf = pikepdf.Pdf.new()
     form = _form(
