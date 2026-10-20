@@ -6,6 +6,7 @@
 
 - Tag Form XObjects that paint a shading, such as gradient bars in embedded letterhead artwork, by keeping the shading as a Layout artifact for vector review instead of skipping level A conversion with "unclassified Form shading without exact painted geometry"
 - Assign OCR text layers to the page that invokes them when pages share one resource dictionary, instead of skipping the conversion with "OCR Forms are not invoked by the page" or "OCR manifest page has 2 new OCR Forms"
+- Repair embedded TrueType fonts whose `hmtx` table lacks trailing side bearings, so their declared glyph widths are corrected instead of failing veraPDF rule 6.2.11.5
 
 ### Documentation
 
