@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Bug Fixes
+
+- Tag Form XObjects that paint a shading, such as gradient bars in embedded letterhead artwork, by keeping the shading as a Layout artifact for vector review instead of skipping level A conversion with "unclassified Form shading without exact painted geometry"
+- Assign OCR text layers to the page that invokes them when pages share one resource dictionary, instead of skipping the conversion with "OCR Forms are not invoked by the page" or "OCR manifest page has 2 new OCR Forms"
+
+### Documentation
+
+- Document how shadings in undescribed Form XObjects are tagged
+
 ## [0.9.22] - 2026-10-19
 
 ### Features

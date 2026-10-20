@@ -156,8 +156,13 @@ def _add_ocr_form(
     page_index: int,
     name: str,
     mcids: Sequence[int],
+    *,
+    invoke: bool = False,
 ) -> None:
-    """Attach an OCR Form whose content marks exactly *mcids*."""
+    """Attach an OCR Form whose content marks exactly *mcids*.
+
+    With *invoke*, the page also paints the Form like OCRmyPDF's text layer.
+    """
     content = b" ".join(
         f"/Span <</MCID {mcid}>> BDC BT ET EMC".encode() for mcid in mcids
     )
@@ -170,6 +175,11 @@ def _add_ocr_form(
     if Name.XObject not in resources:
         resources[Name.XObject] = Dictionary()
     resources.XObject[Name(name)] = form
+    if invoke:
+        pdf.pages[page_index].contents_add(
+            pdf.make_stream(f"q {name} Do Q".encode()),
+            prepend=True,
+        )
 
 
 def _ocr_page_manifest(page_index: int, text: str) -> dict[str, object]:
@@ -1231,6 +1241,7 @@ class TestRotatedOcrFormBoxes:
             xobjects = Dictionary()
             xobjects[Name("/OCR-pdf-0")] = form
             page.obj[Name.Resources] = Dictionary(XObject=xobjects)
+            page.obj[Name.Contents] = pdf.make_stream(b"q /OCR-pdf-0 Do Q")
             pdf.save(path)
 
         new_forms = _finalize_ocr_output(path, ["en"], [frozenset()])
@@ -1240,6 +1251,45 @@ class TestRotatedOcrFormBoxes:
             expected = [0, 0, 432, 576] if rotation in {90, 270} else [0, 0, 576, 432]
             assert [float(value) for value in form.BBox] == expected
         assert new_forms == {0: ("/OCR-pdf-0",)}
+
+    def test_assigns_shared_resource_forms_to_invoking_pages(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        path = tmp_dir / "shared-resources.pdf"
+        with Pdf.new() as pdf:
+            xobjects = Dictionary()
+            resources = pdf.make_indirect(Dictionary(XObject=xobjects))
+            for page_index, size in enumerate(((576, 432), (300, 200))):
+                page = pdf.add_blank_page(page_size=size)
+                page.obj[Name.Resources] = resources
+                form = pdf.make_stream(b"")
+                form[Name.Type] = Name.XObject
+                form[Name.Subtype] = Name.Form
+                form[Name.BBox] = pikepdf.Array([0, 0, 1, 1])
+                xobjects[Name(f"/OCR-page-{page_index}")] = form
+                page.obj[Name.Contents] = pdf.make_stream(
+                    f"q /OCR-page-{page_index} Do Q".encode()
+                )
+            pdf.save(path)
+
+        new_forms = _finalize_ocr_output(path, ["en"], [frozenset(), frozenset()])
+
+        assert new_forms == {0: ("/OCR-page-0",), 1: ("/OCR-page-1",)}
+        with Pdf.open(path) as pdf:
+            xobjects = pdf.pages[0].Resources.XObject
+            assert [float(value) for value in xobjects["/OCR-page-0"].BBox] == [
+                0,
+                0,
+                576,
+                432,
+            ]
+            assert [float(value) for value in xobjects["/OCR-page-1"].BBox] == [
+                0,
+                0,
+                300,
+                200,
+            ]
 
     @pytest.mark.parametrize("inherited", [False, True])
     def test_leaves_preexisting_ocr_form_unchanged(
@@ -2283,7 +2333,7 @@ class TestApplyOcr:
         ) -> None:
             assert kwargs["pages"] == "2"
             with Pdf.open(source) as pdf:
-                _add_ocr_form(pdf, 1, "/OCR-recognized", [])
+                _add_ocr_form(pdf, 1, "/OCR-recognized", [], invoke=True)
                 pdf.save(destination)
 
         with patch(
@@ -3973,6 +4023,10 @@ class TestApplyOcr:
                     form[Name.Resources] = Dictionary()
                     name = Name(f"/OCR-run-{run_number}-page-{page_index}")
                     pdf.pages[page_index].Resources.XObject[name] = form
+                    pdf.pages[page_index].contents_add(
+                        pdf.make_stream(b"q " + name.unparse() + b" Do Q"),
+                        prepend=True,
+                    )
                 pdf.save(destination)
 
         with patch(
@@ -4031,6 +4085,7 @@ class TestApplyOcr:
             "/OCR-run-2-page-2",
         ]
         with Pdf.open(output_path) as pdf:
+            pdf.pages[2].contents_coalesce()
             assert b"(Native text)" in pdf.pages[2].Contents.read_bytes()
             assert "/OCR-run-2-page-2" in pdf.pages[2].Resources.XObject
 
@@ -5203,6 +5258,37 @@ class TestSupplementaryOcr:
             assert contents[1].read_bytes() == (
                 b"BT /F1 12 Tf 3 Tr 10 50 Td (Approved) Tj ET"
             )
+
+    def test_graft_assigns_shared_resource_layers_to_invoking_pages(
+        self,
+        tmp_dir: Path,
+    ) -> None:
+        base_path = tmp_dir / "base.pdf"
+        recognized_path = tmp_dir / "recognized.pdf"
+        output_path = tmp_dir / "output.pdf"
+        self._write_pages(base_path, 2, shared_resources=True)
+        # OCRmyPDF adds each page's Form to the one shared XObject dictionary.
+        with Pdf.open(base_path) as pdf:
+            for page_number, page in enumerate(pdf.pages, start=1):
+                name = f"/OCR-page-{page_number}"
+                page.Resources.XObject[name] = _make_text_ocr_form(
+                    pdf, f"Letterhead {page_number}".encode()
+                )
+                page.contents_add(
+                    pdf.make_stream(f"q 1 0 0 1 0 0 cm {name} Do Q".encode()),
+                    prepend=True,
+                )
+            pdf.save(recognized_path)
+
+        grafted = _graft_supplementary_ocr(
+            base_path, recognized_path, output_path, (1, 2)
+        )
+
+        assert grafted == frozenset({1, 2})
+        assert _ocr_form_names(output_path) == [
+            frozenset({"/OCR-page-1"}),
+            frozenset({"/OCR-page-2"}),
+        ]
 
     def test_graft_skips_layers_without_recognized_text(self, tmp_dir: Path) -> None:
         base_path = tmp_dir / "base.pdf"

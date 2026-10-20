@@ -17,6 +17,7 @@ import os
 import shutil
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from numbers import Number
 from pathlib import Path
@@ -1421,14 +1422,24 @@ def _form_shows_text(form: "pikepdf.Object") -> bool:
     )
 
 
+def _invoked_xobject_names(instructions: Iterable[Any]) -> frozenset[str]:
+    """Return the XObject names that page *instructions* paint with ``Do``.
+
+    Pages that share one resource dictionary also list the OCR Forms OCRmyPDF
+    added for the other pages; only the Forms a page invokes belong to it.
+    """
+    return frozenset(
+        str(operands[0])
+        for operands, operator in instructions
+        if str(operator) == "Do" and len(operands) == 1
+    )
+
+
 def _ocr_layer_instructions(
-    page: "pikepdf.Page",
+    instructions: list[Any],
     form_names: frozenset[str],
 ) -> list[Any]:
     """Return OCRmyPDF's ``q [cm] /Name Do Q`` invocations of *form_names*."""
-    import pikepdf
-
-    instructions = list(pikepdf.parse_content_stream(page))
     layer: list[Any] = []
     found: set[str] = set()
     for index, (operands, operator) in enumerate(instructions):
@@ -1450,10 +1461,6 @@ def _ocr_layer_instructions(
             raise OCRError(f"Unexpected invocation of OCR Form {name}")
         found.add(name)
         layer.extend(instructions[start : index + 2])
-    if found != form_names:
-        raise OCRError(
-            f"OCR Forms are not invoked by the page: {sorted(form_names - found)}"
-        )
     return layer
 
 
@@ -1513,16 +1520,19 @@ def _graft_supplementary_ocr(
                 ocr_xobjects = ocr_page.resources.get("/XObject")
                 if ocr_xobjects is None:
                     continue
+                instructions = list(pikepdf.parse_content_stream(ocr_page))
+                invoked_names = _invoked_xobject_names(instructions)
                 new_forms = {
                     str(name): form
                     for name, form in ocr_xobjects.items()
                     if str(name).startswith("/OCR-")
                     and str(name) not in existing_names
+                    and str(name) in invoked_names
                     and form.get("/Subtype") == pikepdf.Name.Form
                 }
                 if not any(_form_shows_text(form) for form in new_forms.values()):
                     continue
-                layer = _ocr_layer_instructions(ocr_page, frozenset(new_forms))
+                layer = _ocr_layer_instructions(instructions, frozenset(new_forms))
 
                 resources = _private_resources(base_page.resources)
                 xobjects = resources.get("/XObject")
@@ -2336,6 +2346,7 @@ def _finalize_ocr_output(
             if xobjects is None:
                 continue
 
+            invoked_names: frozenset[str] | None = None
             for name, xobject in xobjects.items():
                 if not str(name).startswith("/OCR-"):
                     continue
@@ -2350,6 +2361,12 @@ def _finalize_ocr_output(
                 if is_existing:
                     continue
                 if xobject.get("/Subtype") != pikepdf.Name.Form:
+                    continue
+                if invoked_names is None:
+                    invoked_names = _invoked_xobject_names(
+                        pikepdf.parse_content_stream(page)
+                    )
+                if str(name) not in invoked_names:
                     continue
                 new_ocr_form_names.setdefault(page_index, []).append(str(name))
                 rotation = _validated_ocr_page_rotation(page, page_index + 1)

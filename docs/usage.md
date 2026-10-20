@@ -662,7 +662,10 @@ The internal pipeline rejects the converted candidate when:
 - Level A semantic tagging cannot bind tags to page content safely. Text under
   a curved clipping path, such as a rounded table border, is tagged when its
   glyph box, widened by any text stroke, provably lies inside the clip; text
-  that may be cut by the curve still counts as uncertain.
+  that may be cut by the curve still counts as uncertain. Shadings in
+  undescribed Form XObjects, such as gradient bars in embedded letterhead
+  artwork, are kept as Layout artifacts and reported for vector review; a
+  shading in a Form that carries its own Alt or ActualText still fails.
 
 The high-level converter catches these failures and copies the original input
 unchanged with a warning. It does not publish a partially modified candidate or
