@@ -75,6 +75,7 @@ from .filters import (
     sanitize_nonstandard_inline_filters,
 )
 from .font_notdef import sanitize_font_notdef
+from .font_program import sanitize_font_programs
 from .font_structure import sanitize_font_structure
 from .font_widths import sanitize_font_widths
 from .fonts import sanitize_cidfont_structures, sanitize_fontname_consistency
@@ -375,6 +376,11 @@ def sanitize_for_pdfa(
         "font_stream_subtype_removed", 0
     )
 
+    # Repair truncated hmtx tables so later font-program sanitizers can parse
+    # them. Must run BEFORE truetype_encoding/notdef/glyph_coverage/font_widths
+    font_program_result = sanitize_font_programs(pdf)
+    result["font_hmtx_repaired"] = font_program_result.get("font_hmtx_repaired", 0)
+
     # Fix TrueType font encoding issues (ISO 19005-2, 6.2.11.6)
     # Must run AFTER font_structure (ensures /Subtype and /FontDescriptor exist)
     # and BEFORE notdef/glyph_coverage/font_widths
@@ -529,6 +535,7 @@ __all__ = [
     "sanitize_fontname_consistency",
     "sanitize_font_structure",
     "sanitize_font_notdef",
+    "sanitize_font_programs",
     "sanitize_truetype_encoding",
     "sanitize_font_widths",
     "sanitize_glyph_coverage",
