@@ -6,7 +6,7 @@
 
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import pikepdf
@@ -852,36 +852,86 @@ def _decode_unicode_hex(hex_str: str) -> int:
     return int(hex_str, 16)
 
 
-_PDF_WHITESPACE = b"\x00\t\n\x0c\r "
-# Literal strings are matched first so that "%" inside them is kept; only
-# irregular hex strings (inner whitespace or an odd digit count) are matched
-# so that canonical CMaps pass through the C-level scan untouched.
-_CMAP_SYNTAX_RE = re.compile(
-    rb"(?P<literal>\((?:[^()\\]|\\.|\((?:[^()\\]|\\.)*\))*\))"
-    rb"|(?P<comment>%[^\r\n\x0c]*)"
-    rb"|<<|>>"
-    rb"|<(?P<hex>[0-9A-Fa-f]*[\x00\t\n\x0c\r ][0-9A-Fa-f\x00\t\n\x0c\r ]*"
-    rb"|(?:[0-9A-Fa-f]{2})*[0-9A-Fa-f])>",
-    re.DOTALL,
+_PDF_WHITESPACE_TABLE = str.maketrans("", "", "\x00\t\n\x0c\r ")
+_CMAP_DELIMITER_RE = re.compile(r"[(%]")
+_CMAP_LITERAL_SPECIAL_RE = re.compile(r"[()\\]")
+_CMAP_LINE_END_RE = re.compile(r"[\r\n\x0c]")
+# Irregular hex strings (inner whitespace or an odd digit count); dictionary
+# delimiters are matched too so that "<<" never starts a hex string.
+_IRREGULAR_CMAP_HEX = (
+    r"<(?P<hex>[0-9A-Fa-f]*[\x00\t\n\x0c\r ][0-9A-Fa-f\x00\t\n\x0c\r ]*"
+    r"|(?:[0-9A-Fa-f]{2})*[0-9A-Fa-f])>"
 )
-# Same irregular hex alternative with a literal "<" prefix, which the regex
-# engine scans for quickly; used to skip the full pass for canonical data.
-_IRREGULAR_CMAP_HEX_RE = re.compile(
-    rb"<(?:[0-9A-Fa-f]*[\x00\t\n\x0c\r ][0-9A-Fa-f\x00\t\n\x0c\r ]*"
-    rb"|(?:[0-9A-Fa-f]{2})*[0-9A-Fa-f])>"
-)
+_CMAP_HEX_TOKEN_RE = re.compile(rf"<<|>>|{_IRREGULAR_CMAP_HEX}")
+# Bytes variant with a literal "<" prefix, which the regex engine scans for
+# quickly; used to skip the full pass for canonical data.
+_IRREGULAR_CMAP_HEX_RE = re.compile(_IRREGULAR_CMAP_HEX.encode("ascii"))
 
 
-def _canonicalize_cmap_token(match: re.Match[bytes]) -> bytes:
+def iter_cmap_inert_spans(text: str) -> Iterator[tuple[int, int, bool]]:
+    """Yield ``(start, end, is_comment)`` for CMap literal strings and comments.
+
+    Literal strings nest to any depth with balanced or escaped parentheses,
+    and ``%`` inside one starts no comment. An unterminated literal string
+    runs to the end of the data, as in PDF tokenizers. Comments end at CR,
+    LF or FF.
+    """
+    position = 0
+    length = len(text)
+    while (delimiter := _CMAP_DELIMITER_RE.search(text, position)) is not None:
+        start = delimiter.start()
+        if delimiter.group() == "%":
+            line_end = _CMAP_LINE_END_RE.search(text, start)
+            end = line_end.start() if line_end is not None else length
+            yield start, end, True
+        else:
+            end = length
+            depth = 0
+            escaped_until = -1
+            for special in _CMAP_LITERAL_SPECIAL_RE.finditer(text, start):
+                index = special.start()
+                if index < escaped_until:
+                    continue
+                char = special.group()
+                if char == "\\":
+                    escaped_until = index + 2
+                elif char == "(":
+                    depth += 1
+                else:
+                    depth -= 1
+                    if depth == 0:
+                        end = index + 1
+                        break
+            yield start, end, False
+        position = end
+
+
+def mask_cmap_inert_text(text: str) -> str:
+    """Blank CMap literal strings and comments, keeping every offset.
+
+    Block and entry patterns can then run on the masked text, while
+    rewrites splice the original text at the same offsets.
+    """
+    if "%" not in text and "(" not in text:
+        return text
+    parts: list[str] = []
+    position = 0
+    for start, end, _is_comment in iter_cmap_inert_spans(text):
+        parts.append(text[position:start])
+        parts.append(" " * (end - start))
+        position = end
+    parts.append(text[position:])
+    return "".join(parts)
+
+
+def _canonicalize_cmap_hex(match: re.Match[str]) -> str:
     digits = match.group("hex")
-    if digits is not None:
-        digits = digits.translate(None, _PDF_WHITESPACE)
-        if len(digits) % 2:
-            digits += b"0"
-        return b"<" + digits + b">"
-    if match.group("comment") is not None:
-        return b" "
-    return match.group(0)
+    if digits is None:
+        return match.group(0)
+    digits = digits.translate(_PDF_WHITESPACE_TABLE)
+    if len(digits) % 2:
+        digits += "0"
+    return f"<{digits}>"
 
 
 def normalize_cmap_syntax(data: bytes) -> bytes:
@@ -890,10 +940,21 @@ def normalize_cmap_syntax(data: bytes) -> bytes:
     Hex strings may contain whitespace, and an odd final digit implies a
     trailing zero (ISO 32000-1, 7.3.4.3); ``%`` starts a comment outside
     strings.  Canonical ``<41>`` tokens let entry patterns stay simple.
+    Literal strings are kept unchanged.
     """
     if b"%" not in data and _IRREGULAR_CMAP_HEX_RE.search(data) is None:
         return data
-    return _CMAP_SYNTAX_RE.sub(_canonicalize_cmap_token, data)
+    text = data.decode("latin-1")
+    parts: list[str] = []
+    position = 0
+    for start, end, is_comment in iter_cmap_inert_spans(text):
+        parts.append(
+            _CMAP_HEX_TOKEN_RE.sub(_canonicalize_cmap_hex, text[position:start])
+        )
+        parts.append(" " if is_comment else text[start:end])
+        position = end
+    parts.append(_CMAP_HEX_TOKEN_RE.sub(_canonicalize_cmap_hex, text[position:]))
+    return "".join(parts).encode("latin-1")
 
 
 def parse_tounicode_cmap(data: bytes) -> dict[int, int]:

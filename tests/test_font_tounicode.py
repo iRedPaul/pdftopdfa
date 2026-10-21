@@ -242,6 +242,18 @@ class TestToUnicodeCMapSyntax:
         canonical = b"1 beginbfchar\n<0041> <0061>\nendbfchar"
         assert normalize_cmap_syntax(canonical) is canonical
 
+    @pytest.mark.parametrize(
+        "literal",
+        [b"(a%b(c(d))e)", rb"(a\)%b)", rb"(a\\(%b))", b"(a\n%b)"],
+    )
+    def test_percent_in_nested_or_escaped_literal_is_no_comment(self, literal):
+        cmap = b"/Note " + literal + b" def 1 beginbfchar <01> <0041> endbfchar"
+        assert parse_tounicode_cmap(cmap) == {0x01: 0x41}
+
+    def test_unterminated_literal_runs_to_end(self):
+        data = b"/Note (a % b\n<4 1> % c"
+        assert normalize_cmap_syntax(data) == data
+
 
 class TestSimpleFontToUnicode:
     """Tests for ToUnicode CMap generation for Simple Fonts."""

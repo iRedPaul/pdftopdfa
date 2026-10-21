@@ -135,8 +135,8 @@ class _RemovalGuard:
         self.preserved_fonts: dict[object, str] = {}
 
     def allows(self, font_obj: pikepdf.Object, notdef_codes: _NotdefCodes) -> bool:
-        # The same identity domain as collect_font_usage(), so that direct
-        # Type 0 fonts are judged by their usage as well.
+        # The same identity domain as collect_font_usage(), so that fonts
+        # stored directly in a resource dictionary are judged as well.
         key = _object_identity(font_obj)
         if key in self._decisions:
             return self._decisions[key]
@@ -157,7 +157,9 @@ class _RemovalGuard:
         if notdef_codes.unreliable:
             return "its embedded CMap contains unreadable mappings"
         if self._usage is None:
-            self._usage = collect_font_usage(self._pdf, skip_invisible_text=True)
+            self._usage = collect_font_usage(
+                self._pdf, skip_invisible_text=True, include_direct_simple_fonts=True
+            )
         used = self._usage.get(key, set())
         removed = sum(1 for code in used if code in notdef_codes)
         if (

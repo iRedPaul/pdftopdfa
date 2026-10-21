@@ -679,6 +679,7 @@ def collect_font_usage(
     *,
     require_resolved_font: bool = False,
     skip_invisible_text: bool = False,
+    include_direct_simple_fonts: bool = False,
 ) -> dict[_ObjectKey, set[CharacterCode]]:
     """Collects character codes used with each font across the entire PDF.
 
@@ -693,13 +694,20 @@ def collect_font_usage(
             safety check.
         skip_invisible_text: Ignore text shown in rendering mode 3, for
             callers that treat invisible (OCR) text separately.
+        include_direct_simple_fonts: Also record simple fonts stored directly
+            in a resource dictionary, under their serialized identity.
 
     Returns:
         Dictionary mapping indirect font objgens, or serialized direct Type0
-        font identities, to the character codes used with each font.
+        (and, on request, simple) font identities, to the character codes
+        used with each font.
     """
     return _merge_font_usage(
-        _collect_raw_font_usage(pdf, skip_invisible_text=skip_invisible_text),
+        _collect_raw_font_usage(
+            pdf,
+            skip_invisible_text=skip_invisible_text,
+            include_direct_simple_fonts=include_direct_simple_fonts,
+        ),
         require_resolved_font,
     )
 
@@ -722,7 +730,10 @@ def _merge_font_usage(
 
 
 def _collect_raw_font_usage(
-    pdf: pikepdf.Pdf, *, skip_invisible_text: bool = False
+    pdf: pikepdf.Pdf,
+    *,
+    skip_invisible_text: bool = False,
+    include_direct_simple_fonts: bool = False,
 ) -> _RawFontUsage:
     """Collect (resolved, unresolved) font usage for the whole document.
 
@@ -761,6 +772,7 @@ def _collect_raw_font_usage(
                     parse_cache,
                     saw_unresolved,
                     skip_invisible_text=skip_invisible_text,
+                    include_direct_simple_fonts=include_direct_simple_fonts,
                 )
         if not saw_unresolved:
             break
@@ -777,6 +789,7 @@ def _process_content_stream(
     saw_unresolved: list[bool] | None = None,
     *,
     skip_invisible_text: bool = False,
+    include_direct_simple_fonts: bool = False,
 ) -> None:
     """Parses a content stream and records character code usage.
 
@@ -786,6 +799,7 @@ def _process_content_stream(
         usage: Accumulator mapping font objgen -> used character codes.
         parse_cache: Optional per-collection cache of parsed streams.
         skip_invisible_text: Ignore text shown in rendering mode 3.
+        include_direct_simple_fonts: Also record direct simple fonts.
     """
     cache_key = None
     if parse_cache is not None and isinstance(stream_owner, pikepdf.Stream):
@@ -812,6 +826,8 @@ def _process_content_stream(
     current_font_is_cid = False
     current_code_space_ranges: tuple[tuple[bytes, bytes], ...] | None = None
     text_rendering_mode = 0
+    identified_font: pikepdf.Object | None = None
+    identified_font_key: _ObjectKey = (0, 0)
     graphics_state_stack: list[
         tuple[
             pikepdf.Object | None,
@@ -867,7 +883,7 @@ def _process_content_stream(
             except Exception:
                 continue
             is_cid = _is_cidfont(font_obj)
-            if objgen == (0, 0) and not is_cid:
+            if objgen == (0, 0) and not is_cid and not include_direct_simple_fonts:
                 continue
             font_key = _object_identity(font_obj)
             ranges = get_font_code_space_ranges(font_obj) if is_cid else None
@@ -962,9 +978,17 @@ def _process_content_stream(
             except Exception:
                 continue
 
-            if objgen == (0, 0) and not current_font_is_cid:
+            if (
+                objgen == (0, 0)
+                and not current_font_is_cid
+                and not include_direct_simple_fonts
+            ):
                 continue
 
-            font_key = _object_identity(current_font)
+            # Serializing a direct font is costly; do it once per font change.
+            if current_font is not identified_font:
+                identified_font = current_font
+                identified_font_key = _object_identity(current_font)
+            font_key = identified_font_key
             for operand in text_operands(operands, operator):
                 record_codes(operand, font_key)

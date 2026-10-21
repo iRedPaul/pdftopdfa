@@ -1993,6 +1993,18 @@ class TestRemovalGuard:
         assert result == {"notdef_usage_fixed": 0, "notdef_fonts_preserved": 1}
         assert stream.read_bytes() == content
 
+    def test_mass_removal_in_direct_simple_font_keeps_text(self):
+        """Simple fonts stored directly in the resources are judged too."""
+        pdf = new_pdf()
+        font = _make_mac_roman_truetype_font(pdf, {0x41: "uniF041"})
+        content = b"BT /F1 12 Tf <4142434445> Tj ET"
+        stream = _make_page_with_font_and_content(pdf, font, content)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result == {"notdef_usage_fixed": 0, "notdef_fonts_preserved": 1}
+        assert stream.read_bytes() == content
+
     def test_invisible_notdef_codes_do_not_count_as_removals(self):
         """Invisible OCR codes are remapped, so they cannot trip the guard."""
         pdf = new_pdf()

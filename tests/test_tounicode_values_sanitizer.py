@@ -522,7 +522,7 @@ class TestSanitizeToUnicodeValues:
         font = _make_cidfont_with_tounicode(pdf, {1: 0x0041})
         cmap = bytes(font["/ToUnicode"].read_bytes()).replace(
             b"1 beginbfchar\n<0001> <0041>\nendbfchar",
-            b"/Note (Ad%obe) def 1 beginbfchar <0001> <0000> endbfchar",
+            b"/Note (Ad(o(b))%e) def 1 beginbfchar <0001> <0000> endbfchar",
         )
         font["/ToUnicode"].write(cmap)
         _make_page_with_font(pdf, font)
@@ -531,7 +531,7 @@ class TestSanitizeToUnicodeValues:
 
         new_data = bytes(font["/ToUnicode"].read_bytes())
         assert result["tounicode_values_fixed"] == 1
-        assert b"/Note (Ad%obe) def" in new_data
+        assert b"/Note (Ad(o(b))%e) def" in new_data
         mapping = parse_tounicode_cmap_sequences(new_data)
         assert 0xE000 <= mapping[b"\x00\x01"][0] <= 0xF8FF
 

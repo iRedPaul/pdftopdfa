@@ -632,7 +632,7 @@ endcidrange
     def test_comments_and_literal_percent_do_not_bound_cid_blocks(self) -> None:
         """A '%' in a string starts no comment; one in a block ends nothing."""
         result, cmap_text = self._sanitize_cid_cmap(
-            b"/Registry (Ad%obe) def 2 begincidrange\n"
+            b"/Registry (Ad(o(b))%e) def 2 begincidrange\n"
             b"<0000> <0001> 5\n"
             b"% endcidrange must not end this block\n"
             b"<3F00> <3FFF> 65536\n"
@@ -640,7 +640,7 @@ endcidrange
             b"BT /F1 12 Tf <00003F01> Tj ET",
         )
 
-        assert cmap_text.startswith("/Registry (Ad%obe) def 1 begincidrange\n")
+        assert cmap_text.startswith("/Registry (Ad(o(b))%e) def 1 begincidrange\n")
         assert "% endcidrange must not end this block\n" in cmap_text
         assert "65536" not in cmap_text
         assert "<3F01> 0" in cmap_text

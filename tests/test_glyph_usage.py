@@ -847,6 +847,9 @@ class TestCollectFontUsage:
         # Direct objects have objgen (0,0) and are skipped
         assert usage == {}
 
+        usage = collect_font_usage(pdf, include_direct_simple_fonts=True)
+        assert usage == {("direct", font.unparse()): {65, 66}}
+
     def test_invisible_text_can_be_skipped(self):
         """Rendering mode 3 is graphics state, restored by Q."""
         pdf = new_pdf()

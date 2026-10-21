@@ -33,6 +33,7 @@ from ..fonts.glyph_usage import (
     _iter_content_streams_with_resources,
     collect_font_usage,
 )
+from ..fonts.tounicode import mask_cmap_inert_text
 from ..fonts.traversal import get_page_resources, iter_all_page_fonts
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
@@ -52,27 +53,20 @@ _TEXT_OPERATORS = frozenset({"Tj", "TJ", "'", '"'})
 _HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
 _ASCII_NAME_RE = re.compile(r"[^A-Za-z0-9_.+-]+")
 # CMap mapping blocks and entries, independent of line layout.  Hex strings
-# are self-delimiting and may contain whitespace; literal strings and
-# comments are matched first so that block- or entry-like text inside them
-# is left untouched (only block matches set ``kind``).
+# are self-delimiting and may contain whitespace.  The patterns run on text
+# whose literal strings and comments are blanked (mask_cmap_inert_text), so
+# block- or entry-like text inside them is neither read nor rewritten.
 _PDF_WS = r"[\x00\t\n\x0c\r ]"
-_CMAP_COMMENT = r"%[^\r\n\x0c]*+"
-_CMAP_LITERAL = r"\((?:[^()\\]|\\.|\((?:[^()\\]|\\.)*\))*\)"
 _CMAP_HEX = r"<(?P<{}>[0-9A-Fa-f\x00\t\n\x0c\r ]*)>"
 _CID_BLOCK_RE = re.compile(
-    rf"{_CMAP_LITERAL}|{_CMAP_COMMENT}"
-    rf"|(?:(?P<count>\d+)(?P<gap>(?:{_PDF_WS}|{_CMAP_COMMENT})+))?"
-    r"begincid(?P<kind>char|range)\b"
-    rf"(?P<body>(?:{_CMAP_COMMENT}|[^%])*?)endcid(?P=kind)\b",
+    rf"(?:(?P<count>\d+)(?P<gap>{_PDF_WS}+))?begincid(?P<kind>char|range)\b"
+    r"(?P<body>.*?)endcid(?P=kind)\b",
     re.DOTALL,
 )
 _CID_TARGET = r"(?:" + _CMAP_HEX.format("cid_hex") + r"|(?P<cid>-?\d+))"
-_CIDCHAR_ENTRY_RE = re.compile(
-    rf"{_CMAP_COMMENT}|" + _CMAP_HEX.format("src") + rf"{_PDF_WS}*" + _CID_TARGET
-)
+_CIDCHAR_ENTRY_RE = re.compile(_CMAP_HEX.format("src") + rf"{_PDF_WS}*" + _CID_TARGET)
 _CIDRANGE_ENTRY_RE = re.compile(
-    rf"{_CMAP_COMMENT}|"
-    + _CMAP_HEX.format("src")
+    _CMAP_HEX.format("src")
     + rf"{_PDF_WS}*"
     + _CMAP_HEX.format("end")
     + rf"{_PDF_WS}*"
@@ -914,8 +908,6 @@ def _cmap_hex_digits(text: str) -> str:
 
 def _parse_cid_entry(entry: re.Match[str]) -> tuple[bytes, bytes, int] | None:
     """Return (start, end, first CID) of a cidchar/cidrange entry match."""
-    if entry.group("src") is None:
-        return None  # comment
     try:
         start = bytes.fromhex(_cmap_hex_digits(entry.group("src")))
         end_group = entry.groupdict().get("end")
@@ -937,11 +929,12 @@ def _parse_cid_entry(entry: re.Match[str]) -> tuple[bytes, bytes, int] | None:
     return start, end, cid_start
 
 
-def _iter_cid_entries(data: str):
-    """Yield (block, entry, parsed) for every cidchar/cidrange entry."""
-    for block in _CID_BLOCK_RE.finditer(data):
-        if block.group("kind") is None:
-            continue  # literal string or comment
+def _iter_cid_entries(masked: str):
+    """Yield (block, entry, parsed) for every cidchar/cidrange entry.
+
+    ``masked`` is CMap text with its literal strings and comments blanked.
+    """
+    for block in _CID_BLOCK_RE.finditer(masked):
         pattern = (
             _CIDCHAR_ENTRY_RE if block.group("kind") == "char" else _CIDRANGE_ENTRY_RE
         )
@@ -965,7 +958,7 @@ def _cmap_has_cid_overflow(cmap_stream: Stream) -> bool:
         return False
     return any(
         _cid_entry_overflows(parsed)
-        for _block, _entry, parsed in _iter_cid_entries(data)
+        for _block, _entry, parsed in _iter_cid_entries(mask_cmap_inert_text(data))
     )
 
 
@@ -995,11 +988,12 @@ def _repair_cid_overflow_entries(
     changed_entries = 0
     output: list[str] = []
     position = 0
-    for block in _CID_BLOCK_RE.finditer(data):
-        if block.group("kind") is None:
-            continue  # literal string or comment
+    # Blocks and entries are found in the masked text; everything else is
+    # copied from the original at the same offsets.
+    for block in _CID_BLOCK_RE.finditer(mask_cmap_inert_text(data)):
         is_char = block.group("kind") == "char"
         pattern = _CIDCHAR_ENTRY_RE if is_char else _CIDRANGE_ENTRY_RE
+        body_start, body_end = block.span("body")
         body = block.group("body")
         body_parts: list[str] = []
         body_position = 0
@@ -1052,22 +1046,23 @@ def _repair_cid_overflow_entries(
                 remapped_char_entries.extend(
                     f"<{code:0{source_width}X}> 0" for code in used_in_overflow
                 )
-            body_parts.append(body[body_position : entry.start()])
+            body_parts.append(
+                data[body_start + body_position : body_start + entry.start()]
+            )
             body_parts.append(replacement)
             body_position = entry.end()
 
         if not body_parts:
             continue
-        body_parts.append(body[body_position:])
+        body_parts.append(data[body_start + body_position : body_end])
         output.append(data[position : block.start()])
         keyword_start = block.start()
         if block.group("count") is not None:
             output.append(str(max(0, int(block.group("count")) + count_delta)))
-            output.append(block.group("gap"))
-            keyword_start = block.end("gap")
-        output.append(data[keyword_start : block.start("body")])
+            keyword_start = block.start("gap")
+        output.append(data[keyword_start:body_start])
         output.append("".join(body_parts))
-        output.append(data[block.end("body") : block.end()])
+        output.append(data[body_end : block.end()])
         for offset in range(0, len(remapped_char_entries), 100):
             chunk = remapped_char_entries[offset : offset + 100]
             output.append(f"\n{len(chunk)} begincidchar\n")
