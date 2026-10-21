@@ -629,6 +629,22 @@ endcidrange
         assert result["cid_overflow_entries_repaired"] == 0
         assert cmap_text == cmap_data.decode("latin-1")
 
+    def test_repairs_overflow_in_unterminated_cid_block(self) -> None:
+        """A missing end keyword ends the block at the next one or at EOF."""
+        result, cmap_text = self._sanitize_cid_cmap(
+            b"1 begincidchar\n<0041> 70000\n"
+            b"1 begincidrange\n<0100> <0101> 5\nendcidrange\n"
+            b"1 begincidchar\n<0042> 70001\n",
+            b"BT /F1 12 Tf <00410042> Tj ET",
+        )
+
+        assert "70000" not in cmap_text
+        assert "70001" not in cmap_text
+        assert "<0041> 0" in cmap_text
+        assert "<0042> 0" in cmap_text
+        assert "1 begincidrange\n<0100> <0101> 5\nendcidrange" in cmap_text
+        assert result["cid_overflow_entries_repaired"] == 2
+
     def test_comments_and_literal_percent_do_not_bound_cid_blocks(self) -> None:
         """A '%' in a string starts no comment; one in a block ends nothing."""
         result, cmap_text = self._sanitize_cid_cmap(

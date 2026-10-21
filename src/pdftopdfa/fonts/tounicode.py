@@ -959,13 +959,19 @@ def normalize_cmap_syntax(data: bytes) -> bytes:
     parsed nor counted. An unterminated one is kept with the rest of the
     data unchanged, so that a broken header cannot hide every mapping.
     """
+    return _normalize_cmap_syntax(data)[0]
+
+
+def _normalize_cmap_syntax(data: bytes) -> tuple[bytes, bool]:
+    """Return normalize_cmap_syntax(data) and whether a literal is unterminated."""
     if (
         b"%" not in data
         and b"(" not in data
         and _IRREGULAR_CMAP_HEX_RE.search(data) is None
     ):
-        return data
+        return data, False
     text = data.decode("latin-1")
+    open_literal = False
     parts: list[str] = []
     position = 0
     for start, end, kind in _iter_cmap_inert_spans(text):
@@ -978,9 +984,10 @@ def normalize_cmap_syntax(data: bytes) -> bytes:
             parts.append("()")
         else:
             parts.append(text[start:end])
+            open_literal = True
         position = end
     parts.append(_CMAP_HEX_TOKEN_RE.sub(_canonicalize_cmap_hex, text[position:]))
-    return "".join(parts).encode("latin-1")
+    return "".join(parts).encode("latin-1"), open_literal
 
 
 def parse_tounicode_cmap(data: bytes) -> dict[int, int]:
@@ -1095,7 +1102,9 @@ class CIDEncodingMap:
     decoder: Callable[[bytes], int | None] | None = None
     base: "CIDEncodingMap | None" = None
     # Mapping blocks (in this CMap or its /UseCMap chain) containing text
-    # that is not a valid entry; such a map is not a reliable .notdef oracle.
+    # that is not a valid entry, or an unterminated literal string after
+    # which no operator can be trusted; such a map is not a reliable .notdef
+    # oracle.
     unparsed_blocks: int = 0
 
     @staticmethod
@@ -1213,7 +1222,7 @@ _CID_MAPPING_BLOCK_RE = re.compile(
 
 def parse_cid_encoding_cmap(data: bytes) -> CIDEncodingMap:
     """Parse CID mappings and code-space ranges from an embedded CMap."""
-    normalized = normalize_cmap_syntax(data)
+    normalized, open_literal = _normalize_cmap_syntax(data)
     ranges: list[tuple[bytes, bytes, int]] = []
     notdef_ranges: list[tuple[bytes, bytes, int]] = []
     blocks = 0
@@ -1251,6 +1260,10 @@ def parse_cid_encoding_cmap(data: bytes) -> CIDEncodingMap:
             unparsed_blocks += 1
     # A block without its end keyword is not matched above at all.
     unparsed_blocks += max(0, len(_CID_BLOCK_BEGIN_RE.findall(normalized)) - blocks)
+    # PDF readers take everything after an unterminated literal string as
+    # part of it, so mappings read from there may not exist for them.
+    if open_literal:
+        unparsed_blocks += 1
 
     return CIDEncodingMap(
         ranges=tuple(ranges),

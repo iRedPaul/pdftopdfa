@@ -120,6 +120,17 @@ endcidrange
         assert mapping.unparsed_blocks == 0
         assert mapping.unmapped_to_zero
 
+    def test_unterminated_literal_makes_map_unreliable(self):
+        """Readers take the rest as a string, so its mappings are untrusted."""
+        mapping = parse_cid_encoding_cmap(
+            b"/Note (broken\n"
+            b"1 begincodespacerange <00> <FF> endcodespacerange\n"
+            b"1 begincidchar <41> 7 endcidchar"
+        )
+
+        assert mapping.map_code(b"A") == 7
+        assert mapping.unparsed_blocks == 1
+
     @pytest.mark.parametrize(
         "body",
         [
