@@ -106,6 +106,20 @@ endcidrange
         assert mapping.map_code(b"A") == 7
         assert mapping.unparsed_blocks == 0
 
+    def test_keywords_inside_literal_strings_are_inert(self):
+        """Metadata strings neither add mappings nor count as open blocks."""
+        mapping = parse_cid_encoding_cmap(
+            b"/Note (1 begincidrange <40> <40> 99 endcidrange) def\n"
+            b"/Hint (begincidchar (usecmap)) def\n"
+            b"1 begincodespacerange <00> <FF> endcodespacerange\n"
+            b"1 begincidrange <41> <42> 7 endcidrange"
+        )
+
+        assert mapping.map_code(b"@") == 0
+        assert mapping.map_code(b"A") == 7
+        assert mapping.unparsed_blocks == 0
+        assert mapping.unmapped_to_zero
+
     @pytest.mark.parametrize(
         "body",
         [
@@ -237,7 +251,7 @@ class TestToUnicodeCMapSyntax:
 
     def test_normalize_cmap_syntax(self):
         assert normalize_cmap_syntax(b"(a%b) <<\n>> % c\n<4 1><4>") == (
-            b"(a%b) <<\n>>  \n<41><40>"
+            b"() <<\n>>  \n<41><40>"
         )
         canonical = b"1 beginbfchar\n<0041> <0061>\nendbfchar"
         assert normalize_cmap_syntax(canonical) is canonical
@@ -250,9 +264,20 @@ class TestToUnicodeCMapSyntax:
         cmap = b"/Note " + literal + b" def 1 beginbfchar <01> <0041> endbfchar"
         assert parse_tounicode_cmap(cmap) == {0x01: 0x41}
 
-    def test_unterminated_literal_runs_to_end(self):
+    def test_unterminated_literal_keeps_rest_unchanged(self):
         data = b"/Note (a % b\n<4 1> % c"
         assert normalize_cmap_syntax(data) == data
+
+    def test_mac_roman_follows_pdf_table_at_0xdb(self):
+        """PDF MacRomanEncoding has currency, not the Mac OS Euro, at 0xDB."""
+        from pdftopdfa.fonts.tounicode import generate_tounicode_for_macroman
+
+        mapping = generate_tounicode_for_macroman()
+
+        assert mapping[0xDB] == 0x00A4
+        assert mapping[0xDE] == 0xFB01
+        assert mapping[0xCA] == 0x00A0
+        assert mapping[0xAD] == 0x2260
 
 
 class TestSimpleFontToUnicode:

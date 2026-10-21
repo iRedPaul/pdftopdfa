@@ -272,6 +272,11 @@ def generate_tounicode_for_winansi() -> dict[int, int]:
 def generate_tounicode_for_macroman() -> dict[int, int]:
     """Generates code-to-Unicode mapping for MacRomanEncoding.
 
+    Follows Mac OS Roman, except that the PDF MacRomanEncoding table
+    (ISO 32000-1, Annex D) has currency rather than the Euro sign at 0xDB,
+    matching the glyph name used for that code. Mac OS-only codes the PDF
+    table leaves undefined keep their Mac OS Roman meaning.
+
     Returns:
         Dictionary mapping character codes to Unicode codepoints.
     """
@@ -282,6 +287,7 @@ def generate_tounicode_for_macroman() -> dict[int, int]:
             code_to_unicode[code] = ord(char)
         except UnicodeDecodeError:
             pass
+    code_to_unicode[0xDB] = 0x00A4
     return code_to_unicode
 
 
@@ -868,13 +874,19 @@ _CMAP_HEX_TOKEN_RE = re.compile(rf"<<|>>|{_IRREGULAR_CMAP_HEX}")
 _IRREGULAR_CMAP_HEX_RE = re.compile(_IRREGULAR_CMAP_HEX.encode("ascii"))
 
 
-def iter_cmap_inert_spans(text: str) -> Iterator[tuple[int, int, bool]]:
-    """Yield ``(start, end, is_comment)`` for CMap literal strings and comments.
+# Kinds of the spans reported by _iter_cmap_inert_spans().
+_COMMENT = "comment"
+_LITERAL = "literal"
+_OPEN_LITERAL = "open literal"
+
+
+def _iter_cmap_inert_spans(text: str) -> Iterator[tuple[int, int, str]]:
+    """Yield ``(start, end, kind)`` for CMap literal strings and comments.
 
     Literal strings nest to any depth with balanced or escaped parentheses,
     and ``%`` inside one starts no comment. An unterminated literal string
-    runs to the end of the data, as in PDF tokenizers. Comments end at CR,
-    LF or FF.
+    (``_OPEN_LITERAL``) runs to the end of the data, as in PDF tokenizers.
+    Comments end at CR, LF or FF.
     """
     position = 0
     length = len(text)
@@ -883,9 +895,10 @@ def iter_cmap_inert_spans(text: str) -> Iterator[tuple[int, int, bool]]:
         if delimiter.group() == "%":
             line_end = _CMAP_LINE_END_RE.search(text, start)
             end = line_end.start() if line_end is not None else length
-            yield start, end, True
+            yield start, end, _COMMENT
         else:
             end = length
+            kind = _OPEN_LITERAL
             depth = 0
             escaped_until = -1
             for special in _CMAP_LITERAL_SPECIAL_RE.finditer(text, start):
@@ -901,8 +914,9 @@ def iter_cmap_inert_spans(text: str) -> Iterator[tuple[int, int, bool]]:
                     depth -= 1
                     if depth == 0:
                         end = index + 1
+                        kind = _LITERAL
                         break
-            yield start, end, False
+            yield start, end, kind
         position = end
 
 
@@ -916,7 +930,7 @@ def mask_cmap_inert_text(text: str) -> str:
         return text
     parts: list[str] = []
     position = 0
-    for start, end, _is_comment in iter_cmap_inert_spans(text):
+    for start, end, _kind in _iter_cmap_inert_spans(text):
         parts.append(text[position:start])
         parts.append(" " * (end - start))
         position = end
@@ -935,23 +949,35 @@ def _canonicalize_cmap_hex(match: re.Match[str]) -> str:
 
 
 def normalize_cmap_syntax(data: bytes) -> bytes:
-    """Strip comments and canonicalize hex strings in CMap data.
+    """Strip comments and literal strings and canonicalize hex strings.
 
     Hex strings may contain whitespace, and an odd final digit implies a
     trailing zero (ISO 32000-1, 7.3.4.3); ``%`` starts a comment outside
     strings.  Canonical ``<41>`` tokens let entry patterns stay simple.
-    Literal strings are kept unchanged.
+    Literal strings carry no mappings, only metadata such as ``/Registry
+    (Adobe)``; they become ``()`` so that keywords inside them are neither
+    parsed nor counted. An unterminated one is kept with the rest of the
+    data unchanged, so that a broken header cannot hide every mapping.
     """
-    if b"%" not in data and _IRREGULAR_CMAP_HEX_RE.search(data) is None:
+    if (
+        b"%" not in data
+        and b"(" not in data
+        and _IRREGULAR_CMAP_HEX_RE.search(data) is None
+    ):
         return data
     text = data.decode("latin-1")
     parts: list[str] = []
     position = 0
-    for start, end, is_comment in iter_cmap_inert_spans(text):
+    for start, end, kind in _iter_cmap_inert_spans(text):
         parts.append(
             _CMAP_HEX_TOKEN_RE.sub(_canonicalize_cmap_hex, text[position:start])
         )
-        parts.append(" " if is_comment else text[start:end])
+        if kind == _COMMENT:
+            parts.append(" ")
+        elif kind == _LITERAL:
+            parts.append("()")
+        else:
+            parts.append(text[start:end])
         position = end
     parts.append(_CMAP_HEX_TOKEN_RE.sub(_canonicalize_cmap_hex, text[position:]))
     return "".join(parts).encode("latin-1")

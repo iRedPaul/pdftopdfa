@@ -9,8 +9,8 @@
 ### Bug Fixes
 
 - Read embedded CMaps that omit the whitespace between hex strings, such as `<20><20> 3` in fonts written by GdPicture, instead of mapping every character to `.notdef` and removing most of the text from the page during conversion
-- Read hex strings with embedded whitespace or an odd number of digits, such as `<4 1>` or `<4>`, in embedded and ToUnicode CMaps, and ignore `%` comments in ToUnicode CMaps instead of reading or rewriting commented-out mappings, while a `%` inside a literal string such as `(Ad%obe)` starts no comment
-- Keep fi/fl ligatures and the currency sign in non-symbolic TrueType fonts with `MacRomanEncoding`: glyph names now follow the PDF MacRomanEncoding table and resolve through the font's (1,0) Mac cmap, instead of removing these characters as `.notdef`
+- Read hex strings with embedded whitespace or an odd number of digits, such as `<4 1>` or `<4>`, in embedded and ToUnicode CMaps, and ignore `%` comments in ToUnicode CMaps instead of reading or rewriting commented-out mappings, while a `%` or a CMap keyword inside a literal string such as `(Ad%obe)` is ignored
+- Keep fi/fl ligatures and the currency sign in non-symbolic TrueType fonts with `MacRomanEncoding`: glyph names now follow the PDF MacRomanEncoding table and resolve through the font's (1,0) Mac cmap, instead of removing these characters as `.notdef`; generated ToUnicode CMaps and Unicode cmaps map code 0xDB to the currency sign instead of the Euro sign accordingly
 - Repair CID values above 65535 in embedded CMaps regardless of line layout, without changing commented-out entries or blocks and without ending a block at a commented-out `endcidrange`
 
 ### Documentation
