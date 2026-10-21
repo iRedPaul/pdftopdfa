@@ -4,14 +4,14 @@
 
 ### Changes
 
-- Keep a font's text, warn, and report the conversion like a failed validation (`validation_failed=True`, `target_produced=False`) when `.notdef` cleanup would remove at least 3 distinct characters and at least half of the characters the font shows as visible text, including fonts stored directly in a resource dictionary, or when the font's embedded CMap contains unreadable mappings or an unterminated literal string, because such fonts were almost certainly misread
+- Keep a font's text, warn, and report the conversion like a failed validation (`validation_failed=True`, `target_produced=False`) when `.notdef` cleanup would remove at least 3 distinct characters and at least half of the characters the font shows as visible text, including fonts stored directly in a resource dictionary, or when the font's embedded CMap contains unreadable mappings or an unterminated literal string, because such fonts were almost certainly misread; such a font's invisible text is kept unchanged as well
 
 ### Bug Fixes
 
 - Read embedded CMaps that omit the whitespace between hex strings, such as `<20><20> 3` in fonts written by GdPicture, instead of mapping every character to `.notdef` and removing most of the text from the page during conversion
-- Read hex strings with embedded whitespace or an odd number of digits, such as `<4 1>` or `<4>`, in embedded and ToUnicode CMaps, and ignore `%` comments in ToUnicode CMaps instead of reading or rewriting commented-out mappings, while a `%` or a CMap keyword inside a literal string such as `(Ad%obe)` is ignored
+- Read hex strings with embedded whitespace or an odd number of digits, such as `<4 1>` or `<4>`, in embedded and ToUnicode CMaps, also when replacing forbidden ToUnicode values, and ignore `%` comments in ToUnicode CMaps instead of reading or rewriting commented-out mappings, while a `%` or a CMap keyword inside a literal string such as `(Ad%obe)` or a literal name such as `/begincidrange` is ignored
 - Keep fi/fl ligatures and the currency sign in non-symbolic TrueType fonts with `MacRomanEncoding`: glyph names now follow the PDF MacRomanEncoding table and resolve through the font's (1,0) Mac cmap, instead of removing these characters as `.notdef`; generated ToUnicode CMaps and Unicode cmaps map code 0xDB to the currency sign instead of the Euro sign accordingly
-- Repair CID values above 65535 in embedded CMaps regardless of line layout, without changing commented-out entries or blocks, without ending a block at a commented-out `endcidrange`, and still covering blocks whose end keyword is missing, which are closed when repaired
+- Repair CID values above 65535 in embedded CMaps regardless of line layout, without changing commented-out entries or blocks, without ending a block at a commented-out `endcidrange`, and still covering blocks whose end keyword is missing, which are closed before the next block or `endcmap` when repaired
 
 ### Documentation
 

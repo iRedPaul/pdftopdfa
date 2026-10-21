@@ -647,6 +647,19 @@ endcidrange
         assert result["cid_overflow_entries_repaired"] == 2
         assert parse_cid_encoding_cmap(cmap_text.encode()).unparsed_blocks == 0
 
+    def test_unterminated_final_cid_block_is_closed_before_endcmap(self) -> None:
+        result, cmap_text = self._sanitize_cid_cmap(
+            b"begincmap\n1 begincidchar\n<0041> 70000\nendcmap\n"
+            b"CMapName currentdict /CMap defineresource pop\nend\n",
+            b"BT /F1 12 Tf <0041> Tj ET",
+        )
+
+        assert cmap_text == (
+            "begincmap\n1 begincidchar\n<0041> 0\nendcidchar\nendcmap\n"
+            "CMapName currentdict /CMap defineresource pop\nend\n"
+        )
+        assert result["cid_overflow_entries_repaired"] == 1
+
     def test_comments_and_literal_percent_do_not_bound_cid_blocks(self) -> None:
         """A '%' in a string starts no comment; one in a block ends nothing."""
         result, cmap_text = self._sanitize_cid_cmap(

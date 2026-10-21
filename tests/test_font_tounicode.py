@@ -120,6 +120,16 @@ endcidrange
         assert mapping.unparsed_blocks == 0
         assert mapping.unmapped_to_zero
 
+    def test_keywords_as_literal_names_are_not_operators(self):
+        mapping = parse_cid_encoding_cmap(
+            b"1 begincodespacerange <00> <FF> endcodespacerange\n"
+            b"1 begincidrange <41> <42> 7 endcidrange\n"
+            b"/Hint /begincidrange def /Done /endcidchar def"
+        )
+
+        assert mapping.map_code(b"A") == 7
+        assert mapping.unparsed_blocks == 0
+
     def test_unterminated_literal_makes_map_unreliable(self):
         """Readers take the rest as a string, so its mappings are untrusted."""
         mapping = parse_cid_encoding_cmap(

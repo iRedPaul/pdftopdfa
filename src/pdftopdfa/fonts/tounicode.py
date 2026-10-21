@@ -938,14 +938,20 @@ def mask_cmap_inert_text(text: str) -> str:
     return "".join(parts)
 
 
+def cmap_hex_digits(text: str) -> str:
+    """Return a CMap hex string's digits without whitespace, padded to even.
+
+    An odd final digit implies a trailing zero (ISO 32000-1, 7.3.4.3).
+    """
+    digits = text.translate(_PDF_WHITESPACE_TABLE)
+    return digits + "0" if len(digits) % 2 else digits
+
+
 def _canonicalize_cmap_hex(match: re.Match[str]) -> str:
     digits = match.group("hex")
     if digits is None:
         return match.group(0)
-    digits = digits.translate(_PDF_WHITESPACE_TABLE)
-    if len(digits) % 2:
-        digits += "0"
-    return f"<{digits}>"
+    return f"<{cmap_hex_digits(digits)}>"
 
 
 def normalize_cmap_syntax(data: bytes) -> bytes:
@@ -1191,13 +1197,15 @@ class CIDEncodingMap:
         )
 
 
+# Keywords preceded by "/" are literal names (e.g. "/Hint /begincidrange
+# def"), not operators.
 _CID_BLOCK_RE = re.compile(
-    rb"begin(?P<kind>cidchar|cidrange|notdefchar|notdefrange)\b"
-    rb"(?P<body>.*?)end(?P=kind)\b",
+    rb"(?<!/)begin(?P<kind>cidchar|cidrange|notdefchar|notdefrange)\b"
+    rb"(?P<body>.*?)(?<!/)end(?P=kind)\b",
     re.DOTALL,
 )
 _CID_BLOCK_BEGIN_RE = re.compile(
-    rb"\bbegin(?:cidchar|cidrange|notdefchar|notdefrange)\b"
+    rb"(?<!/)\bbegin(?:cidchar|cidrange|notdefchar|notdefrange)\b"
 )
 # Hex strings are self-delimiting, so producers may omit the whitespace
 # between tokens (e.g. GdPicture writes ``<20><20> 3``).

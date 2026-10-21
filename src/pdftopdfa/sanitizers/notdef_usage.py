@@ -1308,6 +1308,11 @@ def _fix_notdef_in_stream(
                         is_cid=is_cid,
                     )
                 ):
+                    # A distrusted font's .notdef codes are suspect for
+                    # invisible text as well: keep it unchanged.
+                    if guard is not None and not guard.allows(font_obj, notdef_codes):
+                        new_instructions.append(item)
+                        continue
                     if not is_cid:
                         raise ConversionError(
                             "Invisible simple-font OCR text references .notdef"
@@ -1374,6 +1379,11 @@ def _fix_notdef_in_stream(
                         for element in operands[0]
                     )
                 ):
+                    # A distrusted font's .notdef codes are suspect for
+                    # invisible text as well: keep it unchanged.
+                    if guard is not None and not guard.allows(font_obj, notdef_codes):
+                        new_instructions.append(item)
+                        continue
                     if not is_cid:
                         raise ConversionError(
                             "Invisible simple-font OCR text references .notdef"

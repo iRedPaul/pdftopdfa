@@ -32,6 +32,7 @@ from ..fonts.glyph_usage import (
 )
 from ..fonts.tounicode import (
     _is_invalid_unicode,
+    cmap_hex_digits,
     get_font_code_space_ranges,
     mask_cmap_inert_text,
     parse_tounicode_cmap_sequences,
@@ -46,20 +47,28 @@ logger = logging.getLogger(__name__)
 # Text-showing operators (PDF Reference, Table 5.6)
 _TEXT_OPERATORS = frozenset({"Tj", "'", '"'})
 _TJ_OPERATOR = "TJ"
-_BFCHAR_ENTRY_PATTERN = re.compile(r"(<[0-9A-Fa-f]+>\s*)<([0-9A-Fa-f]+)>")
+# Hex strings may contain whitespace and an odd number of digits, as the
+# parser accepts; their values are read through cmap_hex_digits().
+_HEX_DIGITS = r"[\x00\t\n\x0c\r ]*[0-9A-Fa-f][0-9A-Fa-f\x00\t\n\x0c\r ]*"
+_BFCHAR_ENTRY_PATTERN = re.compile(rf"(<{_HEX_DIGITS}>\s*)<({_HEX_DIGITS})>")
 _BFRANGE_ENTRY_PATTERN = re.compile(
-    r"(<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*)"
-    r"(?:<([0-9A-Fa-f]+)>|\[([^\]]*)\])"
+    rf"(<({_HEX_DIGITS})>\s*<({_HEX_DIGITS})>\s*)"
+    rf"(?:<({_HEX_DIGITS})>|\[([^\]]*)\])"
 )
-_HEX_TOKEN_PATTERN = re.compile(r"<([0-9A-Fa-f]+)>")
+_HEX_TOKEN_PATTERN = re.compile(rf"<({_HEX_DIGITS})>")
 # The block patterns run on text whose literal strings and comments are
 # blanked (mask_cmap_inert_text), so that a block can neither start nor end
-# inside one and mapping-like text inside them is never rewritten.
+# inside one and mapping-like text inside them is never rewritten. Keywords
+# preceded by "/" are literal names, not operators.
 _COUNTED_BFRANGE_BLOCK_PATTERN = re.compile(
-    r"\d+\s+beginbfrange\b(.*?)\bendbfrange", re.DOTALL
+    r"\d+\s+(?<!/)beginbfrange\b(.*?)(?<!/)\bendbfrange", re.DOTALL
 )
-_BFCHAR_BLOCK_PATTERN = re.compile(r"(beginbfchar\b)(.*?)(\bendbfchar)", re.DOTALL)
-_BFRANGE_BLOCK_PATTERN = re.compile(r"(beginbfrange\b)(.*?)(\bendbfrange)", re.DOTALL)
+_BFCHAR_BLOCK_PATTERN = re.compile(
+    r"((?<!/)beginbfchar\b)(.*?)((?<!/)\bendbfchar)", re.DOTALL
+)
+_BFRANGE_BLOCK_PATTERN = re.compile(
+    r"((?<!/)beginbfrange\b)(.*?)((?<!/)\bendbfrange)", re.DOTALL
+)
 _CMAP_BLOCK_ENTRY_LIMIT = 100
 
 
@@ -69,7 +78,10 @@ def _split_incrementing_bfrange(entry: re.Match[str]) -> list[str] | None:
     Returns ``None`` when the entry is already well-formed or cannot be split
     without changing its mapping.
     """
-    start_hex, end_hex, destination_hex = entry.group(2, 3, 4)
+    start_hex, end_hex = (cmap_hex_digits(value) for value in entry.group(2, 3))
+    destination_hex = entry.group(4)
+    if destination_hex is not None:
+        destination_hex = cmap_hex_digits(destination_hex)
     if (
         destination_hex is None
         or len(start_hex) != len(end_hex)
@@ -242,18 +254,28 @@ def _sanitize_tounicode_cmap(cmap_data: bytes) -> bytes:
         )
         return f"{match.group(1)}{body}{match.group(3)}"
 
+    def sanitize_hex_token(token: re.Match[str], _text: str) -> str | None:
+        digits = cmap_hex_digits(token.group(1))
+        destination = sanitize_destination(digits)
+        return None if destination == digits else f"<{destination}>"
+
     # Entry matches come from the masked body; the source tokens and any
-    # comments between tokens are copied from the original body.
-    def sanitize_bfchar_entry(entry: re.Match[str], body: str) -> str:
-        destination = sanitize_destination(entry.group(2))
+    # comments between tokens are copied from the original body. Entries
+    # whose values stay valid are left as written.
+    def sanitize_bfchar_entry(entry: re.Match[str], body: str) -> str | None:
+        digits = cmap_hex_digits(entry.group(2))
+        destination = sanitize_destination(digits)
+        if destination == digits:
+            return None
         return f"{body[entry.start(1) : entry.end(1)]}<{destination}>"
 
     def sanitize_bfrange_entry(entry: re.Match[str], body: str) -> str | None:
         prefix = body[entry.start(1) : entry.end(1)]
         destination = entry.group(4)
         if destination is not None:
-            start = int(entry.group(2), 16)
-            end = int(entry.group(3), 16)
+            destination = cmap_hex_digits(destination)
+            start = int(cmap_hex_digits(entry.group(2)), 16)
+            end = int(cmap_hex_digits(entry.group(3)), 16)
             if end < start:
                 return None
 
@@ -268,12 +290,12 @@ def _sanitize_tounicode_cmap(cmap_data: bytes) -> bytes:
             values = " ".join(f"<{value}>" for value in sanitized)
             return f"{prefix}[{values}]"
 
+        array = body[entry.start(5) : entry.end(5)]
         array_body = _sub_outside_inert_text(
-            _HEX_TOKEN_PATTERN,
-            lambda token, _array: f"<{sanitize_destination(token.group(1))}>",
-            body[entry.start(5) : entry.end(5)],
-            masked=entry.group(5),
+            _HEX_TOKEN_PATTERN, sanitize_hex_token, array, masked=entry.group(5)
         )
+        if array_body == array:
+            return None
         return f"{prefix}[{array_body}]"
 
     text = _split_overflowing_bfranges(text)

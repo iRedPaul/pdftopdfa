@@ -535,6 +535,40 @@ class TestSanitizeToUnicodeValues:
         mapping = parse_tounicode_cmap_sequences(new_data)
         assert 0xE000 <= mapping[b"\x00\x01"][0] <= 0xF8FF
 
+    def test_whitespace_in_hex_strings_is_read_like_the_parser(self):
+        """Hex strings may contain whitespace; valid entries stay as written."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_tounicode(pdf, {1: 0x0041})
+        cmap = bytes(font["/ToUnicode"].read_bytes()).replace(
+            b"1 beginbfchar\n<0001> <0041>\nendbfchar",
+            b"2 beginbfchar\n<00 01> <0 000>\n<00 02> <00 4 1>\nendbfchar\n"
+            b"1 beginbfrange\n<00 03> <00 04> [<00 42> <0\n000>]\nendbfrange",
+        )
+        font["/ToUnicode"].write(cmap)
+        _make_page_with_font(pdf, font)
+
+        result = sanitize_tounicode_values(pdf)
+
+        new_data = bytes(font["/ToUnicode"].read_bytes())
+        assert result["tounicode_values_fixed"] == 1
+        assert b"<00 02> <00 4 1>" in new_data
+        assert b"<00 42>" in new_data
+        mapping = parse_tounicode_cmap_sequences(new_data)
+        assert 0xE000 <= mapping[b"\x00\x01"][0] <= 0xF8FF
+        assert 0xE000 <= mapping[b"\x00\x04"][0] <= 0xF8FF
+        assert mapping[b"\x00\x02"] == (0x41,)
+
+    def test_valid_whitespace_hex_strings_are_not_rewritten(self):
+        pdf = new_pdf()
+        font = _make_cidfont_with_tounicode(pdf, {1: 0x0041})
+        cmap = bytes(font["/ToUnicode"].read_bytes()).replace(
+            b"<0001> <0041>", b"<00 01> <00 4 1>"
+        )
+        font["/ToUnicode"].write(cmap)
+        _make_page_with_font(pdf, font)
+
+        assert sanitize_tounicode_values(pdf)["tounicode_values_fixed"] == 0
+
     def test_bfrange_after_commented_block_start_is_split(self):
         """A commented header does not hide the following real block."""
         pdf = new_pdf()

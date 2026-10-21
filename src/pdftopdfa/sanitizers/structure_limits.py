@@ -33,7 +33,7 @@ from ..fonts.glyph_usage import (
     _iter_content_streams_with_resources,
     collect_font_usage,
 )
-from ..fonts.tounicode import mask_cmap_inert_text
+from ..fonts.tounicode import cmap_hex_digits, mask_cmap_inert_text
 from ..fonts.traversal import get_page_resources, iter_all_page_fonts
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
@@ -59,13 +59,14 @@ _ASCII_NAME_RE = re.compile(r"[^A-Za-z0-9_.+-]+")
 _PDF_WS = r"[\x00\t\n\x0c\r ]"
 _PDF_WS_CHARS = ("\x00", "\t", "\n", "\x0c", "\r", " ")
 _CMAP_HEX = r"<(?P<{}>[0-9A-Fa-f\x00\t\n\x0c\r ]*)>"
-# A block without its end keyword runs to the next block or the end of the
-# data, so that its entries are still repaired or rejected.
+# A block without its end keyword runs to the next block, to endcmap or to
+# the end of the data, so that its entries are still repaired or rejected.
+# Keywords preceded by "/" are literal names, not operators.
 _CID_BLOCK_RE = re.compile(
-    rf"(?:(?P<count>\d+)(?P<gap>{_PDF_WS}+))?begincid(?P<kind>char|range)\b"
+    rf"(?:(?P<count>\d+)(?P<gap>{_PDF_WS}+))?(?<!/)begincid(?P<kind>char|range)\b"
     r"(?P<body>.*?)"
-    rf"(?:(?P<end>endcid(?P=kind))\b"
-    rf"|(?=(?:\d++{_PDF_WS}+)?begincid(?:char|range)\b)|\Z)",
+    rf"(?:(?<!/)(?P<end>endcid(?P=kind))\b"
+    rf"|(?=(?:\d++{_PDF_WS}+)?(?<!/)begin[a-z]+\b|(?<!/)endcmap\b)|\Z)",
     re.DOTALL,
 )
 _CID_TARGET = r"(?:" + _CMAP_HEX.format("cid_hex") + r"|(?P<cid>-?\d+))"
@@ -905,25 +906,19 @@ def _sanitize_object_graph(
     return result
 
 
-def _cmap_hex_digits(text: str) -> str:
-    """Return a CMap hex string's digits, padding an odd final digit."""
-    digits = re.sub(_PDF_WS, "", text)
-    return digits + "0" if len(digits) % 2 else digits
-
-
 def _parse_cid_entry(entry: re.Match[str]) -> tuple[bytes, bytes, int] | None:
     """Return (start, end, first CID) of a cidchar/cidrange entry match."""
     try:
-        start = bytes.fromhex(_cmap_hex_digits(entry.group("src")))
+        start = bytes.fromhex(cmap_hex_digits(entry.group("src")))
         end_group = entry.groupdict().get("end")
         end = (
-            bytes.fromhex(_cmap_hex_digits(end_group))
+            bytes.fromhex(cmap_hex_digits(end_group))
             if end_group is not None
             else start
         )
         cid_hex = entry.group("cid_hex")
         cid_start = (
-            int(_cmap_hex_digits(cid_hex), 16)
+            int(cmap_hex_digits(cid_hex), 16)
             if cid_hex is not None
             else int(entry.group("cid"))
         )
@@ -1035,18 +1030,18 @@ def _repair_cid_overflow_entries(
                         if overflow_start <= code <= end_code
                     }
                 )
-                end_digits = _cmap_hex_digits(entry.group("end"))
+                end_digits = cmap_hex_digits(entry.group("end"))
                 if safe_end >= start_code:
                     target = (
                         entry.group("cid")
                         if entry.group("cid") is not None
-                        else f"<{_cmap_hex_digits(entry.group('cid_hex')).upper()}>"
+                        else f"<{cmap_hex_digits(entry.group('cid_hex')).upper()}>"
                     )
                     replacement = f"{source} <{safe_end:0{len(end_digits)}X}> {target}"
                 else:
                     count_delta -= 1
                 source_width = max(
-                    len(_cmap_hex_digits(entry.group("src"))), len(end_digits)
+                    len(cmap_hex_digits(entry.group("src"))), len(end_digits)
                 )
                 remapped_char_entries.extend(
                     f"<{code:0{source_width}X}> 0" for code in used_in_overflow

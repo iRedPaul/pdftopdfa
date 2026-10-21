@@ -1968,6 +1968,22 @@ class TestRemovalGuard:
         assert result == {"notdef_usage_fixed": 0, "notdef_fonts_preserved": 1}
         assert stream.read_bytes() == content
 
+    def test_unreadable_embedded_cmap_keeps_invisible_text(self):
+        """Invisible text is not remapped through a distrusted CMap either."""
+        pdf = new_pdf()
+        encoding = pdf.make_stream(
+            b"1 begincodespacerange\n<00><FF>\nendcodespacerange\n"
+            b"1 begincidrange\n<41><43> 1\n"
+        )
+        font = _make_identity_cidfont(pdf, ["A", "B", "C"], encoding)
+        content = b"BT /F1 12 Tf 3 Tr (ABC) Tj ET"
+        stream = _make_page_with_font_and_content(pdf, font, content)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result == {"notdef_usage_fixed": 0, "notdef_fonts_preserved": 1}
+        assert stream.read_bytes() == content
+
     def test_mass_removal_keeps_text(self):
         """Removing 3 of a font's 4 distinct codes is not trusted."""
         pdf = new_pdf()
