@@ -852,6 +852,50 @@ def _decode_unicode_hex(hex_str: str) -> int:
     return int(hex_str, 16)
 
 
+_PDF_WHITESPACE = b"\x00\t\n\x0c\r "
+# Literal strings are matched first so that "%" inside them is kept; only
+# irregular hex strings (inner whitespace or an odd digit count) are matched
+# so that canonical CMaps pass through the C-level scan untouched.
+_CMAP_SYNTAX_RE = re.compile(
+    rb"(?P<literal>\((?:[^()\\]|\\.|\((?:[^()\\]|\\.)*\))*\))"
+    rb"|(?P<comment>%[^\r\n\x0c]*)"
+    rb"|<<|>>"
+    rb"|<(?P<hex>[0-9A-Fa-f]*[\x00\t\n\x0c\r ][0-9A-Fa-f\x00\t\n\x0c\r ]*"
+    rb"|(?:[0-9A-Fa-f]{2})*[0-9A-Fa-f])>",
+    re.DOTALL,
+)
+# Same irregular hex alternative with a literal "<" prefix, which the regex
+# engine scans for quickly; used to skip the full pass for canonical data.
+_IRREGULAR_CMAP_HEX_RE = re.compile(
+    rb"<(?:[0-9A-Fa-f]*[\x00\t\n\x0c\r ][0-9A-Fa-f\x00\t\n\x0c\r ]*"
+    rb"|(?:[0-9A-Fa-f]{2})*[0-9A-Fa-f])>"
+)
+
+
+def _canonicalize_cmap_token(match: re.Match[bytes]) -> bytes:
+    digits = match.group("hex")
+    if digits is not None:
+        digits = digits.translate(None, _PDF_WHITESPACE)
+        if len(digits) % 2:
+            digits += b"0"
+        return b"<" + digits + b">"
+    if match.group("comment") is not None:
+        return b" "
+    return match.group(0)
+
+
+def normalize_cmap_syntax(data: bytes) -> bytes:
+    """Strip comments and canonicalize hex strings in CMap data.
+
+    Hex strings may contain whitespace, and an odd final digit implies a
+    trailing zero (ISO 32000-1, 7.3.4.3); ``%`` starts a comment outside
+    strings.  Canonical ``<41>`` tokens let entry patterns stay simple.
+    """
+    if b"%" not in data and _IRREGULAR_CMAP_HEX_RE.search(data) is None:
+        return data
+    return _CMAP_SYNTAX_RE.sub(_canonicalize_cmap_token, data)
+
+
 def parse_tounicode_cmap(data: bytes) -> dict[int, int]:
     """Parses a ToUnicode CMap stream into a code-to-Unicode mapping.
 
@@ -867,7 +911,7 @@ def parse_tounicode_cmap(data: bytes) -> dict[int, int]:
     code_to_unicode: dict[int, int] = {}
 
     try:
-        text = data.decode("ascii", errors="replace")
+        text = normalize_cmap_syntax(data).decode("ascii", errors="replace")
     except Exception:
         return code_to_unicode
 
@@ -931,7 +975,7 @@ def parse_cmap_codespace_ranges(
 ) -> tuple[tuple[bytes, bytes], ...]:
     """Return the byte ranges declared by CMap codespace blocks."""
     try:
-        text = data.decode("ascii", errors="replace")
+        text = normalize_cmap_syntax(data).decode("ascii", errors="replace")
     except Exception:
         return ()
 
@@ -963,6 +1007,9 @@ class CIDEncodingMap:
     notdef_ranges: tuple[tuple[bytes, bytes, int], ...] = ()
     decoder: Callable[[bytes], int | None] | None = None
     base: "CIDEncodingMap | None" = None
+    # Mapping blocks (in this CMap or its /UseCMap chain) containing text
+    # that is not a valid entry; such a map is not a reliable .notdef oracle.
+    unparsed_blocks: int = 0
 
     @staticmethod
     def _map_ranges(
@@ -1053,12 +1100,17 @@ _CID_BLOCK_RE = re.compile(
     rb"(?P<body>.*?)end(?P=kind)\b",
     re.DOTALL,
 )
+_CID_BLOCK_BEGIN_RE = re.compile(
+    rb"\bbegin(?:cidchar|cidrange|notdefchar|notdefrange)\b"
+)
+# Hex strings are self-delimiting, so producers may omit the whitespace
+# between tokens (e.g. GdPicture writes ``<20><20> 3``).
 _CIDCHAR_RE = re.compile(
-    rb"<(?P<src>[0-9A-Fa-f]+)>\s+"
+    rb"<(?P<src>[0-9A-Fa-f]+)>\s*"
     rb"(?:<(?P<cid_hex>[0-9A-Fa-f]+)>|(?P<cid_int>-?\d+))"
 )
 _CIDRANGE_RE = re.compile(
-    rb"<(?P<src>[0-9A-Fa-f]+)>\s+<(?P<end>[0-9A-Fa-f]+)>\s+"
+    rb"<(?P<src>[0-9A-Fa-f]+)>\s*<(?P<end>[0-9A-Fa-f]+)>\s*"
     rb"(?:<(?P<cid_hex>[0-9A-Fa-f]+)>|(?P<cid_int>-?\d+))"
 )
 _CODE_SPACE_BLOCK_RE = re.compile(
@@ -1074,13 +1126,18 @@ _CID_MAPPING_BLOCK_RE = re.compile(
 
 def parse_cid_encoding_cmap(data: bytes) -> CIDEncodingMap:
     """Parse CID mappings and code-space ranges from an embedded CMap."""
-    uncommented = re.sub(rb"%[^\r\n]*", b"", data)
+    normalized = normalize_cmap_syntax(data)
     ranges: list[tuple[bytes, bytes, int]] = []
     notdef_ranges: list[tuple[bytes, bytes, int]] = []
-    for block in _CID_BLOCK_RE.finditer(uncommented):
+    blocks = 0
+    unparsed_blocks = 0
+    for block in _CID_BLOCK_RE.finditer(normalized):
+        blocks += 1
         kind = block.group("kind")
         entry_pattern = _CIDCHAR_RE if kind.endswith(b"char") else _CIDRANGE_RE
-        for entry in entry_pattern.finditer(block.group("body")):
+        body = block.group("body")
+        complete = not entry_pattern.sub(b"", body).strip()
+        for entry in entry_pattern.finditer(body):
             try:
                 start = bytes.fromhex(entry.group("src").decode("ascii"))
                 end_group = entry.groupdict().get("end")
@@ -1096,16 +1153,24 @@ def parse_cid_encoding_cmap(data: bytes) -> CIDEncodingMap:
                     else int(entry.group("cid_int"))
                 )
             except (TypeError, ValueError):
+                complete = False
                 continue
             if len(start) == len(end) and start <= end:
                 target = notdef_ranges if kind.startswith(b"notdef") else ranges
                 target.append((start, end, cid_start))
+            else:
+                complete = False
+        if not complete:
+            unparsed_blocks += 1
+    # A block without its end keyword is not matched above at all.
+    unparsed_blocks += max(0, len(_CID_BLOCK_BEGIN_RE.findall(normalized)) - blocks)
 
     return CIDEncodingMap(
         ranges=tuple(ranges),
-        code_space_ranges=parse_cmap_codespace_ranges(uncommented),
-        unmapped_to_zero=not bool(re.search(rb"\busecmap\b", uncommented)),
+        code_space_ranges=parse_cmap_codespace_ranges(normalized),
+        unmapped_to_zero=not bool(re.search(rb"\busecmap\b", normalized)),
         notdef_ranges=tuple(notdef_ranges),
+        unparsed_blocks=unparsed_blocks,
     )
 
 
@@ -1309,6 +1374,7 @@ def _get_cid_encoding_map(
             notdef_ranges=mapping.notdef_ranges,
             decoder=mapping.decoder,
             base=effective,
+            unparsed_blocks=mapping.unparsed_blocks + effective.unparsed_blocks,
         )
     return effective
 
@@ -1415,7 +1481,7 @@ def parse_tounicode_cmap_sequences(
 ) -> dict[bytes, tuple[int, ...]]:
     """Parse a ToUnicode CMap without losing source widths or Unicode sequences."""
     try:
-        text = data.decode("ascii", errors="replace")
+        text = normalize_cmap_syntax(data).decode("ascii", errors="replace")
     except Exception:
         return {}
 

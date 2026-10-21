@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Changes
+
+- Keep a font's text, warn, and report the conversion like a failed validation (`validation_failed=True`, `target_produced=False`) when `.notdef` cleanup would remove at least 3 distinct characters and at least half of the characters the font shows, or when the font's embedded CMap contains unreadable mappings, because such fonts were almost certainly misread
+
+### Bug Fixes
+
+- Read embedded CMaps that omit the whitespace between hex strings, such as `<20><20> 3` in fonts written by GdPicture, instead of mapping every character to `.notdef` and removing most of the text from the page during conversion
+- Read hex strings with embedded whitespace or an odd number of digits, such as `<4 1>` or `<4>`, in embedded and ToUnicode CMaps, and ignore `%` comments in ToUnicode CMaps instead of reading or rewriting commented-out mappings
+- Keep fi/fl ligatures and the currency sign in non-symbolic TrueType fonts with `MacRomanEncoding`: glyph names now follow the PDF MacRomanEncoding table and resolve through the font's (1,0) Mac cmap, instead of removing these characters as `.notdef`
+- Repair CID values above 65535 in embedded CMaps regardless of line layout, without changing commented-out entries
+
+### Documentation
+
+- Document how `.notdef` references are removed and when a font keeps its text instead
+
 ## [0.9.23] - 2026-10-20
 
 ### Bug Fixes

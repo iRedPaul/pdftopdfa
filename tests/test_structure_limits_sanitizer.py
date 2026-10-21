@@ -509,6 +509,87 @@ endcidrange
         assert "65536" not in cmap_text
         assert result["cid_overflow_entries_repaired"] == 1
 
+    def test_repairs_overflow_entries_without_token_whitespace(self) -> None:
+        """Self-delimiting hex strings need no separator in CMap entries."""
+        pdf = new_pdf()
+        encoding_stream = pdf.make_stream(
+            b"""
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 begincidchar
+<0041>65791
+endcidchar
+1 begincidrange
+<3F00><3FFF> 65536
+endcidrange
+"""
+        )
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type0,
+                BaseFont=Name("/TestCID"),
+                Encoding=encoding_stream,
+                DescendantFonts=Array([]),
+            )
+        )
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 200, 200]),
+                Resources=Dictionary(Font=Dictionary(F1=font)),
+                Contents=pdf.make_stream(b"BT /F1 12 Tf <00413F00> Tj ET"),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_structure_limits(pdf)
+        cmap_text = encoding_stream.read_bytes().decode("latin-1")
+
+        assert "<0041> 0" in cmap_text
+        assert "<3F00> 0" in cmap_text
+        assert "65791" not in cmap_text
+        assert "65536" not in cmap_text
+        assert result["cid_overflow_entries_repaired"] == 2
+
+    def test_repairs_overflow_entries_regardless_of_line_layout(self) -> None:
+        """Blocks on one line and comments do not hide or fake entries."""
+        pdf = new_pdf()
+        encoding_stream = pdf.make_stream(
+            b"1 begincodespacerange <0000> <FFFF> endcodespacerange "
+            b"2 begincidrange <0000> <0001> 5 <3F00> <3FFF> 65536 endcidrange\n"
+            b"1 begincidchar\n% <0100> 70000\n<0041> 9\nendcidchar\n"
+        )
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type0,
+                BaseFont=Name("/TestCID"),
+                Encoding=encoding_stream,
+                DescendantFonts=Array([]),
+            )
+        )
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 200, 200]),
+                Resources=Dictionary(Font=Dictionary(F1=font)),
+                Contents=pdf.make_stream(b"BT /F1 12 Tf <00003F01> Tj ET"),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_structure_limits(pdf)
+        cmap_text = encoding_stream.read_bytes().decode("latin-1")
+
+        assert "1 begincidrange <0000> <0001> 5  endcidrange" in cmap_text
+        assert "<3F01> 0" in cmap_text
+        assert "65536" not in cmap_text
+        assert "% <0100> 70000" in cmap_text
+        assert "<0041> 9" in cmap_text
+        assert result["cid_overflow_entries_repaired"] == 1
+
     def test_removes_unused_cmap_cid_overflow_range(self) -> None:
         pdf = new_pdf()
         cmap_data = b"""

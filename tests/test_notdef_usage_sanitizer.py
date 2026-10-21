@@ -690,6 +690,68 @@ endcidchar
         )
         assert bytes(tj.operands[0]) == b"\x00A"
 
+    def test_single_byte_cmap_without_token_whitespace_keeps_text(self):
+        """Compact ``<41><42> 1`` cidrange entries still map to real CIDs.
+
+        GdPicture writes embedded CMaps without whitespace between the
+        source hex strings; misreading them mapped every code to CID 0
+        and stripped all text shown with the font.
+        """
+        pdf = new_pdf()
+        font_stream = pdf.make_stream(_make_ttfont_bytes(["A", "B", "a"]))
+        encoding = pdf.make_stream(
+            b"/CIDInit /ProcSet findresource begin\n"
+            b"12 dict begin\nbegincmap\n"
+            b"/CIDSystemInfo\n<< /Registry(GdPicture)\n/Ordering(CustomCMap)\n"
+            b"/Supplement 0\n>> def\n"
+            b"/CMapName /GDPCX def\n/CMapType 1 def\n"
+            b"1 begincodespacerange\n<00><FF>\nendcodespacerange\n"
+            b"2 begincidrange\n<41><42> 1\n<61><61> 3\nendcidrange\n"
+            b"endcmap\n"
+            b"CMapName currentdict /CMap defineresource pop\nend end\n"
+        )
+        cidfont = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.CIDFontType2,
+            BaseFont=Name("/TestCIDFont"),
+            CIDToGIDMap=Name.Identity,
+            CIDSystemInfo=Dictionary(
+                Registry=String(b"GdPicture"),
+                Ordering=String(b"CustomCMap"),
+                Supplement=0,
+            ),
+            FontDescriptor=Dictionary(
+                Type=Name.FontDescriptor,
+                FontName=Name("/TestCIDFont"),
+                FontFile2=font_stream,
+            ),
+            DW=500,
+        )
+        type0_font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/TestCIDFont"),
+            Encoding=encoding,
+            DescendantFonts=Array([cidfont]),
+        )
+        stream = _make_page_with_font_and_content(
+            pdf, type0_font, b"BT /F1 12 Tf (ABaC) Tj ET"
+        )
+
+        result = sanitize_notdef_usage(pdf)
+
+        # Only the unmapped "C" (CID 0) is .notdef.
+        assert result["notdef_usage_fixed"] == 1
+        tj = next(
+            instruction
+            for instruction in pikepdf.parse_content_stream(stream)
+            if (
+                isinstance(instruction, pikepdf.ContentStreamInstruction)
+                and str(instruction.operator) == "Tj"
+            )
+        )
+        assert bytes(tj.operands[0]) == b"ABa"
+
     def test_cidfont_type0_keeps_valid_nonsequential_cids(self, monkeypatch):
         """CIDFontType0 keeps valid charset CIDs even when they are high values."""
         pdf = new_pdf()
@@ -1789,3 +1851,167 @@ class TestUnmappedEncodingEntry:
         ]
         assert len(tj_ops) == 1
         assert bytes(tj_ops[0].operands[0]) == b"A"
+
+
+def _make_mac_roman_truetype_font(pdf, mac_codes, encoding=Name.MacRomanEncoding):
+    """Non-symbolic TrueType font whose glyphs are reachable only via (1,0)."""
+    from font_helpers import make_mac_roman_only_truetype
+
+    font_stream = pdf.make_stream(make_mac_roman_only_truetype(mac_codes))
+    return Dictionary(
+        Type=Name.Font,
+        Subtype=Name.TrueType,
+        BaseFont=Name("/MacOnly"),
+        FirstChar=0,
+        LastChar=255,
+        Widths=Array([500] * 256),
+        Encoding=encoding,
+        FontDescriptor=Dictionary(
+            Type=Name.FontDescriptor,
+            FontName=Name("/MacOnly"),
+            Flags=32,
+            FontFile2=font_stream,
+        ),
+    )
+
+
+class TestTrueTypeMacRomanCmap:
+    """Glyph names resolve through a (1,0) cmap (ISO 32000-1, 9.6.6.4)."""
+
+    def test_ligatures_reached_through_mac_cmap_are_kept(self):
+        """MacRoman fi/fl ligatures in legacy Mac fonts are real glyphs."""
+        pdf = new_pdf()
+        font = _make_mac_roman_truetype_font(
+            pdf, {0xDE: "uniF0DE", 0xDF: "uniF0DF", 0xDB: "uniF0DB"}
+        )
+        content = b"BT /F1 12 Tf <DEDFDB> Tj ET"
+        stream = _make_page_with_font_and_content(pdf, font, content)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result["notdef_usage_fixed"] == 0
+        assert stream.read_bytes() == content
+
+    def test_differences_name_reached_through_mac_cmap_is_kept(self):
+        """The name, not the code, selects the (1,0) entry."""
+        pdf = new_pdf()
+        encoding = Dictionary(
+            Type=Name.Encoding,
+            BaseEncoding=Name.WinAnsiEncoding,
+            Differences=Array([0x41, Name("/fi")]),
+        )
+        font = _make_mac_roman_truetype_font(pdf, {0xDE: "uniF0DE"}, encoding)
+        content = b"BT /F1 12 Tf <41> Tj ET"
+        stream = _make_page_with_font_and_content(pdf, font, content)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result["notdef_usage_fixed"] == 0
+        assert stream.read_bytes() == content
+
+    def test_code_undefined_in_pdf_mac_roman_is_removed(self):
+        """MacRomanEncoding defines no glyph at 0xBD, so it is .notdef."""
+        pdf = new_pdf()
+        font = _make_mac_roman_truetype_font(pdf, {0xBD: "uniF0BD"})
+        stream = _make_page_with_font_and_content(pdf, font, b"BT /F1 12 Tf <BD> Tj ET")
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result["notdef_usage_fixed"] == 1
+        assert b"<bd>" not in stream.read_bytes().lower()
+
+
+def _make_identity_cidfont(pdf, glyph_names, encoding=None):
+    font_stream = pdf.make_stream(_make_ttfont_bytes(list(glyph_names)))
+    cidfont = Dictionary(
+        Type=Name.Font,
+        Subtype=Name.CIDFontType2,
+        BaseFont=Name("/GuardFont"),
+        CIDToGIDMap=Name.Identity,
+        CIDSystemInfo=Dictionary(
+            Registry=String(b"Adobe"), Ordering=String(b"Identity"), Supplement=0
+        ),
+        FontDescriptor=Dictionary(
+            Type=Name.FontDescriptor,
+            FontName=Name("/GuardFont"),
+            FontFile2=font_stream,
+        ),
+        DW=500,
+    )
+    return pdf.make_indirect(
+        Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/GuardFont"),
+            Encoding=encoding if encoding is not None else Name("/Identity-H"),
+            DescendantFonts=Array([cidfont]),
+        )
+    )
+
+
+class TestRemovalGuard:
+    """Text is kept when .notdef removal looks like a misread font."""
+
+    def test_unreadable_embedded_cmap_keeps_text(self):
+        """An unterminated cidrange block may have mapped every code."""
+        pdf = new_pdf()
+        encoding = pdf.make_stream(
+            b"1 begincodespacerange\n<00><FF>\nendcodespacerange\n"
+            b"1 begincidrange\n<41><43> 1\n"
+        )
+        font = _make_identity_cidfont(pdf, ["A", "B", "C"], encoding)
+        content = b"BT /F1 12 Tf (ABC) Tj ET"
+        stream = _make_page_with_font_and_content(pdf, font, content)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result == {"notdef_usage_fixed": 0, "notdef_fonts_preserved": 1}
+        assert stream.read_bytes() == content
+
+    def test_mass_removal_keeps_text(self):
+        """Removing 3 of a font's 4 distinct codes is not trusted."""
+        pdf = new_pdf()
+        font = _make_identity_cidfont(pdf, ["A"])
+        content = b"BT /F1 12 Tf <0001000500060007> Tj ET"
+        stream = _make_page_with_font_and_content(pdf, font, content)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result == {"notdef_usage_fixed": 0, "notdef_fonts_preserved": 1}
+        assert stream.read_bytes() == content
+
+    def test_few_missing_glyphs_are_still_removed(self):
+        """Two missing codes stay below the emergency threshold."""
+        pdf = new_pdf()
+        font = _make_identity_cidfont(pdf, ["A"])
+        stream = _make_page_with_font_and_content(
+            pdf, font, b"BT /F1 12 Tf <000100050006> Tj ET"
+        )
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result == {"notdef_usage_fixed": 1, "notdef_fonts_preserved": 0}
+        tj = next(
+            instruction
+            for instruction in pikepdf.parse_content_stream(stream)
+            if str(instruction.operator) in {"Tj", "TJ"}
+        )
+        shown = (
+            [bytes(tj.operands[0])]
+            if str(tj.operator) == "Tj"
+            else [bytes(item) for item in tj.operands[0] if isinstance(item, String)]
+        )
+        assert shown == [b"\x00\x01"]
+
+    def test_font_usage_is_collected_only_before_a_removal(self, monkeypatch):
+        def fail(_pdf):
+            raise AssertionError("font usage collected without a removal")
+
+        monkeypatch.setattr(notdef_usage_mod, "collect_font_usage", fail)
+        pdf = new_pdf()
+        font = _make_identity_cidfont(pdf, ["A"])
+        _make_page_with_font_and_content(pdf, font, b"BT /F1 12 Tf <0001> Tj ET")
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result == {"notdef_usage_fixed": 0, "notdef_fonts_preserved": 0}

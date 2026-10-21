@@ -19,6 +19,7 @@ from io import BytesIO
 
 import pikepdf
 from fontTools.agl import AGL2UV, LEGACY_AGL2UV
+from pdfminer.latin_enc import ENCODING as PDF_LATIN_ENCODING
 from pikepdf import Name, Stream
 
 from ..utils import log_suppressed_error
@@ -671,7 +672,7 @@ def _resolve_simple_font_encoding(
         if enc_name == "/WinAnsiEncoding":
             return _build_winansi_glyphnames()
         elif enc_name == "/MacRomanEncoding":
-            return _build_glyphnames_from_unicode(generate_tounicode_for_macroman())
+            return _build_macroman_glyphnames()
         elif enc_name == "/StandardEncoding":
             if not pdfa_normalized:
                 return dict(STANDARD_ENCODING)
@@ -686,9 +687,7 @@ def _resolve_simple_font_encoding(
             if base_name == "/WinAnsiEncoding":
                 code_to_glyphname = _build_winansi_glyphnames()
             elif base_name == "/MacRomanEncoding":
-                code_to_glyphname = _build_glyphnames_from_unicode(
-                    generate_tounicode_for_macroman()
-                )
+                code_to_glyphname = _build_macroman_glyphnames()
             elif base_name == "/StandardEncoding":
                 code_to_glyphname = (
                     _build_winansi_glyphnames()
@@ -791,6 +790,24 @@ def _build_winansi_glyphnames() -> dict[int, str]:
     """Builds WinAnsiEncoding's PDF glyph-name mapping."""
     code_to_glyphname = _build_glyphnames_from_unicode(generate_tounicode_for_winansi())
     code_to_glyphname.update(_WINANSI_GLYPH_NAME_OVERRIDES)
+    return code_to_glyphname
+
+
+def _build_macroman_glyphnames() -> dict[int, str]:
+    """Builds MacRomanEncoding's PDF glyph-name mapping.
+
+    The PDF MacRomanEncoding table (ISO 32000-1, Annex D) is authoritative:
+    it names the fi/fl ligatures, which the reverse Adobe Glyph List cannot,
+    and has currency rather than Mac OS Euro at 0xDB, as veraPDF and MuPDF
+    do. Mac OS-only codes it leaves undefined keep their Unicode-derived
+    names so that their text is retained rather than removed as .notdef.
+    """
+    code_to_glyphname = _build_glyphnames_from_unicode(
+        generate_tounicode_for_macroman()
+    )
+    for glyph_name, _std, mac_code, _win, _pdf in PDF_LATIN_ENCODING:
+        if mac_code is not None:
+            code_to_glyphname[mac_code] = glyph_name
     return code_to_glyphname
 
 

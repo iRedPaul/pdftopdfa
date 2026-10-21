@@ -11,6 +11,7 @@ font uses Unicode-based glyph names (e.g., 'uni2701') rather than Adobe names
 """
 
 from fontTools.agl import AGL2UV, LEGACY_AGL2UV, toUnicode
+from fontTools.encodings.MacRoman import MacRoman
 
 from .encodings import ZAPFDINGBATS_ENCODING
 
@@ -173,4 +174,39 @@ def resolve_glyph_name(
     if adobe_name in hmtx_metrics:
         return adobe_name
 
+    return None
+
+
+# Mac OS standard Roman encoding (printable codes only), used to map glyph
+# names onto a TrueType (1,0) cmap.
+_MAC_OS_ROMAN_CODES: dict[str, int] = {
+    name: code for code, name in enumerate(MacRoman) if code >= 0x20
+}
+
+
+def resolve_mac_roman_cmap_glyph(tt_font, adobe_name: str) -> str | None:
+    """Resolve a glyph name of a non-symbolic TrueType font via its (1,0) cmap.
+
+    ISO 32000-1, 9.6.6.4 maps the name to its code in the Mac OS standard
+    Roman encoding and looks that code up in the (1,0) subtable, so names
+    such as ``fi`` resolve even without a (3,1) entry or post glyph names.
+
+    Args:
+        tt_font: fontTools TTFont object.
+        adobe_name: Glyph name selected by the PDF encoding.
+
+    Returns:
+        The font's glyph name, or None if the (1,0) cmap does not map it to
+        a real glyph.
+    """
+    code = _MAC_OS_ROMAN_CODES.get(adobe_name)
+    if code is None or "cmap" not in tt_font:
+        return None
+    glyph_order = tt_font.getGlyphOrder()
+    for table in tt_font["cmap"].tables:
+        if table.platformID != 1 or table.platEncID != 0:
+            continue
+        glyph_name = (getattr(table, "cmap", None) or {}).get(code)
+        if glyph_name and glyph_name != glyph_order[0] and glyph_name in glyph_order:
+            return glyph_name
     return None

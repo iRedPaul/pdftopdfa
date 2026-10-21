@@ -23,9 +23,11 @@ from pdftopdfa.fonts.tounicode import (
     generate_cidfont_tounicode_cmap,
     get_type0_cid_encoding_map,
     map_type0_character_codes_to_cids,
+    normalize_cmap_syntax,
     parse_cid_encoding_cmap,
     parse_cidtogidmap_stream,
     parse_tounicode_cmap,
+    parse_tounicode_cmap_sequences,
 )
 from pdftopdfa.utils import resolve_indirect as _resolve_indirect
 
@@ -53,6 +55,90 @@ endcidrange
         assert mapping.map_code(0x41) == 7
         assert mapping.map_code(0x101) == 17
         assert mapping.map_code(0x9999) == 0
+
+    def test_parses_entries_without_whitespace_between_tokens(self):
+        """Self-delimiting hex strings need no separator (GdPicture CMaps)."""
+        mapping = parse_cid_encoding_cmap(
+            b"""
+1 begincodespacerange
+<00><FF>
+endcodespacerange
+2 begincidchar
+<21>9
+<22><000A>
+endcidchar
+2 begincidrange
+<20><20> 3
+<61><70><0044>
+endcidrange
+"""
+        )
+
+        assert mapping.code_space_ranges == ((b"\x00", b"\xff"),)
+        assert mapping.map_code(b" ") == 3
+        assert mapping.map_code(b"!") == 9
+        assert mapping.map_code(b'"') == 10
+        assert mapping.map_code(b"a") == 68
+        assert mapping.map_code(b"p") == 83
+        assert mapping.map_code(b"q") == 0
+
+    def test_parses_hex_strings_with_inner_whitespace_and_odd_digits(self):
+        """Hex strings ignore whitespace; an odd last digit means a 0."""
+        mapping = parse_cid_encoding_cmap(
+            b"1 begincodespacerange <0 0> <F\tF> endcodespacerange\n"
+            b"2 begincidrange\n<4 1>\n<4\r\n2> 7\n<5> <5> 20\nendcidrange"
+        )
+
+        assert mapping.code_space_ranges == ((b"\x00", b"\xff"),)
+        assert mapping.map_code(b"A") == 7
+        assert mapping.map_code(b"B") == 8
+        assert mapping.map_code(b"P") == 20
+        assert mapping.unparsed_blocks == 0
+
+    def test_ignores_comments_but_keeps_percent_in_literal_strings(self):
+        mapping = parse_cid_encoding_cmap(
+            b"/CIDSystemInfo << /Registry (Ad%obe) >> def\n"
+            b"1 begincodespacerange <00> <FF> endcodespacerange\n"
+            b"1 begincidrange % <40> <40> 99\n<41> <42> 7 endcidrange"
+        )
+
+        assert mapping.map_code(b"@") == 0
+        assert mapping.map_code(b"A") == 7
+        assert mapping.unparsed_blocks == 0
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            b"1 begincidrange <41> <42> 7 garbage endcidrange",
+            b"1 begincidrange <41> <42> 7",
+            b"1 begincidrange <0041> <42> 7 endcidrange",
+        ],
+        ids=["unknown-token", "unterminated", "length-mismatch"],
+    )
+    def test_counts_mapping_blocks_with_unreadable_text(self, body):
+        mapping = parse_cid_encoding_cmap(
+            b"1 begincodespacerange <00> <FF> endcodespacerange\n" + body
+        )
+
+        assert mapping.unparsed_blocks == 1
+
+    def test_usecmap_chain_carries_unparsed_blocks(self):
+        pdf = new_pdf()
+        parent = pdf.make_stream(b"1 begincidrange <41> <42> 7 ?? endcidrange\n")
+        child = pdf.make_stream(b"1 begincidchar <43> 9 endcidchar\n")
+        child[Name.UseCMap] = parent
+        font = Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            Encoding=child,
+            DescendantFonts=Array([]),
+        )
+
+        mapping = get_type0_cid_encoding_map(font)
+
+        assert mapping is not None
+        assert mapping.unparsed_blocks == 1
+        assert mapping.map_code(b"C") == 9
 
     def test_maps_used_codes_from_embedded_type0_cmap(self):
         pdf = new_pdf()
@@ -118,6 +204,43 @@ endcidchar
         )
 
         assert get_type0_cid_encoding_map(font) is None
+
+
+class TestToUnicodeCMapSyntax:
+    """ToUnicode parsers follow PostScript hex-string and comment syntax."""
+
+    _CMAP = (
+        b"/CIDSystemInfo << /Registry (Ad%obe) /Ordering (UCS) >> def\n"
+        b"1 begincodespacerange <00> <FF> endcodespacerange\n"
+        b"3 beginbfchar\n% <42> <0062>\n<4 1> <00 61>\n<4> <0063>\n"
+        b"<43><0064>\nendbfchar\n"
+        b"1 beginbfrange <44><45><0065> endbfrange\n"
+    )
+
+    def test_parse_tounicode_cmap(self):
+        assert parse_tounicode_cmap(self._CMAP) == {
+            0x41: 0x61,
+            0x40: 0x63,
+            0x43: 0x64,
+            0x44: 0x65,
+            0x45: 0x66,
+        }
+
+    def test_parse_tounicode_cmap_sequences(self):
+        assert parse_tounicode_cmap_sequences(self._CMAP) == {
+            b"A": (0x61,),
+            b"@": (0x63,),
+            b"C": (0x64,),
+            b"D": (0x65,),
+            b"E": (0x66,),
+        }
+
+    def test_normalize_cmap_syntax(self):
+        assert normalize_cmap_syntax(b"(a%b) <<\n>> % c\n<4 1><4>") == (
+            b"(a%b) <<\n>>  \n<41><40>"
+        )
+        canonical = b"1 beginbfchar\n<0041> <0061>\nendbfchar"
+        assert normalize_cmap_syntax(canonical) is canonical
 
 
 class TestSimpleFontToUnicode:

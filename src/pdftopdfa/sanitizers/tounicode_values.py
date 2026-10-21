@@ -45,9 +45,7 @@ logger = logging.getLogger(__name__)
 # Text-showing operators (PDF Reference, Table 5.6)
 _TEXT_OPERATORS = frozenset({"Tj", "'", '"'})
 _TJ_OPERATOR = "TJ"
-_BFCHAR_BLOCK_PATTERN = re.compile(r"(beginbfchar\b)(.*?)(\bendbfchar)", re.DOTALL)
 _BFCHAR_ENTRY_PATTERN = re.compile(r"(<[0-9A-Fa-f]+>\s*)<([0-9A-Fa-f]+)>")
-_BFRANGE_BLOCK_PATTERN = re.compile(r"(beginbfrange\b)(.*?)(\bendbfrange)", re.DOTALL)
 _BFRANGE_ENTRY_PATTERN = re.compile(
     r"(<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*)"
     r"(?:<([0-9A-Fa-f]+)>|\[([^\]]*)\])"
@@ -62,6 +60,20 @@ _CMAP_COMMENT_PATTERN = re.compile(_CMAP_COMMENT)
 _COUNTED_BFRANGE_BLOCK_PATTERN = re.compile(
     rf"{_CMAP_COMMENT}|\d+(?:\s|{_CMAP_COMMENT})+beginbfrange\b"
     rf"((?:{_CMAP_COMMENT}|[^%])*?)\bendbfrange"
+)
+# In-place rewriting patterns that likewise leave comments untouched: only
+# block and entry matches set group 1.
+_BFCHAR_REWRITE_BLOCK_PATTERN = re.compile(
+    rf"{_CMAP_COMMENT}|(beginbfchar\b)((?:{_CMAP_COMMENT}|[^%])*?)(\bendbfchar)"
+)
+_BFRANGE_REWRITE_BLOCK_PATTERN = re.compile(
+    rf"{_CMAP_COMMENT}|(beginbfrange\b)((?:{_CMAP_COMMENT}|[^%])*?)(\bendbfrange)"
+)
+_BFCHAR_REWRITE_ENTRY_PATTERN = re.compile(
+    rf"{_CMAP_COMMENT}|{_BFCHAR_ENTRY_PATTERN.pattern}"
+)
+_BFRANGE_REWRITE_ENTRY_PATTERN = re.compile(
+    rf"{_CMAP_COMMENT}|{_BFRANGE_ENTRY_PATTERN.pattern}"
 )
 _CMAP_BLOCK_ENTRY_LIMIT = 100
 
@@ -204,15 +216,25 @@ def _sanitize_tounicode_cmap(cmap_data: bytes) -> bytes:
         return "".join(f"{value:04X}" for value in units)
 
     def sanitize_bfchar_block(match: re.Match[str]) -> str:
+        if match.group(1) is None:
+            return match.group(0)
+
         def sanitize_entry(entry: re.Match[str]) -> str:
+            if entry.group(1) is None:
+                return entry.group(0)
             destination = sanitize_destination(entry.group(2))
             return f"{entry.group(1)}<{destination}>"
 
-        body = _BFCHAR_ENTRY_PATTERN.sub(sanitize_entry, match.group(2))
+        body = _BFCHAR_REWRITE_ENTRY_PATTERN.sub(sanitize_entry, match.group(2))
         return f"{match.group(1)}{body}{match.group(3)}"
 
     def sanitize_bfrange_block(match: re.Match[str]) -> str:
+        if match.group(1) is None:
+            return match.group(0)
+
         def sanitize_entry(entry: re.Match[str]) -> str:
+            if entry.group(1) is None:
+                return entry.group(0)
             destination = entry.group(4)
             if destination is not None:
                 start = int(entry.group(2), 16)
@@ -237,12 +259,12 @@ def _sanitize_tounicode_cmap(cmap_data: bytes) -> bytes:
             )
             return f"{entry.group(1)}[{array_body}]"
 
-        body = _BFRANGE_ENTRY_PATTERN.sub(sanitize_entry, match.group(2))
+        body = _BFRANGE_REWRITE_ENTRY_PATTERN.sub(sanitize_entry, match.group(2))
         return f"{match.group(1)}{body}{match.group(3)}"
 
     text = _split_overflowing_bfranges(text)
-    text = _BFCHAR_BLOCK_PATTERN.sub(sanitize_bfchar_block, text)
-    text = _BFRANGE_BLOCK_PATTERN.sub(sanitize_bfrange_block, text)
+    text = _BFCHAR_REWRITE_BLOCK_PATTERN.sub(sanitize_bfchar_block, text)
+    text = _BFRANGE_REWRITE_BLOCK_PATTERN.sub(sanitize_bfrange_block, text)
     return text.encode("ascii")
 
 
