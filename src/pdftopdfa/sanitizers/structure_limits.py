@@ -57,13 +57,15 @@ _ASCII_NAME_RE = re.compile(r"[^A-Za-z0-9_.+-]+")
 # whose literal strings and comments are blanked (mask_cmap_inert_text), so
 # block- or entry-like text inside them is neither read nor rewritten.
 _PDF_WS = r"[\x00\t\n\x0c\r ]"
+_PDF_WS_CHARS = ("\x00", "\t", "\n", "\x0c", "\r", " ")
 _CMAP_HEX = r"<(?P<{}>[0-9A-Fa-f\x00\t\n\x0c\r ]*)>"
 # A block without its end keyword runs to the next block or the end of the
 # data, so that its entries are still repaired or rejected.
 _CID_BLOCK_RE = re.compile(
     rf"(?:(?P<count>\d+)(?P<gap>{_PDF_WS}+))?begincid(?P<kind>char|range)\b"
     r"(?P<body>.*?)"
-    rf"(?:endcid(?P=kind)\b|(?=(?:\d++{_PDF_WS}+)?begincid(?:char|range)\b)|\Z)",
+    rf"(?:(?P<end>endcid(?P=kind))\b"
+    rf"|(?=(?:\d++{_PDF_WS}+)?begincid(?:char|range)\b)|\Z)",
     re.DOTALL,
 )
 _CID_TARGET = r"(?:" + _CMAP_HEX.format("cid_hex") + r"|(?P<cid>-?\d+))"
@@ -1064,7 +1066,12 @@ def _repair_cid_overflow_entries(
             output.append(str(max(0, int(block.group("count")) + count_delta)))
             keyword_start = block.start("gap")
         output.append(data[keyword_start:body_start])
-        output.append("".join(body_parts))
+        new_body = "".join(body_parts)
+        output.append(new_body)
+        if block.group("end") is None:
+            # Close a block that ended implicitly, as CMap readers require.
+            separator = "" if new_body.endswith(_PDF_WS_CHARS) else "\n"
+            output.append(f"{separator}endcid{block.group('kind')}\n")
         output.append(data[body_end : block.end()])
         for offset in range(0, len(remapped_char_entries), 100):
             chunk = remapped_char_entries[offset : offset + 100]
