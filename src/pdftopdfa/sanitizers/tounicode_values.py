@@ -54,20 +54,24 @@ _HEX_TOKEN_PATTERN = re.compile(r"<([0-9A-Fa-f]+)>")
 # PostScript comments run to the next CR, LF, or FF and act as whitespace.
 _CMAP_COMMENT = r"%[^\r\n\f]*+"
 _CMAP_COMMENT_PATTERN = re.compile(_CMAP_COMMENT)
-# Comments are consumed whole, before, inside, and between a block's header
-# tokens, so that a block can neither start nor end inside one. Only block
-# matches set group 1.
+# A "%" inside a literal string (e.g. "/Registry (Ad%obe)") starts no comment.
+_CMAP_LITERAL = r"\((?:[^()\\]|\\[\s\S]|\((?:[^()\\]|\\[\s\S])*\))*\)"
+# Literal strings and comments are consumed whole, before, inside, and
+# between a block's header tokens, so that a block can neither start nor end
+# inside one. Only block matches set group 1.
 _COUNTED_BFRANGE_BLOCK_PATTERN = re.compile(
-    rf"{_CMAP_COMMENT}|\d+(?:\s|{_CMAP_COMMENT})+beginbfrange\b"
+    rf"{_CMAP_LITERAL}|{_CMAP_COMMENT}|\d+(?:\s|{_CMAP_COMMENT})+beginbfrange\b"
     rf"((?:{_CMAP_COMMENT}|[^%])*?)\bendbfrange"
 )
-# In-place rewriting patterns that likewise leave comments untouched: only
-# block and entry matches set group 1.
+# In-place rewriting patterns that likewise leave literal strings and
+# comments untouched: only block and entry matches set group 1.
 _BFCHAR_REWRITE_BLOCK_PATTERN = re.compile(
-    rf"{_CMAP_COMMENT}|(beginbfchar\b)((?:{_CMAP_COMMENT}|[^%])*?)(\bendbfchar)"
+    rf"{_CMAP_LITERAL}|{_CMAP_COMMENT}"
+    rf"|(beginbfchar\b)((?:{_CMAP_COMMENT}|[^%])*?)(\bendbfchar)"
 )
 _BFRANGE_REWRITE_BLOCK_PATTERN = re.compile(
-    rf"{_CMAP_COMMENT}|(beginbfrange\b)((?:{_CMAP_COMMENT}|[^%])*?)(\bendbfrange)"
+    rf"{_CMAP_LITERAL}|{_CMAP_COMMENT}"
+    rf"|(beginbfrange\b)((?:{_CMAP_COMMENT}|[^%])*?)(\bendbfrange)"
 )
 _BFCHAR_REWRITE_ENTRY_PATTERN = re.compile(
     rf"{_CMAP_COMMENT}|{_BFCHAR_ENTRY_PATTERN.pattern}"

@@ -410,7 +410,7 @@ def sanitize_for_pdfa(
 
     # Remove .notdef references before width repair so their original text
     # advances can be preserved as TJ adjustments.
-    notdef_usage_result = sanitize_notdef_usage(pdf, usage_cache)
+    notdef_usage_result = sanitize_notdef_usage(pdf)
     result["notdef_usage_fixed"] = notdef_usage_result.get("notdef_usage_fixed", 0)
     result["notdef_fonts_preserved"] = notdef_usage_result.get(
         "notdef_fonts_preserved", 0

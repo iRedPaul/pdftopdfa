@@ -23,8 +23,8 @@ from pikepdf import Array, Dictionary, Name, Operator, Pdf, Stream, String
 from ..exceptions import ConversionError
 from ..fonts.glyph_mapping import resolve_glyph_name, resolve_mac_roman_cmap_glyph
 from ..fonts.glyph_usage import (
-    FontUsageCache,
     _iter_content_streams_with_resources,
+    _object_identity,
     collect_font_usage,
     find_ambiguous_resource_context_streams,
 )
@@ -124,51 +124,41 @@ class _RemovalGuard:
     """Decide per font whether removing its .notdef references is trustworthy.
 
     Decisions are made lazily, right before the first removal, so font usage
-    is collected only for documents that would actually lose text.
+    is collected only for documents that would actually lose text. Only
+    visible text counts: invisible OCR text is remapped, never removed.
     """
 
-    def __init__(self, pdf: Pdf, usage_cache: FontUsageCache | None) -> None:
+    def __init__(self, pdf: Pdf) -> None:
         self._pdf = pdf
-        self._usage_cache = usage_cache
         self._usage: dict | None = None
-        self._decisions: dict[tuple[int, int], bool] = {}
+        self._decisions: dict[object, bool] = {}
         self.preserved_fonts: dict[object, str] = {}
 
     def allows(self, font_obj: pikepdf.Object, notdef_codes: _NotdefCodes) -> bool:
-        objgen = font_obj.objgen
-        if objgen != (0, 0) and objgen in self._decisions:
-            return self._decisions[objgen]
+        # The same identity domain as collect_font_usage(), so that direct
+        # Type 0 fonts are judged by their usage as well.
+        key = _object_identity(font_obj)
+        if key in self._decisions:
+            return self._decisions[key]
 
-        reason = self._distrust_reason(font_obj, notdef_codes)
-        if objgen != (0, 0):
-            self._decisions[objgen] = reason is None
+        reason = self._distrust_reason(key, notdef_codes)
+        self._decisions[key] = reason is None
         if reason is not None:
             font_name = _safe_str(font_obj.get("/BaseFont") or "unnamed font")
-            key = objgen if objgen != (0, 0) else font_name
-            if key not in self.preserved_fonts:
-                self.preserved_fonts[key] = font_name
-                logger.warning(
-                    "Keeping text of font %s that .notdef cleanup would remove: %s",
-                    font_name,
-                    reason,
-                )
+            self.preserved_fonts[key] = font_name
+            logger.warning(
+                "Keeping text of font %s that .notdef cleanup would remove: %s",
+                font_name,
+                reason,
+            )
         return reason is None
 
-    def _distrust_reason(
-        self, font_obj: pikepdf.Object, notdef_codes: _NotdefCodes
-    ) -> str | None:
+    def _distrust_reason(self, key: object, notdef_codes: _NotdefCodes) -> str | None:
         if notdef_codes.unreliable:
             return "its embedded CMap contains unreadable mappings"
-        objgen = font_obj.objgen
-        if objgen == (0, 0):
-            return None
         if self._usage is None:
-            self._usage = (
-                self._usage_cache.get()
-                if self._usage_cache is not None
-                else collect_font_usage(self._pdf)
-            )
-        used = self._usage.get(objgen, set())
+            self._usage = collect_font_usage(self._pdf, skip_invisible_text=True)
+        used = self._usage.get(key, set())
         removed = sum(1 for code in used if code in notdef_codes)
         if (
             removed >= _MASS_REMOVAL_MIN_CODES
@@ -181,10 +171,7 @@ class _RemovalGuard:
         return None
 
 
-def sanitize_notdef_usage(
-    pdf: Pdf,
-    usage_cache: FontUsageCache | None = None,
-) -> dict[str, int]:
+def sanitize_notdef_usage(pdf: Pdf) -> dict[str, int]:
     """Removes .notdef glyph references from content streams.
 
     Scans all content streams for text-showing operators whose character
@@ -197,15 +184,13 @@ def sanitize_notdef_usage(
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
-        usage_cache: Optional shared font usage cache for the emergency
-            guard; when absent, usage is collected only if needed.
 
     Returns:
         Dictionary with ``{"notdef_usage_fixed": N,
         "notdef_fonts_preserved": M}``.
     """
     total_fixed = 0
-    guard = _RemovalGuard(pdf, usage_cache)
+    guard = _RemovalGuard(pdf)
     # Cache notdef codes per font objgen to avoid recomputation
     notdef_cache: dict[tuple[int, int], _NotdefCodes] = {}
     ambiguous_streams = find_ambiguous_resource_context_streams(pdf)

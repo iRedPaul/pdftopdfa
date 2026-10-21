@@ -590,6 +590,62 @@ endcidrange
         assert "<0041> 9" in cmap_text
         assert result["cid_overflow_entries_repaired"] == 1
 
+    @staticmethod
+    def _sanitize_cid_cmap(cmap_data: bytes, content: bytes) -> tuple[dict, str]:
+        pdf = new_pdf()
+        encoding_stream = pdf.make_stream(cmap_data)
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type0,
+                BaseFont=Name("/TestCID"),
+                Encoding=encoding_stream,
+                DescendantFonts=Array([]),
+            )
+        )
+        pdf.pages.append(
+            pikepdf.Page(
+                Dictionary(
+                    Type=Name.Page,
+                    MediaBox=Array([0, 0, 200, 200]),
+                    Resources=Dictionary(Font=Dictionary(F1=font)),
+                    Contents=pdf.make_stream(content),
+                )
+            )
+        )
+        result = sanitize_structure_limits(pdf)
+        return result, encoding_stream.read_bytes().decode("latin-1")
+
+    def test_commented_out_cid_block_is_left_alone(self) -> None:
+        cmap_data = (
+            b"% 1 begincidrange <0000> <FFFF> 70000 endcidrange\n"
+            b"1 begincidchar\n<0041> 9\nendcidchar\n"
+        )
+
+        result, cmap_text = self._sanitize_cid_cmap(
+            cmap_data, b"BT /F1 12 Tf <0041> Tj ET"
+        )
+
+        assert result["cid_overflow_entries_repaired"] == 0
+        assert cmap_text == cmap_data.decode("latin-1")
+
+    def test_comments_and_literal_percent_do_not_bound_cid_blocks(self) -> None:
+        """A '%' in a string starts no comment; one in a block ends nothing."""
+        result, cmap_text = self._sanitize_cid_cmap(
+            b"/Registry (Ad%obe) def 2 begincidrange\n"
+            b"<0000> <0001> 5\n"
+            b"% endcidrange must not end this block\n"
+            b"<3F00> <3FFF> 65536\n"
+            b"endcidrange\n",
+            b"BT /F1 12 Tf <00003F01> Tj ET",
+        )
+
+        assert cmap_text.startswith("/Registry (Ad%obe) def 1 begincidrange\n")
+        assert "% endcidrange must not end this block\n" in cmap_text
+        assert "65536" not in cmap_text
+        assert "<3F01> 0" in cmap_text
+        assert result["cid_overflow_entries_repaired"] == 1
+
     def test_removes_unused_cmap_cid_overflow_range(self) -> None:
         pdf = new_pdf()
         cmap_data = b"""

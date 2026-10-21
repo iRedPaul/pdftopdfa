@@ -516,6 +516,25 @@ class TestSanitizeToUnicodeValues:
         assert b"\x00\x01" not in mapping
         assert 0xE000 <= mapping[b"\x00\x02"][0] <= 0xF8FF
 
+    def test_percent_in_literal_string_does_not_hide_block(self):
+        """A '%' inside a literal string on the block's line starts no comment."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_tounicode(pdf, {1: 0x0041})
+        cmap = bytes(font["/ToUnicode"].read_bytes()).replace(
+            b"1 beginbfchar\n<0001> <0041>\nendbfchar",
+            b"/Note (Ad%obe) def 1 beginbfchar <0001> <0000> endbfchar",
+        )
+        font["/ToUnicode"].write(cmap)
+        _make_page_with_font(pdf, font)
+
+        result = sanitize_tounicode_values(pdf)
+
+        new_data = bytes(font["/ToUnicode"].read_bytes())
+        assert result["tounicode_values_fixed"] == 1
+        assert b"/Note (Ad%obe) def" in new_data
+        mapping = parse_tounicode_cmap_sequences(new_data)
+        assert 0xE000 <= mapping[b"\x00\x01"][0] <= 0xF8FF
+
     def test_bfrange_after_commented_block_start_is_split(self):
         """A commented header does not hide the following real block."""
         pdf = new_pdf()

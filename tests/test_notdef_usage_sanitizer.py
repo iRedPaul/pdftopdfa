@@ -1980,6 +1980,44 @@ class TestRemovalGuard:
         assert result == {"notdef_usage_fixed": 0, "notdef_fonts_preserved": 1}
         assert stream.read_bytes() == content
 
+    def test_mass_removal_in_direct_font_keeps_text(self):
+        """A Type 0 font stored directly in the resources is judged too."""
+        pdf = new_pdf()
+        font = _make_identity_cidfont(pdf, ["A"])
+        direct_font = Dictionary({key: value for key, value in font.items()})
+        content = b"BT /F1 12 Tf <0001000500060007> Tj ET"
+        stream = _make_page_with_font_and_content(pdf, direct_font, content)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result == {"notdef_usage_fixed": 0, "notdef_fonts_preserved": 1}
+        assert stream.read_bytes() == content
+
+    def test_invisible_notdef_codes_do_not_count_as_removals(self):
+        """Invisible OCR codes are remapped, so they cannot trip the guard."""
+        pdf = new_pdf()
+        font = _make_identity_cidfont(pdf, ["A"])
+        stream = _make_page_with_font_and_content(
+            pdf,
+            font,
+            b"BT /F1 12 Tf 3 Tr <000500060007> Tj 0 Tr <00010008> Tj ET",
+        )
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result == {"notdef_usage_fixed": 2, "notdef_fonts_preserved": 0}
+        shown = []
+        for instruction in pikepdf.parse_content_stream(stream):
+            if str(instruction.operator) == "Tj":
+                shown.append(bytes(instruction.operands[0]))
+            elif str(instruction.operator) == "TJ":
+                shown.extend(
+                    bytes(item)
+                    for item in instruction.operands[0]
+                    if isinstance(item, String)
+                )
+        assert shown == [b"\x00\x01"]
+
     def test_few_missing_glyphs_are_still_removed(self):
         """Two missing codes stay below the emergency threshold."""
         pdf = new_pdf()
@@ -2004,7 +2042,7 @@ class TestRemovalGuard:
         assert shown == [b"\x00\x01"]
 
     def test_font_usage_is_collected_only_before_a_removal(self, monkeypatch):
-        def fail(_pdf):
+        def fail(*_args, **_kwargs):
             raise AssertionError("font usage collected without a removal")
 
         monkeypatch.setattr(notdef_usage_mod, "collect_font_usage", fail)

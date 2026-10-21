@@ -847,6 +847,19 @@ class TestCollectFontUsage:
         # Direct objects have objgen (0,0) and are skipped
         assert usage == {}
 
+    def test_invisible_text_can_be_skipped(self):
+        """Rendering mode 3 is graphics state, restored by Q."""
+        pdf = new_pdf()
+        font_obj = pdf.make_indirect(
+            Dictionary(Type=Name.Font, Subtype=Name.TrueType, BaseFont=Name("/F"))
+        )
+        content = b"BT /F1 12 Tf q 3 Tr (A) Tj Q (B) Tj 3 Tr (C) Tj 0 Tr (D) Tj ET"
+        _make_page_with_content(pdf, content, Dictionary(F1=font_obj))
+
+        assert collect_font_usage(pdf)[font_obj.objgen] == {65, 66, 67, 68}
+        visible = collect_font_usage(pdf, skip_invisible_text=True)
+        assert visible[font_obj.objgen] == {66, 68}
+
 
 class TestFontUsageCache:
     """Tests for FontUsageCache."""

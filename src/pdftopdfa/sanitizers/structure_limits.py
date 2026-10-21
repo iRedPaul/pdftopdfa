@@ -52,21 +52,26 @@ _TEXT_OPERATORS = frozenset({"Tj", "TJ", "'", '"'})
 _HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
 _ASCII_NAME_RE = re.compile(r"[^A-Za-z0-9_.+-]+")
 # CMap mapping blocks and entries, independent of line layout.  Hex strings
-# are self-delimiting and may contain whitespace; comments are matched first
-# so that entry-like text inside them is left untouched.
+# are self-delimiting and may contain whitespace; literal strings and
+# comments are matched first so that block- or entry-like text inside them
+# is left untouched (only block matches set ``kind``).
 _PDF_WS = r"[\x00\t\n\x0c\r ]"
+_CMAP_COMMENT = r"%[^\r\n\x0c]*+"
+_CMAP_LITERAL = r"\((?:[^()\\]|\\.|\((?:[^()\\]|\\.)*\))*\)"
 _CMAP_HEX = r"<(?P<{}>[0-9A-Fa-f\x00\t\n\x0c\r ]*)>"
 _CID_BLOCK_RE = re.compile(
-    rf"(?:(?P<count>\d+)(?P<gap>{_PDF_WS}+))?begincid(?P<kind>char|range)\b"
-    r"(?P<body>.*?)endcid(?P=kind)\b",
+    rf"{_CMAP_LITERAL}|{_CMAP_COMMENT}"
+    rf"|(?:(?P<count>\d+)(?P<gap>(?:{_PDF_WS}|{_CMAP_COMMENT})+))?"
+    r"begincid(?P<kind>char|range)\b"
+    rf"(?P<body>(?:{_CMAP_COMMENT}|[^%])*?)endcid(?P=kind)\b",
     re.DOTALL,
 )
 _CID_TARGET = r"(?:" + _CMAP_HEX.format("cid_hex") + r"|(?P<cid>-?\d+))"
 _CIDCHAR_ENTRY_RE = re.compile(
-    r"%[^\r\n\x0c]*|" + _CMAP_HEX.format("src") + rf"{_PDF_WS}*" + _CID_TARGET
+    rf"{_CMAP_COMMENT}|" + _CMAP_HEX.format("src") + rf"{_PDF_WS}*" + _CID_TARGET
 )
 _CIDRANGE_ENTRY_RE = re.compile(
-    r"%[^\r\n\x0c]*|"
+    rf"{_CMAP_COMMENT}|"
     + _CMAP_HEX.format("src")
     + rf"{_PDF_WS}*"
     + _CMAP_HEX.format("end")
@@ -935,6 +940,8 @@ def _parse_cid_entry(entry: re.Match[str]) -> tuple[bytes, bytes, int] | None:
 def _iter_cid_entries(data: str):
     """Yield (block, entry, parsed) for every cidchar/cidrange entry."""
     for block in _CID_BLOCK_RE.finditer(data):
+        if block.group("kind") is None:
+            continue  # literal string or comment
         pattern = (
             _CIDCHAR_ENTRY_RE if block.group("kind") == "char" else _CIDRANGE_ENTRY_RE
         )
@@ -989,6 +996,8 @@ def _repair_cid_overflow_entries(
     output: list[str] = []
     position = 0
     for block in _CID_BLOCK_RE.finditer(data):
+        if block.group("kind") is None:
+            continue  # literal string or comment
         is_char = block.group("kind") == "char"
         pattern = _CIDCHAR_ENTRY_RE if is_char else _CIDRANGE_ENTRY_RE
         body = block.group("body")
