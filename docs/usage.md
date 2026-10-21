@@ -91,7 +91,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 - On macOS and Linux, system fonts are never auto-embedded.
 - `fsType` checks are a technical safeguard only and do not replace the rights holder's EULA or other license terms.
 - For auditable deployments, tie the allowlist to validated target systems or golden images.
-- PDF/A forbids showing the `.notdef` glyph, so characters whose glyph is missing from the embedded font are removed while their advance is kept. If this would remove at least 3 distinct characters and at least half of the distinct characters a font shows as visible text (invisible OCR text is remapped instead of removed and does not count), or if the font's embedded CMap contains mappings that cannot be read, the font data was probably misread: its text is kept, a warning is emitted, and the result reports `validation_failed=True` and `target_produced=False` like a failed validation.
+- PDF/A forbids showing the `.notdef` glyph, so characters whose glyph is missing from the embedded font are removed while their advance is kept. If this would remove at least 3 distinct characters and at least half of the distinct characters a font shows as visible text (invisible OCR text is remapped instead of removed and does not count), or if text uses a font whose embedded CMap contains mappings that cannot be read (including anything after an unterminated literal string), the font data was probably misread: its text is kept, a warning is emitted, and the result reports `validation_failed=True` and `target_produced=False` like a failed validation.
 
 ## CLI Reference
 

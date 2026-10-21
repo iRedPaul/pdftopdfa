@@ -1968,6 +1968,23 @@ class TestRemovalGuard:
         assert result == {"notdef_usage_fixed": 0, "notdef_fonts_preserved": 1}
         assert stream.read_bytes() == content
 
+    def test_text_through_unreadable_cmap_is_flagged_without_removal(self):
+        """Readers may resolve codes after an open literal to .notdef."""
+        pdf = new_pdf()
+        encoding = pdf.make_stream(
+            b"/Note (broken\n"
+            b"1 begincodespacerange\n<00><FF>\nendcodespacerange\n"
+            b"1 begincidchar\n<41> 1\nendcidchar\n"
+        )
+        font = _make_identity_cidfont(pdf, ["A"], encoding)
+        content = b"BT /F1 12 Tf (A) Tj ET"
+        stream = _make_page_with_font_and_content(pdf, font, content)
+
+        result = sanitize_notdef_usage(pdf)
+
+        assert result == {"notdef_usage_fixed": 0, "notdef_fonts_preserved": 1}
+        assert stream.read_bytes() == content
+
     def test_unreadable_embedded_cmap_keeps_invisible_text(self):
         """Invisible text is not remapped through a distrusted CMap either."""
         pdf = new_pdf()

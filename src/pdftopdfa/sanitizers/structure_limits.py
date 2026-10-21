@@ -1073,6 +1073,9 @@ def _repair_cid_overflow_entries(
             output.append(f"\n{len(chunk)} begincidchar\n")
             output.append("\n".join(chunk))
             output.append("\nendcidchar")
+        if remapped_char_entries and not data.startswith(_PDF_WS_CHARS, block.end()):
+            # An implicitly ended block is directly followed by the next one.
+            output.append("\n")
         position = block.end()
 
     if changed_entries > 0:

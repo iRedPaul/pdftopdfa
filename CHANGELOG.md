@@ -4,7 +4,7 @@
 
 ### Changes
 
-- Keep a font's text, warn, and report the conversion like a failed validation (`validation_failed=True`, `target_produced=False`) when `.notdef` cleanup would remove at least 3 distinct characters and at least half of the characters the font shows as visible text, including fonts stored directly in a resource dictionary, or when the font's embedded CMap contains unreadable mappings or an unterminated literal string, because such fonts were almost certainly misread; such a font's invisible text is kept unchanged as well
+- Keep a font's text, warn, and report the conversion like a failed validation (`validation_failed=True`, `target_produced=False`) when `.notdef` cleanup would remove at least 3 distinct characters and at least half of the characters the font shows as visible text, including fonts stored directly in a resource dictionary, or when text uses a font whose embedded CMap contains unreadable mappings or an unterminated literal string, because such fonts were almost certainly misread; such a font's invisible text is kept unchanged as well
 
 ### Bug Fixes
 

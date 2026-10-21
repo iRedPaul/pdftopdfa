@@ -647,6 +647,20 @@ endcidrange
         assert result["cid_overflow_entries_repaired"] == 2
         assert parse_cid_encoding_cmap(cmap_text.encode()).unparsed_blocks == 0
 
+    def test_remapped_codes_of_unterminated_range_precede_next_block(self) -> None:
+        result, cmap_text = self._sanitize_cid_cmap(
+            b"1 begincidrange\n<3F00> <3FFF> 65536\n"
+            b"1 begincidchar\n<0041> 9\nendcidchar",
+            b"BT /F1 12 Tf <3F010041> Tj ET",
+        )
+
+        assert "endcidchar1" not in cmap_text
+        mapping = parse_cid_encoding_cmap(cmap_text.encode())
+        assert mapping.unparsed_blocks == 0
+        assert mapping.map_code(b"\x3f\x01") == 0
+        assert mapping.map_code(b"\x00\x41") == 9
+        assert result["cid_overflow_entries_repaired"] == 1
+
     def test_unterminated_final_cid_block_is_closed_before_endcmap(self) -> None:
         result, cmap_text = self._sanitize_cid_cmap(
             b"begincmap\n1 begincidchar\n<0041> 70000\nendcmap\n"

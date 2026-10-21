@@ -1295,6 +1295,12 @@ def _fix_notdef_in_stream(
             font_obj = font_map.get(current_font_name)
             if font_obj is not None:
                 notdef_codes = _get_notdef_codes(font_obj, notdef_cache)
+                if guard is not None and notdef_codes.unreliable:
+                    # Codes this lenient parse maps to glyphs may be .notdef
+                    # for PDF readers: keep the text and flag the font.
+                    guard.allows(font_obj, notdef_codes)
+                    new_instructions.append(item)
+                    continue
                 is_cid = _is_cidfont(font_obj)
                 string_index = 2 if op_str == '"' else 0
                 if (
@@ -1363,6 +1369,12 @@ def _fix_notdef_in_stream(
             font_obj = font_map.get(current_font_name)
             if font_obj is not None:
                 notdef_codes = _get_notdef_codes(font_obj, notdef_cache)
+                if guard is not None and notdef_codes.unreliable:
+                    # Codes this lenient parse maps to glyphs may be .notdef
+                    # for PDF readers: keep the text and flag the font.
+                    guard.allows(font_obj, notdef_codes)
+                    new_instructions.append(item)
+                    continue
                 is_cid = _is_cidfont(font_obj)
                 if (
                     notdef_codes
