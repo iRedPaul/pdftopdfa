@@ -6,7 +6,7 @@
 
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import pikepdf
@@ -272,6 +272,11 @@ def generate_tounicode_for_winansi() -> dict[int, int]:
 def generate_tounicode_for_macroman() -> dict[int, int]:
     """Generates code-to-Unicode mapping for MacRomanEncoding.
 
+    Follows Mac OS Roman, except that the PDF MacRomanEncoding table
+    (ISO 32000-1, Annex D) has currency rather than the Euro sign at 0xDB,
+    matching the glyph name used for that code. Mac OS-only codes the PDF
+    table leaves undefined keep their Mac OS Roman meaning.
+
     Returns:
         Dictionary mapping character codes to Unicode codepoints.
     """
@@ -282,6 +287,7 @@ def generate_tounicode_for_macroman() -> dict[int, int]:
             code_to_unicode[code] = ord(char)
         except UnicodeDecodeError:
             pass
+    code_to_unicode[0xDB] = 0x00A4
     return code_to_unicode
 
 
@@ -852,6 +858,144 @@ def _decode_unicode_hex(hex_str: str) -> int:
     return int(hex_str, 16)
 
 
+_PDF_WHITESPACE_TABLE = str.maketrans("", "", "\x00\t\n\x0c\r ")
+_CMAP_DELIMITER_RE = re.compile(r"[(%]")
+_CMAP_LITERAL_SPECIAL_RE = re.compile(r"[()\\]")
+_CMAP_LINE_END_RE = re.compile(r"[\r\n\x0c]")
+# Irregular hex strings (inner whitespace or an odd digit count); dictionary
+# delimiters are matched too so that "<<" never starts a hex string.
+_IRREGULAR_CMAP_HEX = (
+    r"<(?P<hex>[0-9A-Fa-f]*[\x00\t\n\x0c\r ][0-9A-Fa-f\x00\t\n\x0c\r ]*"
+    r"|(?:[0-9A-Fa-f]{2})*[0-9A-Fa-f])>"
+)
+_CMAP_HEX_TOKEN_RE = re.compile(rf"<<|>>|{_IRREGULAR_CMAP_HEX}")
+# Bytes variant with a literal "<" prefix, which the regex engine scans for
+# quickly; used to skip the full pass for canonical data.
+_IRREGULAR_CMAP_HEX_RE = re.compile(_IRREGULAR_CMAP_HEX.encode("ascii"))
+
+
+# Kinds of the spans reported by _iter_cmap_inert_spans().
+_COMMENT = "comment"
+_LITERAL = "literal"
+_OPEN_LITERAL = "open literal"
+
+
+def _iter_cmap_inert_spans(text: str) -> Iterator[tuple[int, int, str]]:
+    """Yield ``(start, end, kind)`` for CMap literal strings and comments.
+
+    Literal strings nest to any depth with balanced or escaped parentheses,
+    and ``%`` inside one starts no comment. An unterminated literal string
+    (``_OPEN_LITERAL``) runs to the end of the data, as in PDF tokenizers.
+    Comments end at CR, LF or FF.
+    """
+    position = 0
+    length = len(text)
+    while (delimiter := _CMAP_DELIMITER_RE.search(text, position)) is not None:
+        start = delimiter.start()
+        if delimiter.group() == "%":
+            line_end = _CMAP_LINE_END_RE.search(text, start)
+            end = line_end.start() if line_end is not None else length
+            yield start, end, _COMMENT
+        else:
+            end = length
+            kind = _OPEN_LITERAL
+            depth = 0
+            escaped_until = -1
+            for special in _CMAP_LITERAL_SPECIAL_RE.finditer(text, start):
+                index = special.start()
+                if index < escaped_until:
+                    continue
+                char = special.group()
+                if char == "\\":
+                    escaped_until = index + 2
+                elif char == "(":
+                    depth += 1
+                else:
+                    depth -= 1
+                    if depth == 0:
+                        end = index + 1
+                        kind = _LITERAL
+                        break
+            yield start, end, kind
+        position = end
+
+
+def mask_cmap_inert_text(text: str) -> str:
+    """Blank CMap literal strings and comments, keeping every offset.
+
+    Block and entry patterns can then run on the masked text, while
+    rewrites splice the original text at the same offsets.
+    """
+    if "%" not in text and "(" not in text:
+        return text
+    parts: list[str] = []
+    position = 0
+    for start, end, _kind in _iter_cmap_inert_spans(text):
+        parts.append(text[position:start])
+        parts.append(" " * (end - start))
+        position = end
+    parts.append(text[position:])
+    return "".join(parts)
+
+
+def cmap_hex_digits(text: str) -> str:
+    """Return a CMap hex string's digits without whitespace, padded to even.
+
+    An odd final digit implies a trailing zero (ISO 32000-1, 7.3.4.3).
+    """
+    digits = text.translate(_PDF_WHITESPACE_TABLE)
+    return digits + "0" if len(digits) % 2 else digits
+
+
+def _canonicalize_cmap_hex(match: re.Match[str]) -> str:
+    digits = match.group("hex")
+    if digits is None:
+        return match.group(0)
+    return f"<{cmap_hex_digits(digits)}>"
+
+
+def normalize_cmap_syntax(data: bytes) -> bytes:
+    """Strip comments and literal strings and canonicalize hex strings.
+
+    Hex strings may contain whitespace, and an odd final digit implies a
+    trailing zero (ISO 32000-1, 7.3.4.3); ``%`` starts a comment outside
+    strings.  Canonical ``<41>`` tokens let entry patterns stay simple.
+    Literal strings carry no mappings, only metadata such as ``/Registry
+    (Adobe)``; they become ``()`` so that keywords inside them are neither
+    parsed nor counted. An unterminated one is kept with the rest of the
+    data unchanged, so that a broken header cannot hide every mapping.
+    """
+    return _normalize_cmap_syntax(data)[0]
+
+
+def _normalize_cmap_syntax(data: bytes) -> tuple[bytes, bool]:
+    """Return normalize_cmap_syntax(data) and whether a literal is unterminated."""
+    if (
+        b"%" not in data
+        and b"(" not in data
+        and _IRREGULAR_CMAP_HEX_RE.search(data) is None
+    ):
+        return data, False
+    text = data.decode("latin-1")
+    open_literal = False
+    parts: list[str] = []
+    position = 0
+    for start, end, kind in _iter_cmap_inert_spans(text):
+        parts.append(
+            _CMAP_HEX_TOKEN_RE.sub(_canonicalize_cmap_hex, text[position:start])
+        )
+        if kind == _COMMENT:
+            parts.append(" ")
+        elif kind == _LITERAL:
+            parts.append("()")
+        else:
+            parts.append(text[start:end])
+            open_literal = True
+        position = end
+    parts.append(_CMAP_HEX_TOKEN_RE.sub(_canonicalize_cmap_hex, text[position:]))
+    return "".join(parts).encode("latin-1"), open_literal
+
+
 def parse_tounicode_cmap(data: bytes) -> dict[int, int]:
     """Parses a ToUnicode CMap stream into a code-to-Unicode mapping.
 
@@ -867,7 +1011,7 @@ def parse_tounicode_cmap(data: bytes) -> dict[int, int]:
     code_to_unicode: dict[int, int] = {}
 
     try:
-        text = data.decode("ascii", errors="replace")
+        text = normalize_cmap_syntax(data).decode("ascii", errors="replace")
     except Exception:
         return code_to_unicode
 
@@ -931,7 +1075,7 @@ def parse_cmap_codespace_ranges(
 ) -> tuple[tuple[bytes, bytes], ...]:
     """Return the byte ranges declared by CMap codespace blocks."""
     try:
-        text = data.decode("ascii", errors="replace")
+        text = normalize_cmap_syntax(data).decode("ascii", errors="replace")
     except Exception:
         return ()
 
@@ -963,6 +1107,11 @@ class CIDEncodingMap:
     notdef_ranges: tuple[tuple[bytes, bytes, int], ...] = ()
     decoder: Callable[[bytes], int | None] | None = None
     base: "CIDEncodingMap | None" = None
+    # Mapping blocks (in this CMap or its /UseCMap chain) containing text
+    # that is not a valid entry, or an unterminated literal string after
+    # which no operator can be trusted; such a map is not a reliable .notdef
+    # oracle.
+    unparsed_blocks: int = 0
 
     @staticmethod
     def _map_ranges(
@@ -1048,17 +1197,24 @@ class CIDEncodingMap:
         )
 
 
+# Keywords preceded by "/" are literal names (e.g. "/Hint /begincidrange
+# def"), not operators.
 _CID_BLOCK_RE = re.compile(
-    rb"begin(?P<kind>cidchar|cidrange|notdefchar|notdefrange)\b"
-    rb"(?P<body>.*?)end(?P=kind)\b",
+    rb"(?<!/)begin(?P<kind>cidchar|cidrange|notdefchar|notdefrange)\b"
+    rb"(?P<body>.*?)(?<!/)end(?P=kind)\b",
     re.DOTALL,
 )
+_CID_BLOCK_BEGIN_RE = re.compile(
+    rb"(?<!/)\bbegin(?:cidchar|cidrange|notdefchar|notdefrange)\b"
+)
+# Hex strings are self-delimiting, so producers may omit the whitespace
+# between tokens (e.g. GdPicture writes ``<20><20> 3``).
 _CIDCHAR_RE = re.compile(
-    rb"<(?P<src>[0-9A-Fa-f]+)>\s+"
+    rb"<(?P<src>[0-9A-Fa-f]+)>\s*"
     rb"(?:<(?P<cid_hex>[0-9A-Fa-f]+)>|(?P<cid_int>-?\d+))"
 )
 _CIDRANGE_RE = re.compile(
-    rb"<(?P<src>[0-9A-Fa-f]+)>\s+<(?P<end>[0-9A-Fa-f]+)>\s+"
+    rb"<(?P<src>[0-9A-Fa-f]+)>\s*<(?P<end>[0-9A-Fa-f]+)>\s*"
     rb"(?:<(?P<cid_hex>[0-9A-Fa-f]+)>|(?P<cid_int>-?\d+))"
 )
 _CODE_SPACE_BLOCK_RE = re.compile(
@@ -1074,13 +1230,18 @@ _CID_MAPPING_BLOCK_RE = re.compile(
 
 def parse_cid_encoding_cmap(data: bytes) -> CIDEncodingMap:
     """Parse CID mappings and code-space ranges from an embedded CMap."""
-    uncommented = re.sub(rb"%[^\r\n]*", b"", data)
+    normalized, open_literal = _normalize_cmap_syntax(data)
     ranges: list[tuple[bytes, bytes, int]] = []
     notdef_ranges: list[tuple[bytes, bytes, int]] = []
-    for block in _CID_BLOCK_RE.finditer(uncommented):
+    blocks = 0
+    unparsed_blocks = 0
+    for block in _CID_BLOCK_RE.finditer(normalized):
+        blocks += 1
         kind = block.group("kind")
         entry_pattern = _CIDCHAR_RE if kind.endswith(b"char") else _CIDRANGE_RE
-        for entry in entry_pattern.finditer(block.group("body")):
+        body = block.group("body")
+        complete = not entry_pattern.sub(b"", body).strip()
+        for entry in entry_pattern.finditer(body):
             try:
                 start = bytes.fromhex(entry.group("src").decode("ascii"))
                 end_group = entry.groupdict().get("end")
@@ -1096,16 +1257,28 @@ def parse_cid_encoding_cmap(data: bytes) -> CIDEncodingMap:
                     else int(entry.group("cid_int"))
                 )
             except (TypeError, ValueError):
+                complete = False
                 continue
             if len(start) == len(end) and start <= end:
                 target = notdef_ranges if kind.startswith(b"notdef") else ranges
                 target.append((start, end, cid_start))
+            else:
+                complete = False
+        if not complete:
+            unparsed_blocks += 1
+    # A block without its end keyword is not matched above at all.
+    unparsed_blocks += max(0, len(_CID_BLOCK_BEGIN_RE.findall(normalized)) - blocks)
+    # PDF readers take everything after an unterminated literal string as
+    # part of it, so mappings read from there may not exist for them.
+    if open_literal:
+        unparsed_blocks += 1
 
     return CIDEncodingMap(
         ranges=tuple(ranges),
-        code_space_ranges=parse_cmap_codespace_ranges(uncommented),
-        unmapped_to_zero=not bool(re.search(rb"\busecmap\b", uncommented)),
+        code_space_ranges=parse_cmap_codespace_ranges(normalized),
+        unmapped_to_zero=not bool(re.search(rb"\busecmap\b", normalized)),
         notdef_ranges=tuple(notdef_ranges),
+        unparsed_blocks=unparsed_blocks,
     )
 
 
@@ -1309,6 +1482,7 @@ def _get_cid_encoding_map(
             notdef_ranges=mapping.notdef_ranges,
             decoder=mapping.decoder,
             base=effective,
+            unparsed_blocks=mapping.unparsed_blocks + effective.unparsed_blocks,
         )
     return effective
 
@@ -1415,7 +1589,7 @@ def parse_tounicode_cmap_sequences(
 ) -> dict[bytes, tuple[int, ...]]:
     """Parse a ToUnicode CMap without losing source widths or Unicode sequences."""
     try:
-        text = data.decode("ascii", errors="replace")
+        text = normalize_cmap_syntax(data).decode("ascii", errors="replace")
     except Exception:
         return {}
 

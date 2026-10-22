@@ -412,6 +412,9 @@ def sanitize_for_pdfa(
     # advances can be preserved as TJ adjustments.
     notdef_usage_result = sanitize_notdef_usage(pdf)
     result["notdef_usage_fixed"] = notdef_usage_result.get("notdef_usage_fixed", 0)
+    result["notdef_fonts_preserved"] = notdef_usage_result.get(
+        "notdef_fonts_preserved", 0
+    )
     if result["notdef_usage_fixed"]:
         usage_cache.invalidate()
 

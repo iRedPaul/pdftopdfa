@@ -21,9 +21,11 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Operator, Pdf, Stream, String
 
 from ..exceptions import ConversionError
-from ..fonts.glyph_mapping import resolve_glyph_name
+from ..fonts.glyph_mapping import resolve_glyph_name, resolve_mac_roman_cmap_glyph
 from ..fonts.glyph_usage import (
     _iter_content_streams_with_resources,
+    _object_identity,
+    collect_font_usage,
     find_ambiguous_resource_context_streams,
 )
 from ..fonts.subsetter import (
@@ -104,6 +106,72 @@ class _NotdefCodes:
             return int.from_bytes(code, "big")
         return code
 
+    @property
+    def unreliable(self) -> bool:
+        """Whether the embedded CMap contains mapping text that was not read."""
+        return self._cid_map is not None and self._cid_map.unparsed_blocks > 0
+
+
+# Emergency guard: removing at least this many distinct codes and at least
+# this share of the distinct codes a font shows means the font was misread,
+# not that its glyphs are missing. Across ~4,200 corpus PDFs every
+# legitimate removal affected a single code per font.
+_MASS_REMOVAL_MIN_CODES = 3
+_MASS_REMOVAL_MIN_SHARE = 0.5
+
+
+class _RemovalGuard:
+    """Decide per font whether removing its .notdef references is trustworthy.
+
+    Decisions are made lazily, right before the first removal, so font usage
+    is collected only for documents that would actually lose text. Only
+    visible text counts: invisible OCR text is remapped, never removed.
+    """
+
+    def __init__(self, pdf: Pdf) -> None:
+        self._pdf = pdf
+        self._usage: dict | None = None
+        self._decisions: dict[object, bool] = {}
+        self.preserved_fonts: dict[object, str] = {}
+
+    def allows(self, font_obj: pikepdf.Object, notdef_codes: _NotdefCodes) -> bool:
+        # The same identity domain as collect_font_usage(), so that fonts
+        # stored directly in a resource dictionary are judged as well.
+        key = _object_identity(font_obj)
+        if key in self._decisions:
+            return self._decisions[key]
+
+        reason = self._distrust_reason(key, notdef_codes)
+        self._decisions[key] = reason is None
+        if reason is not None:
+            font_name = _safe_str(font_obj.get("/BaseFont") or "unnamed font")
+            self.preserved_fonts[key] = font_name
+            logger.warning(
+                "Keeping text of font %s that .notdef cleanup would remove: %s",
+                font_name,
+                reason,
+            )
+        return reason is None
+
+    def _distrust_reason(self, key: object, notdef_codes: _NotdefCodes) -> str | None:
+        if notdef_codes.unreliable:
+            return "its embedded CMap contains unreadable mappings"
+        if self._usage is None:
+            self._usage = collect_font_usage(
+                self._pdf, skip_invisible_text=True, include_direct_simple_fonts=True
+            )
+        used = self._usage.get(key, set())
+        removed = sum(1 for code in used if code in notdef_codes)
+        if (
+            removed >= _MASS_REMOVAL_MIN_CODES
+            and removed >= _MASS_REMOVAL_MIN_SHARE * len(used)
+        ):
+            return (
+                f"{removed} of its {len(used)} used character codes would be "
+                "removed, so its font data was probably misread"
+            )
+        return None
+
 
 def sanitize_notdef_usage(pdf: Pdf) -> dict[str, int]:
     """Removes .notdef glyph references from content streams.
@@ -112,13 +180,19 @@ def sanitize_notdef_usage(pdf: Pdf) -> dict[str, int]:
     codes resolve to .notdef for the active font, and strips those bytes
     from the operand strings.
 
+    Fonts whose removal looks like a misreading (an unreadable embedded
+    CMap, or most of the font's text) keep their text instead; callers must
+    then treat the output as not compliant.
+
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
 
     Returns:
-        Dictionary with ``{"notdef_usage_fixed": N}``.
+        Dictionary with ``{"notdef_usage_fixed": N,
+        "notdef_fonts_preserved": M}``.
     """
     total_fixed = 0
+    guard = _RemovalGuard(pdf)
     # Cache notdef codes per font objgen to avoid recomputation
     notdef_cache: dict[tuple[int, int], _NotdefCodes] = {}
     ambiguous_streams = find_ambiguous_resource_context_streams(pdf)
@@ -138,7 +212,7 @@ def sanitize_notdef_usage(pdf: Pdf) -> dict[str, int]:
                         continue
                     fixed_streams.add(objgen)
                     total_fixed += _fix_notdef_in_stream(
-                        owner, _build_font_map(resources), notdef_cache
+                        owner, _build_font_map(resources), notdef_cache, guard=guard
                     )
                 else:
                     total_fixed += _fix_notdef_in_page_contents(
@@ -146,6 +220,7 @@ def sanitize_notdef_usage(pdf: Pdf) -> dict[str, int]:
                         _build_font_map(resources),
                         notdef_cache,
                         ambiguous_streams,
+                        guard=guard,
                     )
 
         except ConversionError:
@@ -158,7 +233,10 @@ def sanitize_notdef_usage(pdf: Pdf) -> dict[str, int]:
     if total_fixed > 0:
         logger.info("Notdef usage: %d text operators fixed", total_fixed)
 
-    return {"notdef_usage_fixed": total_fixed}
+    return {
+        "notdef_usage_fixed": total_fixed,
+        "notdef_fonts_preserved": len(guard.preserved_fonts),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +403,10 @@ def _find_missing_glyphs_in_simple_font(font_obj: pikepdf.Object) -> set[int]:
                 elif (
                     name not in glyph_set
                     and resolve_glyph_name(name, cmap, hmtx_metrics) is None
+                    and (
+                        subtype != "/TrueType"
+                        or resolve_mac_roman_cmap_glyph(tt_font, name) is None
+                    )
                 ):
                     missing.add(code)
 
@@ -1096,6 +1178,8 @@ def _fix_notdef_in_stream(
     font_map: dict[str, pikepdf.Object],
     notdef_cache: dict[tuple[int, int], _NotdefCodes],
     state: _ContentState | None = None,
+    *,
+    guard: _RemovalGuard | None = None,
 ) -> int:
     """Parses a content stream and removes .notdef references from text ops.
 
@@ -1103,6 +1187,7 @@ def _fix_notdef_in_stream(
         stream_obj: A pikepdf Stream whose content may contain text operators.
         font_map: Mapping of font resource names to font dictionaries.
         notdef_cache: Shared cache for notdef code computation.
+        guard: Emergency guard consulted before visible text is removed.
 
     Returns:
         Number of text operators modified.
@@ -1210,6 +1295,12 @@ def _fix_notdef_in_stream(
             font_obj = font_map.get(current_font_name)
             if font_obj is not None:
                 notdef_codes = _get_notdef_codes(font_obj, notdef_cache)
+                if guard is not None and notdef_codes.unreliable:
+                    # Codes this lenient parse maps to glyphs may be .notdef
+                    # for PDF readers: keep the text and flag the font.
+                    guard.allows(font_obj, notdef_codes)
+                    new_instructions.append(item)
+                    continue
                 is_cid = _is_cidfont(font_obj)
                 string_index = 2 if op_str == '"' else 0
                 if (
@@ -1223,6 +1314,11 @@ def _fix_notdef_in_stream(
                         is_cid=is_cid,
                     )
                 ):
+                    # A distrusted font's .notdef codes are suspect for
+                    # invisible text as well: keep it unchanged.
+                    if guard is not None and not guard.allows(font_obj, notdef_codes):
+                        new_instructions.append(item)
+                        continue
                     if not is_cid:
                         raise ConversionError(
                             "Invisible simple-font OCR text references .notdef"
@@ -1257,7 +1353,9 @@ def _fix_notdef_in_stream(
                         state,
                         is_cid=is_cid,
                     )
-                    if replacement is not None:
+                    if replacement is not None and (
+                        guard is None or guard.allows(font_obj, notdef_codes)
+                    ):
                         fixed += 1
                         # Empty list → operator removed entirely
                         new_instructions.extend(replacement)
@@ -1271,6 +1369,12 @@ def _fix_notdef_in_stream(
             font_obj = font_map.get(current_font_name)
             if font_obj is not None:
                 notdef_codes = _get_notdef_codes(font_obj, notdef_cache)
+                if guard is not None and notdef_codes.unreliable:
+                    # Codes this lenient parse maps to glyphs may be .notdef
+                    # for PDF readers: keep the text and flag the font.
+                    guard.allows(font_obj, notdef_codes)
+                    new_instructions.append(item)
+                    continue
                 is_cid = _is_cidfont(font_obj)
                 if (
                     notdef_codes
@@ -1287,6 +1391,11 @@ def _fix_notdef_in_stream(
                         for element in operands[0]
                     )
                 ):
+                    # A distrusted font's .notdef codes are suspect for
+                    # invisible text as well: keep it unchanged.
+                    if guard is not None and not guard.allows(font_obj, notdef_codes):
+                        new_instructions.append(item)
+                        continue
                     if not is_cid:
                         raise ConversionError(
                             "Invisible simple-font OCR text references .notdef"
@@ -1320,7 +1429,9 @@ def _fix_notdef_in_stream(
                         state,
                         is_cid=is_cid,
                     )
-                    if replacement_tj is not None:
+                    if replacement_tj is not None and (
+                        guard is None or guard.allows(font_obj, notdef_codes)
+                    ):
                         fixed += 1
                         # Empty list → operator removed entirely
                         new_instructions.extend(replacement_tj)
@@ -1560,6 +1671,8 @@ def _fix_notdef_in_page_contents(
     font_map: dict[str, pikepdf.Object],
     notdef_cache: dict[tuple[int, int], _NotdefCodes],
     ambiguous_streams: set[object] | None = None,
+    *,
+    guard: _RemovalGuard | None = None,
 ) -> int:
     """Fixes .notdef references in page Contents.
 
@@ -1567,6 +1680,7 @@ def _fix_notdef_in_page_contents(
         page_dict: A resolved page dictionary.
         font_map: Font name to font dict mapping.
         notdef_cache: Shared notdef code cache.
+        guard: Emergency guard consulted before visible text is removed.
 
     Returns:
         Number of text operators fixed.
@@ -1582,7 +1696,9 @@ def _fix_notdef_in_page_contents(
     if isinstance(contents, Stream):
         objgen = contents.objgen
         if objgen == (0, 0) or objgen not in ambiguous_streams:
-            fixed += _fix_notdef_in_stream(contents, font_map, notdef_cache)
+            fixed += _fix_notdef_in_stream(
+                contents, font_map, notdef_cache, guard=guard
+            )
     elif isinstance(contents, Array):
         state = _ContentState()
         for item in contents:
@@ -1596,6 +1712,7 @@ def _fix_notdef_in_page_contents(
                     font_map,
                     notdef_cache,
                     state,
+                    guard=guard,
                 )
 
     return fixed

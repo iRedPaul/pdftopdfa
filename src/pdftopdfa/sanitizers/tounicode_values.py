@@ -19,7 +19,7 @@ otherwise unresolvable character codes.
 
 import logging
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import pikepdf
 from pikepdf import Pdf, Stream
@@ -32,7 +32,9 @@ from ..fonts.glyph_usage import (
 )
 from ..fonts.tounicode import (
     _is_invalid_unicode,
+    cmap_hex_digits,
     get_font_code_space_ranges,
+    mask_cmap_inert_text,
     parse_tounicode_cmap_sequences,
     split_cmap_codes,
 )
@@ -45,23 +47,27 @@ logger = logging.getLogger(__name__)
 # Text-showing operators (PDF Reference, Table 5.6)
 _TEXT_OPERATORS = frozenset({"Tj", "'", '"'})
 _TJ_OPERATOR = "TJ"
-_BFCHAR_BLOCK_PATTERN = re.compile(r"(beginbfchar\b)(.*?)(\bendbfchar)", re.DOTALL)
-_BFCHAR_ENTRY_PATTERN = re.compile(r"(<[0-9A-Fa-f]+>\s*)<([0-9A-Fa-f]+)>")
-_BFRANGE_BLOCK_PATTERN = re.compile(r"(beginbfrange\b)(.*?)(\bendbfrange)", re.DOTALL)
+# Hex strings may contain whitespace and an odd number of digits, as the
+# parser accepts; their values are read through cmap_hex_digits().
+_HEX_DIGITS = r"[\x00\t\n\x0c\r ]*[0-9A-Fa-f][0-9A-Fa-f\x00\t\n\x0c\r ]*"
+_BFCHAR_ENTRY_PATTERN = re.compile(rf"(<{_HEX_DIGITS}>\s*)<({_HEX_DIGITS})>")
 _BFRANGE_ENTRY_PATTERN = re.compile(
-    r"(<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*)"
-    r"(?:<([0-9A-Fa-f]+)>|\[([^\]]*)\])"
+    rf"(<({_HEX_DIGITS})>\s*<({_HEX_DIGITS})>\s*)"
+    rf"(?:<({_HEX_DIGITS})>|\[([^\]]*)\])"
 )
-_HEX_TOKEN_PATTERN = re.compile(r"<([0-9A-Fa-f]+)>")
-# PostScript comments run to the next CR, LF, or FF and act as whitespace.
-_CMAP_COMMENT = r"%[^\r\n\f]*+"
-_CMAP_COMMENT_PATTERN = re.compile(_CMAP_COMMENT)
-# Comments are consumed whole, before, inside, and between a block's header
-# tokens, so that a block can neither start nor end inside one. Only block
-# matches set group 1.
+_HEX_TOKEN_PATTERN = re.compile(rf"<({_HEX_DIGITS})>")
+# The block patterns run on text whose literal strings and comments are
+# blanked (mask_cmap_inert_text), so that a block can neither start nor end
+# inside one and mapping-like text inside them is never rewritten. Keywords
+# preceded by "/" are literal names, not operators.
 _COUNTED_BFRANGE_BLOCK_PATTERN = re.compile(
-    rf"{_CMAP_COMMENT}|\d+(?:\s|{_CMAP_COMMENT})+beginbfrange\b"
-    rf"((?:{_CMAP_COMMENT}|[^%])*?)\bendbfrange"
+    r"\d+\s+(?<!/)beginbfrange\b(.*?)(?<!/)\bendbfrange", re.DOTALL
+)
+_BFCHAR_BLOCK_PATTERN = re.compile(
+    r"((?<!/)beginbfchar\b)(.*?)((?<!/)\bendbfchar)", re.DOTALL
+)
+_BFRANGE_BLOCK_PATTERN = re.compile(
+    r"((?<!/)beginbfrange\b)(.*?)((?<!/)\bendbfrange)", re.DOTALL
 )
 _CMAP_BLOCK_ENTRY_LIMIT = 100
 
@@ -72,7 +78,10 @@ def _split_incrementing_bfrange(entry: re.Match[str]) -> list[str] | None:
     Returns ``None`` when the entry is already well-formed or cannot be split
     without changing its mapping.
     """
-    start_hex, end_hex, destination_hex = entry.group(2, 3, 4)
+    start_hex, end_hex = (cmap_hex_digits(value) for value in entry.group(2, 3))
+    destination_hex = entry.group(4)
+    if destination_hex is not None:
+        destination_hex = cmap_hex_digits(destination_hex)
     if (
         destination_hex is None
         or len(start_hex) != len(end_hex)
@@ -109,6 +118,35 @@ def _split_incrementing_bfrange(entry: re.Match[str]) -> list[str] | None:
     return segments
 
 
+def _sub_outside_inert_text(
+    pattern: re.Pattern[str],
+    rewrite: Callable[[re.Match[str], str], str | None],
+    text: str,
+    masked: str | None = None,
+) -> str:
+    """Rewrite pattern matches outside CMap literal strings and comments.
+
+    Matches are found in ``masked`` (by default the masked ``text``), which
+    keeps every offset. ``rewrite`` receives each match and the original
+    text and returns the replacement, or None to keep the match unchanged.
+    """
+    if masked is None:
+        masked = mask_cmap_inert_text(text)
+    parts: list[str] = []
+    position = 0
+    for match in pattern.finditer(masked):
+        replacement = rewrite(match, text)
+        if replacement is None:
+            continue
+        parts.append(text[position : match.start()])
+        parts.append(replacement)
+        position = match.end()
+    if not parts:
+        return text
+    parts.append(text[position:])
+    return "".join(parts)
+
+
 def _split_overflowing_bfranges(text: str) -> str:
     """Rewrite incrementing bfranges whose codes overflow their last byte.
 
@@ -120,13 +158,12 @@ def _split_overflowing_bfranges(text: str) -> str:
     ``parse_tounicode_cmap_sequences``.
     """
 
-    def split_block(block: re.Match[str]) -> str:
-        if block.group(1) is None:
-            return block.group(0)
-        # Comments carry no mappings and are dropped from rewritten blocks.
-        body = _CMAP_COMMENT_PATTERN.sub("", block.group(1))
+    def split_block(block: re.Match[str], _text: str) -> str | None:
+        # The masked body has no comments; they carry no mappings and are
+        # dropped from rewritten blocks.
+        body = block.group(1)
         if _BFRANGE_ENTRY_PATTERN.sub("", body).strip():
-            return block.group(0)
+            return None
         entries: list[str] = []
         changed = False
         for entry in _BFRANGE_ENTRY_PATTERN.finditer(body):
@@ -137,7 +174,7 @@ def _split_overflowing_bfranges(text: str) -> str:
             entries.extend(segments)
             changed = True
         if not changed:
-            return block.group(0)
+            return None
         blocks = []
         for offset in range(0, len(entries), _CMAP_BLOCK_ENTRY_LIMIT):
             chunk = entries[offset : offset + _CMAP_BLOCK_ENTRY_LIMIT]
@@ -146,7 +183,7 @@ def _split_overflowing_bfranges(text: str) -> str:
             )
         return "\n".join(blocks)
 
-    return _COUNTED_BFRANGE_BLOCK_PATTERN.sub(split_block, text)
+    return _sub_outside_inert_text(_COUNTED_BFRANGE_BLOCK_PATTERN, split_block, text)
 
 
 def _sanitize_tounicode_cmap(cmap_data: bytes) -> bytes:
@@ -203,46 +240,79 @@ def _sanitize_tounicode_cmap(cmap_data: bytes) -> bytes:
             return hex_value
         return "".join(f"{value:04X}" for value in units)
 
-    def sanitize_bfchar_block(match: re.Match[str]) -> str:
-        def sanitize_entry(entry: re.Match[str]) -> str:
-            destination = sanitize_destination(entry.group(2))
-            return f"{entry.group(1)}<{destination}>"
-
-        body = _BFCHAR_ENTRY_PATTERN.sub(sanitize_entry, match.group(2))
+    def sanitize_block_body(
+        match: re.Match[str],
+        text: str,
+        sanitize_entry: Callable[[re.Match[str], str], str | None],
+        entry_pattern: re.Pattern[str],
+    ) -> str:
+        body = _sub_outside_inert_text(
+            entry_pattern,
+            sanitize_entry,
+            text[match.start(2) : match.end(2)],
+            masked=match.group(2),
+        )
         return f"{match.group(1)}{body}{match.group(3)}"
 
-    def sanitize_bfrange_block(match: re.Match[str]) -> str:
-        def sanitize_entry(entry: re.Match[str]) -> str:
-            destination = entry.group(4)
-            if destination is not None:
-                start = int(entry.group(2), 16)
-                end = int(entry.group(3), 16)
-                if end < start:
-                    return entry.group(0)
+    def sanitize_hex_token(token: re.Match[str], _text: str) -> str | None:
+        digits = cmap_hex_digits(token.group(1))
+        destination = sanitize_destination(digits)
+        return None if destination == digits else f"<{destination}>"
 
-                destination_start = int(destination, 16)
-                destinations = [
-                    f"{destination_start + offset:0{len(destination)}X}"
-                    for offset in range(end - start + 1)
-                ]
-                sanitized = [sanitize_destination(value) for value in destinations]
-                if sanitized == destinations:
-                    return entry.group(0)
-                values = " ".join(f"<{value}>" for value in sanitized)
-                return f"{entry.group(1)}[{values}]"
+    # Entry matches come from the masked body; the source tokens and any
+    # comments between tokens are copied from the original body. Entries
+    # whose values stay valid are left as written.
+    def sanitize_bfchar_entry(entry: re.Match[str], body: str) -> str | None:
+        digits = cmap_hex_digits(entry.group(2))
+        destination = sanitize_destination(digits)
+        if destination == digits:
+            return None
+        return f"{body[entry.start(1) : entry.end(1)]}<{destination}>"
 
-            array_body = _HEX_TOKEN_PATTERN.sub(
-                lambda token: f"<{sanitize_destination(token.group(1))}>",
-                entry.group(5),
-            )
-            return f"{entry.group(1)}[{array_body}]"
+    def sanitize_bfrange_entry(entry: re.Match[str], body: str) -> str | None:
+        prefix = body[entry.start(1) : entry.end(1)]
+        destination = entry.group(4)
+        if destination is not None:
+            destination = cmap_hex_digits(destination)
+            start = int(cmap_hex_digits(entry.group(2)), 16)
+            end = int(cmap_hex_digits(entry.group(3)), 16)
+            if end < start:
+                return None
 
-        body = _BFRANGE_ENTRY_PATTERN.sub(sanitize_entry, match.group(2))
-        return f"{match.group(1)}{body}{match.group(3)}"
+            destination_start = int(destination, 16)
+            destinations = [
+                f"{destination_start + offset:0{len(destination)}X}"
+                for offset in range(end - start + 1)
+            ]
+            sanitized = [sanitize_destination(value) for value in destinations]
+            if sanitized == destinations:
+                return None
+            values = " ".join(f"<{value}>" for value in sanitized)
+            return f"{prefix}[{values}]"
+
+        array = body[entry.start(5) : entry.end(5)]
+        array_body = _sub_outside_inert_text(
+            _HEX_TOKEN_PATTERN, sanitize_hex_token, array, masked=entry.group(5)
+        )
+        if array_body == array:
+            return None
+        return f"{prefix}[{array_body}]"
 
     text = _split_overflowing_bfranges(text)
-    text = _BFCHAR_BLOCK_PATTERN.sub(sanitize_bfchar_block, text)
-    text = _BFRANGE_BLOCK_PATTERN.sub(sanitize_bfrange_block, text)
+    text = _sub_outside_inert_text(
+        _BFCHAR_BLOCK_PATTERN,
+        lambda match, text: sanitize_block_body(
+            match, text, sanitize_bfchar_entry, _BFCHAR_ENTRY_PATTERN
+        ),
+        text,
+    )
+    text = _sub_outside_inert_text(
+        _BFRANGE_BLOCK_PATTERN,
+        lambda match, text: sanitize_block_body(
+            match, text, sanitize_bfrange_entry, _BFRANGE_ENTRY_PATTERN
+        ),
+        text,
+    )
     return text.encode("ascii")
 
 

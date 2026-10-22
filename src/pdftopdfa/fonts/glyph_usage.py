@@ -35,9 +35,12 @@ _TEXT_OPERATORS = frozenset(
     }
 )
 # Operators _process_content_stream acts on (graphics state, font, text).
-_USAGE_OPERATORS = "q Q gs Tf Tj TJ ' \""
+_USAGE_OPERATORS = "q Q gs Tf Tr Tj TJ ' \""
 
 _TF_OPERATOR = pikepdf.Operator("Tf")
+_TR_OPERATOR = pikepdf.Operator("Tr")
+# Text rendering mode that neither fills, strokes nor clips (invisible text).
+_INVISIBLE_TEXT_MODE = 3
 _Q_OPERATOR = pikepdf.Operator("q")
 _RESTORE_OPERATOR = pikepdf.Operator("Q")
 
@@ -675,6 +678,8 @@ def collect_font_usage(
     pdf: pikepdf.Pdf,
     *,
     require_resolved_font: bool = False,
+    skip_invisible_text: bool = False,
+    include_direct_simple_fonts: bool = False,
 ) -> dict[_ObjectKey, set[CharacterCode]]:
     """Collects character codes used with each font across the entire PDF.
 
@@ -687,12 +692,24 @@ def collect_font_usage(
         require_resolved_font: Exclude fonts matched only by the conservative
             fallback, so font replacement and subsetting retain the no-usage
             safety check.
+        skip_invisible_text: Ignore text shown in rendering mode 3, for
+            callers that treat invisible (OCR) text separately.
+        include_direct_simple_fonts: Also record simple fonts stored directly
+            in a resource dictionary, under their serialized identity.
 
     Returns:
         Dictionary mapping indirect font objgens, or serialized direct Type0
-        font identities, to the character codes used with each font.
+        (and, on request, simple) font identities, to the character codes
+        used with each font.
     """
-    return _merge_font_usage(_collect_raw_font_usage(pdf), require_resolved_font)
+    return _merge_font_usage(
+        _collect_raw_font_usage(
+            pdf,
+            skip_invisible_text=skip_invisible_text,
+            include_direct_simple_fonts=include_direct_simple_fonts,
+        ),
+        require_resolved_font,
+    )
 
 
 _RawFontUsage = tuple[
@@ -712,7 +729,12 @@ def _merge_font_usage(
     return usage
 
 
-def _collect_raw_font_usage(pdf: pikepdf.Pdf) -> _RawFontUsage:
+def _collect_raw_font_usage(
+    pdf: pikepdf.Pdf,
+    *,
+    skip_invisible_text: bool = False,
+    include_direct_simple_fonts: bool = False,
+) -> _RawFontUsage:
     """Collect (resolved, unresolved) font usage for the whole document.
 
     Resolved usage depends only on each (stream, resources) context, so a
@@ -749,6 +771,8 @@ def _collect_raw_font_usage(pdf: pikepdf.Pdf) -> _RawFontUsage:
                     unresolved_usage,
                     parse_cache,
                     saw_unresolved,
+                    skip_invisible_text=skip_invisible_text,
+                    include_direct_simple_fonts=include_direct_simple_fonts,
                 )
         if not saw_unresolved:
             break
@@ -763,6 +787,9 @@ def _process_content_stream(
     unresolved_usage: dict[_ObjectKey, set[CharacterCode]],
     parse_cache: dict[_ObjectKey, list] | None = None,
     saw_unresolved: list[bool] | None = None,
+    *,
+    skip_invisible_text: bool = False,
+    include_direct_simple_fonts: bool = False,
 ) -> None:
     """Parses a content stream and records character code usage.
 
@@ -771,6 +798,8 @@ def _process_content_stream(
         resources: Resources dictionary for font resolution.
         usage: Accumulator mapping font objgen -> used character codes.
         parse_cache: Optional per-collection cache of parsed streams.
+        skip_invisible_text: Ignore text shown in rendering mode 3.
+        include_direct_simple_fonts: Also record direct simple fonts.
     """
     cache_key = None
     if parse_cache is not None and isinstance(stream_owner, pikepdf.Stream):
@@ -796,11 +825,15 @@ def _process_content_stream(
     current_font: pikepdf.Object | None = None
     current_font_is_cid = False
     current_code_space_ranges: tuple[tuple[bytes, bytes], ...] | None = None
+    text_rendering_mode = 0
+    identified_font: pikepdf.Object | None = None
+    identified_font_key: _ObjectKey = (0, 0)
     graphics_state_stack: list[
         tuple[
             pikepdf.Object | None,
             bool,
             tuple[tuple[bytes, bytes], ...] | None,
+            int,
         ]
     ] = []
 
@@ -850,7 +883,7 @@ def _process_content_stream(
             except Exception:
                 continue
             is_cid = _is_cidfont(font_obj)
-            if objgen == (0, 0) and not is_cid:
+            if objgen == (0, 0) and not is_cid and not include_direct_simple_fonts:
                 continue
             font_key = _object_identity(font_obj)
             ranges = get_font_code_space_ranges(font_obj) if is_cid else None
@@ -875,7 +908,12 @@ def _process_content_stream(
     for operands, operator in instructions:
         if operator == _Q_OPERATOR:
             graphics_state_stack.append(
-                (current_font, current_font_is_cid, current_code_space_ranges)
+                (
+                    current_font,
+                    current_font_is_cid,
+                    current_code_space_ranges,
+                    text_rendering_mode,
+                )
             )
         elif operator == _RESTORE_OPERATOR:
             if graphics_state_stack:
@@ -883,11 +921,19 @@ def _process_content_stream(
                     current_font,
                     current_font_is_cid,
                     current_code_space_ranges,
+                    text_rendering_mode,
                 ) = graphics_state_stack.pop()
             else:
                 current_font = None
                 current_font_is_cid = False
                 current_code_space_ranges = None
+                text_rendering_mode = 0
+        elif operator == _TR_OPERATOR:
+            if operands:
+                try:
+                    text_rendering_mode = int(operands[0])
+                except (TypeError, ValueError):
+                    pass
         elif operator == pikepdf.Operator("gs"):
             states = resources.get("/ExtGState")
             if operands and isinstance(states, pikepdf.Dictionary):
@@ -917,6 +963,8 @@ def _process_content_stream(
                     current_code_space_ranges = None
 
         elif operator in _TEXT_OPERATORS:
+            if skip_invisible_text and text_rendering_mode == _INVISIBLE_TEXT_MODE:
+                continue
             if current_font is None:
                 # A Form XObject may legally inherit the caller's current
                 # text font.  The traversal does not execute Do operators,
@@ -930,9 +978,17 @@ def _process_content_stream(
             except Exception:
                 continue
 
-            if objgen == (0, 0) and not current_font_is_cid:
+            if (
+                objgen == (0, 0)
+                and not current_font_is_cid
+                and not include_direct_simple_fonts
+            ):
                 continue
 
-            font_key = _object_identity(current_font)
+            # Serializing a direct font is costly; do it once per font change.
+            if current_font is not identified_font:
+                identified_font = current_font
+                identified_font_key = _object_identity(current_font)
+            font_key = identified_font_key
             for operand in text_operands(operands, operator):
                 record_codes(operand, font_key)

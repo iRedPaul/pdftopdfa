@@ -21,6 +21,7 @@ import struct
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
+from ..fonts.glyph_mapping import resolve_mac_roman_cmap_glyph
 from ..fonts.glyph_usage import CharacterCode, FontUsageCache, collect_font_usage
 from ..fonts.tounicode import (
     map_type0_character_codes_to_cids,
@@ -299,7 +300,14 @@ def _process_simple_font(pdf: Pdf, font: pikepdf.Object, used_codes: set[int]) -
 
         for code in sorted(used_codes):
             name = encoding.get(code)
-            if name and name not in glyph_set:
+            if (
+                name
+                and name not in glyph_set
+                and not (
+                    subtype == "/TrueType"
+                    and resolve_mac_roman_cmap_glyph(tt_font, name) is not None
+                )
+            ):
                 missing_names.append(name)
                 if widths_arr is not None:
                     idx = code - first_char

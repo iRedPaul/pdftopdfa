@@ -15,6 +15,7 @@ from pdftopdfa.fonts.subsetter import (
     FontSubsetter,
     SubsettingResult,
     _build_glyphnames_from_unicode,
+    _build_macroman_glyphnames,
     _check_subsetting_allowed,
     _find_font_file,
     _generate_subset_prefix,
@@ -2204,6 +2205,22 @@ class TestBuildGlyphnamesFromUnicode:
     def test_empty_input(self):
         """Empty mapping returns empty result."""
         assert _build_glyphnames_from_unicode({}) == {}
+
+
+class TestBuildMacRomanGlyphnames:
+    """MacRomanEncoding glyph names follow ISO 32000-1, Annex D."""
+
+    def test_pdf_table_names_ligatures_and_currency(self):
+        names = _build_macroman_glyphnames()
+
+        assert names[0xDE] == "fi"
+        assert names[0xDF] == "fl"
+        assert names[0xDB] == "currency"
+        assert names[0x41] == "A"
+
+    def test_mac_os_only_codes_keep_their_names(self):
+        """Codes undefined in the PDF table are not turned into .notdef."""
+        assert _build_macroman_glyphnames()[0xAD] == "notequal"
 
 
 class TestPopulateFromEncoding:

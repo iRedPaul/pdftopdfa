@@ -855,6 +855,12 @@ def _figure_text_recognizer(
         yield recognize
 
 
+_NOTDEF_FONTS_PRESERVED_WARNING = (
+    "font(s) kept text that .notdef cleanup would have removed because the "
+    "font data was probably misread; output is not marked as successful and "
+    "needs manual review"
+)
+
 # Sanitization result key -> warning message mappings for convert_to_pdfa().
 _SANITIZE_WARNINGS: list[tuple[str, str]] = [
     (
@@ -866,6 +872,7 @@ _SANITIZE_WARNINGS: list[tuple[str, str]] = [
         "forbidden annotation(s) removed (rule 6.3.1)",
     ),
     ("notdef_usage_fixed", ".notdef usage operator(s) fixed"),
+    ("notdef_fonts_preserved", _NOTDEF_FONTS_PRESERVED_WARNING),
     (
         "proprietary_stamps_normalized",
         "proprietary stamp annotation(s) converted to standard PDF Stamp annotation(s)",
@@ -1208,8 +1215,9 @@ class ConversionResult:
         error: Error details when an output could not be produced or an explicitly
             retained candidate failed validation.
         validation_failed: True if veraPDF reported non-conformance or could
-            not complete, or if a preserved embedded PDF could not be
-            converted.
+            not complete, if a preserved embedded PDF could not be
+            converted, or if .notdef cleanup kept the text of a font whose
+            data was probably misread.
         skipped: True if the original PDF was copied through unchanged.
         published: True if this call wrote the requested output path.
         target_produced: True if the requested conformance target was produced.
@@ -2778,6 +2786,13 @@ def convert_to_pdfa(
         count = late_notdef_result.get("notdef_usage_fixed", 0)
         if count > 0:
             warnings.append(f"{count} .notdef usage operator(s) fixed")
+        # Fonts kept by the early pass are kept again here; report only
+        # fonts that this pass newly kept.
+        late_preserved = late_notdef_result.get("notdef_fonts_preserved", 0)
+        if late_preserved > sanitize_result.get("notdef_fonts_preserved", 0):
+            if not sanitize_result.get("notdef_fonts_preserved"):
+                warnings.append(f"{late_preserved} {_NOTDEF_FONTS_PRESERVED_WARNING}")
+            sanitize_result["notdef_fonts_preserved"] = late_preserved
 
         if level.endswith("a"):
             ocr_manifest = None
@@ -3118,6 +3133,7 @@ def convert_to_pdfa(
         # requests publication of a non-conforming candidate.
         validation_failed = (
             sanitize_result.get("embedded_pdf_conversions_failed", 0) > 0
+            or sanitize_result.get("notdef_fonts_preserved", 0) > 0
         )
         if validate or pdfua:
             logger.debug("Validating output with veraPDF")

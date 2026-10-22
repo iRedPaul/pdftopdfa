@@ -13,6 +13,7 @@ from conftest import new_pdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from pdftopdfa.exceptions import UnsupportedPDFError
+from pdftopdfa.fonts.tounicode import parse_cid_encoding_cmap
 from pdftopdfa.sanitizers import sanitize_for_pdfa
 from pdftopdfa.sanitizers.structure_limits import (
     _operands_contain_parse_placeholders,
@@ -507,6 +508,187 @@ endcidrange
 
         assert "<3F00> 0" in cmap_text
         assert "65536" not in cmap_text
+        assert result["cid_overflow_entries_repaired"] == 1
+
+    def test_repairs_overflow_entries_without_token_whitespace(self) -> None:
+        """Self-delimiting hex strings need no separator in CMap entries."""
+        pdf = new_pdf()
+        encoding_stream = pdf.make_stream(
+            b"""
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+1 begincidchar
+<0041>65791
+endcidchar
+1 begincidrange
+<3F00><3FFF> 65536
+endcidrange
+"""
+        )
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type0,
+                BaseFont=Name("/TestCID"),
+                Encoding=encoding_stream,
+                DescendantFonts=Array([]),
+            )
+        )
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 200, 200]),
+                Resources=Dictionary(Font=Dictionary(F1=font)),
+                Contents=pdf.make_stream(b"BT /F1 12 Tf <00413F00> Tj ET"),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_structure_limits(pdf)
+        cmap_text = encoding_stream.read_bytes().decode("latin-1")
+
+        assert "<0041> 0" in cmap_text
+        assert "<3F00> 0" in cmap_text
+        assert "65791" not in cmap_text
+        assert "65536" not in cmap_text
+        assert result["cid_overflow_entries_repaired"] == 2
+
+    def test_repairs_overflow_entries_regardless_of_line_layout(self) -> None:
+        """Blocks on one line and comments do not hide or fake entries."""
+        pdf = new_pdf()
+        encoding_stream = pdf.make_stream(
+            b"1 begincodespacerange <0000> <FFFF> endcodespacerange "
+            b"2 begincidrange <0000> <0001> 5 <3F00> <3FFF> 65536 endcidrange\n"
+            b"1 begincidchar\n% <0100> 70000\n<0041> 9\nendcidchar\n"
+        )
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type0,
+                BaseFont=Name("/TestCID"),
+                Encoding=encoding_stream,
+                DescendantFonts=Array([]),
+            )
+        )
+        page = pikepdf.Page(
+            Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, 200, 200]),
+                Resources=Dictionary(Font=Dictionary(F1=font)),
+                Contents=pdf.make_stream(b"BT /F1 12 Tf <00003F01> Tj ET"),
+            )
+        )
+        pdf.pages.append(page)
+
+        result = sanitize_structure_limits(pdf)
+        cmap_text = encoding_stream.read_bytes().decode("latin-1")
+
+        assert "1 begincidrange <0000> <0001> 5  endcidrange" in cmap_text
+        assert "<3F01> 0" in cmap_text
+        assert "65536" not in cmap_text
+        assert "% <0100> 70000" in cmap_text
+        assert "<0041> 9" in cmap_text
+        assert result["cid_overflow_entries_repaired"] == 1
+
+    @staticmethod
+    def _sanitize_cid_cmap(cmap_data: bytes, content: bytes) -> tuple[dict, str]:
+        pdf = new_pdf()
+        encoding_stream = pdf.make_stream(cmap_data)
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type0,
+                BaseFont=Name("/TestCID"),
+                Encoding=encoding_stream,
+                DescendantFonts=Array([]),
+            )
+        )
+        pdf.pages.append(
+            pikepdf.Page(
+                Dictionary(
+                    Type=Name.Page,
+                    MediaBox=Array([0, 0, 200, 200]),
+                    Resources=Dictionary(Font=Dictionary(F1=font)),
+                    Contents=pdf.make_stream(content),
+                )
+            )
+        )
+        result = sanitize_structure_limits(pdf)
+        return result, encoding_stream.read_bytes().decode("latin-1")
+
+    def test_commented_out_cid_block_is_left_alone(self) -> None:
+        cmap_data = (
+            b"% 1 begincidrange <0000> <FFFF> 70000 endcidrange\n"
+            b"1 begincidchar\n<0041> 9\nendcidchar\n"
+        )
+
+        result, cmap_text = self._sanitize_cid_cmap(
+            cmap_data, b"BT /F1 12 Tf <0041> Tj ET"
+        )
+
+        assert result["cid_overflow_entries_repaired"] == 0
+        assert cmap_text == cmap_data.decode("latin-1")
+
+    def test_repairs_overflow_in_unterminated_cid_block(self) -> None:
+        """A missing end keyword ends the block at the next one or at EOF."""
+        result, cmap_text = self._sanitize_cid_cmap(
+            b"1 begincidchar\n<0041> 70000\n"
+            b"1 begincidrange\n<0100> <0101> 5\nendcidrange\n"
+            b"1 begincidchar\n<0042> 70001",
+            b"BT /F1 12 Tf <00410042> Tj ET",
+        )
+
+        assert cmap_text == (
+            "1 begincidchar\n<0041> 0\nendcidchar\n"
+            "1 begincidrange\n<0100> <0101> 5\nendcidrange\n"
+            "1 begincidchar\n<0042> 0\nendcidchar\n"
+        )
+        assert result["cid_overflow_entries_repaired"] == 2
+        assert parse_cid_encoding_cmap(cmap_text.encode()).unparsed_blocks == 0
+
+    def test_remapped_codes_of_unterminated_range_precede_next_block(self) -> None:
+        result, cmap_text = self._sanitize_cid_cmap(
+            b"1 begincidrange\n<3F00> <3FFF> 65536\n"
+            b"1 begincidchar\n<0041> 9\nendcidchar",
+            b"BT /F1 12 Tf <3F010041> Tj ET",
+        )
+
+        assert "endcidchar1" not in cmap_text
+        mapping = parse_cid_encoding_cmap(cmap_text.encode())
+        assert mapping.unparsed_blocks == 0
+        assert mapping.map_code(b"\x3f\x01") == 0
+        assert mapping.map_code(b"\x00\x41") == 9
+        assert result["cid_overflow_entries_repaired"] == 1
+
+    def test_unterminated_final_cid_block_is_closed_before_endcmap(self) -> None:
+        result, cmap_text = self._sanitize_cid_cmap(
+            b"begincmap\n1 begincidchar\n<0041> 70000\nendcmap\n"
+            b"CMapName currentdict /CMap defineresource pop\nend\n",
+            b"BT /F1 12 Tf <0041> Tj ET",
+        )
+
+        assert cmap_text == (
+            "begincmap\n1 begincidchar\n<0041> 0\nendcidchar\nendcmap\n"
+            "CMapName currentdict /CMap defineresource pop\nend\n"
+        )
+        assert result["cid_overflow_entries_repaired"] == 1
+
+    def test_comments_and_literal_percent_do_not_bound_cid_blocks(self) -> None:
+        """A '%' in a string starts no comment; one in a block ends nothing."""
+        result, cmap_text = self._sanitize_cid_cmap(
+            b"/Registry (Ad(o(b))%e) def 2 begincidrange\n"
+            b"<0000> <0001> 5\n"
+            b"% endcidrange must not end this block\n"
+            b"<3F00> <3FFF> 65536\n"
+            b"endcidrange\n",
+            b"BT /F1 12 Tf <00003F01> Tj ET",
+        )
+
+        assert cmap_text.startswith("/Registry (Ad(o(b))%e) def 1 begincidrange\n")
+        assert "% endcidrange must not end this block\n" in cmap_text
+        assert "65536" not in cmap_text
+        assert "<3F01> 0" in cmap_text
         assert result["cid_overflow_entries_repaired"] == 1
 
     def test_removes_unused_cmap_cid_overflow_range(self) -> None:

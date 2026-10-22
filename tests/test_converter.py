@@ -7213,3 +7213,102 @@ def test_local_test_docs_pdfa_level_a_matrix(tmp_path: Path) -> None:
             except Exception as exc:
                 failures.append(f"{source.name} PDF/A-{level}: {exc}")
     assert not failures, "\n".join(failures)
+
+
+def _write_pdf_with_unreadable_cmap(path: Path) -> None:
+    """A Type 0 font whose embedded CMap block is never terminated."""
+    import io as _io
+
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.ttLib.tables._g_l_y_f import Glyph
+
+    names = [".notdef", "A", "B", "C"]
+    builder = FontBuilder(1000, isTTF=True)
+    builder.setupGlyphOrder(names)
+    builder.setupCharacterMap({0x41: "A", 0x42: "B", 0x43: "C"})
+    builder.setupGlyf({name: Glyph() for name in names})
+    builder.setupHorizontalMetrics({name: (500, 0) for name in names})
+    builder.setupHorizontalHeader()
+    builder.setupNameTable({"familyName": "Guard", "styleName": "Regular"})
+    builder.setupOS2()
+    builder.setupPost()
+    builder.setupHead(unitsPerEm=1000)
+    font_data = _io.BytesIO()
+    builder.font.save(font_data)
+
+    pdf = pikepdf.new()
+    cidfont = Dictionary(
+        Type=Name.Font,
+        Subtype=Name.CIDFontType2,
+        BaseFont=Name("/ABCDEF+Guard"),
+        CIDToGIDMap=Name.Identity,
+        CIDSystemInfo=Dictionary(
+            Registry=pikepdf.String("Adobe"),
+            Ordering=pikepdf.String("Identity"),
+            Supplement=0,
+        ),
+        FontDescriptor=pdf.make_indirect(
+            Dictionary(
+                Type=Name.FontDescriptor,
+                FontName=Name("/ABCDEF+Guard"),
+                Flags=32,
+                FontBBox=Array([0, 0, 500, 700]),
+                ItalicAngle=0,
+                Ascent=700,
+                Descent=0,
+                CapHeight=700,
+                StemV=80,
+                FontFile2=pdf.make_stream(font_data.getvalue()),
+            )
+        ),
+        DW=500,
+    )
+    encoding = pdf.make_stream(
+        b"1 begincodespacerange\n<00><FF>\nendcodespacerange\n"
+        b"1 begincidrange\n<41><43> 1\n"
+    )
+    font = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type0,
+            BaseFont=Name("/ABCDEF+Guard"),
+            Encoding=encoding,
+            DescendantFonts=Array([pdf.make_indirect(cidfont)]),
+        )
+    )
+    pdf.add_blank_page(page_size=(200, 100))
+    pdf.pages[0].Resources = Dictionary(Font=Dictionary(F1=font))
+    pdf.pages[0].Contents = pdf.make_stream(b"BT /F1 24 Tf 10 40 Td (ABC) Tj ET")
+    pdf.save(path)
+
+
+class TestNotdefRemovalGuard:
+    """A probably misread font keeps its text and fails like validation."""
+
+    def test_candidate_is_published_but_not_a_produced_target(self, tmp_path):
+        source = tmp_path / "input.pdf"
+        _write_pdf_with_unreadable_cmap(source)
+
+        result = convert_to_pdfa(source, tmp_path / "output.pdf", level="2b")
+
+        assert result.published and not result.skipped
+        assert result.validation_failed
+        assert not result.target_produced
+        assert result.sanitization_stats["notdef_fonts_preserved"] == 1
+        assert any("kept text" in warning for warning in result.warnings)
+        with pikepdf.open(tmp_path / "output.pdf") as output:
+            content = output.pages[0].Contents.read_bytes()
+        assert b"(ABC)" in content
+
+    def test_validated_conversion_withholds_candidate(self, tmp_path):
+        source = tmp_path / "input.pdf"
+        _write_pdf_with_unreadable_cmap(source)
+
+        with patch("pdftopdfa.converter._validate_pdfa_output", return_value=False):
+            result = convert_to_pdfa(
+                source, tmp_path / "output.pdf", level="2b", validate=True
+            )
+
+        assert result.skipped and result.validation_failed
+        assert not result.target_produced
+        assert (tmp_path / "output.pdf").read_bytes() == source.read_bytes()

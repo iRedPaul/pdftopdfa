@@ -378,6 +378,22 @@ class TestSimpleFont:
 
         assert result["glyphs_added"] == 0
 
+    def test_glyph_reached_through_mac_cmap_is_not_added(self) -> None:
+        """MacRoman fi resolves via the (1,0) cmap; no empty glyph is added."""
+        from font_helpers import make_mac_roman_only_truetype
+
+        pdf = new_pdf()
+        _build_simple_font_pdf_with_content(
+            pdf, make_mac_roman_only_truetype({0xDE: "uniF0DE"}), [0xDE]
+        )
+        font = pdf.pages[0].Resources.Font["/F1"]
+        font[Name.Encoding] = Name.MacRomanEncoding
+        pdf = _roundtrip(pdf)
+
+        result = sanitize_glyph_coverage(pdf)
+
+        assert result["glyphs_added"] == 0
+
 
 class TestSkipConditions:
     """Tests for fonts that should be skipped."""

@@ -91,6 +91,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 - On macOS and Linux, system fonts are never auto-embedded.
 - `fsType` checks are a technical safeguard only and do not replace the rights holder's EULA or other license terms.
 - For auditable deployments, tie the allowlist to validated target systems or golden images.
+- PDF/A forbids showing the `.notdef` glyph, so characters whose glyph is missing from the embedded font are removed while their advance is kept. If this would remove at least 3 distinct characters and at least half of the distinct characters a font shows as visible text (invisible OCR text is remapped instead of removed and does not count), or if text uses a font whose embedded CMap contains mappings that cannot be read (including anything after an unterminated literal string), the font data was probably misread: its text is kept, a warning is emitted, and the result reports `validation_failed=True` and `target_produced=False` like a failed validation.
 
 ## CLI Reference
 
@@ -492,7 +493,7 @@ the pages need OCR.
 | `warnings` | `list[str]` | Non-fatal conversion warnings |
 | `processing_time` | `float` | Runtime in seconds |
 | `error` | `str \| None` | Error message for a handled per-file or validation failure |
-| `validation_failed` | `bool` | `True` if validation reported non-compliance or could not complete, or if a preserved embedded PDF could not be converted |
+| `validation_failed` | `bool` | `True` if validation reported non-compliance or could not complete, if a preserved embedded PDF could not be converted, or if `.notdef` cleanup kept the text of a font whose data was probably misread (`sanitization_stats["notdef_fonts_preserved"]`) |
 | `skipped` | `bool` | `True` if the original PDF was copied unchanged |
 | `published` | `bool` | Whether this call wrote the requested output path |
 | `target_produced` | `bool` | Whether the requested conformance target was produced; a published non-conforming candidate is `False` |

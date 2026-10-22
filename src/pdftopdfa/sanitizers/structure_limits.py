@@ -33,6 +33,7 @@ from ..fonts.glyph_usage import (
     _iter_content_streams_with_resources,
     collect_font_usage,
 )
+from ..fonts.tounicode import cmap_hex_digits, mask_cmap_inert_text
 from ..fonts.traversal import get_page_resources, iter_all_page_fonts
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve
@@ -51,20 +52,31 @@ _MAX_REAL_MAGNITUDE = Decimal("3.403e+38")
 _TEXT_OPERATORS = frozenset({"Tj", "TJ", "'", '"'})
 _HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
 _ASCII_NAME_RE = re.compile(r"[^A-Za-z0-9_.+-]+")
-_CIDCHAR_INT_RE = re.compile(r"^<[^>]+>\s+(-?\d+)$")
-_CIDS_INT_GROUP_RE = re.compile(
-    r"^(?P<src><(?P<src_hex>[^>]+)>)\s+"
-    r"(?P<end><(?P<end_hex>[^>]+)>)\s+"
-    r"(?P<cid>-?\d+)$"
+# CMap mapping blocks and entries, independent of line layout.  Hex strings
+# are self-delimiting and may contain whitespace.  The patterns run on text
+# whose literal strings and comments are blanked (mask_cmap_inert_text), so
+# block- or entry-like text inside them is neither read nor rewritten.
+_PDF_WS = r"[\x00\t\n\x0c\r ]"
+_PDF_WS_CHARS = ("\x00", "\t", "\n", "\x0c", "\r", " ")
+_CMAP_HEX = r"<(?P<{}>[0-9A-Fa-f\x00\t\n\x0c\r ]*)>"
+# A block without its end keyword runs to the next block, to endcmap or to
+# the end of the data, so that its entries are still repaired or rejected.
+# Keywords preceded by "/" are literal names, not operators.
+_CID_BLOCK_RE = re.compile(
+    rf"(?:(?P<count>\d+)(?P<gap>{_PDF_WS}+))?(?<!/)begincid(?P<kind>char|range)\b"
+    r"(?P<body>.*?)"
+    rf"(?:(?<!/)(?P<end>endcid(?P=kind))\b"
+    rf"|(?=(?:\d++{_PDF_WS}+)?(?<!/)begin[a-z]+\b|(?<!/)endcmap\b)|\Z)",
+    re.DOTALL,
 )
-_CIDS_HEX_GROUP_RE = re.compile(
-    r"^(?P<src><(?P<src_hex>[^>]+)>)\s+"
-    r"(?P<end><(?P<end_hex>[^>]+)>)\s+"
-    r"<(?P<cid_hex>[0-9A-Fa-f]+)>$"
-)
-_BLOCK_BEGIN_RE = re.compile(
-    r"^(?P<indent>\s*)(?P<count>\d+)"
-    r"(?P<suffix>\s+begincid(?:char|range)\s*)$"
+_CID_TARGET = r"(?:" + _CMAP_HEX.format("cid_hex") + r"|(?P<cid>-?\d+))"
+_CIDCHAR_ENTRY_RE = re.compile(_CMAP_HEX.format("src") + rf"{_PDF_WS}*" + _CID_TARGET)
+_CIDRANGE_ENTRY_RE = re.compile(
+    _CMAP_HEX.format("src")
+    + rf"{_PDF_WS}*"
+    + _CMAP_HEX.format("end")
+    + rf"{_PDF_WS}*"
+    + _CID_TARGET
 )
 
 
@@ -894,67 +906,60 @@ def _sanitize_object_graph(
     return result
 
 
+def _parse_cid_entry(entry: re.Match[str]) -> tuple[bytes, bytes, int] | None:
+    """Return (start, end, first CID) of a cidchar/cidrange entry match."""
+    try:
+        start = bytes.fromhex(cmap_hex_digits(entry.group("src")))
+        end_group = entry.groupdict().get("end")
+        end = (
+            bytes.fromhex(cmap_hex_digits(end_group))
+            if end_group is not None
+            else start
+        )
+        cid_hex = entry.group("cid_hex")
+        cid_start = (
+            int(cmap_hex_digits(cid_hex), 16)
+            if cid_hex is not None
+            else int(entry.group("cid"))
+        )
+    except ValueError:
+        return None
+    if not start or len(start) != len(end):
+        return None
+    return start, end, cid_start
+
+
+def _iter_cid_entries(masked: str):
+    """Yield (block, entry, parsed) for every cidchar/cidrange entry.
+
+    ``masked`` is CMap text with its literal strings and comments blanked.
+    """
+    for block in _CID_BLOCK_RE.finditer(masked):
+        pattern = (
+            _CIDCHAR_ENTRY_RE if block.group("kind") == "char" else _CIDRANGE_ENTRY_RE
+        )
+        for entry in pattern.finditer(block.group("body")):
+            parsed = _parse_cid_entry(entry)
+            if parsed is not None:
+                yield block, entry, parsed
+
+
+def _cid_entry_overflows(parsed: tuple[bytes, bytes, int]) -> bool:
+    start, end, cid_start = parsed
+    span = int.from_bytes(end, "big") - int.from_bytes(start, "big")
+    return cid_start + max(0, span) > _MAX_CID_VALUE
+
+
 def _cmap_has_cid_overflow(cmap_stream: Stream) -> bool:
     """Return True if embedded CMap contains CID values greater than 65535."""
     try:
         data = cmap_stream.read_bytes().decode("latin-1")
     except Exception:
         return False
-
-    mode: str | None = None
-    for raw_line in data.splitlines():
-        line = raw_line.strip()
-        if line.endswith("begincidchar"):
-            mode = "char"
-            continue
-        if line.endswith("endcidchar"):
-            mode = None
-            continue
-        if line.endswith("begincidrange"):
-            mode = "range"
-            continue
-        if line.endswith("endcidrange"):
-            mode = None
-            continue
-
-        if mode == "char":
-            match = _CIDCHAR_INT_RE.match(line)
-            if match is not None:
-                try:
-                    if int(match.group(1)) > _MAX_CID_VALUE:
-                        return True
-                except ValueError:
-                    continue
-        elif mode == "range":
-            match_int = _CIDS_INT_GROUP_RE.match(line)
-            if match_int is not None:
-                try:
-                    start = int(match_int.group("src_hex"), 16)
-                    end = int(match_int.group("end_hex"), 16)
-                    cid_start = int(match_int.group("cid"))
-                    if cid_start + max(0, end - start) > _MAX_CID_VALUE:
-                        return True
-                except ValueError:
-                    continue
-            match_hex = _CIDS_HEX_GROUP_RE.match(line)
-            if match_hex is not None:
-                try:
-                    start = int(match_hex.group("src_hex"), 16)
-                    end = int(match_hex.group("end_hex"), 16)
-                    cid_start = int(match_hex.group("cid_hex"), 16)
-                    if cid_start + max(0, end - start) > _MAX_CID_VALUE:
-                        return True
-                except ValueError:
-                    continue
-    return False
-
-
-def _rewrite_cmap_block_begin(line: str, count: int) -> str:
-    """Update the mapping count on a begincidchar/begincidrange line."""
-    match = _BLOCK_BEGIN_RE.match(line)
-    if match is None:
-        return line
-    return f"{match.group('indent')}{count}{match.group('suffix')}"
+    return any(
+        _cid_entry_overflows(parsed)
+        for _block, _entry, parsed in _iter_cid_entries(mask_cmap_inert_text(data))
+    )
 
 
 def _repair_cid_overflow_entries(
@@ -962,6 +967,9 @@ def _repair_cid_overflow_entries(
     used_codes: set[CharacterCode],
 ) -> tuple[int, bool]:
     """Repair overflowing CMap entries, mapping used invalid codes to CID 0.
+
+    Entries are rewritten in place, so comments and the layout of the
+    remaining CMap text are preserved.
 
     Returns:
         Tuple of (number of modified/removed CMap entries, has_remaining_overflow).
@@ -977,172 +985,104 @@ def _repair_cid_overflow_entries(
     def code_is_used(source: bytes) -> bool:
         return source in used_raw or int.from_bytes(source, "big") in used_values
 
-    lines = data.splitlines()
-    had_trailing_newline = data.endswith(("\n", "\r"))
     changed_entries = 0
-    remaining_overflow = False
-    rewritten: list[str] = []
-    i = 0
-
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-
-        if stripped.endswith("begincidchar") or stripped.endswith("begincidrange"):
-            block_mode = "char" if stripped.endswith("begincidchar") else "range"
-            end_marker = "endcidchar" if block_mode == "char" else "endcidrange"
-            begin_line = line
-            begin_match = _BLOCK_BEGIN_RE.match(begin_line)
-            declared_count = (
-                int(begin_match.group("count")) if begin_match is not None else None
-            )
-            count_delta = 0
-            i += 1
-
-            kept_entries: list[str] = []
-            remapped_char_entries: list[str] = []
-            while i < len(lines):
-                entry_line = lines[i]
-                entry_stripped = entry_line.strip()
-                if entry_stripped.endswith(end_marker):
-                    break
-
-                if block_mode == "char":
-                    match = _CIDCHAR_INT_RE.match(entry_stripped)
-                    if match is not None:
-                        try:
-                            source = entry_stripped.split(None, 1)[0]
-                            source_bytes = bytes.fromhex(source.strip("<>"))
-                            cid_value = int(match.group(1))
-                        except ValueError:
-                            kept_entries.append(entry_line)
-                            i += 1
-                            continue
-
-                        if cid_value > _MAX_CID_VALUE:
-                            changed_entries += 1
-                            if code_is_used(source_bytes):
-                                kept_entries.append(f"{source} 0")
-                            else:
-                                count_delta -= 1
-                            i += 1
-                            continue
-
+    output: list[str] = []
+    position = 0
+    # Blocks and entries are found in the masked text; everything else is
+    # copied from the original at the same offsets.
+    for block in _CID_BLOCK_RE.finditer(mask_cmap_inert_text(data)):
+        is_char = block.group("kind") == "char"
+        pattern = _CIDCHAR_ENTRY_RE if is_char else _CIDRANGE_ENTRY_RE
+        body_start, body_end = block.span("body")
+        body = block.group("body")
+        body_parts: list[str] = []
+        body_position = 0
+        count_delta = 0
+        remapped_char_entries: list[str] = []
+        for entry in pattern.finditer(body):
+            parsed = _parse_cid_entry(entry)
+            if parsed is None or not _cid_entry_overflows(parsed):
+                continue
+            start, end, cid_start = parsed
+            changed_entries += 1
+            source = f"<{entry.group('src')}>"
+            replacement = ""
+            if is_char:
+                if code_is_used(start):
+                    replacement = f"{source} 0"
                 else:
-                    match_int = _CIDS_INT_GROUP_RE.match(entry_stripped)
-                    match_hex = _CIDS_HEX_GROUP_RE.match(entry_stripped)
-
-                    if match_int is not None or match_hex is not None:
-                        try:
-                            if match_int is not None:
-                                start_code = int(match_int.group("src_hex"), 16)
-                                end_code = int(match_int.group("end_hex"), 16)
-                                cid_start = int(match_int.group("cid"))
-                            else:
-                                assert match_hex is not None
-                                start_code = int(match_hex.group("src_hex"), 16)
-                                end_code = int(match_hex.group("end_hex"), 16)
-                                cid_start = int(match_hex.group("cid_hex"), 16)
-                        except ValueError:
-                            kept_entries.append(entry_line)
-                            i += 1
-                            continue
-
-                        safe_limit = start_code + (_MAX_CID_VALUE - cid_start)
-                        safe_end = min(end_code, safe_limit)
-                        if cid_start > _MAX_CID_VALUE or safe_end < end_code:
-                            overflow_start = max(start_code, safe_end + 1)
-                            source_width_bytes = (
-                                len(
-                                    match_int.group("src_hex")
-                                    if match_int is not None
-                                    else match_hex.group("src_hex")
-                                )
-                                // 2
-                            )
-                            used_in_overflow = sorted(
-                                {
-                                    int.from_bytes(code, "big")
-                                    for code in used_raw
-                                    if len(code) == source_width_bytes
-                                    and overflow_start
-                                    <= int.from_bytes(code, "big")
-                                    <= end_code
-                                }
-                                | {
-                                    code
-                                    for code in used_values
-                                    if overflow_start <= code <= end_code
-                                }
-                            )
-                            changed_entries += 1
-                            count_delta -= 1
-                            if safe_end >= start_code:
-                                count_delta += 1
-                                end_hex = (
-                                    match_int.group("end_hex")
-                                    if match_int is not None
-                                    else match_hex.group("end_hex")
-                                )
-                                end_hex_len = len(end_hex)
-                                new_end = f"<{safe_end:0{end_hex_len}X}>"
-                                if match_int is not None:
-                                    src = match_int.group("src")
-                                    cid = match_int.group("cid")
-                                    kept_entries.append(f"{src} {new_end} {cid}")
-                                else:
-                                    src = match_hex.group("src")
-                                    cid_hex = match_hex.group("cid_hex")
-                                    kept_entries.append(
-                                        f"{src} {new_end} <{cid_hex.upper()}>"
-                                    )
-                            source_width = max(
-                                len(match_int.group("src_hex"))
-                                if match_int is not None
-                                else len(match_hex.group("src_hex")),
-                                len(match_int.group("end_hex"))
-                                if match_int is not None
-                                else len(match_hex.group("end_hex")),
-                            )
-                            remapped_char_entries.extend(
-                                f"<{code:0{source_width}X}> 0"
-                                for code in used_in_overflow
-                            )
-                            i += 1
-                            continue
-
-                kept_entries.append(entry_line)
-                i += 1
-
-            rewritten.append(
-                _rewrite_cmap_block_begin(
-                    begin_line,
-                    max(0, declared_count + count_delta)
-                    if declared_count is not None
-                    else len(kept_entries),
+                    count_delta -= 1
+            else:
+                start_code = int.from_bytes(start, "big")
+                end_code = int.from_bytes(end, "big")
+                safe_end = min(end_code, start_code + (_MAX_CID_VALUE - cid_start))
+                overflow_start = max(start_code, safe_end + 1)
+                used_in_overflow = sorted(
+                    {
+                        int.from_bytes(code, "big")
+                        for code in used_raw
+                        if len(code) == len(start)
+                        and overflow_start <= int.from_bytes(code, "big") <= end_code
+                    }
+                    | {
+                        code
+                        for code in used_values
+                        if overflow_start <= code <= end_code
+                    }
                 )
+                end_digits = cmap_hex_digits(entry.group("end"))
+                if safe_end >= start_code:
+                    target = (
+                        entry.group("cid")
+                        if entry.group("cid") is not None
+                        else f"<{cmap_hex_digits(entry.group('cid_hex')).upper()}>"
+                    )
+                    replacement = f"{source} <{safe_end:0{len(end_digits)}X}> {target}"
+                else:
+                    count_delta -= 1
+                source_width = max(
+                    len(cmap_hex_digits(entry.group("src"))), len(end_digits)
+                )
+                remapped_char_entries.extend(
+                    f"<{code:0{source_width}X}> 0" for code in used_in_overflow
+                )
+            body_parts.append(
+                data[body_start + body_position : body_start + entry.start()]
             )
-            rewritten.extend(kept_entries)
-            if i < len(lines):
-                rewritten.append(lines[i])
-            for offset in range(0, len(remapped_char_entries), 100):
-                chunk = remapped_char_entries[offset : offset + 100]
-                rewritten.append(f"{len(chunk)} begincidchar")
-                rewritten.extend(chunk)
-                rewritten.append("endcidchar")
-            i += 1
-            continue
+            body_parts.append(replacement)
+            body_position = entry.end()
 
-        rewritten.append(line)
-        i += 1
+        if not body_parts:
+            continue
+        body_parts.append(data[body_start + body_position : body_end])
+        output.append(data[position : block.start()])
+        keyword_start = block.start()
+        if block.group("count") is not None:
+            output.append(str(max(0, int(block.group("count")) + count_delta)))
+            keyword_start = block.start("gap")
+        output.append(data[keyword_start:body_start])
+        new_body = "".join(body_parts)
+        output.append(new_body)
+        if block.group("end") is None:
+            # Close a block that ended implicitly, as CMap readers require.
+            separator = "" if new_body.endswith(_PDF_WS_CHARS) else "\n"
+            output.append(f"{separator}endcid{block.group('kind')}\n")
+        output.append(data[body_end : block.end()])
+        for offset in range(0, len(remapped_char_entries), 100):
+            chunk = remapped_char_entries[offset : offset + 100]
+            output.append(f"\n{len(chunk)} begincidchar\n")
+            output.append("\n".join(chunk))
+            output.append("\nendcidchar")
+        if remapped_char_entries and not data.startswith(_PDF_WS_CHARS, block.end()):
+            # An implicitly ended block is directly followed by the next one.
+            output.append("\n")
+        position = block.end()
 
     if changed_entries > 0:
-        new_data = "\n".join(rewritten)
-        if had_trailing_newline:
-            new_data += "\n"
-        cmap_stream.write(new_data.encode("latin-1"))
+        output.append(data[position:])
+        cmap_stream.write("".join(output).encode("latin-1"))
 
-    return changed_entries, remaining_overflow
+    return changed_entries, False
 
 
 def _ensure_no_cid_overflow(
