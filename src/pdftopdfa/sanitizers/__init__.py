@@ -81,7 +81,6 @@ from .font_widths import sanitize_font_widths
 from .fonts import sanitize_cidfont_structures, sanitize_fontname_consistency
 from .glyph_coverage import sanitize_glyph_coverage
 from .javascript import remove_javascript
-from .jbig2 import convert_jbig2_external_globals
 from .jpx import sanitize_jpx_color_boxes
 from .notdef_usage import sanitize_notdef_usage
 from .optional_content import sanitize_optional_content
@@ -113,6 +112,10 @@ def sanitize_for_pdfa(
     - PDF/A-2: Remove JavaScript, actions, XFA forms (transparency allowed)
     - PDF/A-3: Remove JavaScript, actions, XFA forms (embedded files and
                transparency allowed)
+
+    JBIG2 image data, including refinement coding, is preserved as permitted
+    by ISO 19005-2, 6.1.7.2. Global segments remain in their separate
+    /JBIG2Globals stream as required by ISO 32000-1, 7.4.7.
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
@@ -171,12 +174,6 @@ def sanitize_for_pdfa(
     result["nonstandard_inline_filters_fixed"] = sanitize_nonstandard_inline_filters(
         pdf
     )
-
-    # Convert JBIG2 streams with external globals (all levels)
-    jbig2_result = convert_jbig2_external_globals(pdf)
-    result["jbig2_converted"] = jbig2_result["converted"]
-    result["jbig2_reencoded"] = jbig2_result["reencoded"]
-    result["jbig2_failed"] = jbig2_result["failed"]
 
     # Sanitize JPEG2000 colr boxes (ISO 19005-2, 6.1.4.3)
     jpx_result = sanitize_jpx_color_boxes(pdf)
@@ -553,7 +550,6 @@ __all__ = [
     "remove_external_stream_keys",
     "fix_stream_lengths",
     "sanitize_nonstandard_inline_filters",
-    "convert_jbig2_external_globals",
     "sanitize_jpx_color_boxes",
     # Constants
     "COMPLIANT_ACTIONS",
