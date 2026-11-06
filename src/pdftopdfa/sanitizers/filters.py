@@ -20,6 +20,7 @@ from pikepdf import unparse_content_stream as _unparse_content_stream
 
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
+from .jbig2 import get_jbig2_globals_streams
 
 logger = logging.getLogger(__name__)
 
@@ -910,15 +911,28 @@ def fix_stream_lengths(pdf: Pdf) -> int:
     recalculates the correct /Length on save.
 
     Image streams (DCTDecode, JPXDecode, JBIG2Decode, CCITTFaxDecode) are
-    skipped because they use lossy or specialised encoding.
+    skipped because they use lossy or specialised encoding. Referenced
+    JBIG2 globals retain their encoded bytes, filters, and decode parameters;
+    a mismatched /Length is repaired by writing back the original raw bytes.
 
     Args:
         pdf: pikepdf Pdf object (modified in place).
 
     Returns:
-        Number of streams re-encoded.
+        Number of streams rewritten.
     """
     reencoded = 0
+    globals_streams = get_jbig2_globals_streams(pdf)
+    globals_ids = {stream.objgen for stream in globals_streams}
+    for stream in globals_streams:
+        raw_data = stream.read_raw_bytes()
+        if stream.get("/Length") != len(raw_data):
+            stream.write(
+                raw_data,
+                filter=stream.get("/Filter"),
+                decode_parms=stream.get("/DecodeParms"),
+            )
+            reencoded += 1
 
     for obj in pdf.objects:
         try:
@@ -927,7 +941,7 @@ def fix_stream_lengths(pdf: Pdf) -> int:
             if not isinstance(obj, Stream):
                 continue
 
-            if _has_image_filter(obj):
+            if obj.objgen in globals_ids or _has_image_filter(obj):
                 continue
 
             data = obj.read_bytes()
@@ -938,6 +952,6 @@ def fix_stream_lengths(pdf: Pdf) -> int:
             log_suppressed_error(logger, e, "Error re-encoding stream: %s", e)
 
     if reencoded > 0:
-        logger.info("%d stream(s) re-encoded to fix /Length", reencoded)
+        logger.info("%d stream(s) rewritten to fix /Length", reencoded)
 
     return reencoded

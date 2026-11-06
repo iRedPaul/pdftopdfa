@@ -81,6 +81,7 @@ from .font_widths import sanitize_font_widths
 from .fonts import sanitize_cidfont_structures, sanitize_fontname_consistency
 from .glyph_coverage import sanitize_glyph_coverage
 from .javascript import remove_javascript
+from .jbig2 import convert_jbig2_external_globals, validate_jbig2_globals
 from .jpx import sanitize_jpx_color_boxes
 from .notdef_usage import sanitize_notdef_usage
 from .optional_content import sanitize_optional_content
@@ -132,7 +133,8 @@ def sanitize_for_pdfa(
         - actions_removed: Number of non-compliant actions removed
 
     Raises:
-        ConversionError: If an invalid level is specified.
+        ConversionError: If the level or a JBIG2 globals reference is invalid,
+            or the outer filters on a globals stream cannot be decoded.
     """
     level = validate_pdfa_level(level)
 
@@ -166,6 +168,9 @@ def sanitize_for_pdfa(
 
     # Remove forbidden external stream keys /F, /FFilter, /FDecodeParms (6.1.7.1)
     result["external_stream_keys_removed"] = remove_external_stream_keys(pdf)
+
+    # Validate globals references and outer filters without decoding JBIG2 images.
+    validate_jbig2_globals(pdf)
 
     # Force re-encoding of non-image streams to repair /Length mismatches (6.1.7.1)
     result["stream_lengths_fixed"] = fix_stream_lengths(pdf)
@@ -550,6 +555,7 @@ __all__ = [
     "remove_external_stream_keys",
     "fix_stream_lengths",
     "sanitize_nonstandard_inline_filters",
+    "convert_jbig2_external_globals",
     "sanitize_jpx_color_boxes",
     # Constants
     "COMPLIANT_ACTIONS",
