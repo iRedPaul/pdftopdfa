@@ -117,14 +117,17 @@ def _add_preserved_features(pdf: Pdf) -> None:
             A=Dictionary(S=Name.URI, URI="https://example.com"),
         )
     )
+    trap_appearance = _form(pdf, b"0.5 g 0 0 20 20 re f", size=20)
+    trap_appearance.PCM = Name.DeviceGray
     trap = pdf.make_indirect(
         Dictionary(
             Type=Name.Annot,
             Subtype=Name.TrapNet,
             Rect=Array([20, 150, 40, 170]),
-            F=4,
+            F=68,
+            AS=Name.Normal,
             LastModified="D:20261106000000Z",
-            AP=Dictionary(N=appearance),
+            AP=Dictionary(N=trap_appearance),
         )
     )
     page.Annots = Array([square, link, trap])
@@ -328,6 +331,50 @@ def test_full_conversion_repairs_malformed_preserved_xmp(
         assert actual.xpath(
             "//dc:creator/rdf:Seq/rdf:li/text()", namespaces={"dc": _DC, "rdf": _RDF}
         ) == ["Alice"]
+
+
+@pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
+@pytest.mark.parametrize("versioned", [True, False])
+def test_full_conversion_validates_trap_tracking(
+    source_level, target_level, versioned, tmp_path
+):
+    """Preserve valid Version tracking and flatten missing tracking in conversion."""
+    pdf = _document(source_level)
+    page = pdf.pages[0]
+    page.Contents = pdf.make_stream(b"0.5 g 0 0 200 200 re f")
+    appearance = _form(pdf, b"0 g 0 0 20 20 re f", size=20)
+    appearance.PCM = Name.DeviceGray
+    trap = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Annot,
+            Subtype=Name.TrapNet,
+            F=68,
+            AS=Name.Normal,
+            AP=Dictionary(N=appearance),
+            Rect=Array([0, 0, 20, 20]),
+        )
+    )
+    if versioned:
+        trap.Version, trap.AnnotStates = Array([page.Contents]), Array()
+    page.Annots = Array([trap])
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source, force_version="1.7")
+    if versioned:
+        original = validate_with_verapdf(source, flavour=source_level)
+        assert original.compliant, original
+    result = convert_to_pdfa(source, output, level=target_level, validate=True)
+    assert (
+        result.target_produced and not result.skipped and not result.validation_failed
+    )
+    with pikepdf.open(output) as restored:
+        page = restored.pages[0]
+        if versioned:
+            trap = page.Annots[0]
+            assert trap.Subtype == Name.TrapNet
+            assert trap.Version[0].objgen == page.Contents.objgen
+        else:
+            assert "/Annots" not in page.obj
+            assert result.sanitization_stats["non_compliant_annotations_flattened"] == 1
 
 
 @pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])

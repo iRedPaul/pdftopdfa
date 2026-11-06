@@ -232,12 +232,14 @@ class TestTrapNetPreservation:
         appearance.Subtype = Name.Form
         appearance.BBox = Array([0, 0, 20, 20])
         appearance.Resources = Dictionary()
+        appearance.PCM = Name.DeviceGray
         trapnet = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
                 Subtype=Name.TrapNet,
                 Rect=Array([20, 20, 40, 40]),
-                F=ANNOT_FLAG_PRINT,
+                F=ANNOT_FLAG_PRINT | 64,
+                AS=Name.Normal,
                 NM="prepress-trap-net",
                 Contents="Trapping information",
                 LastModified="D:20261106000000Z",
@@ -268,7 +270,7 @@ class TestTrapNetPreservation:
         assert restored.Type == Name.Annot
         assert restored.Subtype == Name.TrapNet
         assert list(restored.Rect) == [20, 20, 40, 40]
-        assert restored.F == ANNOT_FLAG_PRINT
+        assert restored.F == ANNOT_FLAG_PRINT | 64
         assert str(restored.NM) == "prepress-trap-net"
         assert str(restored.Contents) == "Trapping information"
         assert str(restored.LastModified) == "D:20261106000000Z"

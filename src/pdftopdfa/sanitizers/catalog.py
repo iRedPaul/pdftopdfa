@@ -41,6 +41,7 @@ from lxml import etree
 from pikepdf import Dictionary, Name, Pdf, String
 
 from ..utils import resolve_indirect as _resolve_indirect
+from .navigation import sanitize_catalog_navigation
 
 logger = logging.getLogger(__name__)
 
@@ -364,16 +365,17 @@ def remove_forbidden_catalog_entries(pdf: Pdf) -> int:
     - /NeedsRendering (ISO 32000-1, Table 28)
     - /SpiderInfo (existing web capture metadata cleanup policy)
 
-    PDF/A-2 and PDF/A-3 permit collections and article threads. Preserve
-    their catalog entries and subordinate structures without flattening them.
+    PDF/A-2 and PDF/A-3 permit collections and article threads. Preserve valid
+    structures, repair malformed optional collection settings, and reject
+    article graphs that cannot be safely repaired without changing destinations.
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
 
     Returns:
-        Number of forbidden catalog entries removed.
+        Number of forbidden or malformed catalog entries removed.
     """
-    removed_count = 0
+    removed_count = sanitize_catalog_navigation(pdf)
 
     perms_removed, has_doc_mdp = _sanitize_catalog_perms(pdf)
     removed_count += perms_removed

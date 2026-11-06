@@ -2731,7 +2731,7 @@ def _extract_lang_alt_xmp_property(
                 cleaned = _clean_metadata_text(li.text)
                 if cleaned is None:
                     continue
-                if li.get(xml_lang, "x-default") == "x-default":
+                if li.get(xml_lang, "x-default").casefold() == "x-default":
                     return cleaned
                 if fallback is None:
                     fallback = cleaned
@@ -2918,7 +2918,10 @@ def create_xmp_metadata(
             alt = elem.find(f"{{{ns_rdf}}}Alt")
             assert alt is not None
         xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
-        default = next((li for li in alt if li.get(xml_lang) == "x-default"), None)
+        default = next(
+            (li for li in alt if li.get(xml_lang, "").casefold() == "x-default"),
+            None,
+        )
         if default is None:
             default = etree.Element(f"{{{ns_rdf}}}li")
             default.set(xml_lang, "x-default")

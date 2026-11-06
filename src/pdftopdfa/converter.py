@@ -65,6 +65,7 @@ from .sanitizers import (
 )
 from .sanitizers.catalog import _is_valid_bcp47
 from .sanitizers.extgstate import sanitize_overprint_usage
+from .sanitizers.trapnet import validate_preserved_trapnets
 from .staging import (
     copy_to_private_stage,
     private_staging_directory,
@@ -3098,6 +3099,9 @@ def convert_to_pdfa(
                     ),
                 )
             )
+
+        # Later content/resource edits must not leave a stale TrapNet snapshot.
+        validate_preserved_trapnets(pdf)
 
         # 7. Create output directory if needed
         output_path.parent.mkdir(parents=True, exist_ok=True)

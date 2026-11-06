@@ -231,6 +231,7 @@ with their original calibration. The deprecated
 warning and also preserves them; it no longer substitutes generic ICC profiles.
 Malformed CalGray/CalRGB definitions trigger the original-input fallback with a
 warning rather than producing a PDF/A target with invalid calibration.
+Validation examines declared color spaces; unrelated private data is preserved.
 
 Compatible additional OutputIntents retain their printing information and share
 the embedded ICC profile when required. PDF/X, PDF/VT, and PDF/E identification
@@ -241,6 +242,11 @@ ICCBased CMYK overprint is repaired at affected painting operations. If shared
 Forms, patterns, or Type3 glyphs require incompatible repairs in different
 contexts, conversion uses the original-input fallback described above and
 reports the reason in the result warnings.
+
+Valid TrapNet annotations retain their appearance and trapping data. Malformed
+instances are flattened when a usable appearance is available, or removed
+otherwise. Article threads are checked for complete bead cycles and page links;
+malformed graphs use the original-input fallback to preserve navigation targets.
 
 To run OCR, provide both external model directories. The pair enables OCR;
 `ocr_languages` defaults to `["en"]`:

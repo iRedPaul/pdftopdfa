@@ -11,6 +11,7 @@ from decimal import Decimal
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..exceptions import ConversionError
+from ..utils import iter_type3_fonts
 from ._types import ColorSpaceType
 
 logger = logging.getLogger(__name__)
@@ -69,27 +70,116 @@ def _validate_calibrated_space(cs) -> None:
 
 
 def validate_calibrated_colorspaces(pdf: Pdf) -> None:
-    """Validate reachable CalGray/CalRGB arrays in every PDF resource context."""
-    pending = [pdf.Root]
+    """Validate declared color spaces without interpreting unrelated private data."""
+    from ..fonts.traversal import get_page_resources
+
+    pending = []
+    for page in pdf.pages:
+        pending.append(("owner", page.obj))
+        pending.append(("resources", get_page_resources(page)))
+        pending.extend(
+            ("appearances", annotation.get("/AP"))
+            for annotation in (page.get("/Annots") or [])
+            if isinstance(annotation, Dictionary)
+        )
     visited = set()
+    fonts_seen = set()
     while pending:
-        value = pending.pop()
+        kind, value = pending.pop()
         if not isinstance(value, (Array, Dictionary, Stream)):
             continue
         if value.objgen != (0, 0):
-            if value.objgen in visited:
+            key = (kind, value.objgen)
+            if key in visited:
                 continue
-            visited.add(value.objgen)
-        if isinstance(value, Array):
+            visited.add(key)
+        if kind == "space" and isinstance(value, Array):
             if (
                 value
                 and isinstance(value[0], Name)
                 and value[0] in (Name.CalGray, Name.CalRGB)
             ):
                 _validate_calibrated_space(value)
-            pending.extend(value)
-        else:
-            pending.extend(value.values())
+            elif value:
+                family = value[0]
+                if family in (Name.Indexed, Name.Pattern) and len(value) > 1:
+                    pending.append(("space", value[1]))
+                elif family in (Name.Separation, Name.DeviceN) and len(value) > 2:
+                    pending.append(("space", value[2]))
+                    attrs = value[4] if len(value) > 4 else None
+                    if family == Name.DeviceN and isinstance(attrs, Dictionary):
+                        process = attrs.get("/Process")
+                        if isinstance(process, Dictionary):
+                            pending.append(("space", process.get("/ColorSpace")))
+                        colorants = attrs.get("/Colorants")
+                        if isinstance(colorants, Dictionary):
+                            pending.extend(("space", cs) for cs in colorants.values())
+                elif (
+                    family == Name.ICCBased
+                    and len(value) > 1
+                    and isinstance(value[1], Stream)
+                ):
+                    pending.append(("space", value[1].get("/Alternate")))
+        elif kind == "resources" and isinstance(value, Dictionary):
+            spaces = value.get("/ColorSpace")
+            if isinstance(spaces, Dictionary):
+                pending.extend(("space", cs) for cs in spaces.values())
+            for category, target in (
+                ("/XObject", "owner"),
+                ("/Pattern", "pattern"),
+                ("/Shading", "shading"),
+            ):
+                table = value.get(category)
+                if isinstance(table, Dictionary):
+                    pending.extend((target, obj) for obj in table.values())
+            states = value.get("/ExtGState")
+            if isinstance(states, Dictionary):
+                for state in states.values():
+                    mask = (
+                        state.get("/SMask") if isinstance(state, Dictionary) else None
+                    )
+                    if isinstance(mask, Dictionary):
+                        pending.append(("owner", mask.get("/G")))
+            for _, font in iter_type3_fonts(value, fonts_seen):
+                pending.append(("resources", font.get("/Resources")))
+        elif kind == "appearances" and isinstance(value, Dictionary):
+            pending.extend(("appearance", value.get(key)) for key in ("/N", "/R", "/D"))
+        elif kind == "appearance":
+            if isinstance(value, Stream):
+                pending.append(("owner", value))
+            elif isinstance(value, Dictionary):
+                pending.extend(
+                    ("owner", entry)
+                    for entry in value.values()
+                    if isinstance(entry, Stream)
+                )
+        elif kind == "pattern" and isinstance(value, (Dictionary, Stream)):
+            if value.get("/PatternType") == 1:
+                pending.append(("tiling", value))
+            elif value.get("/PatternType") == 2:
+                pending.append(("shading", value.get("/Shading")))
+        elif kind == "shading" and isinstance(value, (Dictionary, Stream)):
+            pending.append(("space", value.get("/ColorSpace")))
+        elif kind in ("owner", "tiling") and isinstance(value, (Dictionary, Stream)):
+            form_or_page = (
+                value.get("/Subtype") == Name.Form or value.get("/Type") == Name.Page
+            )
+            if form_or_page or kind == "tiling":
+                pending.append(("resources", value.get("/Resources")))
+            group = value.get("/Group") if form_or_page else None
+            if isinstance(group, Dictionary) and group.get("/S") == Name.Transparency:
+                pending.append(("space", group.get("/CS")))
+            if value.get("/Subtype") == Name.Image:
+                pending.append(("space", value.get("/ColorSpace")))
+                pending.append(("owner", value.get("/SMask")))
+                pending.append(("owner", value.get("/Mask")))
+                alternates = value.get("/Alternates")
+                if isinstance(alternates, Array):
+                    pending.extend(
+                        ("owner", item.get("/Image"))
+                        for item in alternates
+                        if isinstance(item, Dictionary)
+                    )
 
 
 def _convert_calibrated_colorspaces(

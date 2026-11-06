@@ -1330,6 +1330,60 @@ class TestEmbedColorProfiles:
 class TestPreservedColorValidation:
     """Preserved dictionaries and color spaces still have to be well formed."""
 
+    @pytest.mark.parametrize(
+        "location", ["catalog", "resources", "calibration", "image"]
+    )
+    def test_private_arrays_are_not_interpreted_as_color_spaces(self, location):
+        """A color-like first name does not change private objects' semantics."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        payload = Array([Name.CalRGB, "Private data, not calibration"])
+        if location == "catalog":
+            pdf.Root.AcmePrivate = Dictionary(Payload=payload)
+        elif location == "resources":
+            page.Resources.AcmePrivate = Dictionary(Payload=payload)
+        elif location == "calibration":
+            cs = TestCalibratedPreservation._colorspace("CalRGB")
+            cs[1].AcmePrivate = payload
+            page.Resources.ColorSpace = Dictionary(Cal=cs)
+        else:
+            image = pdf.make_stream(b"\x80")
+            image.Subtype = Name.Image
+            image.ColorSpace = Name.DeviceGray
+            image.AcmePrivate = payload
+            image.Resources = Dictionary(ColorSpace=Dictionary(Private=payload))
+            page.Resources.XObject = Dictionary(Im=image)
+        expected = payload.unparse()
+        embed_color_profiles(pdf)
+        assert payload.unparse() == expected
+
+    @pytest.mark.parametrize(
+        "location",
+        ["shading", "type3", "page_group", "appearance_group", "indexed_image", "form"],
+    )
+    def test_invalid_calibration_is_found_in_typed_contexts(self, location):
+        """All actual nested color contexts retain calibration validation."""
+        pdf = new_pdf()
+        TestCalibratedPreservation._add_colorspace(
+            pdf, Array([Name.CalRGB, Dictionary()]), location
+        )
+        with pytest.raises(ConversionError, match="invalid /WhitePoint"):
+            embed_color_profiles(pdf)
+
+    def test_private_array_survives_full_conversion(self, tmp_path):
+        """Unrelated extension data cannot cause the original-input fallback."""
+        from pdftopdfa.converter import convert_to_pdfa
+
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        pdf.Root.AcmePrivate = Dictionary(Payload=Array([Name.CalGray, 42]))
+        source, output = tmp_path / "private.pdf", tmp_path / "converted.pdf"
+        pdf.save(source)
+        result = convert_to_pdfa(source, output)
+        assert result.target_produced and not result.skipped
+        with Pdf.open(output) as restored:
+            assert list(restored.Root.AcmePrivate.Payload) == [Name.CalGray, 42]
+
     @pytest.mark.parametrize("profiled", [False, True])
     @pytest.mark.parametrize(
         "key,value",

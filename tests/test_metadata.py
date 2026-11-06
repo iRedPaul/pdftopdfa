@@ -1652,6 +1652,33 @@ class TestDublinCoreMultivaluePreservation:
             "</rdf:Seq></dc:creator>"
         )
 
+    @pytest.mark.parametrize("language", ["X-DEFAULT", "x-Default", "X-default"])
+    @pytest.mark.parametrize("property_name", ["title", "description"])
+    def test_default_language_matching_ignores_case(self, language, property_name):
+        """Reuse an existing default even when another translation occurs first."""
+        original = self._source_tree()
+        alt = original.find(f".//{{{NAMESPACES['dc']}}}{property_name}")[0]
+        default = alt[0]
+        default.set("{http://www.w3.org/XML/1998/namespace}lang", language)
+        expected = default.text
+        alt.remove(default)
+        alt.append(default)
+        for info in (
+            {},
+            {"title" if property_name == "title" else "subject": "Updated"},
+        ):
+            result = _parse_xmp_bytes(
+                create_xmp_metadata(info, 2, "B", existing_xmp_tree=original)
+            )
+            items = result.find(f".//{{{NAMESPACES['dc']}}}{property_name}")[0]
+            languages = [
+                item.get("{http://www.w3.org/XML/1998/namespace}lang").casefold()
+                for item in items
+            ]
+            assert languages.count("x-default") == 1
+            assert languages[0] == "x-default"
+            assert items[0].text == ("Updated" if info else expected)
+
     @staticmethod
     def _values(tree: etree._Element, property_name: str) -> list[str]:
         """Read all simple values from a Dublin Core array in document order."""

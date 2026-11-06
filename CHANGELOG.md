@@ -14,6 +14,8 @@
 - Preserve custom DocInfo text fields, valid XMP provenance, translated titles/descriptions, and ordered author lists
 - Validate preserved XMP arrays, provenance fields, soft-mask transfer functions, calibrated color spaces, and additional OutputIntent dictionaries
 - Detect annotation color arrays when choosing profiles, normalize inline-image color abbreviations, and reuse equivalent overprint proofs for large documents
+- Match XMP default-language tags case-insensitively and restrict calibration validation to actual color contexts
+- Validate TrapNet appearances/tracking and collection/article structures before preserving them
 
 ### Tests
 
