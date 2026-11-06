@@ -25,7 +25,7 @@ _ICC_SIGNATURE_TO_COLORSPACE: dict[bytes, tuple[int, ColorSpaceType]] = {
 
 @dataclass(frozen=True)
 class OutputIntentPreparation:
-    """Decision from local OutputIntent preparation."""
+    """Preservation decision, with a color space if an output profile exists."""
 
     keep_existing: bool
     document_colorspace: ColorSpaceType | None = None
@@ -34,7 +34,7 @@ class OutputIntentPreparation:
 
 @dataclass(frozen=True)
 class _ValidOutputIntent:
-    """Locally validated PDF/A OutputIntent details."""
+    """Locally validated embedded OutputIntent profile details."""
 
     intent: Dictionary
     profile_data: bytes
@@ -44,10 +44,10 @@ class _ValidOutputIntent:
 def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
     """Validate and repair existing OutputIntents using fail-closed rules.
 
-    Existing PDF/A OutputIntents are kept only when every relevant local check
-    succeeds.  Repair is limited to deterministic, local fixes: removing
-    ``/DestOutputProfileRef`` from PDF/X intents and correcting missing or
-    wrong ICC stream ``/N`` values.
+    Keep compatible intent dictionaries and their individual printing metadata.
+    All embedded profiles must describe the same output condition. Byte-identical
+    profile streams are unified to the same indirect object (rule 6.2.3-2).
+    A PDF/A intent can be added using an existing compatible output profile.
     """
     output_intents = pdf.Root.get("/OutputIntents")
     if not isinstance(output_intents, Array) or len(output_intents) == 0:
@@ -57,6 +57,7 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
         )
 
     pdfa_intents: list[_ValidOutputIntent] = []
+    profiled_intents: list[_ValidOutputIntent] = []
     for intent_ref in output_intents:
         intent = _resolve_indirect(intent_ref)
         if not isinstance(intent, Dictionary):
@@ -66,53 +67,75 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
             )
 
         subtype = intent.get("/S")
+        if not isinstance(subtype, Name):
+            return OutputIntentPreparation(
+                keep_existing=False,
+                reason="OutputIntent subtype is missing or is not a name",
+            )
         if subtype == Name("/GTS_PDFX"):
             if "/DestOutputProfileRef" in intent:
                 del intent["/DestOutputProfileRef"]
                 logger.debug("Removed DestOutputProfileRef from PDF/X OutputIntent")
+        # DestOutputProfile is optional for non-PDF/A intents (for example a
+        # registered PDF/X printing condition). Rule 6.2.3-2 constrains the
+        # entries that actually contain an embedded profile.
+        if subtype != Name.GTS_PDFA1 and "/DestOutputProfile" not in intent:
             continue
-
-        if subtype != Name.GTS_PDFA1:
-            return OutputIntentPreparation(
-                keep_existing=False,
-                reason=f"Unhandled OutputIntent subtype: {subtype}",
-            )
 
         valid_intent = _validate_pdfa_output_intent(intent)
         if valid_intent is None:
             return OutputIntentPreparation(
                 keep_existing=False,
-                reason="PDF/A OutputIntent failed local validation",
+                reason="OutputIntent profile failed local validation",
             )
-        pdfa_intents.append(valid_intent)
+        profiled_intents.append(valid_intent)
+        if subtype == Name.GTS_PDFA1:
+            pdfa_intents.append(valid_intent)
 
-    if not pdfa_intents:
+    if not profiled_intents:
         return OutputIntentPreparation(
-            keep_existing=False,
-            reason="No valid PDF/A OutputIntent found",
+            keep_existing=True,
+            reason="Registered output conditions can accompany a new PDF/A profile",
         )
 
-    profile_datas = {intent.profile_data for intent in pdfa_intents}
-    color_spaces = {intent.document_colorspace for intent in pdfa_intents}
+    profile_datas = {intent.profile_data for intent in profiled_intents}
+    color_spaces = {intent.document_colorspace for intent in profiled_intents}
     if len(profile_datas) > 1 or len(color_spaces) > 1:
         logger.warning(
-            "Multiple PDF/A OutputIntents reference different ICC profiles. "
+            "Multiple OutputIntents reference different ICC profiles. "
             "Replacing existing OutputIntents."
         )
         return OutputIntentPreparation(
             keep_existing=False,
-            reason="Multiple PDF/A OutputIntents reference different ICC profiles",
+            reason="Multiple OutputIntents reference different ICC profiles",
         )
 
-    first_intent = pdfa_intents[0]
-    if len(output_intents) != 1:
-        pdf.Root.OutputIntents = Array([first_intent.intent])
-        logger.debug("Reduced OutputIntents to one valid PDF/A OutputIntent")
+    first_intent = (pdfa_intents or profiled_intents)[0]
+    shared_profile = first_intent.intent["/DestOutputProfile"]
+    for valid_intent in profiled_intents:
+        valid_intent.intent["/DestOutputProfile"] = shared_profile
+
+    if not pdfa_intents:
+        # Preserve a PDF/X (or other) output condition when converting to PDF/A;
+        # adding its PDF/A counterpart does not require discarding that intent.
+        pdfa_intent = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name.GTS_PDFA1,
+            OutputConditionIdentifier=first_intent.intent.get(
+                "/OutputConditionIdentifier", "Custom"
+            ),
+            DestOutputProfile=shared_profile,
+        )
+        for key in ("/OutputCondition", "/RegistryName", "/Info"):
+            if key in first_intent.intent:
+                pdfa_intent[key] = first_intent.intent[key]
+        output_intents.append(pdf.make_indirect(pdfa_intent))
+        logger.debug("Added PDF/A OutputIntent using the existing output profile")
 
     return OutputIntentPreparation(
         keep_existing=True,
         document_colorspace=first_intent.document_colorspace,
-        reason="Existing PDF/A OutputIntent is locally valid",
+        reason="Existing output conditions are compatible with PDF/A",
     )
 
 

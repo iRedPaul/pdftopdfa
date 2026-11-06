@@ -128,7 +128,7 @@ pdftopdfa -r -f --verbose ./documents/ ./output/
 | `--ocr-figure-text` | Use sufficiently confident OCR text as review-required `ActualText` for otherwise undescribed direct image Figures and mark OCR-rejected Figures as Layout artifacts; requires PDF/A-2a or PDF/A-3a and both model-directory options; see [OCR Figure Text](ocr.md#figure-text) |
 | `--deskew` | Straighten scan-like, raster-dominant pages; requires both model-directory options and implies `--ocr` |
 | `--rotate-pages` | Automatically orient pages with the bundled Paddle model; requires both model-directory options and implies `--ocr` |
-| `--convert-calibrated/--no-convert-calibrated` | Convert CalGray/CalRGB to ICCBased (default: enabled) |
+| `--convert-calibrated/--no-convert-calibrated` | Deprecated compatibility option (default: disabled); both preserve CalGray/CalRGB calibration, and `--convert-calibrated` emits a warning |
 | `--preserve-stamps` | Convert known proprietary stamp annotations to standard PDF Stamp annotations instead of flattening them |
 | `--skip-any-pdfa` | Skip inputs that veraPDF validates as any compliant PDF/A, regardless of target level |
 | `--allow-signature-invalidation` | Convert digitally signed PDFs even though conversion removes or invalidates their signatures |
@@ -219,11 +219,26 @@ def convert_to_pdfa(
     ocr_execution_provider: str = "cpu",
     ocr_layout: bool = False,
     ocr_figure_text: bool = False,
-    convert_calibrated: bool = True,
+    convert_calibrated: bool = False,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
 ) -> ConversionResult
 ```
+
+Valid CalGray and CalRGB color spaces are permitted by PDF/A and are preserved
+with their original calibration. The deprecated
+`convert_calibrated=True` option is accepted for compatibility, but emits a
+warning and also preserves them; it no longer substitutes generic ICC profiles.
+
+Compatible additional OutputIntents retain their printing information and share
+the embedded ICC profile when required. PDF/X, PDF/VT, and PDF/E identification
+claims are still removed from XMP because conversion does not revalidate those
+standards.
+
+ICCBased CMYK overprint is repaired at affected painting operations. If shared
+Forms, patterns, or Type3 glyphs require incompatible repairs in different
+contexts, conversion uses the original-input fallback described above and
+reports the reason in the result warnings.
 
 To run OCR, provide both external model directories. The pair enables OCR;
 `ocr_languages` defaults to `["en"]`:
@@ -393,7 +408,7 @@ def convert_directory(
     ocr_layout: bool = False,
     ocr_figure_text: bool = False,
     force_overwrite: bool = False,
-    convert_calibrated: bool = True,
+    convert_calibrated: bool = False,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
 ) -> list[ConversionResult]
@@ -438,7 +453,7 @@ def convert_files(
     force_overwrite: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,
-    convert_calibrated: bool = True,
+    convert_calibrated: bool = False,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
 ) -> list[ConversionResult]

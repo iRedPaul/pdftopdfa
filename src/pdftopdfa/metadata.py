@@ -176,15 +176,12 @@ _MANAGED_ELEMENTS = {
 # Attribute-form equivalents of managed elements (Clark notation)
 _MANAGED_ATTRS = _MANAGED_ELEMENTS
 
-# These xmpMM properties consistently fail veraPDF PDF/A-2/3 validation
-# (clause 6.6.2.3.1) even when copied verbatim from source files. Preserve
-# stable identifiers such as DocumentID/InstanceID, but strip the known
-# problematic fields from catalog and non-catalog XMP packets.
+# These properties are not supported by the predefined PDF/A XMP schemas.
+# History and DerivedFrom are supported structured properties; their values
+# are checked below rather than being discarded by name.
 _PDF_A_UNSAFE_PRESERVED_PROPERTIES = frozenset(
     {
         (NAMESPACES["xmpMM"], "OriginalDocumentID"),
-        (NAMESPACES["xmpMM"], "DerivedFrom"),
-        (NAMESPACES["xmpMM"], "History"),
         (NAMESPACES["exif"], "NativeDigest"),
         (NAMESPACES["tiff"], "NativeDigest"),
     }
@@ -1571,7 +1568,10 @@ def _validate_alt_lang(elem: etree._Element, ns_rdf: str) -> bool:
                     continue
                 if li.get(xml_lang) is None:
                     return False
-                if _clean_metadata_text(li.text) is None:
+                # Empty strings and literal text such as "None" are valid
+                # translations. A scalar cleanup heuristic must not discard
+                # their entire language array, including other translations.
+                if any(isinstance(grand.tag, str) for grand in li):
                     return False
                 valid_items += 1
             return valid_items > 0
@@ -1805,6 +1805,79 @@ def _get_extension_type_code(uri: str, local_name: str) -> str | None:
     return None
 
 
+def _is_valid_provenance_struct(elem: etree._Element, namespace: str) -> bool:
+    """Validate the fields of a ResourceRef or ResourceEvent struct.
+
+    XMP supports both parseType="Resource" and nested rdf:Description,
+    with fields expressed as elements or attributes. These representations
+    must not be mistaken for a simple string or a sequence of strings.
+    """
+    ns_rdf = NAMESPACES["rdf"]
+    children = [child for child in elem if isinstance(child.tag, str)]
+    if len(children) == 1 and children[0].tag == f"{{{ns_rdf}}}Description":
+        if _clean_metadata_text(elem.text) is not None:
+            return False
+        source = children[0]
+    else:
+        source = elem
+        if (
+            source.get(f"{{{ns_rdf}}}parseType") != "Resource"
+            and not children
+            and not any(key.startswith(f"{{{namespace}}}") for key in source.attrib)
+        ):
+            return False
+
+    if _clean_metadata_text(source.text) is not None:
+        return False
+    fields: dict[str, str] = {}
+    for key, value in source.attrib.items():
+        if key in {f"{{{ns_rdf}}}parseType", f"{{{ns_rdf}}}about"}:
+            continue
+        if not key.startswith(f"{{{namespace}}}"):
+            return False
+        fields[key] = value
+    for field in source:
+        if not isinstance(field.tag, str):
+            continue
+        if not field.tag.startswith(f"{{{namespace}}}"):
+            return False
+        if _clean_metadata_text(field.tail) is not None:
+            return False
+        if field.tag in fields:
+            return False
+        if field.tag == f"{{{NAMESPACES['stRef']}}}alternatePaths":
+            if not _validate_text_container(field, ns_rdf, "Seq"):
+                return False
+            continue
+        if len(field):
+            return False
+        fields[field.tag] = field.get(f"{{{ns_rdf}}}resource", field.text or "")
+
+    date_field = "when" if namespace == NAMESPACES["stEvt"] else "lastModifyDate"
+    date_value = fields.get(f"{{{namespace}}}{date_field}")
+    return date_value is None or _is_valid_simple_value(date_value.strip(), "d")
+
+
+def _is_valid_provenance_property(elem: etree._Element, local_name: str) -> bool:
+    """Check the defined ResourceRef / Seq ResourceEvent XMP value types."""
+    if local_name == "DerivedFrom":
+        return _is_valid_provenance_struct(elem, NAMESPACES["stRef"])
+    ns_rdf = NAMESPACES["rdf"]
+    containers = [child for child in elem if isinstance(child.tag, str)]
+    if (
+        _clean_metadata_text(elem.text) is not None
+        or len(containers) != 1
+        or containers[0].tag != f"{{{ns_rdf}}}Seq"
+    ):
+        return False
+    return all(
+        item.tag == f"{{{ns_rdf}}}li"
+        and _is_valid_provenance_struct(item, NAMESPACES["stEvt"])
+        for item in containers[0]
+        if isinstance(item.tag, str)
+    )
+
+
 def _is_valid_preserved_property(
     elem: etree._Element,
     uri: str,
@@ -1817,6 +1890,9 @@ def _is_valid_preserved_property(
     """
     if (uri, local_name) in _PDF_A_UNSAFE_PRESERVED_PROPERTIES:
         return False
+
+    if uri == _XMPMM and local_name in {"DerivedFrom", "History"}:
+        return _is_valid_provenance_property(elem, local_name)
 
     expected = _PREDEFINED_PROPERTY_TYPES.get((uri, local_name))
     if expected is None:
@@ -2189,6 +2265,9 @@ def _collect_preserved_elements(
                             attr_name,
                             attr_value,
                         )
+                        continue
+                    if a_uri == _XMPMM and a_local in {"History", "DerivedFrom"}:
+                        # These predefined properties require structured values.
                         continue
                     text = _clean_metadata_text(attr_value)
                     if text is None:
@@ -2627,6 +2706,20 @@ def _extract_array_xmp_property(
     return [simple] if simple is not None else []
 
 
+def _copy_valid_xmp_property(
+    tree: etree._Element | None,
+    namespace: str,
+    local_name: str,
+) -> etree._Element | None:
+    """Copy a valid top-level property without flattening its array values."""
+    property_name = f"{{{namespace}}}{local_name}"
+    for description in _iter_top_level_xmp_descriptions(tree):
+        for prop in description.findall(property_name):
+            if _is_valid_preserved_property(prop, namespace, local_name):
+                return copy.deepcopy(prop)
+    return None
+
+
 def create_xmp_metadata(
     info: dict[str, Any],
     pdfa_part: int,
@@ -2644,7 +2737,9 @@ def create_xmp_metadata(
 
     Non-managed properties from existing_xmp_tree are preserved
     (e.g. PDF/X, PDF/UA, PDF/E, PDF/VT identifications, custom
-    namespaces). Managed properties are always written fresh.
+    namespaces). Managed scalar properties are written fresh. Dublin Core
+    language alternatives and creator lists retain their additional values;
+    DocInfo text updates only the default language or the first creator.
 
     Args:
         info: Metadata dictionary from extract_pdf_info.
@@ -2706,18 +2801,26 @@ def create_xmp_metadata(
     author = _clean_metadata_text(info.get("author"))
     subject = _clean_metadata_text(info.get("subject"))
 
-    # dc:title/creator/description are managed properties, so they are not
-    # copied over from the existing XMP. Modern producers often store these
-    # values only in XMP (no DocInfo entries); fall back to the source XMP
-    # so they are not lost.
+    # DocInfo can represent only a single text value for these properties.
+    # Keep their richer XMP structures and synchronize only the corresponding
+    # default language or first creator, rather than replacing whole arrays.
     if title is None:
         title = _extract_lang_alt_xmp_property(existing_xmp_tree, ns_dc, "title")
     if title is None and pdfua:
         title = _clean_metadata_text(fallback_title) or "Untitled"
-    if author is None:
-        creators = _extract_array_xmp_property(existing_xmp_tree, ns_dc, "creator")
-        if creators:
-            author = ", ".join(creators)
+    creators = _extract_array_xmp_property(existing_xmp_tree, ns_dc, "creator")
+    if author is not None:
+        if not creators:
+            creators = [author]
+        elif author not in creators and author not in {
+            ", ".join(creators),
+            "; ".join(creators),
+        }:
+            # A genuinely different DocInfo /Author replaces the synchronized
+            # first creator only. Never split arbitrary names on punctuation,
+            # and keep independently listed co-authors. A textual reflection
+            # of the existing list must not become a single combined creator.
+            creators[0] = author
     if subject is None:
         subject = _extract_lang_alt_xmp_property(
             existing_xmp_tree, ns_dc, "description"
@@ -2736,18 +2839,39 @@ def create_xmp_metadata(
     )
 
     def _build_lang_alt(tag_name: str, text: str) -> etree._Element:
-        elem = dc(tag_name)
-        alt = etree.SubElement(elem, f"{{{ns_rdf}}}Alt")
-        li = etree.SubElement(alt, f"{{{ns_rdf}}}li")
-        li.set("{http://www.w3.org/XML/1998/namespace}lang", "x-default")
-        li.text = text
+        elem = _copy_valid_xmp_property(existing_xmp_tree, ns_dc, tag_name)
+        if elem is None:
+            elem = dc(tag_name)
+            alt = etree.SubElement(elem, f"{{{ns_rdf}}}Alt")
+        else:
+            alt = elem.find(f"{{{ns_rdf}}}Alt")
+            assert alt is not None
+        xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
+        default = next((li for li in alt if li.get(xml_lang) == "x-default"), None)
+        if default is None:
+            default = etree.Element(f"{{{ns_rdf}}}li")
+            default.set(xml_lang, "x-default")
+        else:
+            alt.remove(default)
+        default.text = text
+        alt.insert(0, default)
         return elem
 
-    def _build_seq(tag_name: str, text: str) -> etree._Element:
+    def _build_seq(tag_name: str, values: list[str]) -> etree._Element:
+        elem = _copy_valid_xmp_property(existing_xmp_tree, ns_dc, tag_name)
+        if elem is not None:
+            seq = elem.find(f"{{{ns_rdf}}}Seq")
+            assert seq is not None
+            items = seq.findall(f"{{{ns_rdf}}}li")
+            if len(items) == len(values):
+                for li, text in zip(items, values, strict=True):
+                    li.text = text
+                return elem
         elem = dc(tag_name)
         seq = etree.SubElement(elem, f"{{{ns_rdf}}}Seq")
-        li = etree.SubElement(seq, f"{{{ns_rdf}}}li")
-        li.text = text
+        for text in values:
+            li = etree.SubElement(seq, f"{{{ns_rdf}}}li")
+            li.text = text
         return elem
 
     # Build the RDF Description
@@ -2771,8 +2895,8 @@ def create_xmp_metadata(
     description.append(format_elem)
     if title is not None:
         description.append(_build_lang_alt("title", title))
-    if author is not None:
-        description.append(_build_seq("creator", author))
+    if creators:
+        description.append(_build_seq("creator", creators))
     if subject is not None:
         description.append(_build_lang_alt("description", subject))
 
@@ -3179,6 +3303,9 @@ def _sanitize_non_catalog_xmp_tree(tree: etree._Element) -> None:
                 del desc.attrib[attr_name]
                 continue
             if (uri, local) in _PDF_A_UNSAFE_PRESERVED_PROPERTIES:
+                del desc.attrib[attr_name]
+                continue
+            if uri == _XMPMM and local in {"History", "DerivedFrom"}:
                 del desc.attrib[attr_name]
                 continue
 
@@ -3753,9 +3880,10 @@ def sync_metadata(
         docinfo = None
 
     if docinfo is not None:
-        # Remove non-standard keys from DocInfo (PDF/A only allows standard keys)
+        # ISO 32000-1, 14.3.3 permits custom DocInfo entries with text-string
+        # values. Preserve those alongside the standard fields synchronized below.
         try:
-            allowed_keys = {
+            standard_keys = {
                 "/Title",
                 "/Author",
                 "/Subject",
@@ -3767,11 +3895,15 @@ def sync_metadata(
                 "/Trapped",
             }
             for key in list(docinfo.keys()):
-                if key not in allowed_keys:
+                if key not in standard_keys and not isinstance(
+                    docinfo[key], pikepdf.String
+                ):
                     del docinfo[key]
-                    logger.debug("Removed non-standard key %s from DocInfo", key)
+                    logger.warning(
+                        "Removed custom DocInfo entry %s with a non-text value", key
+                    )
         except Exception as e:
-            logger.warning("Error removing non-standard DocInfo keys: %s", e)
+            logger.warning("Error validating custom DocInfo values: %s", e)
 
         # Synchronize standard DocInfo fields with the metadata we decided to keep.
         try:

@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Changes
+
+- Preserve CalGray/CalRGB calibration by default; retain `convert_calibrated=True` and `--convert-calibrated` as deprecated compatibility options that warn and preserve the original colors
+
+### Bug Fixes
+
+- Preserve permitted soft-mask transfer functions and avoid changing valid overprint behavior in unrelated graphics contexts
+- Preserve annotation colors, valid opacity values, and PDF/A-2/3 TrapNet annotations
+- Retain PDF portfolios, article threads, and compatible additional OutputIntents
+- Preserve custom DocInfo text fields, valid XMP provenance, translated titles/descriptions, and ordered author lists
+
+### Tests
+
+- Validate feature preservation through complete PDF/A-2b/PDF/A-3b conversions using the pinned veraPDF CI installation
+
 ## [0.9.25] - 2026-11-06
 
 ### Changes

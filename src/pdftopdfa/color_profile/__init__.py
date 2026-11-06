@@ -144,7 +144,7 @@ def embed_color_profiles(
     level: str = "3b",
     *,
     replace_existing: bool = True,
-    convert_calibrated: bool = True,
+    convert_calibrated: bool = False,
 ) -> list[ColorSpaceType]:
     """
     Detect color spaces and embed appropriate ICC profiles.
@@ -155,10 +155,11 @@ def embed_color_profiles(
     Args:
         pdf: pikepdf Pdf object to modify.
         level: PDF/A conformance level.
-        replace_existing: If True, replace existing OutputIntents.
+        replace_existing: If True, repair or replace incompatible OutputIntents
+            while retaining compatible output conditions.
             If False and OutputIntents exist, do nothing.
-        convert_calibrated: If True, convert CalGray/CalRGB color spaces
-            to ICCBased equivalents.
+        convert_calibrated: Deprecated compatibility option. If True, warn and
+            preserve CalGray/CalRGB calibration unchanged.
 
     Returns:
         List of color space types that were embedded.
@@ -169,14 +170,16 @@ def embed_color_profiles(
     level = validate_pdfa_level(level)
 
     existing_output_intent_colorspace: ColorSpaceType | None = None
+    retained_output_intents = Array()
     if has_output_intent(pdf):
         if replace_existing:
             output_intent_preparation = prepare_existing_output_intents(pdf)
             if output_intent_preparation.keep_existing:
+                retained_output_intents = pdf.Root.OutputIntents
                 existing_output_intent_colorspace = (
                     output_intent_preparation.document_colorspace
                 )
-                logger.info("Keeping existing PDF/A OutputIntent")
+                logger.info("Keeping compatible existing OutputIntents")
             else:
                 logger.info(
                     "Replacing existing OutputIntents: %s",
@@ -195,8 +198,10 @@ def embed_color_profiles(
         detected = {ColorSpaceType.DEVICE_RGB}
         logger.debug("No color spaces detected, using default sRGB")
 
-    # PDF/A allows only a single OutputIntent with S=GTS_PDFA1
-    # Select dominant color space by priority: CMYK > RGB > Gray
+    # Add a PDF/A intent when none carries a usable profile. Compatible existing
+    # intents remain intact; all embedded profiles share one indirect object
+    # (ISO 19005-2/3, 6.2.3-2).
+    # Select a new dominant color space by priority: CMYK > RGB > Gray.
     if ColorSpaceType.DEVICE_CMYK in detected:
         dominant = ColorSpaceType.DEVICE_CMYK
     elif ColorSpaceType.DEVICE_RGB in detected:
@@ -220,7 +225,8 @@ def embed_color_profiles(
         output_intent = create_output_intent_for_colorspace(
             pdf, dominant, profile_data, level
         )
-        pdf.Root.OutputIntents = Array([pdf.make_indirect(output_intent)])
+        retained_output_intents.append(pdf.make_indirect(output_intent))
+        pdf.Root.OutputIntents = retained_output_intents
 
     # Cover non-dominant Device color spaces with contextual Default entries.
     # Note: Separation/DeviceN spaces are not converted - they are PDF/A-2/3
@@ -247,7 +253,7 @@ def embed_color_profiles(
     if tg_fixed > 0:
         logger.info("Transparency group /CS fixed: %d", tg_fixed)
 
-    # Optionally convert CalGray/CalRGB -> ICCBased
+    # Honor the legacy option without discarding valid color calibration.
     if convert_calibrated:
         _convert_calibrated_colorspaces(pdf, icc_stream_cache)
 

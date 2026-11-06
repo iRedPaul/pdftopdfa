@@ -64,6 +64,7 @@ from .sanitizers import (
     sanitize_truetype_encoding,
 )
 from .sanitizers.catalog import _is_valid_bcp47
+from .sanitizers.extgstate import sanitize_overprint_usage
 from .staging import (
     copy_to_private_stage,
     private_staging_directory,
@@ -1987,7 +1988,7 @@ def convert_to_pdfa(
     ocr_execution_provider: str = "cpu",
     ocr_layout: bool = False,
     ocr_figure_text: bool = False,
-    convert_calibrated: bool = True,
+    convert_calibrated: bool = False,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
     _allow_output_overwrite: bool = True,
@@ -2038,7 +2039,8 @@ def convert_to_pdfa(
             mark OCR-rejected Figures as Layout artifacts. Images with a soft
             mask (``/SMask``) are recognized as composited in front of white
             and follow the same rule.
-        convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
+        convert_calibrated: Deprecated compatibility option. If True, warn and
+            preserve CalGray/CalRGB calibration unchanged.
         preserve_stamps: If True, known proprietary stamp annotations are
             normalized to standard ``/Stamp`` annotations instead of being
             flattened into page content.
@@ -2740,29 +2742,42 @@ def convert_to_pdfa(
         embedded_spaces = embed_color_profiles(
             pdf, level, convert_calibrated=convert_calibrated
         )
+        # Installing DefaultCMYK may turn DeviceCMYK paints into ICCBased
+        # CMYK after the first sanitizer pass. Check their effective state
+        # again instead of publishing newly prohibited OPM=1 combinations.
+        late_overprint_fixes = sanitize_overprint_usage(pdf)
+        if late_overprint_fixes:
+            sanitize_result["extgstate_fixed"] = (
+                sanitize_result.get("extgstate_fixed", 0) + late_overprint_fixes
+            )
+            warnings.append(
+                f"{late_overprint_fixes} ICCBased CMYK overprint paint(s) repaired "
+                "after color-profile embedding"
+            )
         if len(embedded_spaces) > 1:
             warnings.append(
                 "Multiple color spaces handled: "
                 f"{', '.join(cs.value for cs in embedded_spaces)}"
             )
 
-        # embed_color_profiles() keeps at most a single PDF/A OutputIntent,
-        # so any PDF/X OutputIntent is gone. Remove a stale PDF/X claim from
-        # the XMP so the file does not assert PDF/X without its OutputIntent.
+        # Compatible OutputIntents are retained, but that alone does not prove
+        # PDF/X, PDF/VT or PDF/E conformance after rewriting fonts, content and
+        # the PDF version. Keep the printing metadata without asserting that
+        # these additional standards have been revalidated by this pipeline.
         if remove_pdfx_identification(pdf):
             warnings.append(
                 "PDF/X identification removed from XMP metadata "
-                "(PDF/X OutputIntent not preserved)"
+                "(PDF/X conformance is not revalidated)"
             )
         if remove_pdfvt_identification(pdf):
             warnings.append(
                 "PDF/VT identification removed from XMP metadata "
-                "(required PDF/X conformance not preserved)"
+                "(PDF/VT conformance is not revalidated)"
             )
         if remove_pdfe_identification(pdf):
             warnings.append(
                 "PDF/E identification removed from XMP metadata "
-                "(required DocInfo identification not preserved)"
+                "(PDF/E conformance is not revalidated)"
             )
 
         # Final pass for structural limits:
@@ -3344,7 +3359,7 @@ def convert_files(
     force_overwrite: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,
-    convert_calibrated: bool = True,
+    convert_calibrated: bool = False,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
 ) -> list[ConversionResult]:
@@ -3539,7 +3554,7 @@ def convert_directory(
     ocr_layout: bool = False,
     ocr_figure_text: bool = False,
     force_overwrite: bool = False,
-    convert_calibrated: bool = True,
+    convert_calibrated: bool = False,
     preserve_stamps: bool = False,
     allow_signature_invalidation: bool = False,
 ) -> list[ConversionResult]:

@@ -3283,10 +3283,10 @@ class TestConvertToPdfa:
             )
 
     @pytest.mark.parametrize("level", ["2a", "3a"])
-    def test_convert_level_a_removes_pdfe_claim_after_docinfo_cleanup(
+    def test_convert_level_a_preserves_pdfe_marker_but_removes_unverified_claim(
         self, sample_pdf: Path, tmp_dir: Path, level: str
     ) -> None:
-        """Dropping PDF/E's required DocInfo marker also drops its XMP claim."""
+        """Keep custom source metadata without claiming revalidated PDF/E output."""
         input_path = tmp_dir / f"claimed_pdfe_{level}.pdf"
         output_path = tmp_dir / f"without_pdfe_{level}.pdf"
         xmp = f"""\
@@ -3310,7 +3310,7 @@ class TestConvertToPdfa:
             "PDF/E identification removed" in warning for warning in result.warnings
         )
         with Pdf.open(output_path) as pdf:
-            assert "/ISO_PDFEVersion" not in pdf.docinfo
+            assert str(pdf.docinfo["/ISO_PDFEVersion"]) == "PDF/E-1"
             assert all(
                 standard.standard != "PDF/E" for standard in detect_iso_standards(pdf)
             )

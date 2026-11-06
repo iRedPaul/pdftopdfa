@@ -4,7 +4,7 @@
 
 """Extended Graphics State sanitization for PDF/A compliance.
 
-ISO 19005-2, Section 6.2.8 forbids certain ExtGState entries:
+ISO 19005-2, Section 6.2.5 forbids certain ExtGState entries:
 - /TR (transfer function) — always forbidden
 - /TR2 — forbidden unless value is /Default
 - /HTP (halftone phase) — always forbidden
@@ -24,6 +24,7 @@ from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
+from .overprint import sanitize_overprint
 from .rendering_intent import VALID_RENDERING_INTENTS
 
 # Valid blend modes per PDF Reference 1.7, Table 136
@@ -149,6 +150,25 @@ def _resources_use_iccbased_cmyk(
                 if cs and _colorspace_uses_iccbased_cmyk(cs, visited):
                     return True
 
+    shadings = resources.get("/Shading")
+    if isinstance(shadings, Dictionary):
+        for shading in shadings.values():
+            if isinstance(
+                shading, (Dictionary, Stream)
+            ) and _colorspace_uses_iccbased_cmyk(shading.get("/ColorSpace"), visited):
+                return True
+
+    patterns = resources.get("/Pattern")
+    if isinstance(patterns, Dictionary):
+        for pattern in patterns.values():
+            if not isinstance(pattern, Dictionary):
+                continue
+            shading = pattern.get("/Shading")
+            if isinstance(
+                shading, (Dictionary, Stream)
+            ) and _colorspace_uses_iccbased_cmyk(shading.get("/ColorSpace"), visited):
+                return True
+
     return False
 
 
@@ -209,9 +229,11 @@ def _overprint_enabled(gs_dict: Dictionary, key: str) -> bool:
 
 
 def _pdf_enables_overprint(pdf: Pdf) -> bool:
-    """Return True when any reachable graphics state enables overprint."""
+    """Return whether reachable state entries can enable overprint with OPM 1."""
     stack = [pdf.Root]
     visited: set[tuple[int, int]] = set()
+    overprint = False
+    mode_one = False
 
     while stack:
         try:
@@ -224,6 +246,10 @@ def _pdf_enables_overprint(pdf: Pdf) -> bool:
 
             if isinstance(obj, (Dictionary, Stream)):
                 if _overprint_enabled(obj, "/OP") or _overprint_enabled(obj, "/op"):
+                    overprint = True
+                if obj.get("/OPM") == 1:
+                    mode_one = True
+                if overprint and mode_one:
                     return True
                 stack.extend(obj.values())
             elif isinstance(obj, Array):
@@ -272,7 +298,7 @@ def _sanitize_smask_dict(gs_dict: Dictionary, smask_dict: Dictionary) -> int:
     Per PDF Reference 1.7 Table 144:
     - /S (required): must be /Alpha or /Luminosity
     - /G (required): must be a Stream (Form XObject)
-    - /TR: forbidden in PDF/A (ISO 19005-2, 6.2.8)
+    - /TR (optional): preserve the soft-mask transfer function
     - /BC (optional): if present, must be an Array
 
     If a required entry is invalid or missing, the SMask is replaced
@@ -318,11 +344,9 @@ def _sanitize_smask_dict(gs_dict: Dictionary, smask_dict: Dictionary) -> int:
         )
         return 1
 
-    # /TR is forbidden in PDF/A (ISO 19005-2, 6.2.8)
-    if "/TR" in smask_dict:
-        del smask_dict["/TR"]
-        fixes += 1
-        logger.debug("Removed forbidden /TR from SMask dictionary")
+    # ISO 19005-2/3, 6.2.5 prohibits /TR in an ExtGState dictionary only.
+    # A soft mask's /TR is a separate, permitted opacity mapping. Removing
+    # it would change the mask and therefore the rendered page appearance.
 
     # /BC must be an Array if present
     if "/BC" in smask_dict:
@@ -450,7 +474,7 @@ def _sanitize_halftone_dict(
     return fixes, True
 
 
-def _sanitize_gs_dict(gs_dict: Dictionary, reset_opm: bool) -> int:
+def _sanitize_gs_dict(gs_dict: Dictionary) -> int:
     """Check and remove forbidden entries from a single ExtGState dictionary.
 
     Args:
@@ -466,22 +490,6 @@ def _sanitize_gs_dict(gs_dict: Dictionary, reset_opm: bool) -> int:
         del gs_dict["/TR"]
         removed += 1
         logger.debug("Removed forbidden /TR from ExtGState")
-
-    # PDF/A 6.2.4.2:
-    # OPM=1 is forbidden with ICCBased CMYK when overprint is enabled.
-    # Both the colour space and overprint flags are intentionally checked
-    # document-wide. Graphics-state parameters persist independently, so an
-    # /OPM value and /OP or /op may be supplied by different ExtGState
-    # dictionaries or inherited across a nested content stream.
-    if reset_opm and "/OPM" in gs_dict:
-        try:
-            opm = int(_resolve_indirect(gs_dict["/OPM"]))
-        except Exception:
-            opm = 0
-        if opm == 1:
-            gs_dict["/OPM"] = 0
-            removed += 1
-            logger.debug("Set /OPM to 0 due to ICCBased CMYK with overprint enabled")
 
     # /TR2 is forbidden unless value is /Default
     if "/TR2" in gs_dict:
@@ -590,7 +598,7 @@ def _sanitize_gs_dict(gs_dict: Dictionary, reset_opm: bool) -> int:
     return removed
 
 
-def _process_extgstate_dict(extgstate_dict, reset_opm: bool) -> int:
+def _process_extgstate_dict(extgstate_dict) -> int:
     """Iterate all entries in an /ExtGState resource dictionary.
 
     Args:
@@ -608,7 +616,7 @@ def _process_extgstate_dict(extgstate_dict, reset_opm: bool) -> int:
     for gs_name in list(extgstate_dict.keys()):
         gs = _resolve_indirect(extgstate_dict[gs_name])
         if isinstance(gs, Dictionary):
-            removed += _sanitize_gs_dict(gs, reset_opm)
+            removed += _sanitize_gs_dict(gs)
 
     return removed
 
@@ -681,7 +689,7 @@ def _sanitize_shadings_in_resources(resources) -> int:
     return removed
 
 
-def _process_resources(resources, reset_opm: bool) -> int:
+def _process_resources(resources) -> int:
     """Extract /ExtGState from a Resources dictionary and process it.
 
     Args:
@@ -698,7 +706,7 @@ def _process_resources(resources, reset_opm: bool) -> int:
 
     extgstate = resources.get("/ExtGState")
     if extgstate:
-        removed += _process_extgstate_dict(extgstate, reset_opm)
+        removed += _process_extgstate_dict(extgstate)
 
     # Remove /TR and /TR2 from Shading dictionaries (ISO 19005-2, §6.2.5)
     removed += _sanitize_shadings_in_resources(resources)
@@ -706,10 +714,17 @@ def _process_resources(resources, reset_opm: bool) -> int:
     return removed
 
 
+def sanitize_overprint_usage(pdf: Pdf) -> int:
+    """Repair actual ICCBased CMYK overprint, including newly installed defaults."""
+    if _pdf_uses_iccbased_cmyk(pdf) and _pdf_enables_overprint(pdf):
+        return sanitize_overprint(pdf)
+    return 0
+
+
 def sanitize_extgstate(pdf: Pdf) -> dict[str, int]:
     """Sanitize Extended Graphics State dictionaries for PDF/A compliance.
 
-    Removes forbidden entries per ISO 19005-2, Section 6.2.8:
+    Removes forbidden entries per ISO 19005-2, Section 6.2.5:
     - /TR (transfer function)
     - /TR2 (unless /Default)
     - /HTP (halftone phase)
@@ -729,13 +744,17 @@ def sanitize_extgstate(pdf: Pdf) -> dict[str, int]:
     Returns:
         Dictionary with key 'extgstate_fixed': number of entries removed.
     """
-    reset_opm = _pdf_uses_iccbased_cmyk(pdf) and _pdf_enables_overprint(pdf)
     total_removed = 0
     for resources in _iter_resource_dictionaries(pdf):
         try:
-            total_removed += _process_resources(resources, reset_opm)
+            total_removed += _process_resources(resources)
         except Exception as e:
             log_suppressed_error(logger, e, "Error sanitizing ExtGState: %s", e)
+
+    # Resource presence is only a cheap preflight. The overprint pass resolves
+    # actual graphics state at each paint and never edits shared /OPM entries.
+    # Keep ConversionError outside the best-effort dictionary cleanup above.
+    total_removed += sanitize_overprint_usage(pdf)
 
     if total_removed > 0:
         logger.info("ExtGState sanitized: %d forbidden entries removed", total_removed)

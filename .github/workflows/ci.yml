@@ -119,3 +119,10 @@ jobs:
           python -m pytest tests/test_converter.py
           -k "convert_pdfua_passes_both_verapdf_profiles"
           --no-cov
+
+      - name: PDF/A feature preservation gate
+        env:
+          VERAPDF_PATH: ${{ runner.temp }}/verapdf/verapdf
+        run: >-
+          python -m pytest tests/test_pdfa_preservation_e2e.py
+          tests/test_overprint_pipeline.py --no-cov

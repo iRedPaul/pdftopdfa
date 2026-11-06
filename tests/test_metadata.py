@@ -756,24 +756,63 @@ class TestSyncMetadata:
         xmp_bytes = bytes(pdf.Root.Metadata.read_bytes())
         assert b"Trapped" not in xmp_bytes
 
-    def test_sync_removes_non_standard_docinfo_keys(
-        self, sample_pdf_bytes: bytes
+    @pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
+    def test_sync_preserves_custom_docinfo_text_after_save(
+        self, sample_pdf_bytes: bytes, tmp_path: Path, level: str
     ) -> None:
-        """sync_metadata removes non-standard keys from DocInfo."""
+        """Custom text metadata survives synchronization and PDF serialization."""
         from io import BytesIO
 
         pdf = open_pdf(BytesIO(sample_pdf_bytes))
         pdf.docinfo["/Title"] = "My Title"
         pdf.docinfo["/Author"] = "My Author"
+        custom_info = {
+            "/Company": "Acme Corp",
+            "/Department": "Forschung / Entwicklung \u2013 \u6771\u4eac",
+            "/SourceModified": "D:20200101",
+            "/EmptyCustomValue": "",
+        }
+        for key, value in custom_info.items():
+            pdf.docinfo[key] = value
+
+        sync_metadata(pdf, level)
+
+        output_path = tmp_path / "custom_docinfo.pdf"
+        pdf.save(output_path)
+        with Pdf.open(output_path) as reopened:
+            assert str(reopened.docinfo["/Title"]) == "My Title"
+            assert str(reopened.docinfo["/Author"]) == "My Author"
+            for key, value in custom_info.items():
+                assert str(reopened.docinfo[key]) == value
+
+    @pytest.mark.parametrize(
+        "invalid_value",
+        [42, True, Name("/Acme"), Array([1, 2]), Dictionary(Value="Acme")],
+        ids=["integer", "boolean", "name", "array", "dictionary"],
+    )
+    def test_sync_removes_only_non_text_custom_docinfo(
+        self,
+        sample_pdf_bytes: bytes,
+        invalid_value: object,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Invalid custom value types are reported without losing valid text."""
+        from io import BytesIO
+
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
         pdf.docinfo["/Company"] = "Acme Corp"
-        pdf.docinfo["/SourceModified"] = "D:20200101"
+        pdf.docinfo["/InvalidCustomValue"] = invalid_value
+        pdf.docinfo["/Trapped"] = Name("/False")
 
-        sync_metadata(pdf, "2b")
+        with caplog.at_level(logging.WARNING, logger="pdftopdfa.metadata"):
+            sync_metadata(pdf, "3b")
 
-        assert "/Title" in pdf.docinfo
-        assert "/Author" in pdf.docinfo
-        assert "/Company" not in pdf.docinfo
-        assert "/SourceModified" not in pdf.docinfo
+        assert str(pdf.docinfo["/Company"]) == "Acme Corp"
+        assert "/InvalidCustomValue" not in pdf.docinfo
+        assert pdf.docinfo["/Trapped"] == Name("/False")
+        assert "custom DocInfo entry /InvalidCustomValue with a non-text value" in (
+            caplog.text
+        )
 
     def test_sync_preserves_keywords_in_docinfo(self, sample_pdf_bytes: bytes) -> None:
         """Preserves /Keywords in DocInfo, writes pdf:Keywords to XMP."""
@@ -1216,8 +1255,8 @@ class TestXmpPreservation:
         assert [elem.text for elem in result.iter(tag)] == ["EN 16931"]
         assert all(tag not in description.attrib for description in descriptions)
 
-    def test_problematic_xmpmm_properties_stripped(self) -> None:
-        """PDF/A-unsafe xmpMM properties are dropped during preservation."""
+    def test_predefined_xmpmm_provenance_preserved(self) -> None:
+        """Structured provenance survives while unsupported identifiers are dropped."""
         ns_rdf = NAMESPACES["rdf"]
         ns_xmpmm = NAMESPACES["xmpMM"]
         ns_stref = NAMESPACES["stRef"]
@@ -1261,8 +1300,10 @@ class TestXmpPreservation:
         assert "xmpMM:DocumentID" in xmp_str
         assert "xmpMM:InstanceID" in xmp_str
         assert "xmpMM:OriginalDocumentID" not in xmp_str
-        assert "xmpMM:DerivedFrom" not in xmp_str
-        assert "xmpMM:History" not in xmp_str
+        assert "xmpMM:DerivedFrom" in xmp_str
+        assert "xmpMM:History" in xmp_str
+        assert "uuid:src-inst" in xmp_str
+        assert "2024-01-01T00:00:00Z" in xmp_str
 
     def test_xmpmm_instance_id_is_refreshed(self) -> None:
         """Existing xmpMM:InstanceID is replaced for the new PDF instance."""
@@ -1501,7 +1542,11 @@ class TestXmpOnlyDublinCoreFallback:
             pdfa_conformance="B",
             existing_xmp_tree=tree,
         )
-        assert b"Alice, Bob" in xmp
+        parsed = _parse_xmp_bytes(xmp)
+        assert parsed is not None
+        assert parsed.xpath(
+            "//dc:creator/rdf:Seq/rdf:li/text()", namespaces=NAMESPACES
+        ) == ["Alice", "Bob"]
 
     def test_xmp_only_description_preserved(self) -> None:
         """dc:description from source XMP is kept when DocInfo has no /Subject."""
@@ -1552,7 +1597,7 @@ class TestXmpOnlyDublinCoreFallback:
             existing_xmp_tree=tree,
         )
         assert b"Default Title" in xmp
-        assert b"Deutscher Titel" not in xmp
+        assert b"Deutscher Titel" in xmp
 
     def test_lang_alt_falls_back_to_first_language(self) -> None:
         """Without an x-default entry, the first language entry is used."""
@@ -1583,6 +1628,158 @@ class TestXmpOnlyDublinCoreFallback:
         assert b"<dc:title" not in xmp
         assert b"<dc:creator" not in xmp
         assert b"<dc:description" not in xmp
+
+
+class TestDublinCoreMultivaluePreservation:
+    """DocInfo synchronization must not flatten richer Dublin Core arrays."""
+
+    @staticmethod
+    def _source_tree() -> etree._Element:
+        return _build_xmp_with_extras(
+            "<dc:title><rdf:Alt>"
+            '<rdf:li xml:lang="x-default">Report</rdf:li>'
+            '<rdf:li xml:lang="de-DE">Bericht</rdf:li>'
+            '<rdf:li xml:lang="fr-FR">Rapport</rdf:li>'
+            "</rdf:Alt></dc:title>"
+            "<dc:description><rdf:Alt>"
+            '<rdf:li xml:lang="x-default">Details</rdf:li>'
+            '<rdf:li xml:lang="de-DE">Einzelheiten</rdf:li>'
+            "</rdf:Alt></dc:description>"
+            "<dc:creator><rdf:Seq>"
+            "<rdf:li>Alice</rdf:li><rdf:li>Bob</rdf:li>"
+            "</rdf:Seq></dc:creator>"
+        )
+
+    @staticmethod
+    def _values(tree: etree._Element, property_name: str) -> list[str]:
+        return tree.xpath(
+            f"//dc:{property_name}/*/rdf:li/text()", namespaces=NAMESPACES
+        )
+
+    @pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
+    @pytest.mark.parametrize("with_docinfo", [False, True])
+    def test_sync_preserves_arrays_after_save_and_repeat(
+        self, level: str, with_docinfo: bool, tmp_path: Path
+    ) -> None:
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        tree = self._source_tree()
+        embed_xmp_metadata(pdf, _reserialize_xmp(tree))
+        if with_docinfo:
+            pdf.docinfo["/Title"] = "Report"
+            pdf.docinfo["/Subject"] = "Details"
+            pdf.docinfo["/Author"] = "Alice, Bob"
+
+        sync_metadata(pdf, level)
+        path = tmp_path / "preserved.pdf"
+        pdf.save(path)
+        with open_pdf(path) as restored:
+            # A second synchronization must not collapse the arrays either.
+            sync_metadata(restored, level)
+            result = _extract_existing_xmp(restored)
+            assert result is not None
+            for name in ("title", "description", "creator"):
+                assert self._values(result, name) == self._values(tree, name)
+            assert result.xpath(
+                "//dc:title/rdf:Alt/rdf:li/@xml:lang", namespaces=NAMESPACES
+            ) == ["x-default", "de-DE", "fr-FR"]
+            if with_docinfo:
+                assert str(restored.docinfo["/Author"]) == "Alice, Bob"
+
+    @pytest.mark.parametrize(
+        "author", [None, "Alice", "Bob", "Alice, Bob", "Alice; Bob"]
+    )
+    def test_existing_author_reflection_preserves_sequence(self, author) -> None:
+        xmp = create_xmp_metadata(
+            {"author": author}, 2, "B", existing_xmp_tree=self._source_tree()
+        )
+        tree = _parse_xmp_bytes(xmp)
+        assert tree is not None
+        assert self._values(tree, "creator") == ["Alice", "Bob"]
+
+    @pytest.mark.parametrize("property_name", ["title", "description"])
+    @pytest.mark.parametrize("translation", ["", "None", "null", "  texte  "])
+    def test_literal_translation_does_not_discard_other_languages(
+        self, property_name: str, translation: str
+    ) -> None:
+        original = self._source_tree()
+        items = original.xpath(
+            f"//dc:{property_name}/rdf:Alt/rdf:li", namespaces=NAMESPACES
+        )
+        items[1].text = translation
+        expected = [
+            (item.get("{http://www.w3.org/XML/1998/namespace}lang"), item.text or "")
+            for item in items
+        ]
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        embed_xmp_metadata(pdf, _reserialize_xmp(original))
+        for level in ("2b", "3b"):
+            sync_metadata(pdf, level)
+            result = _extract_existing_xmp(pdf)
+            actual = result.xpath(
+                f"//dc:{property_name}/rdf:Alt/rdf:li", namespaces=NAMESPACES
+            )
+            assert [
+                (
+                    item.get("{http://www.w3.org/XML/1998/namespace}lang"),
+                    item.text or "",
+                )
+                for item in actual
+            ] == expected
+
+    def test_overrides_update_default_and_first_creator_only(self) -> None:
+        original = self._source_tree()
+        original_bytes = etree.tostring(original)
+        xmp = create_xmp_metadata(
+            {"title": "New report", "subject": "New details", "author": "Doe, Jane"},
+            3,
+            "B",
+            existing_xmp_tree=original,
+        )
+        result = _parse_xmp_bytes(xmp)
+        assert result is not None
+        assert self._values(result, "title") == ["New report", "Bericht", "Rapport"]
+        assert self._values(result, "description") == ["New details", "Einzelheiten"]
+        assert self._values(result, "creator") == ["Doe, Jane", "Bob"]
+        assert etree.tostring(original) == original_bytes
+
+    def test_original_snapshot_keeps_arrays_when_current_metadata_changed(self) -> None:
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        source_tree = self._source_tree()
+        # Simulate metadata overwritten by an intermediate producer such as OCR.
+        pdf.docinfo["/Title"] = "Temporary title"
+        pdf.docinfo["/Author"] = "Intermediate tool"
+        sync_metadata(pdf, "3b")
+        sync_metadata(
+            pdf,
+            "3b",
+            source_info={"title": "Report", "subject": "Details", "author": "Alice"},
+            source_xmp_tree=source_tree,
+        )
+        result = _extract_existing_xmp(pdf)
+        assert result is not None
+        for name in ("title", "description", "creator"):
+            assert self._values(result, name) == self._values(source_tree, name)
+        assert str(pdf.docinfo["/Title"]) == "Report"
+        assert str(pdf.docinfo["/Author"]) == "Alice"
+
+    def test_missing_default_adds_fallback_without_losing_translation(self) -> None:
+        source_tree = _build_xmp_with_extras(
+            "<dc:title><rdf:Alt>"
+            '<rdf:li xml:lang="de-DE">Bericht</rdf:li>'
+            '<rdf:li xml:lang="fr-FR">Rapport</rdf:li>'
+            "</rdf:Alt></dc:title>"
+        )
+        result = _parse_xmp_bytes(
+            create_xmp_metadata({}, 2, "B", existing_xmp_tree=source_tree)
+        )
+        assert result is not None
+        assert self._values(result, "title") == ["Bericht", "Bericht", "Rapport"]
+        assert result.xpath(
+            "//dc:title/rdf:Alt/rdf:li/@xml:lang", namespaces=NAMESPACES
+        ) == ["x-default", "de-DE", "fr-FR"]
 
 
 class TestExtractExistingXmp:
@@ -3369,6 +3566,134 @@ class TestNamespacePrefixSerialization:
         assert xmpmm_count <= 1
 
 
+class TestProvenancePreservation:
+    """Keep typed provenance in both document and object metadata packets."""
+
+    @staticmethod
+    def _packet(properties: str) -> etree._Element:
+        return etree.fromstring(
+            f'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            f'<rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}" '
+            f'xmlns:xmpMM="{NAMESPACES["xmpMM"]}" '
+            f'xmlns:stRef="{NAMESPACES["stRef"]}" '
+            f'xmlns:stEvt="{NAMESPACES["stEvt"]}">'
+            f'<rdf:Description rdf:about="">{properties}</rdf:Description>'
+            "</rdf:RDF></x:xmpmeta>"
+        )
+
+    @staticmethod
+    def _roundtrip(pdf: Pdf, tree: etree._Element, level: str, location: str, path):
+        stream = pdf.make_stream(_reserialize_xmp(tree))
+        stream.Type = Name.Metadata
+        stream.Subtype = Name.XML
+        owner = pdf.Root if location == "catalog" else pdf.pages[0].obj
+        owner.Metadata = stream
+        sync_metadata(pdf, level)
+        pdf.save(path)
+        with pikepdf.open(path) as reopened:
+            owner = reopened.Root if location == "catalog" else reopened.pages[0].obj
+            result = _parse_xmp_bytes(owner.Metadata.read_bytes())
+        assert result is not None
+        return result
+
+    @pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
+    @pytest.mark.parametrize("location", ["catalog", "page"])
+    @pytest.mark.parametrize("structure", ["parse_type", "description", "attributes"])
+    def test_valid_provenance_survives_save_reopen(
+        self, level, location, structure, tmp_path
+    ) -> None:
+        ref_fields = (
+            "<stRef:instanceID>uuid:source</stRef:instanceID>"
+            "<stRef:alternatePaths><rdf:Seq>"
+            "<rdf:li>file:///source.pdf</rdf:li>"
+            "<rdf:li>https://example.org/source.pdf</rdf:li>"
+            "</rdf:Seq></stRef:alternatePaths>"
+        )
+        event_fields = (
+            "<stEvt:action>saved</stEvt:action>"
+            "<stEvt:when>2024-01-01T00:00:00Z</stEvt:when>"
+        )
+        if structure == "parse_type":
+            ref = f'<xmpMM:DerivedFrom rdf:parseType="Resource">{ref_fields}'
+            event = f'<rdf:li rdf:parseType="Resource">{event_fields}</rdf:li>'
+        elif structure == "description":
+            ref = f"<xmpMM:DerivedFrom><rdf:Description>{ref_fields}</rdf:Description>"
+            event = (
+                f"<rdf:li><rdf:Description>{event_fields}</rdf:Description></rdf:li>"
+            )
+        else:
+            ref = '<xmpMM:DerivedFrom><rdf:Description stRef:instanceID="uuid:source"/>'
+            event = (
+                '<rdf:li><rdf:Description stEvt:action="saved" '
+                'stEvt:when="2024-01-01T00:00:00Z"/></rdf:li>'
+            )
+        tree = self._packet(
+            ref + "</xmpMM:DerivedFrom>"
+            f"<xmpMM:History><rdf:Seq>{event}</rdf:Seq></xmpMM:History>"
+        )
+        with new_pdf() as pdf:
+            pdf.add_blank_page()
+            result = self._roundtrip(
+                pdf, tree, level, location, tmp_path / "provenance.pdf"
+            )
+        assert result.xpath(
+            "//stRef:instanceID/text() | //@stRef:instanceID", namespaces=NAMESPACES
+        ) == ["uuid:source"]
+        assert result.xpath(
+            "//stEvt:action/text() | //@stEvt:action", namespaces=NAMESPACES
+        ) == ["saved"]
+        assert result.xpath(
+            "//stEvt:when/text() | //@stEvt:when", namespaces=NAMESPACES
+        ) == ["2024-01-01T00:00:00Z"]
+        if structure != "attributes":
+            assert result.xpath(
+                "//stRef:alternatePaths/rdf:Seq/rdf:li/text()", namespaces=NAMESPACES
+            ) == ["file:///source.pdf", "https://example.org/source.pdf"]
+
+    @pytest.mark.parametrize("location", ["catalog", "page"])
+    @pytest.mark.parametrize(
+        "properties",
+        [
+            "<xmpMM:DerivedFrom>source.pdf</xmpMM:DerivedFrom>",
+            "<xmpMM:DerivedFrom><rdf:Bag><rdf:li>source</rdf:li>"
+            "</rdf:Bag></xmpMM:DerivedFrom>",
+            '<xmpMM:DerivedFrom rdf:parseType="Resource">'
+            "<stRef:lastModifyDate>yesterday</stRef:lastModifyDate>"
+            "</xmpMM:DerivedFrom>",
+            "<xmpMM:History>saved</xmpMM:History>",
+            "<xmpMM:History><rdf:Seq><rdf:li>saved</rdf:li></rdf:Seq></xmpMM:History>",
+            "<xmpMM:History><rdf:Bag/></xmpMM:History>",
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
+            "<stEvt:when>yesterday</stEvt:when></rdf:li></rdf:Seq></xmpMM:History>",
+        ],
+    )
+    def test_malformed_provenance_is_not_retained(
+        self, location, properties, tmp_path
+    ) -> None:
+        tree = self._packet(properties)
+        with new_pdf() as pdf:
+            pdf.add_blank_page()
+            result = self._roundtrip(pdf, tree, "2b", location, tmp_path / "fixed.pdf")
+        assert not result.xpath(
+            "//xmpMM:DerivedFrom | //xmpMM:History", namespaces=NAMESPACES
+        )
+
+    @pytest.mark.parametrize("location", ["catalog", "page"])
+    def test_structured_properties_cannot_be_plain_attributes(
+        self, location, tmp_path
+    ) -> None:
+        tree = self._packet("")
+        description = tree.find(f".//{{{NAMESPACES['rdf']}}}Description")
+        description.set(f"{{{NAMESPACES['xmpMM']}}}History", "saved")
+        description.set(f"{{{NAMESPACES['xmpMM']}}}DerivedFrom", "source.pdf")
+        with new_pdf() as pdf:
+            pdf.add_blank_page()
+            result = self._roundtrip(pdf, tree, "2b", location, tmp_path / "fixed.pdf")
+        assert not result.xpath(
+            "//@xmpMM:DerivedFrom | //@xmpMM:History", namespaces=NAMESPACES
+        )
+
+
 class TestStructuralPropertyNormalization:
     """Tests for stEvt:When -> stEvt:when normalization."""
 
@@ -3560,11 +3885,11 @@ class TestSanitizeNonCatalogMetadata:
         assert removed == 0
         assert "/Metadata" in pdf.pages[0].obj
 
-    def test_strips_problematic_xmpmm_properties(
+    def test_preserves_predefined_xmpmm_provenance(
         self,
         sample_pdf_bytes: bytes,
     ) -> None:
-        """PDF/A-unsafe xmpMM properties are removed from non-catalog XMP."""
+        """Non-catalog XMP retains valid History and DerivedFrom structures."""
         from io import BytesIO
 
         pdf = open_pdf(BytesIO(sample_pdf_bytes))
@@ -3606,8 +3931,10 @@ class TestSanitizeNonCatalogMetadata:
         content = bytes(pdf.get_object(ref.objgen).read_bytes())
         assert b"xmpMM:DocumentID" in content
         assert b"xmpMM:OriginalDocumentID" not in content
-        assert b"xmpMM:DerivedFrom" not in content
-        assert b"xmpMM:History" not in content
+        assert b"xmpMM:DerivedFrom" in content
+        assert b"xmpMM:History" in content
+        assert b"uuid:src-inst" in content
+        assert b"2024-01-01T00:00:00Z" in content
 
     def test_ensures_uncompressed_after_sanitize(
         self,
