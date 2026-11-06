@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.25] - 2026-11-06
+
+### Changes
+
+- Deprecate `convert_jbig2_external_globals()` while retaining its import paths and zero-valued result counters as a compatibility no-op
+
+### Bug Fixes
+
+- Preserve JBIG2 image data, refinement coding, and separate globals streams instead of inlining globals or re-encoding images during PDF/A conversion
+- Validate JBIG2 decode parameters, globals references, and globals outer filters, preserving the original input when they are invalid
+- Repair globals stream lengths while preserving their encoded bytes, filters, and decode parameters
+
 ## [0.9.24] - 2026-10-22
 
 ### Changes
