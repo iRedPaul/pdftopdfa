@@ -334,6 +334,33 @@ def test_full_conversion_repairs_malformed_preserved_xmp(
 
 
 @pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
+def test_full_conversion_rejects_binary_custom_docinfo(
+    source_level, target_level, tmp_path
+):
+    """Reject invalid text encodings while retaining valid PDFDoc and Unicode text."""
+    pdf = _document(source_level)
+    invalid = {
+        "/Binary": b"invalid\x9f",
+        "/UndefinedControl": b"invalid\x00",
+        "/OddUnicode": b"\xfe\xff\x00",
+        "/Surrogate": b"\xfe\xff\xd8\x00",
+    }
+    valid = {
+        "/PDFDoc": b"\x80\x95\xa0",
+        "/Unicode": b"\xfe\xff\xd8\x3d\xde\x00",
+    }
+    for key, value in {**invalid, **valid}.items():
+        pdf.docinfo[key] = pikepdf.String(value)
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source, force_version="1.7")
+    result = convert_to_pdfa(source, output, level=target_level, validate=True)
+    assert result.target_produced and not result.validation_failed, result
+    with pikepdf.open(output) as restored:
+        assert not any(key in restored.docinfo for key in invalid)
+        assert {key: bytes(restored.docinfo[key]) for key in valid} == valid
+
+
+@pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
 def test_full_conversion_synchronizes_first_creator(
     source_level, target_level, tmp_path
 ):

@@ -17,6 +17,7 @@
 - Match XMP default-language tags case-insensitively and restrict calibration validation to actual color contexts
 - Validate TrapNet appearances/tracking and collection/article structures before preserving them
 - Synchronize DocInfo Author with the first XMP creator and skip invisible Type3 glyphs during overprint analysis
+- Detect stale TrapNets after page/resource edits, including OCR and date-based tracking; reject invalid text encodings in custom DocInfo strings
 
 ### Tests
 

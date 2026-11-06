@@ -3859,6 +3859,25 @@ def _infer_factur_x_properties(
     return dict(_XRECHNUNG_30_FACTUR_X_PROPERTIES)
 
 
+def _is_pdf_text_string(value) -> bool:
+    """Validate PDF 1.7 text encoding without changing the original string bytes."""
+    if not isinstance(value, pikepdf.String):
+        return False
+    data = bytes(value)
+    try:
+        if data.startswith(b"\xfe\xff"):
+            data[2:].decode("utf-16-be", errors="strict")
+        else:
+            # ISO 32000-1, Table D.2 marks these controls undefined even though
+            # pikepdf's codec maps them to Unicode control characters.
+            if any(byte < 0x18 and byte not in (9, 10, 13) for byte in data):
+                return False
+            data.decode("pdfdoc_pikepdf", errors="strict")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
 def sync_metadata(
     pdf: pikepdf.Pdf,
     pdfa_level: str,
@@ -3971,9 +3990,7 @@ def sync_metadata(
                 "/Trapped",
             }
             for key in list(docinfo.keys()):
-                if key not in standard_keys and not isinstance(
-                    docinfo[key], pikepdf.String
-                ):
+                if key not in standard_keys and not _is_pdf_text_string(docinfo[key]):
                     del docinfo[key]
                     logger.warning(
                         "Removed custom DocInfo entry %s with a non-text value", key

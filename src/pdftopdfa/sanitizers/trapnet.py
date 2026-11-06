@@ -4,11 +4,12 @@
 
 """Structural requirements for permitted ISO 32000-1 trap network annotations."""
 
+import hashlib
 import math
 import re
 from decimal import Decimal
 
-from pikepdf import Array, Dictionary, Name, Page, Pdf, Stream, String
+from pikepdf import Array, Dictionary, Name, Page, Pdf, PdfError, Stream, String
 
 from ..exceptions import ConversionError
 
@@ -204,9 +205,116 @@ def valid_trapnet(annotation, owner, annotations, index: int, count: int) -> boo
     return _version_objects(owner) <= {_key(item) for item in version}
 
 
-def validate_preserved_trapnets(pdf: Pdf) -> None:
+def _page_snapshot(page: Page) -> bytes:
+    """Hash page content, resource graphs, geometry, and other annotation states."""
+    from ..fonts.traversal import get_page_resources
+
+    inherited = Dictionary()
+    owner = page.obj
+    parents = set()
+    while isinstance(owner, Dictionary):
+        if owner.objgen != (0, 0):
+            if owner.objgen in parents:
+                break
+            parents.add(owner.objgen)
+        for key in ("/MediaBox", "/CropBox", "/Rotate"):
+            if key not in inherited and owner.get(key) is not None:
+                inherited[key] = owner[key]
+        owner = owner.get("/Parent")
+    cropbox = inherited.get("/CropBox", inherited.get("/MediaBox"))
+    if cropbox is not None:
+        inherited["/CropBox"] = cropbox
+    if "/Rotate" not in inherited:
+        inherited.Rotate = 0
+    annotations = page.get("/Annots", [])
+    states = Array(
+        Array([item.get("/AS"), item.get("/AP")])
+        for item in annotations
+        if isinstance(item, Dictionary) and item.get("/Subtype") != Name.TrapNet
+    )
+    description = Array(
+        [
+            page.get("/Contents"),
+            get_page_resources(page),
+            inherited,
+            states,
+            page.get("/Group"),
+            page.get("/UserUnit", 1),
+            *[page.get(key, cropbox) for key in ("/BleedBox", "/TrimBox", "/ArtBox")],
+            page.get("/SeparationInfo"),
+        ]
+    )
+    digest = hashlib.sha256()
+
+    def record(data: bytes) -> None:
+        """Frame each token so distinct PDF graphs cannot concatenate identically."""
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+
+    pending = [description]
+    visited = {}
+    while pending:
+        value = pending.pop()
+        if isinstance(value, (Dictionary, Stream, Array)):
+            if value.objgen != (0, 0):
+                if value.objgen in visited:
+                    record(f"reference:{visited[value.objgen]}".encode())
+                    continue
+                # Local traversal IDs survive object renumbering during OCR saves.
+                visited[value.objgen] = len(visited)
+                record(f"object:{visited[value.objgen]}".encode())
+            if isinstance(value, Array):
+                record(f"array:{len(value)}".encode())
+                pending.extend(reversed(value))
+            else:
+                # Table 366 excludes obsolete procedure-set lists from tracking.
+                items = sorted(
+                    (key, item) for key, item in value.items() if key != "/ProcSet"
+                )
+                if isinstance(value, Stream):
+                    ignored = {"/Length"}
+                    try:
+                        data = value.read_bytes()
+                    except PdfError:
+                        data = value.read_raw_bytes()
+                    else:
+                        ignored.update(("/Filter", "/DecodeParms"))
+                    items = [(key, item) for key, item in items if key not in ignored]
+                    record(b"stream")
+                    record(data)
+                record(f"dictionary:{len(items)}".encode())
+                for key, item in reversed(items):
+                    pending.extend((item, key.encode()))
+        elif isinstance(value, bytes):
+            record(b"key:" + value)
+        elif isinstance(value, String):
+            record(b"string:" + bytes(value))
+        elif isinstance(value, Name):
+            record(b"name:" + value.unparse())
+        elif isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+            number = format(Decimal(str(value)), "f")
+            if "." in number:
+                number = number.rstrip("0").rstrip(".")
+            record(b"number:" + ("0" if Decimal(number) == 0 else number).encode())
+        else:
+            record(f"{type(value).__name__}:{value!r}".encode())
+    return digest.digest()
+
+
+def capture_trapnet_snapshots(pdf: Pdf) -> dict[int, bytes]:
+    """Capture immutable page descriptions before any converter or OCR edits."""
+    return {
+        index: _page_snapshot(page)
+        for index, page in enumerate(pdf.pages)
+        if trapnet_count(page.get("/Annots", []))
+    }
+
+
+def validate_preserved_trapnets(
+    pdf: Pdf, snapshots: dict[int, bytes] | None = None
+) -> None:
     """Reject retained trap networks invalidated by later conversion edits."""
-    for page in pdf.pages:
+    for page_index, page in enumerate(pdf.pages):
         annotations = page.get("/Annots", [])
         if not isinstance(annotations, Array):
             continue
@@ -216,7 +324,11 @@ def validate_preserved_trapnets(pdf: Pdf) -> None:
                 isinstance(annotation, Dictionary)
                 and annotation.get("/Subtype") == Name.TrapNet
             ):
-                if not valid_trapnet(annotation, page.obj, annotations, index, count):
+                if (
+                    not valid_trapnet(annotation, page.obj, annotations, index, count)
+                    or snapshots is None
+                    or snapshots.get(page_index) != _page_snapshot(page)
+                ):
                     raise ConversionError(
                         "Conversion invalidated a preserved TrapNet annotation"
                     )

@@ -10,7 +10,10 @@ from pikepdf import Array, Dictionary, Name
 
 from pdftopdfa.exceptions import ConversionError
 from pdftopdfa.sanitizers import sanitize_for_pdfa
-from pdftopdfa.sanitizers.trapnet import validate_preserved_trapnets
+from pdftopdfa.sanitizers.trapnet import (
+    capture_trapnet_snapshots,
+    validate_preserved_trapnets,
+)
 
 
 def _trap(pdf, *, version=False):
@@ -47,11 +50,12 @@ def test_complete_trap_network_is_preserved(version):
     pdf = new_pdf()
     page, trap = _trap(pdf, version=version)
     before = trap.AP.N.read_bytes()
+    snapshots = capture_trapnet_snapshots(pdf)
     result = sanitize_for_pdfa(pdf)
     assert result["non_compliant_annotations_flattened"] == 0
     assert page.Annots[0].objgen == trap.objgen
     assert trap.AP.N.read_bytes() == before
-    validate_preserved_trapnets(pdf)
+    validate_preserved_trapnets(pdf, snapshots)
 
 
 @pytest.mark.parametrize(
@@ -155,7 +159,157 @@ def test_late_content_changes_cannot_publish_stale_version():
     """Recheck saved references after conversion rewrites content streams."""
     pdf = new_pdf()
     page, _ = _trap(pdf, version=True)
-    validate_preserved_trapnets(pdf)
+    snapshots = capture_trapnet_snapshots(pdf)
+    validate_preserved_trapnets(pdf, snapshots)
     page.Contents = pdf.make_stream(page.Contents.read_bytes())
     with pytest.raises(ConversionError, match="invalidated a preserved TrapNet"):
-        validate_preserved_trapnets(pdf)
+        validate_preserved_trapnets(pdf, snapshots)
+
+
+@pytest.mark.parametrize("page_date", [None, "D:20200101000000Z"])
+@pytest.mark.parametrize(
+    "change", ["content", "in_place", "resources", "nested", "inherited", "state"]
+)
+def test_late_page_changes_invalidate_date_tracking(page_date, change):
+    """Dates cannot hide changed streams or resource values, including shared ones."""
+    pdf = new_pdf()
+    page, trap = _trap(pdf)
+    if page_date is not None:
+        page.LastModified = page_date
+    state = pdf.make_indirect(Dictionary(CA=1))
+    form = pdf.make_stream(b"0 g 0 0 10 10 re f")
+    form.Subtype = Name.Form
+    form.Resources = Dictionary(ExtGState=Dictionary(GS=state))
+    page.Resources.XObject = Dictionary(Form=form)
+    if change == "inherited":
+        page.Parent.Resources = page.Resources
+        del page.Resources
+    other = pdf.make_indirect(Dictionary(Subtype=Name.Square, AS=Name.Normal))
+    page.Annots = Array([other, trap])
+    snapshots = capture_trapnet_snapshots(pdf)
+    validate_preserved_trapnets(pdf, snapshots)
+    if change == "content":
+        page.Contents = pdf.make_stream(b"0 g 0 0 200 200 re f")
+    elif change == "in_place":
+        page.Contents.write(b"0 g 0 0 200 200 re f")
+    elif change in {"nested", "inherited"}:
+        state.CA = 0.5
+    elif change == "resources":
+        page.Resources.ColorSpace = Dictionary(DefaultGray=Name.DeviceGray)
+    else:
+        other.AS = Name.Changed
+    with pytest.raises(ConversionError, match="invalidated a preserved TrapNet"):
+        validate_preserved_trapnets(pdf, snapshots)
+
+
+def test_in_place_content_changes_also_invalidate_version_tracking():
+    """Reference identity alone cannot prove that a Version-tracked page is intact."""
+    pdf = new_pdf()
+    page, _ = _trap(pdf, version=True)
+    snapshots = capture_trapnet_snapshots(pdf)
+    page.Contents.write(b"1 g 0 0 100 100 re f")
+    with pytest.raises(ConversionError, match="invalidated a preserved TrapNet"):
+        validate_preserved_trapnets(pdf, snapshots)
+
+
+def test_snapshots_ignore_metadata_and_other_page_changes():
+    """Unrelated edits cannot invalidate an unchanged page's date-tracked trap."""
+    pdf = new_pdf()
+    page, _ = _trap(pdf)
+    page.Resources.ProcSet = Array([Name.PDF])
+    other = pdf.add_blank_page()
+    snapshots = capture_trapnet_snapshots(pdf)
+    pdf.docinfo["/Title"] = "Updated"
+    page.Resources.ProcSet.append(Name.Text)
+    other.Contents = pdf.make_stream(b"0 g 0 0 10 10 re f")
+    validate_preserved_trapnets(pdf, snapshots)
+
+
+def test_snapshots_survive_saving_and_object_renumbering(tmp_path):
+    """Compression and object numbers alone do not change a page description."""
+    from pikepdf import Pdf
+
+    pdf = new_pdf()
+    pdf.make_indirect(Dictionary(Unused="Renumber subsequent objects"))
+    page, _ = _trap(pdf)
+    form = pdf.make_stream(b"0 g 0 0 20 20 re f")
+    form.Resources = Dictionary(XObject=Dictionary(Self=form))
+    page.Resources.XObject = Dictionary(Form=form)
+    snapshots = capture_trapnet_snapshots(pdf)
+    path = tmp_path / "roundtrip.pdf"
+    pdf.save(path)
+    with Pdf.open(path) as restored:
+        assert restored.pages[0].objgen != page.objgen
+        validate_preserved_trapnets(restored, snapshots)
+
+
+@pytest.mark.parametrize("change", [None, "content", "resource"])
+def test_conversion_rejects_stale_date_traps_after_late_edits(
+    change, tmp_path, monkeypatch
+):
+    """Final conversion checks use the original page, before profile/content edits."""
+    import pdftopdfa.converter as converter
+
+    pdf = new_pdf()
+    page, trap = _trap(pdf)
+    trap.LastModified = "D:20990101000000Z"
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    embed_profiles = converter.embed_color_profiles
+
+    def rewrite_page(pdf, *args, **kwargs):
+        """Apply a late edit without updating either stored modification date."""
+        result = embed_profiles(pdf, *args, **kwargs)
+        if change == "content":
+            pdf.pages[0].Contents.write(b"1 g 0 0 100 100 re f")
+        elif change == "resource":
+            pdf.pages[0].Resources.ExtGState = Dictionary(GS=Dictionary(CA=0.5))
+        return result
+
+    monkeypatch.setattr(converter, "embed_color_profiles", rewrite_page)
+    result = converter.convert_to_pdfa(source, output, level="3b")
+    if change is None:
+        assert result.target_produced and not result.skipped, result
+    else:
+        assert result.skipped and not result.target_produced, result
+        assert output.read_bytes() == source.read_bytes()
+        assert any("invalidated a preserved TrapNet" in w for w in result.warnings)
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_conversion_tracks_date_traps_across_ocr(changed, tmp_path, monkeypatch):
+    """OCR changes must be compared with the original, before annotations restore."""
+    from pikepdf import Pdf
+
+    import pdftopdfa.converter as converter
+    import pdftopdfa.ocr as ocr
+
+    pdf = new_pdf()
+    _trap(pdf)
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+
+    def apply_ocr(input_path, output_path, *args, **kwargs):
+        """Simulate OCR with or without a page-content rewrite."""
+        with Pdf.open(input_path) as processed:
+            if changed:
+                processed.pages[0].Contents.write(b"1 g 0 0 100 100 re f")
+            processed.save(output_path)
+        kwargs["_processed_pages"].add(1)
+        return output_path
+
+    monkeypatch.setattr(ocr, "is_ocr_available", lambda: True)
+    monkeypatch.setattr(ocr, "apply_ocr", apply_ocr)
+    result = converter.convert_to_pdfa(
+        source,
+        output,
+        level="3b",
+        ocr_detection_model_dir=tmp_path / "detection",
+        ocr_recognition_model_dir=tmp_path / "recognition",
+    )
+    if changed:
+        assert result.skipped and not result.target_produced, result
+        assert output.read_bytes() == source.read_bytes()
+        assert any("invalidated a preserved TrapNet" in w for w in result.warnings)
+    else:
+        assert result.target_produced and not result.skipped, result

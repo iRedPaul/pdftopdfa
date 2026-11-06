@@ -815,6 +815,51 @@ class TestSyncMetadata:
             caplog.text
         )
 
+    @pytest.mark.parametrize(
+        "data,valid",
+        [
+            (b"", True),
+            (b"Acme Corp", True),
+            (b"\x80\x95\xa0", True),
+            (b"\t\n\r", True),
+            (b"\x18\x1b\x1f", True),
+            (b"\xfe\xff", True),
+            (b"\xfe\xff\x67\x71\x4e\xac", True),
+            (b"\xfe\xff\xd8\x3d\xde\x00", True),
+            (b"\xfe\xff\xff\xfd", True),
+            (b"bad\x00", False),
+            (b"bad\x01", False),
+            (b"bad\x07", False),
+            (b"bad\x0b", False),
+            (b"bad\x0c", False),
+            (b"bad\x17", False),
+            (b"bad\x7f", False),
+            (b"bad\x9f", False),
+            (b"bad\xad", False),
+            (b"\xfe\xff\x00", False),
+            (b"\xfe\xff\xd8\x00", False),
+            (b"\xfe\xff\xdc\x00", False),
+            (b"\xfe\xff\xd8\x00\x00A", False),
+        ],
+    )
+    @pytest.mark.parametrize("level", ["2b", "3b"])
+    def test_sync_validates_custom_docinfo_encoding(
+        self, data, valid, level, tmp_path
+    ) -> None:
+        """Reject malformed PDF text while preserving every byte of valid strings."""
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        pdf.docinfo["/Company"] = "Acme Corp"
+        pdf.docinfo["/Custom"] = pikepdf.String(data)
+        sync_metadata(pdf, level)
+        path = tmp_path / "custom.pdf"
+        pdf.save(path)
+        with pikepdf.open(path) as restored:
+            assert str(restored.docinfo["/Company"]) == "Acme Corp"
+            assert ("/Custom" in restored.docinfo) == valid
+            if valid:
+                assert bytes(restored.docinfo["/Custom"]) == data
+
     def test_sync_preserves_keywords_in_docinfo(self, sample_pdf_bytes: bytes) -> None:
         """Preserves /Keywords in DocInfo, writes pdf:Keywords to XMP."""
         from io import BytesIO

@@ -245,7 +245,12 @@ reports the reason in the result warnings.
 
 Valid TrapNet annotations retain their appearance and trapping data. Malformed
 instances are flattened when a usable appearance is available, or removed
-otherwise. Article threads are checked for complete bead cycles and page links;
+otherwise. If conversion or OCR changes the description of a page with a retained
+TrapNet, conversion uses the original-input fallback because its trapping may be
+stale. This check also covers date-based tracking without a page modification date.
+Custom DocInfo strings are retained only with valid PDFDocEncoding or BOM-prefixed
+UTF-16BE text encoding; valid string bytes remain unchanged.
+Article threads are checked for complete bead cycles and page links;
 malformed graphs use the original-input fallback to preserve navigation targets.
 
 To run OCR, provide both external model directories. The pair enables OCR;
