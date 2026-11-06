@@ -1722,7 +1722,6 @@ class TestDublinCoreMultivaluePreservation:
         [
             None,
             "Alice",
-            "Bob",
             "Alice, Bob",
             "Alice; Bob",
             "Alice,Bob",
@@ -1738,6 +1737,21 @@ class TestDublinCoreMultivaluePreservation:
         tree = _parse_xmp_bytes(xmp)
         assert tree is not None
         assert self._values(tree, "creator") == ["Alice", "Bob"]
+
+    @pytest.mark.parametrize("level", ["2b", "3b"])
+    def test_author_matching_later_creator_updates_first(self, level) -> None:
+        """A later co-author cannot stand in for the synchronized first creator."""
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        embed_xmp_metadata(pdf, _reserialize_xmp(self._source_tree()))
+        pdf.docinfo["/Author"] = "Bob"
+
+        for _ in range(2):
+            sync_metadata(pdf, level)
+            tree = _extract_existing_xmp(pdf)
+            assert tree is not None
+            assert self._values(tree, "creator") == ["Bob", "Bob"]
+            assert str(pdf.docinfo["/Author"]) == "Bob"
 
     @pytest.mark.parametrize("property_name", ["title", "description", "creator"])
     @pytest.mark.parametrize("malformation", ["sibling", "extra_container", "nested"])

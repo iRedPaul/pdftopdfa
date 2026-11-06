@@ -16,6 +16,7 @@
 - Detect annotation color arrays when choosing profiles, normalize inline-image color abbreviations, and reuse equivalent overprint proofs for large documents
 - Match XMP default-language tags case-insensitively and restrict calibration validation to actual color contexts
 - Validate TrapNet appearances/tracking and collection/article structures before preserving them
+- Synchronize DocInfo Author with the first XMP creator and skip invisible Type3 glyphs during overprint analysis
 
 ### Tests
 

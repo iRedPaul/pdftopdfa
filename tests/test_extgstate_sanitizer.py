@@ -1328,6 +1328,31 @@ class TestOverprintIccBasedCmyk:
         else:
             assert page.Contents.read_bytes() == content
 
+    @pytest.mark.parametrize("mode", range(8))
+    @pytest.mark.parametrize("show", [b"(A) Tj", b"[(A)] TJ", b"(A) '", b'0 0 (A) "'])
+    def test_type3_overprint_ignores_only_invisible_text(self, mode, show) -> None:
+        """Only mode 3 suppresses Type3 glyph paints, for every text-show operator."""
+        pdf = new_pdf()
+        content = b"/GS0 gs BT /F 12 Tf " + str(mode).encode() + b" Tr " + show + b" ET"
+        page = self._page(pdf, content, OPM=1, OP=True)
+        glyph_data = b"600 0 d0 /CS0 cs 0 0 0 1 scn 0 0 20 20 re f"
+        glyph = pdf.make_stream(glyph_data)
+        page.Resources.Font = Dictionary(
+            F=Dictionary(
+                Subtype=Name.Type3,
+                CharProcs=Dictionary(A=glyph),
+                Resources=Dictionary(ColorSpace=page.Resources.ColorSpace),
+            )
+        )
+        if mode == 3:
+            assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        else:
+            with pytest.raises(ConversionError, match="Type3 glyph"):
+                sanitize_extgstate(pdf)
+        assert page.Contents.read_bytes() == content
+        assert glyph.read_bytes() == glyph_data
+        assert page.Resources.ExtGState.GS0.OPM == 1
+
     def test_repeated_type3_proofs_do_not_exhaust_context_budget(self) -> None:
         """A large harmless Type3 text page needs one proof per glyph context."""
         from pdftopdfa.sanitizers.overprint import _Analyzer, _State

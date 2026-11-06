@@ -2880,13 +2880,13 @@ def create_xmp_metadata(
     if author is not None:
         if not creators:
             creators = [author]
-        elif author not in creators and not any(
+        elif author != creators[0] and not any(
             re.fullmatch(
                 r"\s*" + separator.join(re.escape(c) for c in creators) + r"\s*", author
             )
             for separator in (r"\s*,\s*", r"\s*;\s*")
         ):
-            # A genuinely different DocInfo /Author replaces the synchronized
+            # A different DocInfo /Author replaces the synchronized
             # first creator only. Never split arbitrary names on punctuation,
             # and keep independently listed co-authors. A textual reflection
             # of the existing list must not become a single combined creator.

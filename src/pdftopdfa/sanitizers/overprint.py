@@ -437,6 +437,9 @@ class _Analyzer:
                     )
                 elif op in _TEXT:
                     if state.type3:
+                        # ISO 32000-1, 9.3.6: only mode 3 suppresses Type3 paint.
+                        if state.text_mode == 3:
+                            continue
                         charprocs = state.font.get("/CharProcs")
                         if not isinstance(charprocs, Dictionary):
                             raise _error("invalid Type3 CharProcs")

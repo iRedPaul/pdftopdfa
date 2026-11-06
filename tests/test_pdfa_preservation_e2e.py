@@ -334,6 +334,80 @@ def test_full_conversion_repairs_malformed_preserved_xmp(
 
 
 @pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
+def test_full_conversion_synchronizes_first_creator(
+    source_level, target_level, tmp_path
+):
+    """An Author found later in the creator list still updates its first entry."""
+    pdf = _document(source_level)
+    tree = etree.fromstring(pdf.Root.Metadata.read_bytes())
+    description = tree.find(f".//{{{_RDF}}}Description")
+    creator = etree.SubElement(description, f"{{{_DC}}}creator")
+    sequence = etree.SubElement(creator, f"{{{_RDF}}}Seq")
+    for author in ("Alice", "Bob"):
+        etree.SubElement(sequence, f"{{{_RDF}}}li").text = author
+    pdf.Root.Metadata.write(etree.tostring(tree))
+    pdf.docinfo["/Author"] = "Bob"
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source, force_version="1.7")
+
+    result = convert_to_pdfa(source, output, level=target_level, validate=True)
+    assert result.target_produced and not result.validation_failed, result
+    with pikepdf.open(output) as restored:
+        tree = etree.fromstring(restored.Root.Metadata.read_bytes())
+        assert tree.xpath(
+            "//dc:creator/rdf:Seq/rdf:li/text()", namespaces={"dc": _DC, "rdf": _RDF}
+        ) == ["Bob", "Bob"]
+        assert str(restored.docinfo["/Author"]) == "Bob"
+
+
+@pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
+def test_full_conversion_preserves_invisible_type3_overprint(
+    source_level, target_level, tmp_path
+):
+    """Invisible Type3 glyph paint cannot abort conversion before validation."""
+    pdf = _document(source_level, cmyk=True)
+    page = pdf.pages[0]
+    glyph_data = b"600 0 d0 /ICC cs 0 1 0 0 scn 0 0 600 600 re f"
+    font = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type3,
+            FontBBox=Array([0, 0, 600, 600]),
+            FontMatrix=Array([0.001, 0, 0, 0.001, 0, 0]),
+            CharProcs=Dictionary(A=pdf.make_stream(glyph_data)),
+            Encoding=Dictionary(Type=Name.Encoding, Differences=Array([65, Name.A])),
+            FirstChar=65,
+            LastChar=65,
+            Widths=Array([600]),
+            Resources=Dictionary(
+                ColorSpace=Dictionary(
+                    ICC=Array(
+                        [Name.ICCBased, pdf.Root.OutputIntents[0].DestOutputProfile]
+                    )
+                )
+            ),
+        )
+    )
+    page.Resources = Dictionary(
+        Font=Dictionary(F=font), ExtGState=Dictionary(GS=Dictionary(OP=True, OPM=1))
+    )
+    content = b"/GS gs BT /F 20 Tf 3 Tr 1 0 0 1 20 20 Tm (A) Tj ET"
+    page.Contents = pdf.make_stream(content)
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source, force_version="1.7")
+
+    # veraPDF 1.30.2 also checks paints in invisible glyphs. Isolate the
+    # converter's behavior here; external validation retains its usual fallback.
+    result = convert_to_pdfa(source, output, level=target_level, validate=False)
+    assert result.target_produced and not result.validation_failed, result
+    with pikepdf.open(output) as restored:
+        page = restored.pages[0]
+        assert page.Contents.read_bytes() == content
+        assert page.Resources.Font.F.CharProcs.A.read_bytes() == glyph_data
+        assert page.Resources.ExtGState.GS.OPM == 1
+
+
+@pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
 @pytest.mark.parametrize("versioned", [True, False])
 def test_full_conversion_validates_trap_tracking(
     source_level, target_level, versioned, tmp_path
