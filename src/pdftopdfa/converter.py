@@ -940,12 +940,6 @@ _SANITIZE_WARNINGS: list[tuple[str, str]] = [
 # Sanitization keys that indicate fatal failures.
 _SANITIZE_ERRORS: list[tuple[str, str]] = [
     (
-        "jbig2_failed",
-        "JBIG2 stream(s) with external globals "
-        "could not be converted (unsupported filter configuration). "
-        "The output PDF would not be PDF/A compliant.",
-    ),
-    (
         "jpx_failed",
         "JPEG2000 stream(s) could not be fixed. "
         "The output PDF would not be PDF/A compliant.",

@@ -81,7 +81,7 @@ from .font_widths import sanitize_font_widths
 from .fonts import sanitize_cidfont_structures, sanitize_fontname_consistency
 from .glyph_coverage import sanitize_glyph_coverage
 from .javascript import remove_javascript
-from .jbig2 import convert_jbig2_external_globals
+from .jbig2 import convert_jbig2_external_globals, validate_jbig2_globals
 from .jpx import sanitize_jpx_color_boxes
 from .notdef_usage import sanitize_notdef_usage
 from .optional_content import sanitize_optional_content
@@ -114,6 +114,10 @@ def sanitize_for_pdfa(
     - PDF/A-3: Remove JavaScript, actions, XFA forms (embedded files and
                transparency allowed)
 
+    JBIG2 image data, including refinement coding, is preserved as permitted
+    by ISO 19005-2, 6.1.7.2. Global segments remain in their separate
+    /JBIG2Globals stream as required by ISO 32000-1, 7.4.7.
+
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
         level: PDF/A conformance level ('2a', '2b', '2u', '3a', '3b',
@@ -129,7 +133,8 @@ def sanitize_for_pdfa(
         - actions_removed: Number of non-compliant actions removed
 
     Raises:
-        ConversionError: If an invalid level is specified.
+        ConversionError: If the level or a JBIG2 globals reference is invalid,
+            or the outer filters on a globals stream cannot be decoded.
     """
     level = validate_pdfa_level(level)
 
@@ -164,6 +169,9 @@ def sanitize_for_pdfa(
     # Remove forbidden external stream keys /F, /FFilter, /FDecodeParms (6.1.7.1)
     result["external_stream_keys_removed"] = remove_external_stream_keys(pdf)
 
+    # Validate globals references and outer filters without decoding JBIG2 images.
+    validate_jbig2_globals(pdf)
+
     # Force re-encoding of non-image streams to repair /Length mismatches (6.1.7.1)
     result["stream_lengths_fixed"] = fix_stream_lengths(pdf)
 
@@ -171,12 +179,6 @@ def sanitize_for_pdfa(
     result["nonstandard_inline_filters_fixed"] = sanitize_nonstandard_inline_filters(
         pdf
     )
-
-    # Convert JBIG2 streams with external globals (all levels)
-    jbig2_result = convert_jbig2_external_globals(pdf)
-    result["jbig2_converted"] = jbig2_result["converted"]
-    result["jbig2_reencoded"] = jbig2_result["reencoded"]
-    result["jbig2_failed"] = jbig2_result["failed"]
 
     # Sanitize JPEG2000 colr boxes (ISO 19005-2, 6.1.4.3)
     jpx_result = sanitize_jpx_color_boxes(pdf)
