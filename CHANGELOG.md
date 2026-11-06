@@ -12,6 +12,8 @@
 - Preserve annotation colors, valid opacity values, and PDF/A-2/3 TrapNet annotations
 - Retain PDF portfolios, article threads, and compatible additional OutputIntents
 - Preserve custom DocInfo text fields, valid XMP provenance, translated titles/descriptions, and ordered author lists
+- Validate preserved XMP arrays, provenance fields, soft-mask transfer functions, calibrated color spaces, and additional OutputIntent dictionaries
+- Detect annotation color arrays when choosing profiles, normalize inline-image color abbreviations, and reuse equivalent overprint proofs for large documents
 
 ### Tests
 

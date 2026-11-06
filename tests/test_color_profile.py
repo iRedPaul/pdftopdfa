@@ -1327,6 +1327,176 @@ class TestEmbedColorProfiles:
             assert validation.compliant, validation.failed_rules
 
 
+class TestPreservedColorValidation:
+    """Preserved dictionaries and color spaces still have to be well formed."""
+
+    @pytest.mark.parametrize("profiled", [False, True])
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("/Type", Name.Other),
+            ("/OutputConditionIdentifier", None),
+            ("/OutputConditionIdentifier", 42),
+            ("/Info", Name.Bad),
+            ("/RegistryName", 42),
+        ],
+    )
+    def test_malformed_additional_intent_is_replaced(
+        self, profiled, key, value
+    ) -> None:
+        """A registered printing condition cannot bypass dictionary validation."""
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        intent = pdf.make_indirect(
+            Dictionary(
+                Type=Name.OutputIntent,
+                S=Name.GTS_PDFX,
+                OutputConditionIdentifier="Original",
+            )
+        )
+        if profiled:
+            intent.DestOutputProfile = pdf.make_stream(get_srgb_profile())
+            intent.DestOutputProfile.N = 3
+        if value is None:
+            del intent[key]
+        else:
+            intent[key] = value
+        pdf.Root.OutputIntents = Array([intent])
+        embed_color_profiles(pdf)
+        assert len(pdf.Root.OutputIntents) == 1
+        replacement = pdf.Root.OutputIntents[0]
+        assert replacement.objgen != intent.objgen
+        assert replacement.Type == Name.OutputIntent and replacement.S == Name.GTS_PDFA1
+        assert isinstance(replacement.OutputConditionIdentifier, pikepdf.String)
+
+    @pytest.mark.parametrize("profiled", [False, True])
+    def test_optional_output_intent_type_can_be_absent(self, profiled) -> None:
+        """ISO 32000-1 Table 365 permits an omitted OutputIntent /Type."""
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        intent = pdf.make_indirect(
+            Dictionary(S=Name.GTS_PDFX, OutputConditionIdentifier="FOGRA39")
+        )
+        if profiled:
+            intent.DestOutputProfile = pdf.make_stream(get_cmyk_profile())
+            intent.DestOutputProfile.N = 4
+        pdf.Root.OutputIntents = Array([intent])
+        embed_color_profiles(pdf)
+        assert len(pdf.Root.OutputIntents) == 2
+        assert pdf.Root.OutputIntents[0].objgen == intent.objgen
+        assert "/Type" not in pdf.Root.OutputIntents[0]
+
+    @pytest.mark.parametrize(
+        "kind,key,value",
+        [
+            ("CalGray", "/WhitePoint", None),
+            ("CalRGB", "/WhitePoint", Array([1, 1])),
+            ("CalGray", "/WhitePoint", Array([0, 1, 1])),
+            ("CalRGB", "/WhitePoint", Array([1, 2, 1])),
+            ("CalGray", "/BlackPoint", Array([-1, 0, 0])),
+            ("CalGray", "/Gamma", 0),
+            ("CalGray", "/Gamma", True),
+            ("CalRGB", "/Gamma", Array([1, 2])),
+            ("CalRGB", "/Matrix", Array([1, 2])),
+        ],
+    )
+    @pytest.mark.parametrize("option", [False, True])
+    def test_malformed_calibration_cannot_be_preserved(
+        self, kind, key, value, option
+    ) -> None:
+        """Both option paths reject invalid calibration before preserving it."""
+        pdf = new_pdf()
+        cs = TestCalibratedPreservation._colorspace(kind)
+        if value is None:
+            del cs[1][key]
+        else:
+            cs[1][key] = value
+        page = pdf.add_blank_page()
+        page.Resources.ColorSpace = Dictionary(Cal=cs)
+        with pytest.raises(ConversionError, match="Malformed /Cal"):
+            embed_color_profiles(pdf, convert_calibrated=option)
+
+    @pytest.mark.parametrize("kind", ["CalGray", "CalRGB"])
+    def test_invalid_calibration_uses_original_input_fallback(
+        self, kind, tmp_path
+    ) -> None:
+        """Report invalid calibration without publishing a claimed PDF/A target."""
+        from pdftopdfa.converter import convert_to_pdfa
+
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        page.Resources.ColorSpace = Dictionary(
+            Cal=Array([Name("/" + kind), Dictionary()])
+        )
+        page.Contents = pdf.make_stream(b"/Cal cs 0.5 scn 0 0 100 100 re f")
+        source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+        pdf.save(source)
+        result = convert_to_pdfa(source, output)
+        assert result.skipped and not result.target_produced
+        assert output.read_bytes() == source.read_bytes()
+        assert any("Malformed /Cal" in warning for warning in result.warnings)
+
+    @pytest.mark.parametrize(
+        "key,color,expected",
+        [
+            ("/C", [0, 1, 0, 0], ColorSpaceType.DEVICE_CMYK),
+            ("/IC", [0, 1, 0], ColorSpaceType.DEVICE_RGB),
+            ("/C", [0.5], ColorSpaceType.DEVICE_GRAY),
+        ],
+    )
+    def test_annotation_color_without_appearance_is_detected(
+        self, key, color, expected
+    ) -> None:
+        """Border and interior arrays contribute their device color space."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        annotation = Dictionary(Subtype=Name.Link if key == "/C" else Name.Square)
+        annotation[key] = Array(color)
+        page.Annots = Array([pdf.make_indirect(annotation)])
+        assert expected in detect_color_spaces(pdf).detected_spaces
+
+    @pytest.mark.parametrize("cmyk_border", [False, True])
+    def test_link_border_profiles_survive_full_conversion(
+        self, cmyk_border, tmp_path
+    ) -> None:
+        """Give a visible Link border a matching profile or contextual default."""
+        from pdftopdfa.converter import convert_to_pdfa
+        from pdftopdfa.verapdf import is_verapdf_available
+
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        if not cmyk_border:
+            page.Contents = pdf.make_stream(b"0 1 0 0 k 0 0 100 100 re f")
+        color = [0, 1, 0, 0] if cmyk_border else [1, 0, 0]
+        page.Annots = Array(
+            [
+                pdf.make_indirect(
+                    Dictionary(
+                        Type=Name.Annot,
+                        Subtype=Name.Link,
+                        Rect=Array([20, 20, 100, 100]),
+                        C=Array(color),
+                        Border=Array([0, 0, 2]),
+                        F=4,
+                    )
+                )
+            ]
+        )
+        source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+        pdf.save(source)
+        result = convert_to_pdfa(
+            source, output, level="2b", validate=is_verapdf_available()
+        )
+        assert (
+            result.success and result.target_produced and not result.validation_failed
+        )
+        with Pdf.open(output) as restored:
+            assert list(restored.pages[0].Annots[0].C) == color
+            assert restored.Root.OutputIntents[0].DestOutputProfile.N == 4
+            if not cmyk_border:
+                assert restored.pages[0].Resources.ColorSpace.DefaultRGB[1].N == 3
+
+
 class TestDefaultColorSpaces:
     """Tests for context-dependent Default color space entries."""
 
@@ -3485,6 +3655,7 @@ class TestCalibratedPreservation:
 
     @staticmethod
     def _colorspace(kind):
+        """Build a calibrated space with nondefault gamma and colorimetry."""
         params = Dictionary(
             WhitePoint=Array([0.9505, 1, 1.089]),
             BlackPoint=Array([0, 0, 0]),
@@ -3500,6 +3671,7 @@ class TestCalibratedPreservation:
 
     @staticmethod
     def _add_colorspace(pdf, cs, location):
+        """Install a calibrated space in the requested nested resource context."""
         page = pdf.add_blank_page()
         if location == "named":
             page.Resources.ColorSpace = Dictionary(CS0=cs)

@@ -48,6 +48,7 @@ class TestRemoveForbiddenCatalogEntries:
         assert key not in pdf.Root
 
     def test_remove_only_forbidden_entries(self):
+        """Retain navigation while removing catalog entries prohibited by PDF/A."""
         pdf = new_pdf()
         pdf.Root["/Requirements"] = pikepdf.Array()
         pdf.Root["/Collection"] = pikepdf.Dictionary()
@@ -340,6 +341,7 @@ class TestSanitizeForPdfaIntegration:
         assert "forbidden_catalog_entries_removed" in result
 
     def test_forbidden_entries_removed_via_sanitize(self):
+        """Apply catalog restrictions through the complete sanitizer pipeline."""
         pdf = new_pdf()
         pdf.Root["/Perms"] = pikepdf.Dictionary()
         pdf.Root["/Requirements"] = pikepdf.Array()

@@ -19,8 +19,11 @@ ISO 19005-2, Section 6.4 constrains transparency-related entries:
 """
 
 import logging
+import math
+import re
+from decimal import Decimal
 
-from pikepdf import Array, Dictionary, Name, Pdf, Stream
+from pikepdf import Array, Dictionary, Name, Pdf, PdfError, Stream
 
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
@@ -292,6 +295,143 @@ def _clamp_opacity(gs_dict: Dictionary, key: str) -> int:
     return 0
 
 
+def _function_numbers(value, count: int) -> bool:
+    """Check the dimensions and finite numeric entries of a function parameter."""
+    return (
+        isinstance(value, Array)
+        and len(value) == count
+        and all(
+            not isinstance(number, bool)
+            and isinstance(number, (int, float, Decimal))
+            and math.isfinite(number)
+            for number in value
+        )
+    )
+
+
+_CALCULATOR_OPERATORS = frozenset(
+    "abs add atan ceiling cos cvi cvr div exp floor idiv ln log mod mul neg round "
+    "sin sqrt sub truncate and bitshift eq false ge gt le lt ne not or true xor "
+    "if ifelse copy dup exch index pop roll".split()
+)
+
+
+def _calculator_syntax(data: bytes) -> bool:
+    """Require a braced calculator program using PDF numbers and legal operators."""
+    data = re.sub(rb"%[^\r\n]*", b"", data.replace(b"\x00", b" ")).strip()
+    if not data.startswith(b"{") or not data.endswith(b"}"):
+        return False
+    depth = 0
+    tokens = re.findall(rb"[{}]|[^\s{}]+", data)
+    for index, token in enumerate(tokens):
+        if token == b"{":
+            depth += 1
+        elif token == b"}":
+            depth -= 1
+            if depth < 0 or (depth == 0 and index != len(tokens) - 1):
+                return False
+        elif not (
+            token.decode("latin-1") in _CALCULATOR_OPERATORS
+            or re.fullmatch(rb"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", token)
+        ):
+            return False
+    return depth == 0
+
+
+def _is_scalar_transfer_function(function, ancestors=frozenset()) -> bool:
+    """Validate one-input, one-output PDF functions without executing their code."""
+    if function == Name.Identity:
+        return True
+    if not isinstance(function, (Dictionary, Stream)) or len(ancestors) >= 64:
+        return False
+    key = function.objgen if function.objgen != (0, 0) else function.unparse()
+    if key in ancestors:
+        return False
+    ancestors = ancestors | {key}
+    kind = function.get("/FunctionType")
+    domain = function.get("/Domain")
+    limits = function.get("/Range")
+    if (
+        isinstance(kind, bool)
+        or not isinstance(kind, int)
+        or not _function_numbers(domain, 2)
+        or domain[0] > domain[1]
+    ):
+        return False
+    if "/Range" in function and (
+        not _function_numbers(limits, 2) or limits[0] > limits[1]
+    ):
+        return False
+    if kind in (0, 4):
+        if not isinstance(function, Stream) or not _function_numbers(limits, 2):
+            return False
+        try:
+            data = function.read_bytes()
+        except (PdfError, RuntimeError):
+            return False
+        if kind == 4:
+            return _calculator_syntax(data)
+        size = function.get("/Size")
+        bits = function.get("/BitsPerSample")
+        order = function.get("/Order", 1)
+        return (
+            isinstance(size, Array)
+            and len(size) == 1
+            and not isinstance(size[0], bool)
+            and isinstance(size[0], int)
+            and size[0] > 0
+            and not isinstance(bits, bool)
+            and isinstance(bits, int)
+            and bits in (1, 2, 4, 8, 12, 16, 24, 32)
+            and not isinstance(order, bool)
+            and isinstance(order, int)
+            and order in (1, 3)
+            and len(data) >= (size[0] * bits + 7) // 8
+            and all(
+                key not in function or _function_numbers(function[key], 2)
+                for key in ("/Encode", "/Decode")
+            )
+        )
+    if not isinstance(function, Dictionary):
+        return False
+    if kind == 2:
+        exponent = function.get("/N")
+        return (
+            not isinstance(exponent, bool)
+            and isinstance(exponent, (int, float, Decimal))
+            and math.isfinite(exponent)
+            and (int(exponent) == exponent or domain[0] >= 0)
+            and (exponent >= 0 or not domain[0] <= 0 <= domain[1])
+            and all(
+                key not in function or _function_numbers(function[key], 1)
+                for key in ("/C0", "/C1")
+            )
+        )
+    if kind == 3:
+        functions = function.get("/Functions")
+        if not isinstance(functions, Array) or not functions:
+            return False
+        count = len(functions)
+        bounds = function.get("/Bounds")
+        if not _function_numbers(bounds, count - 1) or not _function_numbers(
+            function.get("/Encode"), 2 * count
+        ):
+            return False
+        if any(a >= b for a, b in zip([domain[0], *bounds], [*bounds, domain[1]])):
+            # The final interval may have zero width (ISO 32000-1, 7.10.4).
+            if count != 1 and not (
+                bounds[-1] == domain[1]
+                and all(a < b for a, b in zip([domain[0], *bounds[:-1]], bounds))
+            ):
+                return False
+        return all(
+            isinstance(child, (Dictionary, Stream))
+            and _is_scalar_transfer_function(child, ancestors)
+            for child in functions
+        )
+    return False
+
+
 def _sanitize_smask_dict(gs_dict: Dictionary, smask_dict: Dictionary) -> int:
     """Validate internal entries of a soft mask dictionary.
 
@@ -347,6 +487,10 @@ def _sanitize_smask_dict(gs_dict: Dictionary, smask_dict: Dictionary) -> int:
     # ISO 19005-2/3, 6.2.5 prohibits /TR in an ExtGState dictionary only.
     # A soft mask's /TR is a separate, permitted opacity mapping. Removing
     # it would change the mask and therefore the rendered page appearance.
+    if "/TR" in smask_dict and not _is_scalar_transfer_function(smask_dict.TR):
+        del smask_dict["/TR"]
+        fixes += 1
+        logger.warning("Removed malformed soft-mask /TR; using the identity mapping")
 
     # /BC must be an Array if present
     if "/BC" in smask_dict:

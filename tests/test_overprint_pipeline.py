@@ -19,6 +19,7 @@ from pdftopdfa.verapdf import is_verapdf_available, validate_with_verapdf
 def test_default_cmyk_overprint_is_repaired_after_profile_embedding(
     tmp_path: Path, level: str
 ) -> None:
+    """Validate local repairs when profile embedding installs DefaultCMYK."""
     source = tmp_path / "input.pdf"
     target = tmp_path / "output.pdf"
     with pikepdf.Pdf.new() as pdf:

@@ -55,11 +55,69 @@ class _Plan:
     resource_signature: bytes
 
 
+@dataclass
+class _Budget:
+    calls: int = 0
+
+
+def _object_key(value):
+    """Identify a PDF object without traversing its resource-reference graph."""
+    if value is None:
+        return None
+    if value.objgen != (0, 0):
+        return value.objgen
+    return value.unparse()
+
+
+def _state_key(state: _State):
+    """Include every painting parameter and selected pattern's definition context."""
+
+    def pattern_key(pattern):
+        """Represent the resource and initial state captured by a selected pattern."""
+        if pattern is None:
+            return None
+        return (
+            _object_key(pattern.definition),
+            pattern.base,
+            _state_key(pattern.initial),
+            pattern.resources.unparse(),
+        )
+
+    return (
+        state.stroke,
+        state.fill,
+        state.stroke_overprint,
+        state.fill_overprint,
+        state.mode,
+        state.text_mode,
+        state.type3,
+        _object_key(state.font),
+        _object_key(state.soft_mask),
+        pattern_key(state.stroke_pattern),
+        pattern_key(state.fill_pattern),
+    )
+
+
+def _inline_space(cs):
+    """Expand color-space abbreviations only at an inline-image boundary."""
+    if isinstance(cs, Name):
+        return {
+            "/G": Name.DeviceGray,
+            "/RGB": Name.DeviceRGB,
+            "/CMYK": Name.DeviceCMYK,
+        }.get(str(cs), cs)
+    if isinstance(cs, Array) and len(cs) >= 2 and str(cs[0]) in {"/I", "/Indexed"}:
+        return Array([Name.Indexed, _inline_space(cs[1]), *list(cs)[2:]])
+    return cs
+
+
 def _error(detail: str) -> ConversionError:
+    """Build an error handled by the converter's original-input fallback."""
     return ConversionError(f"Cannot safely repair PDF/A overprint: {detail}")
 
 
 def _resource(resources: Dictionary, category: str, name: object):
+    """Resolve a named resource or fail before any painting stream is changed."""
     table = resources.get(category)
     if not isinstance(table, Dictionary) or not isinstance(name, Name):
         raise _error(f"missing {category} resource {name}")
@@ -106,6 +164,7 @@ def _colour_kind(cs, resources: Dictionary, seen: frozenset[str] = frozenset()) 
 
 
 def _pattern_base(cs, resources: Dictionary) -> str:
+    """Resolve an uncolored pattern's source color space through resource aliases."""
     seen = set()
     while isinstance(cs, Name) and cs != Name.Pattern:
         if str(cs) in seen:
@@ -119,6 +178,7 @@ def _pattern_base(cs, resources: Dictionary) -> str:
 
 
 def _graphics_state(state: _State, gs: Dictionary) -> _State:
+    """Apply the independently persistent ExtGState parameters used by analysis."""
     values = {}
     # OP also sets nonstroking overprint when this dictionary omits op.
     if "/OP" in gs:
@@ -146,6 +206,7 @@ def _graphics_state(state: _State, gs: Dictionary) -> _State:
 
 
 def _needs_repair(state: _State, *, stroke: bool, fill: bool) -> bool:
+    """Identify prohibited paints while rejecting ambiguous combined operations."""
     if state.mode != 1:
         return False
     active = []
@@ -165,11 +226,21 @@ def _needs_repair(state: _State, *, stroke: bool, fill: bool) -> bool:
 
 
 class _Analyzer:
-    def __init__(self):
+    def __init__(self, budget: _Budget | None = None):
+        """Keep completed contexts separate from recursion checks and repair plans."""
         self.plans: dict[tuple[int, int], _Plan] = {}
-        self.calls = 0
+        self.budget = budget if budget is not None else _Budget()
+        self.contexts: set[tuple] = set()
+        self.proofs: set[tuple] = set()
+        self.instructions: dict[tuple[int, int], list] = {}
+
+    @property
+    def calls(self) -> int:
+        """Return the number of unique contexts analyzed across nested proofs."""
+        return self.budget.calls
 
     def record(self, plan: _Plan) -> None:
+        """Reject shared streams whose contexts require incompatible rewrites."""
         key = plan.owner.objgen
         previous = self.plans.get(key)
         if previous is not None and (previous.repairs or plan.repairs):
@@ -183,20 +254,30 @@ class _Analyzer:
     def prove_programs(
         self, streams, resources, state, ancestors, description, resource_initial
     ) -> None:
+        """Reuse successful glyph or pattern proofs under equivalent full contexts."""
         # Prove all glyph/cell programs harmless without guessing which glyph
         # or cell gets painted. A repair requires a specific invocation.
-        proof = _Analyzer()
+        streams = list(streams)
+        context = (
+            tuple(_object_key(stream) for stream in streams),
+            resources.unparse(),
+            _state_key(state),
+            _state_key(resource_initial),
+            ancestors,
+        )
+        if context in self.proofs:
+            return
+        proof = _Analyzer(self.budget)
         for stream in streams:
             proof.form(stream, resources, state, ancestors, resource_initial)
-        self.calls += proof.calls
-        if self.calls > 100_000:
-            raise _error("too many painting contexts")
         if any(plan.repairs for plan in proof.plans.values()):
             raise _error(f"{description} needs invocation-specific overprint repair")
         for plan in proof.plans.values():
             self.record(plan)
+        self.proofs.add(context)
 
     def pattern(self, selected: _Pattern | None, ancestors) -> None:
+        """Evaluate a pattern using the initial state of its defining resource scope."""
         if selected is None or selected.definition is None:
             raise _error("pattern paint without a selected pattern")
         pattern = selected.definition
@@ -247,17 +328,30 @@ class _Analyzer:
         ancestors: frozenset[tuple[int, int]] = frozenset(),
         resource_initial: _State | None = None,
     ) -> None:
+        """Plan a stream once per full context, checking recursion before cache hits."""
         if resource_initial is None:
             resource_initial = initial
         key = owner.objgen
         if key in ancestors or len(ancestors) >= 64:
             raise _error("recursive or excessively nested painting stream")
-        self.calls += 1
+        context = (
+            key,
+            resources.unparse(),
+            _state_key(initial),
+            _state_key(resource_initial),
+            ancestors,
+        )
+        if context in self.contexts:
+            return
+        self.budget.calls += 1
         if self.calls > 100_000:
             raise _error("too many painting contexts")
         ancestors = ancestors | {key}
         try:
-            instructions = list(pikepdf.parse_content_stream(owner))
+            instructions = self.instructions.get(key)
+            if instructions is None:
+                instructions = list(pikepdf.parse_content_stream(owner))
+                self.instructions[key] = instructions
         except Exception as exc:
             raise _error("unreadable painting stream") from exc
         state = initial
@@ -275,7 +369,9 @@ class _Analyzer:
                     kind = (
                         state.fill
                         if image.get("/ImageMask", False)
-                        else _colour_kind(image.get("/ColorSpace"), resources)
+                        else _colour_kind(
+                            _inline_space(image.get("/ColorSpace")), resources
+                        )
                     )
                     painted = replace(state, fill=kind)
                     fill = True
@@ -399,8 +495,10 @@ class _Analyzer:
             owner, resources, instructions, frozenset(repairs), resources.unparse()
         )
         self.record(plan)
+        self.contexts.add(context)
 
     def form(self, stream, inherited, state, ancestors, resource_initial=None) -> None:
+        """Enter a Form while preserving the initial state of inherited resources."""
         if not isinstance(stream, Stream):
             raise _error("invalid Form XObject")
         resources = stream.get("/Resources", inherited)

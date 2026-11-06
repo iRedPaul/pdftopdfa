@@ -10,7 +10,10 @@ from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..exceptions import ConversionError
 from ..utils import validate_pdfa_level
-from ._calibrated import _convert_calibrated_colorspaces
+from ._calibrated import (
+    _convert_calibrated_colorspaces,
+    validate_calibrated_colorspaces,
+)
 from ._defaults import _apply_default_colorspaces, _apply_defaults_to_ap_entry
 from ._detection import (
     _analyze_colorspace,
@@ -168,6 +171,7 @@ def embed_color_profiles(
         ConversionError: If level is invalid or profiles cannot be embedded.
     """
     level = validate_pdfa_level(level)
+    validate_calibrated_colorspaces(pdf)
 
     existing_output_intent_colorspace: ColorSpaceType | None = None
     retained_output_intents = Array()

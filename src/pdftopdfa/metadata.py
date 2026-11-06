@@ -574,12 +574,45 @@ _STRUCTURAL_PROPERTY_CORRECTIONS: dict[str, str] = {
     f"{{{NAMESPACES['stEvt']}}}When": f"{{{NAMESPACES['stEvt']}}}when",
 }
 
+_PROVENANCE_FIELD_TYPES = {
+    NAMESPACES["stEvt"]: {
+        "action": "s",
+        "changed": "s",
+        "instanceID": "s",
+        "parameters": "s",
+        "softwareAgent": "s",
+        "when": "d",
+    },
+    NAMESPACES["stRef"]: {
+        "documentID": "s",
+        "instanceID": "s",
+        "filePath": "s",
+        "renditionClass": "s",
+        "renditionParams": "s",
+        "alternatePaths": "q",
+        "lastModifyDate": "d",
+        "manager": "s",
+        "managerVariant": "s",
+        "manageTo": "s",
+        "manageUI": "s",
+        "versionID": "s",
+        "fromPart": "s",
+        "toPart": "s",
+        "partMapping": "s",
+        "maskMarkers": "s",
+    },
+}
+
 
 def _normalize_structural_properties(elem: etree._Element) -> None:
     """Recursively correct non-standard property names in structural types."""
     corrected = _STRUCTURAL_PROPERTY_CORRECTIONS.get(elem.tag)
     if corrected is not None:
         elem.tag = corrected
+    for name in list(elem.attrib):
+        corrected = _STRUCTURAL_PROPERTY_CORRECTIONS.get(name)
+        if corrected is not None:
+            elem.set(corrected, elem.attrib.pop(name))
     for child in elem:
         _normalize_structural_properties(child)
 
@@ -1557,47 +1590,53 @@ def _validate_seq_items(
     return False  # No Seq found
 
 
-def _validate_alt_lang(elem: etree._Element, ns_rdf: str) -> bool:
-    """Check that Lang Alt items have xml:lang attributes."""
+def _text_array_items(elem, ns_rdf: str, container: str):
+    """Return simple RDF list items only for a structurally valid text array."""
+    children = [child for child in elem if isinstance(child.tag, str)]
+    if len(children) != 1 or children[0].tag != f"{{{ns_rdf}}}{container}":
+        return None
+    array = children[0]
+    if (
+        (elem.text or "").strip()
+        or (array.text or "").strip()
+        or (array.tail or "").strip()
+    ):
+        return None
+    if any(name.startswith(f"{{{ns_rdf}}}") for name in elem.attrib) or array.attrib:
+        return None
     xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
-    for child in elem:
-        if child.tag == f"{{{ns_rdf}}}Alt":
-            valid_items = 0
-            for li in child:
-                if li.tag != f"{{{ns_rdf}}}li":
-                    continue
-                if li.get(xml_lang) is None:
-                    return False
-                # Empty strings and literal text such as "None" are valid
-                # translations. A scalar cleanup heuristic must not discard
-                # their entire language array, including other translations.
-                if any(isinstance(grand.tag, str) for grand in li):
-                    return False
-                valid_items += 1
-            return valid_items > 0
-    return False  # No Alt found
+    items = []
+    for item in array:
+        if not isinstance(item.tag, str):
+            continue
+        if (
+            item.tag != f"{{{ns_rdf}}}li"
+            or any(isinstance(child.tag, str) for child in item)
+            or set(item.attrib) - {xml_lang}
+            or (item.tail or "").strip()
+        ):
+            return None
+        items.append(item)
+    return items or None
+
+
+def _validate_alt_lang(elem: etree._Element, ns_rdf: str) -> bool:
+    """Require a simple language array with unique, nonempty language tags."""
+    xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
+    items = _text_array_items(elem, ns_rdf, "Alt")
+    if items is None:
+        return False
+    languages = [item.get(xml_lang, "").casefold() for item in items]
+    # Empty strings and literal values such as "None" are valid translations.
+    return all(languages) and len(languages) == len(set(languages))
 
 
 def _validate_text_container(elem: etree._Element, ns_rdf: str, container: str) -> bool:
     """Check that a text container has at least one useful list item."""
-    container_tag = f"{{{ns_rdf}}}{container}"
-    li_tag = f"{{{ns_rdf}}}li"
-
-    for child in elem:
-        if child.tag != container_tag:
-            continue
-        valid_items = 0
-        for li in child:
-            if li.tag != li_tag:
-                continue
-            if any(isinstance(grand.tag, str) for grand in li):
-                return False
-            if _clean_metadata_text(li.text) is None:
-                return False
-            valid_items += 1
-        return valid_items > 0
-
-    return False
+    items = _text_array_items(elem, ns_rdf, container)
+    return items is not None and all(
+        _clean_metadata_text(item.text) is not None for item in items
+    )
 
 
 def _validate_structured_container(
@@ -1813,13 +1852,22 @@ def _is_valid_provenance_struct(elem: etree._Element, namespace: str) -> bool:
     must not be mistaken for a simple string or a sequence of strings.
     """
     ns_rdf = NAMESPACES["rdf"]
+    parse_type = f"{{{ns_rdf}}}parseType"
+    if elem.get(parse_type) not in (None, "Resource"):
+        return False
     children = [child for child in elem if isinstance(child.tag, str)]
     if len(children) == 1 and children[0].tag == f"{{{ns_rdf}}}Description":
-        if _clean_metadata_text(elem.text) is not None:
+        if (
+            (elem.text or "").strip()
+            or (children[0].tail or "").strip()
+            or elem.get(parse_type) is not None
+        ):
             return False
         source = children[0]
     else:
         source = elem
+        if children and source.get(parse_type) != "Resource":
+            return False
         if (
             source.get(f"{{{ns_rdf}}}parseType") != "Resource"
             and not children
@@ -1827,35 +1875,48 @@ def _is_valid_provenance_struct(elem: etree._Element, namespace: str) -> bool:
         ):
             return False
 
-    if _clean_metadata_text(source.text) is not None:
+    if source.get(parse_type) not in (None, "Resource"):
+        return False
+    if (source.text or "").strip():
         return False
     fields: dict[str, str] = {}
     for key, value in source.attrib.items():
         if key in {f"{{{ns_rdf}}}parseType", f"{{{ns_rdf}}}about"}:
             continue
-        if not key.startswith(f"{{{namespace}}}"):
+        key = _STRUCTURAL_PROPERTY_CORRECTIONS.get(key, key)
+        if not key.startswith(f"{{{namespace}}}") or key in fields:
+            return False
+        value_type = _PROVENANCE_FIELD_TYPES[namespace].get(key.split("}", 1)[1])
+        if value_type is None or value_type == "q":
+            return False
+        if not _is_valid_simple_value(value.strip(), value_type):
             return False
         fields[key] = value
     for field in source:
         if not isinstance(field.tag, str):
             continue
-        if not field.tag.startswith(f"{{{namespace}}}"):
+        key = _STRUCTURAL_PROPERTY_CORRECTIONS.get(field.tag, field.tag)
+        if not key.startswith(f"{{{namespace}}}"):
             return False
-        if _clean_metadata_text(field.tail) is not None:
+        if (field.tail or "").strip():
             return False
-        if field.tag in fields:
+        if key in fields:
             return False
-        if field.tag == f"{{{NAMESPACES['stRef']}}}alternatePaths":
+        value_type = _PROVENANCE_FIELD_TYPES[namespace].get(key.split("}", 1)[1])
+        if value_type is None:
+            return False
+        if value_type == "q":
             if not _validate_text_container(field, ns_rdf, "Seq"):
                 return False
+            fields[key] = ""
             continue
-        if len(field):
+        if len(field) or set(field.attrib) - {f"{{{ns_rdf}}}resource"}:
             return False
-        fields[field.tag] = field.get(f"{{{ns_rdf}}}resource", field.text or "")
-
-    date_field = "when" if namespace == NAMESPACES["stEvt"] else "lastModifyDate"
-    date_value = fields.get(f"{{{namespace}}}{date_field}")
-    return date_value is None or _is_valid_simple_value(date_value.strip(), "d")
+        value = field.get(f"{{{ns_rdf}}}resource", field.text or "")
+        if not _is_valid_simple_value(value.strip(), value_type):
+            return False
+        fields[key] = value
+    return True
 
 
 def _is_valid_provenance_property(elem: etree._Element, local_name: str) -> bool:
@@ -1865,9 +1926,16 @@ def _is_valid_provenance_property(elem: etree._Element, local_name: str) -> bool
     ns_rdf = NAMESPACES["rdf"]
     containers = [child for child in elem if isinstance(child.tag, str)]
     if (
-        _clean_metadata_text(elem.text) is not None
+        (elem.text or "").strip()
+        or elem.get(f"{{{ns_rdf}}}parseType") is not None
         or len(containers) != 1
         or containers[0].tag != f"{{{ns_rdf}}}Seq"
+    ):
+        return False
+    if (
+        containers[0].attrib
+        or (containers[0].text or "").strip()
+        or (containers[0].tail or "").strip()
     ):
         return False
     return all(
@@ -2812,10 +2880,12 @@ def create_xmp_metadata(
     if author is not None:
         if not creators:
             creators = [author]
-        elif author not in creators and author not in {
-            ", ".join(creators),
-            "; ".join(creators),
-        }:
+        elif author not in creators and not any(
+            re.fullmatch(
+                r"\s*" + separator.join(re.escape(c) for c in creators) + r"\s*", author
+            )
+            for separator in (r"\s*,\s*", r"\s*;\s*")
+        ):
             # A genuinely different DocInfo /Author replaces the synchronized
             # first creator only. Never split arbitrary names on punctuation,
             # and keep independently listed co-authors. A textual reflection
@@ -2839,6 +2909,7 @@ def create_xmp_metadata(
     )
 
     def _build_lang_alt(tag_name: str, text: str) -> etree._Element:
+        """Copy translations while updating the synchronized default language."""
         elem = _copy_valid_xmp_property(existing_xmp_tree, ns_dc, tag_name)
         if elem is None:
             elem = dc(tag_name)
@@ -2858,6 +2929,7 @@ def create_xmp_metadata(
         return elem
 
     def _build_seq(tag_name: str, values: list[str]) -> etree._Element:
+        """Retain a valid ordered sequence while updating synchronized item values."""
         elem = _copy_valid_xmp_property(existing_xmp_tree, ns_dc, tag_name)
         if elem is not None:
             seq = elem.find(f"{{{ns_rdf}}}Seq")
@@ -3272,6 +3344,7 @@ def _sanitize_non_catalog_xmp_tree(tree: etree._Element) -> None:
 
             if predefined is not None and local in predefined:
                 if _is_valid_preserved_property(child, uri, local):
+                    _normalize_structural_properties(child)
                     continue
                 desc.remove(child)
                 continue

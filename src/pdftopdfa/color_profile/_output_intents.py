@@ -7,7 +7,7 @@
 import logging
 from dataclasses import dataclass
 
-from pikepdf import Array, Dictionary, Name, Pdf
+from pikepdf import Array, Dictionary, Name, Pdf, String
 
 from ..utils import resolve_indirect as _resolve_indirect
 from ._profiles import _validate_icc_profile
@@ -71,6 +71,18 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
             return OutputIntentPreparation(
                 keep_existing=False,
                 reason="OutputIntent subtype is missing or is not a name",
+            )
+        if (
+            intent.get("/Type") not in (None, Name.OutputIntent)
+            or not isinstance(intent.get("/OutputConditionIdentifier"), String)
+            or any(
+                intent.get(key) is not None and not isinstance(intent[key], String)
+                for key in ("/OutputCondition", "/RegistryName", "/Info")
+            )
+        ):
+            return OutputIntentPreparation(
+                keep_existing=False,
+                reason="OutputIntent dictionary has missing or malformed fields",
             )
         if subtype == Name("/GTS_PDFX"):
             if "/DestOutputProfileRef" in intent:
@@ -140,6 +152,7 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
 
 
 def _validate_pdfa_output_intent(intent: Dictionary) -> _ValidOutputIntent | None:
+    """Check an embedded output profile and repair its deterministic component count."""
     dest_profile = intent.get("/DestOutputProfile")
     if dest_profile is None:
         return None
@@ -177,6 +190,7 @@ def _validate_pdfa_output_intent(intent: Dictionary) -> _ValidOutputIntent | Non
 
 
 def _as_int(value: object) -> int | None:
+    """Interpret a PDF numeric value without propagating invalid-field errors."""
     try:
         return int(value)
     except (TypeError, ValueError):

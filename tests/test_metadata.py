@@ -4,6 +4,7 @@
 
 """Unit tests for metadata.py."""
 
+import copy
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1635,6 +1636,7 @@ class TestDublinCoreMultivaluePreservation:
 
     @staticmethod
     def _source_tree() -> etree._Element:
+        """Create multilingual properties and independently ordered creator entries."""
         return _build_xmp_with_extras(
             "<dc:title><rdf:Alt>"
             '<rdf:li xml:lang="x-default">Report</rdf:li>'
@@ -1652,6 +1654,7 @@ class TestDublinCoreMultivaluePreservation:
 
     @staticmethod
     def _values(tree: etree._Element, property_name: str) -> list[str]:
+        """Read all simple values from a Dublin Core array in document order."""
         return tree.xpath(
             f"//dc:{property_name}/*/rdf:li/text()", namespaces=NAMESPACES
         )
@@ -1661,6 +1664,7 @@ class TestDublinCoreMultivaluePreservation:
     def test_sync_preserves_arrays_after_save_and_repeat(
         self, level: str, with_docinfo: bool, tmp_path: Path
     ) -> None:
+        """Retain language alternatives and creator order through repeated syncing."""
         pdf = new_pdf()
         pdf.add_blank_page()
         tree = self._source_tree()
@@ -1687,9 +1691,20 @@ class TestDublinCoreMultivaluePreservation:
                 assert str(restored.docinfo["/Author"]) == "Alice, Bob"
 
     @pytest.mark.parametrize(
-        "author", [None, "Alice", "Bob", "Alice, Bob", "Alice; Bob"]
+        "author",
+        [
+            None,
+            "Alice",
+            "Bob",
+            "Alice, Bob",
+            "Alice; Bob",
+            "Alice,Bob",
+            "Alice;Bob",
+            "Alice ,  Bob",
+        ],
     )
     def test_existing_author_reflection_preserves_sequence(self, author) -> None:
+        """Recognize alternate textual formatting of an existing creator list."""
         xmp = create_xmp_metadata(
             {"author": author}, 2, "B", existing_xmp_tree=self._source_tree()
         )
@@ -1697,11 +1712,51 @@ class TestDublinCoreMultivaluePreservation:
         assert tree is not None
         assert self._values(tree, "creator") == ["Alice", "Bob"]
 
+    @pytest.mark.parametrize("property_name", ["title", "description", "creator"])
+    @pytest.mark.parametrize("malformation", ["sibling", "extra_container", "nested"])
+    def test_malformed_array_is_rebuilt_before_preservation(
+        self, property_name, malformation
+    ) -> None:
+        """Malformed siblings cannot survive copying an otherwise useful array."""
+        original = self._source_tree()
+        prop = original.find(f".//{{{NAMESPACES['dc']}}}{property_name}")
+        array = prop[0]
+        if malformation == "sibling":
+            etree.SubElement(array, f"{{{NAMESPACES['rdf']}}}notAnItem").text = "bad"
+        elif malformation == "extra_container":
+            prop.append(copy.deepcopy(array))
+        else:
+            etree.SubElement(array[0], f"{{{NAMESPACES['rdf']}}}Description")
+        result = _parse_xmp_bytes(
+            create_xmp_metadata({}, 2, "B", existing_xmp_tree=original)
+        )
+        restored = result.find(f".//{{{NAMESPACES['dc']}}}{property_name}")
+        assert len(restored) == 1
+        assert all(
+            item.tag == f"{{{NAMESPACES['rdf']}}}li" and not len(item)
+            for item in restored[0]
+        )
+
+    @pytest.mark.parametrize("property_name", ["title", "description"])
+    def test_duplicate_languages_are_not_copied(self, property_name) -> None:
+        """Language alternatives must contain each language only once."""
+        original = self._source_tree()
+        prop = original.find(f".//{{{NAMESPACES['dc']}}}{property_name}")
+        prop[0].append(copy.deepcopy(prop[0][0]))
+        result = _parse_xmp_bytes(
+            create_xmp_metadata({}, 2, "B", existing_xmp_tree=original)
+        )
+        languages = result.xpath(
+            f"//dc:{property_name}/rdf:Alt/rdf:li/@xml:lang", namespaces=NAMESPACES
+        )
+        assert len(languages) == len(set(languages))
+
     @pytest.mark.parametrize("property_name", ["title", "description"])
     @pytest.mark.parametrize("translation", ["", "None", "null", "  texte  "])
     def test_literal_translation_does_not_discard_other_languages(
         self, property_name: str, translation: str
     ) -> None:
+        """Retain literal or empty translations without losing other languages."""
         original = self._source_tree()
         items = original.xpath(
             f"//dc:{property_name}/rdf:Alt/rdf:li", namespaces=NAMESPACES
@@ -1729,6 +1784,7 @@ class TestDublinCoreMultivaluePreservation:
             ] == expected
 
     def test_overrides_update_default_and_first_creator_only(self) -> None:
+        """Update synchronized values while retaining translations and co-authors."""
         original = self._source_tree()
         original_bytes = etree.tostring(original)
         xmp = create_xmp_metadata(
@@ -1745,6 +1801,7 @@ class TestDublinCoreMultivaluePreservation:
         assert etree.tostring(original) == original_bytes
 
     def test_original_snapshot_keeps_arrays_when_current_metadata_changed(self) -> None:
+        """Restore source arrays after intermediate metadata has been replaced."""
         pdf = new_pdf()
         pdf.add_blank_page()
         source_tree = self._source_tree()
@@ -1766,6 +1823,7 @@ class TestDublinCoreMultivaluePreservation:
         assert str(pdf.docinfo["/Author"]) == "Alice"
 
     def test_missing_default_adds_fallback_without_losing_translation(self) -> None:
+        """Add a default language while preserving the existing translations."""
         source_tree = _build_xmp_with_extras(
             "<dc:title><rdf:Alt>"
             '<rdf:li xml:lang="de-DE">Bericht</rdf:li>'
@@ -3571,6 +3629,7 @@ class TestProvenancePreservation:
 
     @staticmethod
     def _packet(properties: str) -> etree._Element:
+        """Wrap provenance properties with the required XMP and RDF namespaces."""
         return etree.fromstring(
             f'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
             f'<rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}" '
@@ -3583,6 +3642,7 @@ class TestProvenancePreservation:
 
     @staticmethod
     def _roundtrip(pdf: Pdf, tree: etree._Element, level: str, location: str, path):
+        """Synchronize and reopen either document or page metadata for inspection."""
         stream = pdf.make_stream(_reserialize_xmp(tree))
         stream.Type = Name.Metadata
         stream.Subtype = Name.XML
@@ -3602,6 +3662,7 @@ class TestProvenancePreservation:
     def test_valid_provenance_survives_save_reopen(
         self, level, location, structure, tmp_path
     ) -> None:
+        """Retain supported provenance encodings in document and page packets."""
         ref_fields = (
             "<stRef:instanceID>uuid:source</stRef:instanceID>"
             "<stRef:alternatePaths><rdf:Seq>"
@@ -3665,11 +3726,32 @@ class TestProvenancePreservation:
             "<xmpMM:History><rdf:Bag/></xmpMM:History>",
             '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
             "<stEvt:when>yesterday</stEvt:when></rdf:li></rdf:Seq></xmpMM:History>",
+            '<xmpMM:DerivedFrom rdf:parseType="Literal">'
+            "<stRef:instanceID>uuid:source</stRef:instanceID></xmpMM:DerivedFrom>",
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Literal">'
+            "<stEvt:action>saved</stEvt:action></rdf:li></rdf:Seq></xmpMM:History>",
+            '<xmpMM:DerivedFrom rdf:parseType="Resource">'
+            "<stRef:notAField>bad</stRef:notAField></xmpMM:DerivedFrom>",
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource" '
+            'stEvt:notAField="bad"/></rdf:Seq></xmpMM:History>',
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
+            "<stEvt:When>yesterday</stEvt:When></rdf:li></rdf:Seq></xmpMM:History>",
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource" '
+            'stEvt:When="yesterday"/></rdf:Seq></xmpMM:History>',
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource" '
+            'stEvt:when="2024-01-01" stEvt:When="2024-01-02"/>'
+            "</rdf:Seq></xmpMM:History>",
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
+            "<stEvt:When>2024-01-01</stEvt:When><stEvt:when>2024-01-02</stEvt:when>"
+            "</rdf:li></rdf:Seq></xmpMM:History>",
+            '<xmpMM:DerivedFrom rdf:parseType="Resource">'
+            "<stRef:instanceID><rdf:Bag/></stRef:instanceID></xmpMM:DerivedFrom>",
         ],
     )
     def test_malformed_provenance_is_not_retained(
         self, location, properties, tmp_path
     ) -> None:
+        """Reject invalid provenance types, fields, dates, and normalized collisions."""
         tree = self._packet(properties)
         with new_pdf() as pdf:
             pdf.add_blank_page()
@@ -3679,9 +3761,32 @@ class TestProvenancePreservation:
         )
 
     @pytest.mark.parametrize("location", ["catalog", "page"])
+    @pytest.mark.parametrize("attribute", [False, True])
+    def test_valid_alias_is_normalized_before_retention(
+        self, location, attribute, tmp_path
+    ) -> None:
+        """Both metadata paths emit the same validated canonical event date."""
+        value = "2024-01-01T00:00:00Z"
+        fields = f"<stEvt:When>{value}</stEvt:When>"
+        item = (
+            f'<rdf:li rdf:parseType="Resource" stEvt:When="{value}"/>'
+            if attribute
+            else f'<rdf:li rdf:parseType="Resource">{fields}</rdf:li>'
+        )
+        tree = self._packet(f"<xmpMM:History><rdf:Seq>{item}</rdf:Seq></xmpMM:History>")
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        result = self._roundtrip(pdf, tree, "2b", location, tmp_path / "normalized.pdf")
+        assert not result.xpath("//stEvt:When | //@stEvt:When", namespaces=NAMESPACES)
+        assert result.xpath(
+            "//stEvt:when/text() | //@stEvt:when", namespaces=NAMESPACES
+        ) == [value]
+
+    @pytest.mark.parametrize("location", ["catalog", "page"])
     def test_structured_properties_cannot_be_plain_attributes(
         self, location, tmp_path
     ) -> None:
+        """Do not retain scalar attributes where structured provenance is required."""
         tree = self._packet("")
         description = tree.find(f".//{{{NAMESPACES['rdf']}}}Description")
         description.set(f"{{{NAMESPACES['xmpMM']}}}History", "saved")

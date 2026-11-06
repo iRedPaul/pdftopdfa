@@ -33,6 +33,7 @@ _MM = "http://ns.adobe.com/xap/1.0/mm/"
 
 
 def _document(level: str, *, cmyk: bool = False) -> Pdf:
+    """Create a conforming document with a matching output profile."""
     pdf = new_pdf()
     pdf.add_blank_page(page_size=(200, 200))
     sync_metadata(pdf, level)
@@ -44,6 +45,7 @@ def _document(level: str, *, cmyk: bool = False) -> Pdf:
 
 
 def _form(pdf: Pdf, data: bytes, size: int = 200):
+    """Create a Form appearance with explicit dimensions and resources."""
     form = pdf.make_stream(data)
     form.Type = Name.XObject
     form.Subtype = Name.Form
@@ -182,6 +184,7 @@ def _add_preserved_features(pdf: Pdf) -> None:
 def test_full_conversion_preserves_conforming_features(
     source_level: str, target_level: str, tmp_path: Path
 ) -> None:
+    """Retain allowed features through conversion to the other PDF/A part."""
     pdf = _document(source_level)
     _add_preserved_features(pdf)
     source = tmp_path / "source.pdf"
@@ -237,6 +240,7 @@ def test_full_conversion_preserves_conforming_features(
 def test_full_conversion_preserves_overprint_on_an_unrelated_page(
     source_level: str, target_level: str, tmp_path: Path
 ) -> None:
+    """Keep unrelated valid overprint unchanged through full conversion."""
     pdf = _document(source_level, cmyk=True)
     first = pdf.pages[0]
     first.Resources = Dictionary(
@@ -269,10 +273,69 @@ def test_full_conversion_preserves_overprint_on_an_unrelated_page(
 
 
 @pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
+def test_full_conversion_repairs_malformed_preserved_xmp(
+    source_level: str, target_level: str, tmp_path: Path
+) -> None:
+    """Invalid arrays and provenance cannot survive as copied metadata packets."""
+    pdf = _document(source_level)
+    event = "http://ns.adobe.com/xap/1.0/sType/ResourceEvent#"
+    ref = "http://ns.adobe.com/xap/1.0/sType/ResourceRef#"
+    tree = etree.fromstring(pdf.Root.Metadata.read_bytes())
+    description = tree.find(f".//{{{_RDF}}}Description")
+    properties = (
+        f'<dc:title xmlns:dc="{_DC}" xmlns:rdf="{_RDF}"><rdf:Alt>'
+        '<rdf:li xml:lang="x-default">Report</rdf:li>'
+        '<rdf:li xml:lang="x-default">Duplicate</rdf:li>'
+        "<rdf:notAnItem>bad</rdf:notAnItem></rdf:Alt></dc:title>",
+        f'<dc:creator xmlns:dc="{_DC}" xmlns:rdf="{_RDF}"><rdf:Seq>'
+        "<rdf:li>Alice</rdf:li><rdf:notAnItem>bad</rdf:notAnItem>"
+        "</rdf:Seq></dc:creator>",
+        f'<xmpMM:History xmlns:xmpMM="{_MM}" xmlns:rdf="{_RDF}" '
+        f'xmlns:stEvt="{event}"><rdf:Seq><rdf:li rdf:parseType="Resource" '
+        'stEvt:notAField="bad"/></rdf:Seq></xmpMM:History>',
+        f'<xmpMM:DerivedFrom xmlns:xmpMM="{_MM}" xmlns:rdf="{_RDF}" '
+        f'xmlns:stRef="{ref}" rdf:parseType="Literal">'
+        "<stRef:instanceID>uuid:source</stRef:instanceID></xmpMM:DerivedFrom>",
+    )
+    for xml in properties:
+        description.append(etree.fromstring(xml.encode()))
+    pdf.Root.Metadata.write(etree.tostring(tree))
+    page_tree = etree.fromstring(
+        f'<x:xmpmeta xmlns:x="adobe:ns:meta/" xmlns:rdf="{_RDF}" '
+        f'xmlns:xmpMM="{_MM}" xmlns:stEvt="{event}"><rdf:RDF>'
+        '<rdf:Description rdf:about=""><xmpMM:History><rdf:Seq>'
+        '<rdf:li rdf:parseType="Resource" stEvt:When="yesterday"/>'
+        "</rdf:Seq></xmpMM:History></rdf:Description></rdf:RDF></x:xmpmeta>"
+    )
+    metadata = pdf.make_stream(etree.tostring(page_tree))
+    metadata.Type, metadata.Subtype = Name.Metadata, Name.XML
+    pdf.pages[0].Metadata = metadata
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source, force_version="1.7")
+    assert not validate_with_verapdf(source, flavour=source_level).compliant
+    result = convert_to_pdfa(source, output, level=target_level, validate=True)
+    assert result.success and result.target_produced and not result.validation_failed
+    with pikepdf.open(output) as restored:
+        for owner in (restored.Root, restored.pages[0].obj):
+            actual = etree.fromstring(owner.Metadata.read_bytes())
+            assert not actual.xpath(
+                "//xmpMM:History | //xmpMM:DerivedFrom", namespaces={"xmpMM": _MM}
+            )
+        actual = etree.fromstring(restored.Root.Metadata.read_bytes())
+        assert actual.xpath(
+            "//dc:title/rdf:Alt/rdf:li/text()", namespaces={"dc": _DC, "rdf": _RDF}
+        ) == ["Report"]
+        assert actual.xpath(
+            "//dc:creator/rdf:Seq/rdf:li/text()", namespaces={"dc": _DC, "rdf": _RDF}
+        ) == ["Alice"]
+
+
+@pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
 @pytest.mark.parametrize("kind", ["tiling", "shading"])
 def test_full_conversion_preserves_valid_pattern_overprint(
     source_level: str, target_level: str, kind: str, tmp_path: Path
 ) -> None:
+    """Validate allowed tiling and shading overprint through full conversion."""
     pdf = _document(source_level, cmyk=True)
     page = pdf.pages[0]
     icc = Array([Name.ICCBased, pdf.Root.OutputIntents[0].DestOutputProfile])

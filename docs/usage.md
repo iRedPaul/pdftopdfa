@@ -229,6 +229,8 @@ Valid CalGray and CalRGB color spaces are permitted by PDF/A and are preserved
 with their original calibration. The deprecated
 `convert_calibrated=True` option is accepted for compatibility, but emits a
 warning and also preserves them; it no longer substitutes generic ICC profiles.
+Malformed CalGray/CalRGB definitions trigger the original-input fallback with a
+warning rather than producing a PDF/A target with invalid calibration.
 
 Compatible additional OutputIntents retain their printing information and share
 the embedded ICC profile when required. PDF/X, PDF/VT, and PDF/E identification

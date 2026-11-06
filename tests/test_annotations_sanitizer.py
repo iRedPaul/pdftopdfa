@@ -221,6 +221,7 @@ class TestTrapNetPreservation:
     def test_sanitization_preserves_trapnet_properties_and_appearance(
         self, make_pdf_with_page, level
     ):
+        """Retain valid TrapNet properties, appearance bytes, and page content."""
         from pdftopdfa.sanitizers import sanitize_for_pdfa
 
         pdf = make_pdf_with_page()
@@ -1864,6 +1865,7 @@ class TestRemoveAnnotationColors:
     """Valid PDF/A-2/3 annotation colors survive the legacy removal entry point."""
 
     def test_no_annotations(self, make_pdf_with_page):
+        """Leave pages without annotations unchanged."""
         pdf = make_pdf_with_page()
         assert remove_annotation_colors(pdf) == 0
 
