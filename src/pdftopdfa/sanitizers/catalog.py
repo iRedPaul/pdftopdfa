@@ -11,8 +11,9 @@ header and /Root/Version, so the catalog /Version must be removed or
 overwritten to prevent it from elevating the effective version beyond
 what ``force_version`` sets in the header.
 
-ISO 19005-2, clauses 6.1.10–6.1.13 forbid /Requirements and /Collection
-keys in the Document Catalog. /Perms is sanitized to keep only /UR3 and
+ISO 19005-2, clause 6.11 forbids /Requirements in the Document Catalog.
+Collections and article threads are permitted and remain intact.
+/Perms is sanitized to keep only /UR3 and
 /DocMDP entries (clause 6.1.12-1). If /DocMDP remains in /Perms, digest
 keys are removed from Signature Reference dictionaries per clause 6.1.12-2.
 /NeedsRendering (ISO 32000-1, Table 28) is also removed as it is
@@ -40,6 +41,7 @@ from lxml import etree
 from pikepdf import Dictionary, Name, Pdf, String
 
 from ..utils import resolve_indirect as _resolve_indirect
+from .navigation import sanitize_catalog_navigation
 
 logger = logging.getLogger(__name__)
 
@@ -54,14 +56,12 @@ def _is_valid_bcp47(tag: str) -> bool:
     return bool(_BCP47_RE.fullmatch(tag))
 
 
-# Catalog keys forbidden by ISO 19005-2, clauses 6.1.10–6.1.13,
-# plus /NeedsRendering (ISO 32000-1, Table 28),
-# /Threads (article threads) and /SpiderInfo (web capture)
+# Catalog cleanup: /Requirements is forbidden by ISO 19005-2/3, 6.11;
+# /NeedsRendering is incompatible with static rendering. Retain the existing
+# /SpiderInfo cleanup policy, but preserve permitted /Collection and /Threads.
 FORBIDDEN_CATALOG_KEYS = (
     "/Requirements",
-    "/Collection",
     "/NeedsRendering",
-    "/Threads",
     "/SpiderInfo",
 )
 
@@ -357,23 +357,29 @@ def _remove_docmdp_sigref_digest_keys(pdf: Pdf) -> int:
 def remove_forbidden_catalog_entries(pdf: Pdf) -> int:
     """Remove forbidden entries from the Document Catalog.
 
-    PDF/A-2 and PDF/A-3 require the following Catalog cleanup:
+    Apply the following Catalog cleanup:
     - /Perms is sanitized to keep only /UR3 and /DocMDP (clause 6.1.12-1)
     - When sanitized /Perms contains /DocMDP, Signature Reference digest
       keys are removed (clause 6.1.12-2)
-    - /Requirements (clause 6.1.10)
-    - /Collection (clause 6.1.13)
+    - /Requirements (clause 6.11)
     - /NeedsRendering (ISO 32000-1, Table 28)
-    - /Threads (article threads, no archival purpose)
-    - /SpiderInfo (web capture metadata, no archival purpose)
+    - /SpiderInfo (existing web capture metadata cleanup policy)
+
+    PDF/A-2 and PDF/A-3 permit collections and article threads. Preserve valid
+    structures, repair malformed optional collection settings, and reject
+    article graphs that cannot be safely repaired without changing destinations.
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
 
     Returns:
-        Number of forbidden catalog entries removed.
+        Number of forbidden or malformed catalog entries removed.
+
+    Raises:
+        ConversionError: If article navigation is malformed; validation fails
+            before any catalog cleanup is applied.
     """
-    removed_count = 0
+    removed_count = sanitize_catalog_navigation(pdf)
 
     perms_removed, has_doc_mdp = _sanitize_catalog_perms(pdf)
     removed_count += perms_removed

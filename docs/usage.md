@@ -245,8 +245,14 @@ Forms, patterns, or Type3 glyphs require incompatible repairs in different
 contexts, conversion uses the original-input fallback described above and
 reports the reason in the result warnings.
 
+TrapNet annotations are flattened into the page when they are visible and have an
+appearance, and removed otherwise. PDF/A does not require this. It is a deliberate
+choice, because conversion can edit the page, which makes existing trapping stale.
+
 Custom DocInfo strings are retained only with valid PDFDocEncoding or BOM-prefixed
 UTF-16BE text encoding; valid string bytes remain unchanged.
+Article threads are checked for complete bead cycles and page links;
+malformed graphs use the original-input fallback to preserve navigation targets.
 
 To run OCR, provide both external model directories. The pair enables OCR;
 `ocr_languages` defaults to `["en"]`:

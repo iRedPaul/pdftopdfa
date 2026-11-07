@@ -289,6 +289,36 @@ class TestFlattenNonCompliantAnnotations:
         flattened_ap = resolve(xobjects.get("/FmFlattenAnnot0"))
         assert flattened_ap.read_bytes() == b"1 0 0 rg"
 
+    @pytest.mark.parametrize(
+        "flags,with_appearance,flattened",
+        [(4, True, 1), (2, True, 0), (4, False, 0)],
+        ids=["visible", "hidden", "no-appearance"],
+    )
+    def test_trapnet_is_flattened_only_when_visible(
+        self, make_pdf_with_page, flags, with_appearance, flattened
+    ):
+        """Keep visible trapping marks when the annotation itself is not retained."""
+        pdf = make_pdf_with_page()
+        annot = Dictionary(
+            Type=Name.Annot,
+            Subtype=Name.TrapNet,
+            Rect=Array([10, 10, 30, 30]),
+            F=flags,
+        )
+        if with_appearance:
+            appearance = pdf.make_stream(b"0 g 0 0 20 20 re f")
+            appearance[Name.Type] = Name.XObject
+            appearance[Name.Subtype] = Name.Form
+            appearance[Name.BBox] = Array([0, 0, 20, 20])
+            annot[Name.AP] = Dictionary(N=appearance)
+        pdf.pages[0]["/Annots"] = Array([pdf.make_indirect(annot)])
+
+        pdf = save_and_reopen(pdf)
+
+        assert flatten_non_compliant_annotations(pdf) == flattened
+        assert remove_forbidden_annotations(pdf) == 1 - flattened
+        assert len(pdf.pages[0].get("/Annots", [])) == 0
+
     def test_sanitize_for_pdfa_flattens_before_removal(self, make_pdf_with_page):
         """Integration: sanitize_for_pdfa preserves visible appearance."""
         from pdftopdfa.sanitizers import sanitize_for_pdfa
