@@ -5,6 +5,7 @@
 """Local OutputIntent validation and repair helpers."""
 
 import logging
+import re
 from dataclasses import dataclass
 
 from pikepdf import Array, Dictionary, Name, Pdf, String
@@ -25,6 +26,12 @@ _ICC_SIGNATURE_TO_COLORSPACE: dict[bytes, tuple[int, ColorSpaceType]] = {
 # ISO 32000-1, Table 365. Other keys would need an ISO 32000 extension declaration,
 # and the pipeline does not keep those for third-party extensions.
 _DEFINED_OUTPUT_INTENT_SUBTYPES = (Name.GTS_PDFA1, Name.GTS_PDFX, Name.ISO_PDFE1)
+
+# Well-known families in the ICC characterization data registry.
+_KNOWN_CONDITION_RE = re.compile(
+    r"(?:FOGRA|IFRA)\s*\d+|CGATS\s*TR\s*\d+|JC[A-Z]*\s*\d+",
+    re.ASCII | re.IGNORECASE,
+)
 
 # Tags that describe a color model without a lookup table, which CMYK requires.
 _ICC_MODEL_TAGS: dict[bytes, frozenset[bytes]] = {
@@ -107,7 +114,7 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
         # standard production condition (ISO 32000-1, Table 365). Rule 6.2.3-2
         # constrains the entries that actually contain an embedded profile.
         if subtype != Name.GTS_PDFA1 and "/DestOutputProfile" not in intent:
-            if not _may_name_standard_condition(intent):
+            if not _names_standard_condition(intent):
                 invalid_additional.append(index)
             continue
 
@@ -179,15 +186,20 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
     )
 
 
-def _may_name_standard_condition(intent: Dictionary) -> bool:
-    """Return whether a profile-less intent can name a standard production condition.
+def _names_standard_condition(intent: Dictionary) -> bool:
+    """Return whether a profile-less intent names a standard production condition.
 
-    No registry can be queried here, and /RegistryName is optional, so a name such as
-    FOGRA39 cannot be disproved. Custom and an empty value clearly name no standard
-    condition, so those have to embed their profile.
+    No registry can be queried here, so this is a heuristic. It accepts a condition
+    that claims a registry, or that belongs to a well-known family of characterizations
+    if /RegistryName is omitted. Custom never names a standard condition.
     """
-    identifier = str(intent.get("/OutputConditionIdentifier"))
-    return identifier.strip().casefold() not in ("", "custom")
+    identifier = str(intent.get("/OutputConditionIdentifier")).strip()
+    if identifier.casefold() in ("", "custom"):
+        return False
+    registry = intent.get("/RegistryName")
+    if isinstance(registry, String) and str(registry).strip():
+        return True
+    return _KNOWN_CONDITION_RE.fullmatch(identifier) is not None
 
 
 def _remove_redundant_pdfa_intents(output_intents: Array) -> None:

@@ -38,7 +38,7 @@
 - Remove OutputIntents with an undefined subtype or a non-standard condition without a profile while retaining the others, and check uncolored tiling patterns under the overprint state at their painting operation
 - Treat changes to the print flag, rectangle, opacity, blend mode, or optional content of other annotations as making a TrapNet stale
 - Restore the reading order of a page's article beads, and reject a TrapNet with an invalid annotation type
-- Validate calibrated color spaces that inline images declare directly
+- Validate calibrated color spaces that inline images declare directly, and those in interactive form default resources
 - Remove collection item values without a matching schema field or with the wrong type, and a default document that is not an embedded file
 - Sanitize an `/ExtGState` stored directly on a shading pattern like other graphics states, and validate calibrated spaces in its soft mask
 - Remove the PDF/X markers from DocInfo along with their XMP identification

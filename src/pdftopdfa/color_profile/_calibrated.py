@@ -80,6 +80,30 @@ def _validate_calibrated_space(cs) -> None:
         raise ConversionError("Malformed /CalRGB color space: invalid /Matrix")
 
 
+def _acroform_resources(pdf: Pdf) -> list:
+    """Return the default resources of an interactive form and of its fields."""
+    acroform = pdf.Root.get("/AcroForm")
+    if not isinstance(acroform, Dictionary):
+        return []
+    found = [acroform.get("/DR")]
+    fields = acroform.get("/Fields")
+    pending = list(fields) if isinstance(fields, Array) else []
+    seen = set()
+    while pending:
+        field = pending.pop()
+        if not isinstance(field, Dictionary):
+            continue
+        if field.objgen != (0, 0):
+            if field.objgen in seen:
+                continue
+            seen.add(field.objgen)
+        found.append(field.get("/DR"))
+        kids = field.get("/Kids")
+        if isinstance(kids, Array):
+            pending.extend(kids)
+    return found
+
+
 def _inline_image_spaces(owner) -> list:
     """Return color spaces that inline images in a content stream declare directly.
 
@@ -131,6 +155,7 @@ def validate_calibrated_colorspaces(pdf: Pdf) -> None:
             for annotation in (page.get("/Annots") or [])
             if isinstance(annotation, Dictionary)
         )
+    pending.extend(("resources", found) for found in _acroform_resources(pdf))
     visited = set()
     fonts_seen = set()
     while pending:

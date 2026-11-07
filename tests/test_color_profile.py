@@ -1312,11 +1312,20 @@ class TestEmbedColorProfiles:
         assert "/DestOutputProfile" not in pdf.Root.OutputIntents[1]
 
     @pytest.mark.parametrize(
-        "identifier",
-        ["Custom", "custom", " CUSTOM ", "", "  "],
+        "identifier,registry",
+        [
+            ("Custom", None),
+            ("custom", "http://www.color.org"),
+            (" CUSTOM ", None),
+            ("", None),
+            ("  ", "http://www.color.org"),
+            ("NotARegistryEntry", None),
+            ("NotARegistryEntry", " "),
+            ("FOGRA39 extra", None),
+        ],
     )
     def test_additional_intent_without_a_standard_condition_is_removed(
-        self, identifier
+        self, identifier, registry
     ) -> None:
         """A non-standard condition must embed its profile, and others stay intact."""
         pdf = new_pdf()
@@ -1327,6 +1336,8 @@ class TestEmbedColorProfiles:
             S=Name.GTS_PDFX,
             OutputConditionIdentifier=pikepdf.String(identifier),
         )
+        if registry is not None:
+            unregistered.RegistryName = pikepdf.String(registry)
         pdf.Root.OutputIntents = Array(
             [
                 Dictionary(
@@ -1345,6 +1356,40 @@ class TestEmbedColorProfiles:
 
         assert [str(i.OutputConditionIdentifier) for i in pdf.Root.OutputIntents] == [
             "Keep"
+        ]
+
+    @pytest.mark.parametrize(
+        "identifier,registry",
+        [
+            ("FOGRA39", None),
+            ("fogra 51", None),
+            ("IFRA26", None),
+            ("CGATS TR 006", None),
+            ("JC200103", None),
+            ("JCW2003", None),
+            ("Regional press condition", "http://www.color.org"),
+        ],
+    )
+    def test_additional_intent_naming_a_standard_condition_is_retained(
+        self, identifier, registry
+    ) -> None:
+        """A known family or a stated registry can be used instead of a profile."""
+        pdf = new_pdf()
+        pdf.add_blank_page(page_size=(612, 792))
+        intent = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name.GTS_PDFX,
+            OutputConditionIdentifier=pikepdf.String(identifier),
+        )
+        if registry is not None:
+            intent.RegistryName = pikepdf.String(registry)
+        pdf.Root.OutputIntents = Array([intent])
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        assert [str(i.S) for i in pdf.Root.OutputIntents] == [
+            "/GTS_PDFX",
+            "/GTS_PDFA1",
         ]
 
     def test_same_family_different_content_detected(self, caplog) -> None:
@@ -1636,6 +1681,42 @@ class TestPreservedColorValidation:
         )
         with pytest.raises(ConversionError, match="invalid /WhitePoint"):
             embed_color_profiles(pdf)
+
+    @pytest.mark.parametrize("location", ["form", "field", "nested_field"])
+    def test_invalid_calibration_in_form_resources_is_rejected(self, location):
+        """Default form resources are reachable without any page referring to them."""
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        resources = Dictionary(
+            ColorSpace=Dictionary(CS=Array([Name.CalRGB, Dictionary()]))
+        )
+        field = pdf.make_indirect(Dictionary(T="Field"))
+        pdf.Root.AcroForm = Dictionary(Fields=Array([field]))
+        if location == "form":
+            pdf.Root.AcroForm.DR = resources
+        elif location == "field":
+            field.DR = resources
+        else:
+            child = pdf.make_indirect(Dictionary(T="Child", Parent=field, DR=resources))
+            field.Kids = Array([child])
+        with pytest.raises(ConversionError, match="invalid /WhitePoint"):
+            embed_color_profiles(pdf)
+
+    def test_valid_form_resources_and_cyclic_fields_are_accepted(self):
+        """Traversing the field tree terminates and does not reject valid resources."""
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        field = pdf.make_indirect(Dictionary(T="Field"))
+        field.Kids = Array([field])
+        pdf.Root.AcroForm = Dictionary(
+            Fields=Array([field]),
+            DR=Dictionary(
+                ColorSpace=Dictionary(
+                    CS=TestCalibratedPreservation._colorspace("CalRGB")
+                )
+            ),
+        )
+        embed_color_profiles(pdf)
 
     def test_invalid_calibration_in_shading_pattern_soft_mask_is_rejected(self):
         """A pattern's ExtGState holds its mask group outside any resource table."""
