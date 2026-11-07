@@ -1152,20 +1152,24 @@ def remove_non_normal_appearance_keys(pdf: Pdf) -> int:
 
 
 def remove_annotation_colors(pdf: Pdf, level: str = "3b") -> int:
-    """Removes /C and /IC color arrays from annotations.
+    """Remove malformed annotation colors, preserving valid /C and /IC arrays.
 
-    /C (border color) and /IC (interior color) are Device color values
-    (DeviceRGB or DeviceGray arrays) which violate PDF/A's requirement
-    for device-independent color (ISO 19005-2).  Since /AP appearance
-    streams determine the actual visual rendering, these keys can be
-    safely removed.
+    PDF/A-2 and PDF/A-3 permit these DeviceGray, DeviceRGB and DeviceCMYK
+    values; the color-profile stage handles device color calibration.
+    In particular, Link annotations need not have an appearance stream,
+    so their /C entry can determine the visible border color. For other
+    annotations these properties also retain the colors used when editing.
+    An empty array is valid and means transparent, not a missing color.
+
+    The historical function name and removal counter are retained for API
+    compatibility. Only arrays with invalid lengths or components are removed.
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
         level: PDF/A conformance level (for future compatibility).
 
     Returns:
-        Number of color arrays removed.
+        Number of malformed color entries removed.
     """
     removed_count = 0
 
@@ -1175,10 +1179,23 @@ def remove_annotation_colors(pdf: Pdf, level: str = "3b") -> int:
                 resolved = _resolve_indirect(annot)
 
                 for key in ("/C", "/IC"):
-                    if resolved.get(key) is not None:
+                    color = _resolve_indirect(resolved.get(key))
+                    if color is None:
+                        continue
+                    if not isinstance(color, Array) or len(color) not in (0, 1, 3, 4):
+                        valid = False
+                    else:
+                        valid = all(
+                            not isinstance(value, bool)
+                            and isinstance(value, (int, float, Decimal))
+                            and math.isfinite(value)
+                            and 0 <= value <= 1
+                            for value in color
+                        )
+                    if not valid:
                         del resolved[key]
                         removed_count += 1
-                        logger.debug("Removed %s from annotation", key)
+                        logger.debug("Removed malformed %s from annotation", key)
 
             except Exception as e:
                 log_suppressed_error(
@@ -1189,7 +1206,7 @@ def remove_annotation_colors(pdf: Pdf, level: str = "3b") -> int:
                 )
 
     if removed_count > 0:
-        logger.info("%d annotation color array(s) removed", removed_count)
+        logger.info("%d malformed annotation color entr(y/ies) removed", removed_count)
     return removed_count
 
 
@@ -1307,12 +1324,12 @@ def fix_button_appearance_subdicts(pdf: Pdf) -> int:
 
 
 def fix_annotation_opacity(pdf: Pdf, level: str = "3b") -> int:
-    """Fixes annotation-level /CA (opacity) for PDF/A compliance.
+    """Repair malformed annotation opacity while preserving valid transparency.
 
-    ISO 19005-2, clause 6.5.3 requires that the /CA key on annotation
-    dictionaries (not to be confused with ExtGState /CA) must be 1.0
-    if present.  Non-conforming values are set to 1.0; missing /CA is
-    acceptable and left untouched.
+    PDF/A-2 and PDF/A-3 permit annotation /CA values from 0 to 1. Preserve
+    these values and existing appearance streams. Clamp out-of-range numbers
+    to that interval and replace invalid types or non-finite values with the
+    default opacity, 1. Missing /CA entries remain absent.
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
@@ -1332,22 +1349,20 @@ def fix_annotation_opacity(pdf: Pdf, level: str = "3b") -> int:
                 if ca is None:
                     continue
 
-                try:
+                if isinstance(ca, bool) or not isinstance(ca, (int, float, Decimal)):
+                    replacement = 1.0
+                else:
                     ca_val = float(ca)
-                except (TypeError, ValueError):
-                    # Non-numeric /CA — force to 1.0
-                    resolved[Name("/CA")] = 1.0
-                    fixed_count += 1
-                    logger.debug("Fixed non-numeric annotation /CA")
-                    continue
+                    if not math.isfinite(ca_val):
+                        replacement = 1.0
+                    elif 0.0 <= ca_val <= 1.0:
+                        continue
+                    else:
+                        replacement = max(0.0, min(1.0, ca_val))
 
-                if ca_val != 1.0:
-                    resolved[Name("/CA")] = 1.0
-                    fixed_count += 1
-                    logger.debug(
-                        "Fixed annotation /CA %.4f -> 1.0",
-                        ca_val,
-                    )
+                resolved[Name("/CA")] = replacement
+                fixed_count += 1
+                logger.debug("Repaired invalid annotation /CA to %.4f", replacement)
 
             except Exception as e:
                 log_suppressed_error(
