@@ -247,6 +247,8 @@ reports the reason in the result warnings.
 
 Custom DocInfo strings are retained only with valid PDFDocEncoding or BOM-prefixed
 UTF-16BE text encoding; valid string bytes remain unchanged.
+Article threads are checked for complete bead cycles and page links;
+malformed graphs use the original-input fallback to preserve navigation targets.
 
 To run OCR, provide both external model directories. The pair enables OCR;
 `ocr_languages` defaults to `["en"]`:

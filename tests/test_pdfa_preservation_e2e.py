@@ -238,6 +238,36 @@ def test_full_conversion_keeps_conforming_provenance_parts(
         assert not tree.xpath("//@stEvt:changed", namespaces=namespaces)
 
 
+def test_full_conversion_keeps_collection_items_without_a_schema(tmp_path):
+    """Portfolio metadata without a schema is compatible with PDF/A-3."""
+    pdf = _document("3b")
+    embedded = pdf.make_stream(b"text", Type=Name.EmbeddedFile)
+    embedded[Name.Subtype] = Name("/text/plain")
+    embedded.Params = Dictionary(ModDate="D:20240101000000Z", Size=4)
+    spec = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Filespec,
+            F="a.txt",
+            UF="a.txt",
+            Desc="Attachment",
+            AFRelationship=Name.Unspecified,
+            EF=Dictionary(F=embedded, UF=embedded),
+            CI=pdf.make_indirect(Dictionary(Type=Name.CollectionItem, Note="kept")),
+        )
+    )
+    pdf.Root.Names = Dictionary(EmbeddedFiles=Dictionary(Names=Array(["a.txt", spec])))
+    pdf.Root.AF = Array([spec])
+    pdf.Root.Collection = Dictionary(Type=Name.Collection, View=Name.D)
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source, force_version="1.7")
+
+    result = convert_to_pdfa(source, output, level="3b", validate=True)
+    assert result.target_produced and not result.validation_failed, result
+    with pikepdf.open(output) as restored:
+        filespec = restored.Root.Names.EmbeddedFiles.Names[1]
+        assert str(filespec.CI.Note) == "kept"
+
+
 @pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
 def test_full_conversion_repairs_xmp_language_tags(
     source_level, target_level, tmp_path
