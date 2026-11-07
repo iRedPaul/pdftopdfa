@@ -208,6 +208,14 @@ def _validate_threads(pdf: Pdf) -> None:
 
 
 def sanitize_catalog_navigation(pdf: Pdf) -> int:
-    """Preserve portfolios/articles and reject ambiguous repairs of article graphs."""
+    """Preserve portfolios/articles and reject ambiguous repairs of article graphs.
+
+    Returns:
+        Number of malformed collection entries removed in place.
+
+    Raises:
+        ConversionError: If article navigation is malformed. Article validation
+            precedes collection edits and leaves thread destinations unchanged.
+    """
     _validate_threads(pdf)
     return _sanitize_collection(pdf)

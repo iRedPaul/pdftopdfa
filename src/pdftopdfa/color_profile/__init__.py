@@ -152,8 +152,9 @@ def embed_color_profiles(
     """
     Detect color spaces and embed appropriate ICC profiles.
 
-    This function analyzes the PDF for used color spaces and embeds
-    the corresponding ICC profiles as OutputIntents.
+    Analyze used color spaces, retain compatible OutputIntents, and add a
+    PDF/A OutputIntent when needed. Install contextual default color spaces
+    and repair transparency groups in place.
 
     Args:
         pdf: pikepdf Pdf object to modify.
@@ -165,10 +166,14 @@ def embed_color_profiles(
             preserve CalGray/CalRGB calibration unchanged.
 
     Returns:
-        List of color space types that were embedded.
+        Detected color space types sorted by their string values, defaulting
+        to DeviceRGB when none are detected. Return an empty list when existing
+        OutputIntents are kept with replace_existing=False.
 
     Raises:
-        ConversionError: If level is invalid or profiles cannot be embedded.
+        ConversionError: If level is invalid, declared CalGray/CalRGB calibration
+            is malformed, or profiles cannot be embedded. Calibration validation
+            is skipped when existing OutputIntents are kept without replacement.
     """
     level = validate_pdfa_level(level)
 

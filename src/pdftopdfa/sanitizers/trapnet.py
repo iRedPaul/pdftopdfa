@@ -312,7 +312,13 @@ def _page_snapshot(page: Page) -> bytes:
 
 
 def capture_trapnet_snapshots(pdf: Pdf) -> dict[int, bytes]:
-    """Capture immutable page descriptions before any converter or OCR edits."""
+    """Capture immutable page descriptions before any converter or OCR edits.
+
+    Returns:
+        Page description hashes keyed by zero-based page index, including only
+        pages that currently contain TrapNet annotations. Pass these snapshots
+        to validate_preserved_trapnets after conversion.
+    """
     return {
         index: _page_snapshot(page)
         for index, page in enumerate(pdf.pages)
@@ -323,7 +329,18 @@ def capture_trapnet_snapshots(pdf: Pdf) -> dict[int, bytes]:
 def validate_preserved_trapnets(
     pdf: Pdf, snapshots: dict[int, bytes] | None = None
 ) -> None:
-    """Reject retained trap networks invalidated by later conversion edits."""
+    """Reject retained trap networks invalidated by later conversion edits.
+
+    Args:
+        pdf: Converted PDF to check without modification.
+        snapshots: Page hashes from capture_trapnet_snapshots before conversion,
+            using the same page indices. None is accepted only when no TrapNet
+            annotations remain.
+
+    Raises:
+        ConversionError: If a retained TrapNet is structurally invalid, its page
+            snapshot is missing, or its tracked page description has changed.
+    """
     for page_index, page in enumerate(pdf.pages):
         annotations = page.get("/Annots", [])
         if not isinstance(annotations, Array):

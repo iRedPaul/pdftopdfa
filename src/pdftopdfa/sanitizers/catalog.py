@@ -374,6 +374,10 @@ def remove_forbidden_catalog_entries(pdf: Pdf) -> int:
 
     Returns:
         Number of forbidden or malformed catalog entries removed.
+
+    Raises:
+        ConversionError: If article navigation is malformed; validation fails
+            before any catalog cleanup is applied.
     """
     removed_count = sanitize_catalog_navigation(pdf)
 

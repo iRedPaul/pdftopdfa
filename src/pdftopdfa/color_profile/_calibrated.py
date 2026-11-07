@@ -70,7 +70,14 @@ def _validate_calibrated_space(cs) -> None:
 
 
 def validate_calibrated_colorspaces(pdf: Pdf) -> None:
-    """Validate declared color spaces without interpreting unrelated private data."""
+    """Validate declared color spaces without interpreting unrelated private data.
+
+    Leave the PDF unchanged.
+
+    Raises:
+        ConversionError: If a CalGray or CalRGB array encountered in a declared
+            color context has malformed calibration parameters.
+    """
     from ..fonts.traversal import get_page_resources
 
     pending = []
@@ -196,6 +203,9 @@ def _convert_calibrated_colorspaces(
 
     The signature and zero replacement count are retained for compatibility.
     Neither the PDF nor the supplied ICC stream cache is modified.
+
+    Raises:
+        ConversionError: If declared CalGray/CalRGB calibration is malformed.
     """
     logger.warning(
         "convert_calibrated=True is deprecated: CalGray/CalRGB color spaces "

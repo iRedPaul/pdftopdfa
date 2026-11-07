@@ -442,7 +442,8 @@ def _sanitize_smask_dict(gs_dict: Dictionary, smask_dict: Dictionary) -> int:
     - /BC (optional): if present, must be an Array
 
     If a required entry is invalid or missing, the SMask is replaced
-    with /None on gs_dict.
+    with /None on gs_dict. Otherwise, malformed /TR and non-array /BC entries
+    are removed from smask_dict; removing /TR restores the identity mapping.
 
     Args:
         gs_dict: The parent ExtGState dictionary (modified in place).
@@ -859,7 +860,17 @@ def _process_resources(resources) -> int:
 
 
 def sanitize_overprint_usage(pdf: Pdf) -> int:
-    """Repair actual ICCBased CMYK overprint, including newly installed defaults."""
+    """Repair actual ICCBased CMYK overprint, including newly installed defaults.
+
+    Modify affected painting streams and their resources in place.
+
+    Returns:
+        Number of painting operations repaired, or zero when no repair is needed.
+
+    Raises:
+        ConversionError: If content cannot be safely analyzed or shared graphics
+            contexts require incompatible repairs.
+    """
     if _pdf_uses_iccbased_cmyk(pdf) and _pdf_enables_overprint(pdf):
         return sanitize_overprint(pdf)
     return 0
@@ -886,7 +897,12 @@ def sanitize_extgstate(pdf: Pdf) -> dict[str, int]:
         pdf: Opened pikepdf PDF object (modified in place).
 
     Returns:
-        Dictionary with key 'extgstate_fixed': number of entries removed.
+        Dictionary with key 'extgstate_fixed': total dictionary fixes and
+        repaired painting operations.
+
+    Raises:
+        ConversionError: If overprint analysis cannot determine a safe repair.
+            Resource dictionary cleanup errors are caught and skipped instead.
     """
     total_removed = 0
     for resources in _iter_resource_dictionaries(pdf):
