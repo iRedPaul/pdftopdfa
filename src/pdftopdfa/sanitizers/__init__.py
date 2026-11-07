@@ -83,6 +83,7 @@ from .glyph_coverage import sanitize_glyph_coverage
 from .javascript import remove_javascript
 from .jbig2 import convert_jbig2_external_globals, validate_jbig2_globals
 from .jpx import sanitize_jpx_color_boxes
+from .navigation import remove_dangling_collection_default
 from .notdef_usage import sanitize_notdef_usage
 from .optional_content import sanitize_optional_content
 from .page_boxes import sanitize_page_boxes
@@ -461,6 +462,10 @@ def sanitize_for_pdfa(
         result["embedded_files_converted"] = embed_result.get("converted", 0)
         result["embedded_pdf_conversions_failed"] = embed_result.get(
             "conversion_failed", 0
+        )
+        # The removed file may have been the portfolio's initial document.
+        result["forbidden_catalog_entries_removed"] += (
+            remove_dangling_collection_default(pdf)
         )
 
     # Ensure AF relationships and embedded file metadata (PDF/A-2 and PDF/A-3)

@@ -42,6 +42,12 @@
 - Check uncolored tiling patterns under the overprint state at their painting operation
 - Sanitize an `/ExtGState` stored directly on a shading pattern like other graphics states
 - Place overprint repairs for path paints before the path object instead of inside it, add the repair states to the resource scope a Form inherits instead of copying it into the Form, and reuse the same repair states on repeated passes
+- Retain PDF portfolios and article threads
+- Validate collection and article structures before preserving them
+- Remove collection sorting unless every `/S` field resolves in the collection schema
+- Accept article threads on pages that omit the optional `/B` array instead of using the original-input fallback
+- Remove duplicate beads from a page's `/B` array, and restore the reading order of a page's article beads
+- Remove collection item values without a matching schema field or with the wrong type, keeping them when a portfolio has no schema, and a default document that is not an embedded file
 
 ### Tests
 
