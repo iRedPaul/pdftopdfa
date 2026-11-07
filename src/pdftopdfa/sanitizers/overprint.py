@@ -191,7 +191,12 @@ def _graphics_state(state: _State, gs: Dictionary) -> _State:
             raise _error("non-boolean /op")
         values["fill_overprint"] = gs.op
     if "/OPM" in gs:
-        if isinstance(gs.OPM, bool) or gs.OPM not in (0, 1):
+        # ExtGState sanitization has already repaired every reachable dictionary.
+        if (
+            isinstance(gs.OPM, bool)
+            or not isinstance(gs.OPM, int)
+            or gs.OPM not in (0, 1)
+        ):
             raise _error("invalid /OPM")
         values["mode"] = int(gs.OPM)
     if "/Font" in gs:

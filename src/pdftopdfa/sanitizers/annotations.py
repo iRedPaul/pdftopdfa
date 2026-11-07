@@ -25,7 +25,12 @@ from .base import (
     ANNOT_FLAG_TOGGLENOVIEW,
     FORBIDDEN_ANNOTATION_SUBTYPES,
 )
-from .trapnet import trapnet_count, usable_form_appearance, valid_trapnet
+from .trapnet import (
+    has_valid_rect,
+    trapnet_count,
+    usable_form_appearance,
+    valid_trapnet,
+)
 from .widget_appearance import (
     _color_array_to_ops,
     _format_pdf_number,
@@ -318,8 +323,11 @@ def flatten_non_compliant_annotations(pdf: Pdf, level: str = "3b") -> int:
                     continue
                 if malformed_trap:
                     normal = resolved.get("/AP", Dictionary()).get("/N")
+                    # Without a rectangle the appearance has no defined position,
+                    # so flattening would paint it at the wrong place on the page.
                     if (
-                        not usable_form_appearance(appearance)
+                        not has_valid_rect(resolved)
+                        or not usable_form_appearance(appearance)
                         or not isinstance(normal, Stream)
                         and (
                             not isinstance(normal, Dictionary)

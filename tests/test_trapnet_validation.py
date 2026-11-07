@@ -99,6 +99,51 @@ def test_trap_without_usable_appearance_is_removed():
 
 
 @pytest.mark.parametrize(
+    "rect",
+    [
+        None,
+        Array([0, 0, 20]),
+        Array([0, 0, 20, 20, 20]),
+        Array([0, 0, 20, Name.Bad]),
+        Array([0, 0, 20, True]),
+        Name.Bad,
+    ],
+)
+@pytest.mark.parametrize("version", [False, True])
+def test_trap_without_valid_rect_is_removed(rect, version):
+    """Without a position, the appearance can be neither kept nor flattened."""
+    pdf = new_pdf()
+    page, trap = _trap(pdf, version=version)
+    before = page.Contents.read_bytes()
+    if rect is None:
+        del trap.Rect
+    else:
+        trap.Rect = rect
+    result = sanitize_for_pdfa(pdf)
+    assert result["non_compliant_annotations_flattened"] == 0
+    assert result["forbidden_annotations_removed"] == 1
+    assert "/Annots" not in page.obj and "/XObject" not in page.Resources
+    assert page.Contents.read_bytes() == before
+
+
+def test_conversion_removes_trap_without_rect(tmp_path):
+    """A trap that cannot be retained does not force the original-input fallback."""
+    from pikepdf import Pdf
+
+    import pdftopdfa.converter as converter
+
+    pdf = new_pdf()
+    _, trap = _trap(pdf)
+    del trap.Rect
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    result = converter.convert_to_pdfa(source, output, level="3b")
+    assert result.target_produced and not result.skipped, result
+    with Pdf.open(output) as converted:
+        assert "/Annots" not in converted.pages[0].obj
+
+
+@pytest.mark.parametrize(
     "field,value",
     [
         ("/BBox", Array([0, 0, 20])),

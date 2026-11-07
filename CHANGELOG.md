@@ -25,6 +25,8 @@
 - Repair `_` separators in XMP language tags such as `en_US`, reject other malformed tags, and stop copying `xml:lang` from the top-level `rdf:Description`, which validators report as an undeclared property
 - Remove collection sorting unless every `/S` field resolves in the collection schema
 - Remove empty `xml:lang` qualifiers while retaining their values
+- Remove TrapNets without a valid `/Rect` instead of retaining them or flattening their appearance at an undefined position
+- Store real `/OPM` values such as `1.0` as the required integers and remove values without a defined overprint mode
 
 ### Tests
 

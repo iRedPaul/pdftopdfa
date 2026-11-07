@@ -16,6 +16,8 @@ ISO 19005-2, Section 6.4 constrains transparency-related entries:
 - /BM (blend mode) — must be a valid PDF blend mode name
 - /CA and /ca (opacity) — must be numeric in [0.0, 1.0]
 - /SMask (soft mask) — must be /None or a valid soft mask dictionary
+
+ISO 32000-1, Table 58 defines /OPM (overprint mode) as the integer 0 or 1.
 """
 
 import logging
@@ -629,6 +631,20 @@ def _sanitize_gs_dict(gs_dict: Dictionary) -> int:
         Number of entries removed.
     """
     removed = 0
+
+    # ISO 32000-1, Table 58 defines /OPM as the integer 0 or 1. A real with the
+    # same value selects the same mode, so this repair is also safe for shared
+    # dictionaries. Any other value selects no defined mode.
+    if "/OPM" in gs_dict:
+        opm = _resolve_indirect(gs_dict["/OPM"])
+        if isinstance(opm, Decimal) and opm in (0, 1):
+            gs_dict["/OPM"] = int(opm)
+            removed += 1
+            logger.debug("Normalized real /OPM to an integer in ExtGState")
+        elif isinstance(opm, bool) or not isinstance(opm, int) or opm not in (0, 1):
+            del gs_dict["/OPM"]
+            removed += 1
+            logger.debug("Removed undefined /OPM from ExtGState")
 
     # /TR is always forbidden
     if "/TR" in gs_dict:

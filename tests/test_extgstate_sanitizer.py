@@ -4,6 +4,7 @@
 
 """Tests for Extended Graphics State sanitization for PDF/A compliance."""
 
+from decimal import Decimal
 from io import BytesIO
 
 import pikepdf
@@ -16,6 +17,7 @@ from pdftopdfa.exceptions import ConversionError
 from pdftopdfa.sanitizers.extgstate import (
     _sanitize_shadings_in_resources,
     sanitize_extgstate,
+    sanitize_overprint_usage,
 )
 
 
@@ -1288,6 +1290,61 @@ class TestOverprintIccBasedCmyk:
         self._assert_guard(page, paint.decode())
         # The restoration must also make a second sanitizer pass a no-op.
         assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+
+    @pytest.mark.parametrize(
+        "value,mode,fixes",
+        [(Decimal("1.0"), 1, 2), (Decimal("1"), 1, 2), (Decimal("0.0"), 0, 1)],
+    )
+    def test_equivalent_real_mode_becomes_an_integer(self, value, mode, fixes) -> None:
+        """Keep the selected mode while storing the required integer type."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs 0 0 20 20 re f", op=True)
+        page.Resources.ExtGState.GS0.OPM = value
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == fixes
+        state = page.Resources.ExtGState.GS0
+        assert isinstance(state.OPM, int) and state.OPM == mode
+        assert b"/OPM 1.0" not in state.unparse()
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+
+    def test_real_mode_without_iccbased_cmyk_is_normalized(self) -> None:
+        """The stored type does not depend on whether overprint analysis runs."""
+        pdf = new_pdf()
+        gs = Dictionary(Type=Name.ExtGState, OP=True)
+        gs.OPM = Decimal("1.0")
+        _make_pdf_with_extgstate(pdf, gs)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        assert isinstance(pdf.pages[0].Resources.ExtGState.GS0.OPM, int)
+
+    @pytest.mark.parametrize(
+        "value", [Decimal("0.5"), Decimal("2.0"), 2, -1, True, Name.One]
+    )
+    def test_undefined_mode_is_removed(self, value) -> None:
+        """An optional entry without a defined mode cannot remain in the output."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs 0 0 20 20 re f", op=True)
+        page.Resources.ExtGState.GS0.OPM = value
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        assert "/OPM" not in page.Resources.ExtGState.GS0
+        assert page.Resources.ExtGState.GS0.op is True
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+
+    @pytest.mark.parametrize("value", [1, 0])
+    def test_valid_integer_mode_is_unchanged(self, value) -> None:
+        """Repairing malformed modes must not touch the two defined values."""
+        pdf = new_pdf()
+        gs = Dictionary(Type=Name.ExtGState, OP=False)
+        gs.OPM = value
+        _make_pdf_with_extgstate(pdf, gs)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert pdf.pages[0].Resources.ExtGState.GS0.OPM == value
+
+    def test_overprint_analysis_rejects_unrepaired_real_mode(self) -> None:
+        """A dictionary that sanitization did not reach still fails closed."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs 0 0 20 20 re f", op=True)
+        page.Resources.ExtGState.GS0.OPM = Decimal("1.0")
+        with pytest.raises(ConversionError, match="invalid /OPM"):
+            sanitize_overprint_usage(pdf)
 
     def test_independently_persistent_graphics_states(self) -> None:
         """Combine overprint parameters selected by separate ExtGState operations."""
