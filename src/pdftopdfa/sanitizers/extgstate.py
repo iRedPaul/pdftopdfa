@@ -4,7 +4,7 @@
 
 """Extended Graphics State sanitization for PDF/A compliance.
 
-ISO 19005-2, Section 6.2.8 forbids certain ExtGState entries:
+ISO 19005-2, Section 6.2.5 forbids certain ExtGState entries:
 - /TR (transfer function) — always forbidden
 - /TR2 — forbidden unless value is /Default
 - /HTP (halftone phase) — always forbidden
@@ -19,8 +19,11 @@ ISO 19005-2, Section 6.4 constrains transparency-related entries:
 """
 
 import logging
+import math
+import re
+from decimal import Decimal
 
-from pikepdf import Array, Dictionary, Name, Pdf, Stream
+from pikepdf import Array, Dictionary, Name, Pdf, PdfError, Stream
 
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
@@ -266,17 +269,426 @@ def _clamp_opacity(gs_dict: Dictionary, key: str) -> int:
     return 0
 
 
+def _function_numbers(value, count: int) -> bool:
+    """Check the dimensions and finite numeric entries of a function parameter."""
+    return (
+        isinstance(value, Array)
+        and len(value) == count
+        and all(
+            not isinstance(number, bool)
+            and isinstance(number, (int, float, Decimal))
+            and math.isfinite(number)
+            for number in value
+        )
+    )
+
+
+_CALCULATOR_UNARY = frozenset(
+    "abs ceiling cos cvi cvr floor ln log neg round sin sqrt truncate".split()
+)
+_CALCULATOR_BINARY = frozenset("add atan bitshift div exp idiv mod mul sub".split())
+_CALCULATOR_COMPARISONS = {
+    "eq": lambda a, b: a == b,
+    "ge": lambda a, b: a >= b,
+    "gt": lambda a, b: a > b,
+    "le": lambda a, b: a <= b,
+    "lt": lambda a, b: a < b,
+    "ne": lambda a, b: a != b,
+}
+_CALCULATOR_LOGICAL = frozenset("and not or xor".split())
+_CALCULATOR_OPERATORS = (
+    _CALCULATOR_UNARY
+    | _CALCULATOR_BINARY
+    | frozenset(_CALCULATOR_COMPARISONS)
+    | _CALCULATOR_LOGICAL
+    | frozenset("copy dup exch false if ifelse index pop roll true".split())
+)
+_CALCULATOR_BOOLEAN = object()
+# A number known to be an integer, although its value is not known.
+_CALCULATOR_INTEGER = object()
+_CALCULATOR_INTEGER_ONLY = frozenset("and bitshift idiv mod not or xor".split())
+_CALCULATOR_PRESERVES_INTEGER = frozenset(
+    "abs add ceiling floor mul neg round sub truncate".split()
+)
+_CALCULATOR_MAX_NESTING = 32
+_CALCULATOR_MAX_STACK = 100
+_CALCULATOR_MAX_INTEGER = 2**31 - 1
+
+
+def _calculator_atan(numerator, denominator) -> float:
+    """Compute PostScript atan in degrees, in which 0 0 atan has no defined result."""
+    if numerator == 0 and denominator == 0:
+        raise ValueError("undefined angle")
+    return math.degrees(math.atan2(numerator, denominator)) % 360
+
+
+# Deterministic results of operators whose literal operands are known, which keep
+# later copy, index and roll operands provable. Other operators yield unknown numbers.
+_CALCULATOR_FOLDS = {
+    "abs": abs,
+    "neg": lambda a: -a,
+    "cvi": int,
+    "cvr": float,
+    "ceiling": lambda a: type(a)(math.ceil(a)),
+    "floor": lambda a: type(a)(math.floor(a)),
+    # PostScript rounds a tie to the greater value, so -1.5 becomes -1, but renderers
+    # may differ. Such a value is not treated as known in order to prove a stack effect.
+    "round": lambda a: None if a < 0 and a % 1 == 0.5 else type(a)(math.floor(a + 0.5)),
+    "truncate": lambda a: type(a)(math.trunc(a)),
+    "add": lambda a, b: a + b,
+    "sub": lambda a, b: a - b,
+    "mul": lambda a, b: a * b,
+    "div": lambda a, b: float(a) / b,
+    # These raise ValueError for an operand without a defined result, such as -1 sqrt.
+    "sqrt": math.sqrt,
+    "ln": math.log,
+    "log": math.log10,
+    "exp": math.pow,
+    "sin": lambda a: math.sin(math.radians(a)),
+    "cos": lambda a: math.cos(math.radians(a)),
+    "atan": _calculator_atan,
+}
+_CALCULATOR_INTEGER_FOLDS = {
+    # idiv truncates toward zero, and mod takes the sign of the dividend.
+    "idiv": lambda a, b: (1 if (a < 0) == (b < 0) else -1) * (abs(a) // abs(b)),
+    "mod": lambda a, b: (1 if a >= 0 else -1) * (abs(a) % abs(b)),
+    "and": lambda a, b: a & b,
+    "or": lambda a, b: a | b,
+    "xor": lambda a, b: a ^ b,
+    "not": lambda a: ~a,
+}
+
+
+def _parse_calculator(data: bytes) -> list | None:
+    """Parse one braced calculator program into nested blocks, rejecting bad syntax."""
+    data = re.sub(rb"%[^\r\n]*", b"", data.replace(b"\x00", b" "))
+    outer: list = []
+    blocks = [outer]
+    for token in re.findall(rb"[{}]|[^\s{}]+", data):
+        if token == b"{":
+            block: list = []
+            blocks[-1].append(block)
+            blocks.append(block)
+            if len(blocks) > _CALCULATOR_MAX_NESTING:
+                return None
+        elif token == b"}":
+            blocks.pop()
+            if not blocks:
+                return None
+        elif len(blocks) > 1 and (
+            token.decode("latin-1") in _CALCULATOR_OPERATORS
+            or re.fullmatch(rb"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", token)
+        ):
+            blocks[-1].append(token)
+        else:
+            return None
+    return outer[0] if len(blocks) == 1 and len(outer) == 1 else None
+
+
+def _calculator_boolean(value) -> bool:
+    """Return whether a stack entry is a boolean, with a known value or not."""
+    return value is _CALCULATOR_BOOLEAN or isinstance(value, bool)
+
+
+def _calculator_known_integer(value) -> bool:
+    """Return whether a stack entry is an integer of known value."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _calculator_integer(value) -> bool:
+    """Return whether a stack entry is certainly an integer."""
+    return _calculator_known_integer(value) or value is _CALCULATOR_INTEGER
+
+
+def _fold_calculator_operator(operator: str, operands: list):
+    """Return the most specific abstract result that an operator's operands allow."""
+    function = _CALCULATOR_FOLDS.get(operator) or _CALCULATOR_INTEGER_FOLDS.get(
+        operator
+    )
+    if function is not None and all(isinstance(a, (int, float)) for a in operands):
+        result = function(*operands)
+        # Integer overflow produces an implementation-dependent real result.
+        if isinstance(result, int) and abs(result) > _CALCULATOR_MAX_INTEGER:
+            return None
+        return result
+    if (
+        operator == "cvi"
+        or operator in _CALCULATOR_INTEGER_ONLY
+        or (
+            operator in _CALCULATOR_PRESERVES_INTEGER
+            and all(_calculator_integer(a) for a in operands)
+        )
+    ):
+        return _CALCULATOR_INTEGER
+    return None
+
+
+def _apply_calculator_operator(token: bytes, stack: list) -> bool:
+    """Apply one number or non-conditional operator to an abstract operand stack."""
+    operator = token.decode("latin-1")
+    if operator not in _CALCULATOR_OPERATORS:
+        text = token.decode("ascii")
+        stack.append(int(text) if re.fullmatch(r"[+-]?\d+", text) else float(text))
+        return True
+    if operator in ("true", "false"):
+        stack.append(operator == "true")
+        return True
+    single = operator in _CALCULATOR_UNARY or operator in (
+        "copy",
+        "dup",
+        "index",
+        "not",
+        "pop",
+    )
+    pops = 1 if single else 2
+    if len(stack) < pops:
+        return False
+    if operator == "dup":
+        stack.append(stack[-1])
+        return True
+    if operator == "exch":
+        stack[-1], stack[-2] = stack[-2], stack[-1]
+        return True
+    operands = stack[-pops:]
+    del stack[-pops:]
+    booleans = [_calculator_boolean(operand) for operand in operands]
+    known = all(isinstance(operand, (int, float)) for operand in operands)
+    if operator == "pop":
+        return True
+    if operator == "copy":
+        count = operands[0]
+        if not _calculator_known_integer(count) or not 0 <= count <= len(stack):
+            return False
+        stack.extend(stack[len(stack) - count :])
+    elif operator == "index":
+        offset = operands[0]
+        if not _calculator_known_integer(offset) or not 0 <= offset < len(stack):
+            return False
+        stack.append(stack[-1 - offset])
+    elif operator == "roll":
+        count, shift = operands
+        if (
+            not _calculator_known_integer(count)
+            or not _calculator_known_integer(shift)
+            or not 0 <= count <= len(stack)
+        ):
+            return False
+        if count:
+            shift %= count
+            rolled = stack[-count:]
+            stack[-count:] = rolled[-shift:] + rolled[:-shift]
+    elif operator in _CALCULATOR_COMPARISONS:
+        if booleans[0] != booleans[1] or (booleans[0] and operator not in ("eq", "ne")):
+            return False
+        stack.append(
+            _CALCULATOR_COMPARISONS[operator](*operands)
+            if known
+            else _CALCULATOR_BOOLEAN
+        )
+    elif all(booleans) and operator in _CALCULATOR_LOGICAL:
+        if not known:
+            stack.append(_CALCULATOR_BOOLEAN)
+        elif operator == "not":
+            stack.append(not operands[0])
+        else:
+            stack.append(_CALCULATOR_INTEGER_FOLDS[operator](*operands))
+    else:
+        # The function input is a real number, so integer operators need a proof
+        # such as cvi. Applying them to anything else is a run-time type error.
+        if any(booleans) or (
+            operator in _CALCULATOR_INTEGER_ONLY
+            and not all(_calculator_integer(a) for a in operands)
+        ):
+            return False
+        stack.append(_fold_calculator_operator(operator, operands))
+    return True
+
+
+def _apply_calculator_block(block: list, stack: list) -> bool:
+    """Prove a block's effect on an abstract operand stack along each possible path.
+
+    Entries are a known integer, real or boolean, None for an unknown number, or a
+    marker for a boolean or an integer of unknown value. Known integers let copy,
+    index and roll be proven; other operands cannot. A known condition takes only
+    its own path, and an unknown one has to be valid along both.
+    """
+    conditional: list[list] = []
+    for item in block:
+        if isinstance(item, list):
+            conditional.append(item)
+        elif item in (b"if", b"ifelse"):
+            if len(conditional) != (1 if item == b"if" else 2):
+                return False
+            if not stack or not _calculator_boolean(stack[-1]):
+                return False
+            condition = stack.pop()
+            if condition is not _CALCULATOR_BOOLEAN:
+                if condition or item == b"ifelse":
+                    taken = conditional[0] if condition else conditional[1]
+                    if not _apply_calculator_block(taken, stack):
+                        return False
+                conditional = []
+                continue
+            outcomes = [list(stack) for _ in conditional]
+            for branch, outcome in zip(conditional, outcomes, strict=True):
+                if not _apply_calculator_block(branch, outcome):
+                    return False
+            first, second = outcomes if len(outcomes) == 2 else (outcomes[0], stack)
+            if len(first) != len(second) or any(
+                _calculator_boolean(a) != _calculator_boolean(b)
+                for a, b in zip(first, second, strict=True)
+            ):
+                return False
+            stack[:] = [
+                a
+                if type(a) is type(b) and a == b
+                else _CALCULATOR_BOOLEAN
+                if _calculator_boolean(a)
+                else _CALCULATOR_INTEGER
+                if _calculator_integer(a) and _calculator_integer(b)
+                else None
+                for a, b in zip(first, second, strict=True)
+            ]
+            conditional = []
+        elif conditional or not _apply_calculator_operator(item, stack):
+            return False
+        if len(stack) > _CALCULATOR_MAX_STACK:
+            return False
+    return not conditional
+
+
+def _is_scalar_calculator(data: bytes, domain) -> bool:
+    """Require a calculator program that provably maps one number to one number.
+
+    The program must hold for any input. It also runs for the ends and the middle of
+    its domain, where actual conditions select the path, so a guarded { ln } passes
+    but an unguarded one fails at zero. This samples the domain and is not a proof.
+    """
+    program = _parse_calculator(data)
+    if program is None:
+        return False
+    low, high = float(domain[0]), float(domain[1])
+    try:
+        for value in (None, low, high, (low + high) / 2):
+            stack: list = [value]
+            if (
+                not _apply_calculator_block(program, stack)
+                or len(stack) != 1
+                or _calculator_boolean(stack[0])
+            ):
+                return False
+    except (ZeroDivisionError, OverflowError, ValueError):
+        # An operation without a defined result, such as a division by zero.
+        return False
+    return True
+
+
+def _is_scalar_transfer_function(function, ancestors=frozenset()) -> bool:
+    """Validate that a PDF function maps one input to one output, in each type."""
+    if function == Name.Identity:
+        return True
+    if not isinstance(function, (Dictionary, Stream)) or len(ancestors) >= 64:
+        return False
+    key = function.objgen if function.objgen != (0, 0) else function.unparse()
+    if key in ancestors:
+        return False
+    ancestors = ancestors | {key}
+    kind = function.get("/FunctionType")
+    domain = function.get("/Domain")
+    limits = function.get("/Range")
+    if (
+        isinstance(kind, bool)
+        or not isinstance(kind, int)
+        or not _function_numbers(domain, 2)
+        or domain[0] > domain[1]
+    ):
+        return False
+    if "/Range" in function and (
+        not _function_numbers(limits, 2) or limits[0] > limits[1]
+    ):
+        return False
+    if kind in (0, 4):
+        if not isinstance(function, Stream) or not _function_numbers(limits, 2):
+            return False
+        try:
+            data = function.read_bytes()
+        except (PdfError, RuntimeError):
+            return False
+        if kind == 4:
+            return _is_scalar_calculator(data, domain)
+        size = function.get("/Size")
+        bits = function.get("/BitsPerSample")
+        order = function.get("/Order", 1)
+        return (
+            isinstance(size, Array)
+            and len(size) == 1
+            and not isinstance(size[0], bool)
+            and isinstance(size[0], int)
+            and size[0] > 0
+            and not isinstance(bits, bool)
+            and isinstance(bits, int)
+            and bits in (1, 2, 4, 8, 12, 16, 24, 32)
+            and not isinstance(order, bool)
+            and isinstance(order, int)
+            and order in (1, 3)
+            and len(data) >= (size[0] * bits + 7) // 8
+            and all(
+                key not in function or _function_numbers(function[key], 2)
+                for key in ("/Encode", "/Decode")
+            )
+        )
+    if not isinstance(function, Dictionary):
+        return False
+    if kind == 2:
+        exponent = function.get("/N")
+        return (
+            not isinstance(exponent, bool)
+            and isinstance(exponent, (int, float, Decimal))
+            and math.isfinite(exponent)
+            and (int(exponent) == exponent or domain[0] >= 0)
+            and (exponent >= 0 or not domain[0] <= 0 <= domain[1])
+            and all(
+                key not in function or _function_numbers(function[key], 1)
+                for key in ("/C0", "/C1")
+            )
+        )
+    if kind == 3:
+        functions = function.get("/Functions")
+        if not isinstance(functions, Array) or not functions:
+            return False
+        count = len(functions)
+        bounds = function.get("/Bounds")
+        if not _function_numbers(bounds, count - 1) or not _function_numbers(
+            function.get("/Encode"), 2 * count
+        ):
+            return False
+        if any(a >= b for a, b in zip([domain[0], *bounds], [*bounds, domain[1]])):
+            # The final interval may have zero width (ISO 32000-1, 7.10.4).
+            if count != 1 and not (
+                bounds[-1] == domain[1]
+                and all(a < b for a, b in zip([domain[0], *bounds[:-1]], bounds))
+            ):
+                return False
+        return all(
+            isinstance(child, (Dictionary, Stream))
+            and _is_scalar_transfer_function(child, ancestors)
+            for child in functions
+        )
+    return False
+
+
 def _sanitize_smask_dict(gs_dict: Dictionary, smask_dict: Dictionary) -> int:
     """Validate internal entries of a soft mask dictionary.
 
     Per PDF Reference 1.7 Table 144:
     - /S (required): must be /Alpha or /Luminosity
     - /G (required): must be a Stream (Form XObject)
-    - /TR: forbidden in PDF/A (ISO 19005-2, 6.2.8)
+    - /TR (optional): preserve the soft-mask transfer function
     - /BC (optional): if present, must be an Array
 
     If a required entry is invalid or missing, the SMask is replaced
-    with /None on gs_dict.
+    with /None on gs_dict. Otherwise, malformed /TR and non-array /BC entries
+    are removed from smask_dict; removing /TR restores the identity mapping.
 
     Args:
         gs_dict: The parent ExtGState dictionary (modified in place).
@@ -318,11 +730,13 @@ def _sanitize_smask_dict(gs_dict: Dictionary, smask_dict: Dictionary) -> int:
         )
         return 1
 
-    # /TR is forbidden in PDF/A (ISO 19005-2, 6.2.8)
-    if "/TR" in smask_dict:
+    # ISO 19005-2/3, 6.2.5 prohibits /TR in an ExtGState dictionary only.
+    # A soft mask's /TR is a separate, permitted opacity mapping. Removing
+    # it would change the mask and therefore the rendered page appearance.
+    if "/TR" in smask_dict and not _is_scalar_transfer_function(smask_dict.TR):
         del smask_dict["/TR"]
         fixes += 1
-        logger.debug("Removed forbidden /TR from SMask dictionary")
+        logger.warning("Removed malformed soft-mask /TR; using the identity mapping")
 
     # /BC must be an Array if present
     if "/BC" in smask_dict:
@@ -709,7 +1123,7 @@ def _process_resources(resources, reset_opm: bool) -> int:
 def sanitize_extgstate(pdf: Pdf) -> dict[str, int]:
     """Sanitize Extended Graphics State dictionaries for PDF/A compliance.
 
-    Removes forbidden entries per ISO 19005-2, Section 6.2.8:
+    Removes forbidden entries per ISO 19005-2, Section 6.2.5:
     - /TR (transfer function)
     - /TR2 (unless /Default)
     - /HTP (halftone phase)
