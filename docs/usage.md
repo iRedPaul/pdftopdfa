@@ -240,6 +240,11 @@ PDF/X, PDF/VT, and PDF/E identification
 claims are still removed from XMP because conversion does not revalidate those
 standards. The formal PDF/X and PDF/E markers in DocInfo are removed along with them.
 
+ICCBased CMYK overprint is repaired at affected painting operations. If shared
+Forms, patterns, or Type3 glyphs require incompatible repairs in different
+contexts, conversion uses the original-input fallback described above and
+reports the reason in the result warnings.
+
 Custom DocInfo strings are retained only with valid PDFDocEncoding or BOM-prefixed
 UTF-16BE text encoding; valid string bytes remain unchanged.
 
