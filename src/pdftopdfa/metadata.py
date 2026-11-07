@@ -2001,7 +2001,15 @@ def _is_valid_provenance_struct(elem: etree._Element, namespace: str) -> bool:
         if not _is_valid_simple_value(value.strip(), value_type):
             return False
         fields[key] = value
-    return True
+    # A ResourceEvent shall include these fields; the others need not be present.
+    return (
+        namespace != NAMESPACES["stEvt"]
+        or {
+            f"{{{namespace}}}action",
+            f"{{{namespace}}}when",
+        }
+        <= fields.keys()
+    )
 
 
 def _is_valid_provenance_property(elem: etree._Element, local_name: str) -> bool:

@@ -59,14 +59,17 @@ def test_complete_trap_network_is_preserved(version):
 
 
 @pytest.mark.parametrize(
-    "damage", ["date", "bad_date", "flags", "state", "pcm", "tracking", "version"]
+    "damage",
+    ["date", "bad_date", "flags", "state", "pcm", "tracking", "version", "type"],
 )
 def test_malformed_trap_network_appearance_is_flattened(damage):
     """A usable appearance survives even when subtype-specific metadata is invalid."""
     pdf = new_pdf()
     page, trap = _trap(pdf, version=damage == "version")
     appearance = trap.AP.N
-    if damage == "date":
+    if damage == "type":
+        trap.Type = Name.Bogus
+    elif damage == "date":
         del trap.LastModified
     elif damage == "bad_date":
         trap.LastModified = "D:2024garbage"

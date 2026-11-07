@@ -129,6 +129,8 @@ def valid_trapnet(annotation, owner, annotations, index: int, count: int) -> boo
     """Check trap cardinality, geometry, state, flags, appearances and tracking."""
     if owner.get("/Type") != Name.Page or count != 1 or index != len(annotations) - 1:
         return False
+    if annotation.get("/Type") not in (None, Name.Annot):
+        return False
     if not has_valid_rect(annotation):
         return False
     # ISO 32000-1, 14.11.6.2: only Print (4) and ReadOnly (64) are set.

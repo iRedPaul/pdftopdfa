@@ -370,6 +370,72 @@ def test_conversion_keeps_article_without_page_bead_arrays(tmp_path):
         assert "/B" not in converted.pages[0].obj
 
 
+def _two_bead_article(pdf):
+    """Create an article with two beads on one page, listed in reading order."""
+    thread, first, page = _article(pdf)
+    second = pdf.make_indirect(
+        Dictionary(T=thread, P=page.obj, R=Array([0, 0, 100, 100]))
+    )
+    first.N = first.V = second
+    second.N = second.V = first
+    page.B = Array([first, second])
+    return first, second, page
+
+
+def test_page_beads_in_reading_order_are_unchanged():
+    """A correctly ordered array needs no repair."""
+    pdf = new_pdf()
+    first, second, page = _two_bead_article(pdf)
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert [bead.objgen for bead in page.B] == [first.objgen, second.objgen]
+
+
+def test_page_beads_out_of_reading_order_are_repaired():
+    """The thread defines the order, so this does not need the original fallback."""
+    pdf = new_pdf()
+    first, second, page = _two_bead_article(pdf)
+    page.B = Array([second, first])
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert [bead.objgen for bead in page.B] == [first.objgen, second.objgen]
+
+
+def test_page_bead_repair_keeps_positions_of_other_threads():
+    """No order between separate articles is defined, so they stay in place."""
+    pdf = new_pdf()
+    first, second, page = _two_bead_article(pdf)
+    other_thread = pdf.make_indirect(Dictionary())
+    other = pdf.make_indirect(
+        Dictionary(T=other_thread, P=page.obj, R=Array([0, 0, 50, 50]))
+    )
+    other.N = other.V = other
+    other_thread.F = other
+    pdf.Root.Threads.append(other_thread)
+    page.B = Array([second, other, first])
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert [bead.objgen for bead in page.B] == [
+        first.objgen,
+        other.objgen,
+        second.objgen,
+    ]
+
+
+def test_conversion_repairs_page_bead_order(tmp_path):
+    """An unordered /B array cannot send a document to the original-input fallback."""
+    from pikepdf import Pdf
+
+    pdf = new_pdf()
+    first, second, page = _two_bead_article(pdf)
+    page.B = Array([second, first])
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    result = convert_to_pdfa(source, output)
+    assert result.target_produced and not result.skipped, result
+    with Pdf.open(output) as converted:
+        listed = converted.pages[0].B
+        assert listed[0].N.objgen == listed[1].objgen
+        assert converted.Root.Threads[0].F.objgen == listed[0].objgen
+
+
 def test_malformed_article_conversion_preserves_original_file(tmp_path):
     """A malformed graph cannot be published as a claimed PDF/A conversion."""
     pdf = new_pdf()

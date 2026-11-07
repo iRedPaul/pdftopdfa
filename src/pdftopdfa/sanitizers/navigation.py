@@ -288,15 +288,58 @@ def _validate_threads(pdf: Pdf) -> None:
             raise _thread_error("page /B contains an unrelated or malformed bead")
 
 
+def _order_page_beads(pdf: Pdf) -> int:
+    """List the beads of each thread on a page in the reading order of that thread.
+
+    ISO 32000-1, Table 30 requires natural reading order in /B. Only a thread defines
+    an order for its own beads, so other threads keep their positions in the array.
+    Requires validated threads, whose bead cycles are complete.
+    """
+    positions = {}
+    for thread in pdf.Root.get("/Threads", []):
+        first = bead = thread.F
+        position = 0
+        while True:
+            positions[bead.objgen] = (thread.objgen, position)
+            position += 1
+            bead = bead.N
+            if bead.objgen == first.objgen:
+                break
+
+    reordered = 0
+    for page in pdf.pages:
+        listed = page.get("/B")
+        if listed is None:
+            continue
+        beads = list(listed)
+        slots: dict[tuple[int, int], list[int]] = {}
+        for index, bead in enumerate(beads):
+            slots.setdefault(positions[bead.objgen][0], []).append(index)
+        ordered = list(beads)
+        for indices in slots.values():
+            thread_beads = sorted(
+                (beads[index] for index in indices),
+                key=lambda bead: positions[bead.objgen][1],
+            )
+            for index, bead in zip(indices, thread_beads, strict=True):
+                ordered[index] = bead
+        if [bead.objgen for bead in ordered] != [bead.objgen for bead in beads]:
+            page.B = Array(ordered)
+            reordered += 1
+            logger.warning("Restored the reading order of a page /B array")
+    return reordered
+
+
 def sanitize_catalog_navigation(pdf: Pdf) -> int:
     """Preserve portfolios/articles and reject ambiguous repairs of article graphs.
 
     Returns:
-        Number of malformed collection entries removed in place.
+        Number of /B arrays reordered and malformed collection entries removed in
+        place.
 
     Raises:
         ConversionError: If article navigation is malformed. Article validation
             precedes collection edits and leaves thread destinations unchanged.
     """
     _validate_threads(pdf)
-    return _sanitize_collection(pdf)
+    return _order_page_beads(pdf) + _sanitize_collection(pdf)

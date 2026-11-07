@@ -33,7 +33,9 @@
 - Remove soft-mask calculator functions unless their stack effects provably yield one number, and reject constant operations without a defined result
 - Require a usable tag table before retaining an existing OutputIntent profile
 - Require custom XMP structure fields to use the namespace of their declared value type, and validate XMP numbers against their lexical forms
-- Reject non-integer text rendering modes during overprint analysis
+- Reject non-integer text rendering modes during overprint analysis, and evaluate a soft mask at the invocation of a transparency group instead of at its inner paints
+- Require `stEvt:action` and `stEvt:when` in preserved XMP history events
+- Restore the reading order of a page's article beads, and reject a TrapNet with an invalid annotation type
 - Validate calibrated color spaces that inline images declare directly
 - Remove collection item values without a matching schema field or with the wrong type, and a default document that is not an embedded file
 - Sanitize an `/ExtGState` stored directly on a shading pattern like other graphics states, and validate calibrated spaces in its soft mask

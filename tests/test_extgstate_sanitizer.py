@@ -1923,6 +1923,61 @@ class TestOverprintIccBasedCmyk:
         assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
         assert page.Contents.read_bytes() == content
 
+    def _masked_form(self, pdf, page, form_data, mask_data, *, group):
+        """Paint a Form under a soft mask, optionally as a transparency group."""
+        mask = pdf.make_stream(mask_data)
+        mask.Subtype = Name.Form
+        mask.BBox = Array([0, 0, 20, 20])
+        mask.Resources = Dictionary(ColorSpace=page.Resources.ColorSpace)
+        form = pdf.make_stream(form_data)
+        form.Subtype = Name.Form
+        form.BBox = Array([0, 0, 20, 20])
+        form.Resources = Dictionary(
+            ColorSpace=page.Resources.ColorSpace,
+            ExtGState=Dictionary(Off=Dictionary(OP=False, op=False)),
+        )
+        if group:
+            form.Group = Dictionary(S=Name.Transparency)
+        page.Resources.ExtGState.GS0.SMask = Dictionary(S=Name.Alpha, G=mask)
+        page.Resources.XObject = Dictionary(Fm=form)
+        return form, mask
+
+    def test_transparency_group_mask_is_analyzed_at_the_invocation(self) -> None:
+        """Inner state changes cannot hide the mask that composites the whole group."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /Fm Do", OPM=1, op=True)
+        form_data = b"/Off gs 0 g 0 0 20 20 re f"
+        form, mask = self._masked_form(
+            pdf, page, form_data, b"/CS0 cs 0 0 20 20 re f", group=True
+        )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        self._assert_guard(mask, "f")
+        assert form.read_bytes() == form_data
+
+    def test_transparency_group_mask_ignores_inner_paint_state(self) -> None:
+        """A group starts without the mask, so inner paints do not re-evaluate it."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /Fm Do", OPM=1, op=False)
+        form_data = b"/Enable gs 0 g 0 0 20 20 re f"
+        mask_data = b"/CS0 cs 0 0 20 20 re f"
+        form, mask = self._masked_form(pdf, page, form_data, mask_data, group=True)
+        form.Resources.ExtGState.Enable = Dictionary(op=True)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert mask.read_bytes() == mask_data
+        assert form.read_bytes() == form_data
+
+    def test_plain_form_keeps_the_mask_for_each_inner_paint(self) -> None:
+        """Without a group, the inherited mask still applies to every paint inside."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /Fm Do", OPM=1, op=False)
+        form_data = b"/Enable gs 0 g 0 0 20 20 re f"
+        form, mask = self._masked_form(
+            pdf, page, form_data, b"/CS0 cs 0 0 20 20 re f", group=False
+        )
+        form.Resources.ExtGState.Enable = Dictionary(op=True)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        self._assert_guard(mask, "f")
+
     @pytest.mark.parametrize("mode", [b"3.5", b"3.0", b"8", b"-1"])
     def test_invalid_text_rendering_mode_fails_closed(self, mode) -> None:
         """A truncated mode could hide Type3 paint from the overprint analysis."""

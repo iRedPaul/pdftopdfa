@@ -210,6 +210,12 @@ def _graphics_state(state: _State, gs: Dictionary) -> _State:
     return replace(state, **values)
 
 
+def _is_transparency_group(stream) -> bool:
+    """Return whether a Form XObject is painted as a transparency group."""
+    group = stream.get("/Group")
+    return isinstance(group, Dictionary) and group.get("/S") == Name.Transparency
+
+
 def _needs_repair(state: _State, *, stroke: bool, fill: bool) -> bool:
     """Identify prohibited paints while rejecting ambiguous combined operations."""
     if state.mode != 1:
@@ -483,6 +489,19 @@ class _Analyzer:
                         self.form(
                             xobject, resources, state, ancestors, resource_initial
                         )
+                        # A group paints as one object, so the selected mask
+                        # belongs to this invocation and not to its inner paints.
+                        if (
+                            _is_transparency_group(xobject)
+                            and state.soft_mask is not None
+                        ):
+                            self.form(
+                                state.soft_mask,
+                                resources,
+                                replace(state, soft_mask=None),
+                                ancestors,
+                                resource_initial,
+                            )
                     elif xobject.get("/Subtype") == Name.Image:
                         kind = (
                             state.fill
@@ -530,6 +549,9 @@ class _Analyzer:
         resources = stream.get("/Resources", inherited)
         if not isinstance(resources, Dictionary):
             raise _error("invalid form resources")
+        # ISO 32000-1, 11.6.6: a transparency group starts without a soft mask.
+        if _is_transparency_group(stream):
+            state = replace(state, soft_mask=None)
         if "/Resources" in stream:
             resource_initial = state
         self.walk(stream, resources, state, ancestors, resource_initial)

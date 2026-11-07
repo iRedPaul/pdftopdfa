@@ -3876,6 +3876,21 @@ class TestProvenancePreservation:
             '<xmpMM:DerivedFrom rdf:parseType="Resource">'
             "<stRef:lastModifyDate>2024-01-01T25:00:00Z</stRef:lastModifyDate>"
             "</xmpMM:DerivedFrom>",
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource"/>'
+            "</rdf:Seq></xmpMM:History>",
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
+            "<stEvt:softwareAgent>Tool</stEvt:softwareAgent></rdf:li>"
+            "</rdf:Seq></xmpMM:History>",
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
+            "<stEvt:action>saved</stEvt:action></rdf:li></rdf:Seq></xmpMM:History>",
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
+            "<stEvt:when>2024-01-01</stEvt:when></rdf:li></rdf:Seq></xmpMM:History>",
+            '<xmpMM:History><rdf:Seq><rdf:li stEvt:action="saved"/>'
+            "</rdf:Seq></xmpMM:History>",
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
+            "<stEvt:action>saved</stEvt:action><stEvt:when>2024-01-01</stEvt:when>"
+            '</rdf:li><rdf:li rdf:parseType="Resource">'
+            "<stEvt:action>converted</stEvt:action></rdf:li></rdf:Seq></xmpMM:History>",
         ],
     )
     def test_malformed_provenance_is_not_retained(
@@ -3897,9 +3912,10 @@ class TestProvenancePreservation:
     ) -> None:
         """Both metadata paths emit the same validated canonical event date."""
         value = "2024-01-01T00:00:00Z"
-        fields = f"<stEvt:When>{value}</stEvt:When>"
+        fields = f"<stEvt:action>saved</stEvt:action><stEvt:When>{value}</stEvt:When>"
         item = (
-            f'<rdf:li><rdf:Description stEvt:When="{value}"/></rdf:li>'
+            f'<rdf:li><rdf:Description stEvt:action="saved" stEvt:When="{value}"/>'
+            "</rdf:li>"
             if attribute
             else f'<rdf:li rdf:parseType="Resource">{fields}</rdf:li>'
         )
