@@ -26,7 +26,7 @@
 - Remove collection sorting unless every `/S` field resolves in the collection schema
 - Remove empty `xml:lang` qualifiers while retaining their values
 - Remove TrapNets without a valid `/Rect` instead of retaining them or flattening their appearance at an undefined position
-- Store real `/OPM` values such as `1.0` as the required integers and remove values without a defined overprint mode
+- Store real `/OPM` values such as `1.0` as the required integers, store numeric `/OP` and `/op` values 0 and 1 as booleans, and remove other values without a defined meaning
 - Rewrite real `/N` entries of retained OutputIntent profiles as integers
 - Accept article threads on pages that omit the optional `/B` array instead of using the original-input fallback
 - Analyze soft masks selected by a shading pattern's `/ExtGState` during overprint repair

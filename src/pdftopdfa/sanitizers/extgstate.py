@@ -17,7 +17,8 @@ ISO 19005-2, Section 6.4 constrains transparency-related entries:
 - /CA and /ca (opacity) — must be numeric in [0.0, 1.0]
 - /SMask (soft mask) — must be /None or a valid soft mask dictionary
 
-ISO 32000-1, Table 58 defines /OPM (overprint mode) as the integer 0 or 1.
+ISO 32000-1, Table 58 defines /OPM (overprint mode) as the integer 0 or 1, and
+/OP and /op (overprint) as booleans.
 """
 
 import logging
@@ -645,6 +646,22 @@ def _sanitize_gs_dict(gs_dict: Dictionary) -> int:
             del gs_dict["/OPM"]
             removed += 1
             logger.debug("Removed undefined /OPM from ExtGState")
+
+    # The same table defines /OP and /op as booleans. Numeric 0 and 1 are
+    # unambiguous, and overprint analysis needs the type it can rely on.
+    for key in ("/OP", "/op"):
+        if key not in gs_dict:
+            continue
+        flag = _resolve_indirect(gs_dict[key])
+        if isinstance(flag, bool):
+            continue
+        if isinstance(flag, (int, Decimal)) and flag in (0, 1):
+            gs_dict[key] = bool(flag)
+            logger.debug("Normalized numeric %s to a boolean in ExtGState", key)
+        else:
+            del gs_dict[key]
+            logger.debug("Removed undefined %s from ExtGState", key)
+        removed += 1
 
     # /TR is always forbidden
     if "/TR" in gs_dict:

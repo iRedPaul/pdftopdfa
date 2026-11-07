@@ -1338,6 +1338,68 @@ class TestOverprintIccBasedCmyk:
         assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
         assert pdf.pages[0].Resources.ExtGState.GS0.OPM == value
 
+    @pytest.mark.parametrize(
+        "value,flag,fixes",
+        [
+            (1, True, 2),
+            (Decimal("1.0"), True, 2),
+            (0, False, 1),
+            (Decimal("0.0"), False, 1),
+        ],
+    )
+    def test_numeric_overprint_flag_becomes_a_boolean(self, value, flag, fixes) -> None:
+        """Unambiguous flags keep their meaning, and enabled ones are still repaired."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs 0 0 20 20 re f", OPM=1)
+        page.Resources.ExtGState.GS0.op = value
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == fixes
+        assert page.Resources.ExtGState.GS0.op is flag
+        if flag:
+            self._assert_guard(page, "f")
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+
+    @pytest.mark.parametrize("key", ["/OP", "/op"])
+    @pytest.mark.parametrize("value", [2, -1, Decimal("0.5"), Name.Yes])
+    def test_undefined_overprint_flag_is_removed(self, key, value) -> None:
+        """A flag without a defined meaning cannot force the original-input fallback."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs 0 0 20 20 re f", OPM=1)
+        page.Resources.ExtGState.GS0[key] = value
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        assert key not in page.Resources.ExtGState.GS0
+        assert page.Resources.ExtGState.GS0.OPM == 1
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_boolean_overprint_flag_is_unchanged(self, value) -> None:
+        """The repair leaves correctly typed flags alone."""
+        pdf = new_pdf()
+        _make_pdf_with_extgstate(pdf, Dictionary(Type=Name.ExtGState, OP=value))
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert pdf.pages[0].Resources.ExtGState.GS0.OP is value
+
+    @pytest.mark.parametrize("key,value", [("/OP", 1), ("/op", 1), ("/OP", 2)])
+    def test_conversion_does_not_fall_back_for_numeric_flags(
+        self, key, value, tmp_path
+    ) -> None:
+        """These documents converted before point-of-use overprint analysis."""
+        from pdftopdfa.converter import convert_to_pdfa
+
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs 0 0 20 20 re f", OPM=1)
+        page.Resources.ExtGState.GS0[key] = value
+        source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+        pdf.save(source)
+        result = convert_to_pdfa(source, output, level="3b")
+        assert result.target_produced and not result.skipped, result
+
+    def test_overprint_analysis_rejects_unrepaired_flag(self) -> None:
+        """A dictionary that sanitization did not reach still fails closed."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs 0 0 20 20 re f", OPM=1)
+        page.Resources.ExtGState.GS0.OP = 1
+        with pytest.raises(ConversionError, match="non-boolean /OP"):
+            sanitize_overprint_usage(pdf)
+
     def test_overprint_analysis_rejects_unrepaired_real_mode(self) -> None:
         """A dictionary that sanitization did not reach still fails closed."""
         pdf = new_pdf()
