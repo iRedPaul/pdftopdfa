@@ -30,6 +30,7 @@ from pdftopdfa.metadata import (
     _extract_existing_xmp,
     _extract_extension_schema_blocks,
     _format_pdf_date,
+    _has_invalid_rdf_syntax,
     _has_undeclarable_structure,
     _is_valid_extension_property_value,
     _is_valid_simple_value,
@@ -4272,6 +4273,31 @@ class TestInvalidRdfSyntaxIsNotCopied:
     """A copied form rejected by XMP parsers would invalidate the whole packet."""
 
     PAGED_TEXT = "http://ns.adobe.com/xap/1.0/t/pg/"
+
+    @pytest.mark.parametrize(
+        "attributes,text,invalid",
+        [
+            ('rdf:resource="urn:x"', "label", True),
+            ('rdf:nodeID="n"', "label", True),
+            ('rdf:parseType="Resource"', "label", True),
+            ('c:field="1"', "label", True),
+            ('rdf:resource="urn:x"', "  \n ", False),
+            ('rdf:resource="urn:x"', "", False),
+            ('rdf:parseType="Resource"', " ", False),
+            ('rdf:datatype="urn:t"', "label", False),
+            ('xml:lang="en"', "label", False),
+            ("", "label", False),
+        ],
+    )
+    def test_literal_text_needs_a_literal_property_form(
+        self, attributes, text, invalid
+    ) -> None:
+        """XMP parsers reject text on the empty and resource property forms."""
+        elem = etree.fromstring(
+            f'<c:prop xmlns:c="urn:custom" xmlns:rdf="{NAMESPACES["rdf"]}" '
+            f"{attributes}>{text}</c:prop>"
+        )
+        assert _has_invalid_rdf_syntax(elem) is invalid
 
     @classmethod
     def _copied(cls, prop: str) -> etree._Element:

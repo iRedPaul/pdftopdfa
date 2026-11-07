@@ -1745,7 +1745,9 @@ def _has_invalid_rdf_syntax(prop: etree._Element) -> bool:
     RDF/XML 1.1, 7.2, permits only rdf:ID and rdf:parseType on an element with
     parseType="Resource", whose fields must be child properties. Node elements
     cannot carry rdf:parseType, property elements cannot carry rdf:about, and
-    property attributes exclude nested content. XMP also requires language tags
+    property attributes exclude nested content and literal text, as does
+    parseType="Resource". Only rdf:datatype accompanies text. XMP also requires
+    language tags
     in xml:lang qualifiers. An empty value is not rejected here, because
     _normalize_structural_properties() removes it from every copied property.
     """
@@ -1767,14 +1769,20 @@ def _has_invalid_rdf_syntax(prop: etree._Element) -> bool:
                 return True
             continue
         attributes = set(elem.attrib) - ignored
+        has_text = bool((elem.text or "").strip())
         if parse_type in attributes:
             if (
                 elem.get(parse_type) != "Resource"
                 or len(attributes) > 1
+                or has_text
                 or any(child.tag in node_tags for child in children)
             ):
                 return True
-        elif f"{{{ns_rdf}}}about" in attributes or (attributes and children):
+        elif (
+            f"{{{ns_rdf}}}about" in attributes
+            or (attributes and children)
+            or (has_text and attributes - {f"{{{ns_rdf}}}datatype"})
+        ):
             return True
     return False
 

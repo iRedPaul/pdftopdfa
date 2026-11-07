@@ -307,6 +307,47 @@ def test_non_normal_appearances_do_not_affect_snapshots(key):
     validate_preserved_trapnets(pdf, snapshots)
 
 
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("/F", 0),
+        ("/Rect", Array([1, 1, 21, 21])),
+        ("/CA", 0.5),
+        ("/ca", 0.5),
+        ("/BM", Name.Multiply),
+        ("/OC", Dictionary(Type=Name.OCG, Name="Layer")),
+    ],
+)
+def test_changed_rendering_property_invalidates_snapshots(key, value):
+    """These entries decide whether and how another annotation prints."""
+    pdf = new_pdf()
+    page, trap = _trap(pdf)
+    sibling = _sibling_with_all_appearances(pdf)
+    page.Annots = Array([sibling, trap])
+    snapshots = capture_trapnet_snapshots(pdf)
+    sibling[key] = value
+    with pytest.raises(ConversionError, match="invalidated a preserved TrapNet"):
+        validate_preserved_trapnets(pdf, snapshots)
+
+
+def test_conversion_falls_back_when_a_sibling_gains_the_print_flag(tmp_path):
+    """Newly printed content makes the trap network stale."""
+    import pdftopdfa.converter as converter
+
+    pdf = new_pdf()
+    page, trap = _trap(pdf)
+    trap.LastModified = "D:20990101000000Z"
+    sibling = _sibling_with_all_appearances(pdf)
+    del sibling.F
+    page.Annots = Array([sibling, trap])
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    result = converter.convert_to_pdfa(source, output, level="3b")
+    assert result.skipped and not result.target_produced, result
+    assert output.read_bytes() == source.read_bytes()
+    assert any("invalidated a preserved TrapNet" in w for w in result.warnings)
+
+
 def test_changed_normal_appearance_still_invalidates_snapshots():
     """Reducing /AP to /N must not hide a change to the printed appearance."""
     pdf = new_pdf()

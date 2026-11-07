@@ -69,7 +69,7 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
 
     pdfa_intents: list[_ValidOutputIntent] = []
     profiled_intents: list[_ValidOutputIntent] = []
-    undefined_subtypes: list[int] = []
+    invalid_additional: list[int] = []
     for index, intent_ref in enumerate(output_intents):
         intent = _resolve_indirect(intent_ref)
         if not isinstance(intent, Dictionary):
@@ -85,7 +85,7 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
                 reason="OutputIntent subtype is missing or is not a name",
             )
         if subtype not in _DEFINED_OUTPUT_INTENT_SUBTYPES:
-            undefined_subtypes.append(index)
+            invalid_additional.append(index)
             continue
         if (
             intent.get("/Type") not in (None, Name.OutputIntent)
@@ -103,10 +103,12 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
             if "/DestOutputProfileRef" in intent:
                 del intent["/DestOutputProfileRef"]
                 logger.debug("Removed DestOutputProfileRef from PDF/X OutputIntent")
-        # DestOutputProfile is optional for non-PDF/A intents (for example a
-        # registered PDF/X printing condition). Rule 6.2.3-2 constrains the
-        # entries that actually contain an embedded profile.
+        # DestOutputProfile is optional for non-PDF/A intents only if they name a
+        # standard production condition (ISO 32000-1, Table 365). Rule 6.2.3-2
+        # constrains the entries that actually contain an embedded profile.
         if subtype != Name.GTS_PDFA1 and "/DestOutputProfile" not in intent:
+            if not _may_name_standard_condition(intent):
+                invalid_additional.append(index)
             continue
 
         valid_intent = _validate_pdfa_output_intent(intent)
@@ -119,10 +121,10 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
         if subtype == Name.GTS_PDFA1:
             pdfa_intents.append(valid_intent)
 
-    # An undefined subtype cannot affect the output conditions that remain.
-    for index in reversed(undefined_subtypes):
+    # These entries cannot affect the output conditions that remain.
+    for index in reversed(invalid_additional):
         logger.warning(
-            "Removed OutputIntent with undefined subtype %s",
+            "Removed OutputIntent %s with an undefined subtype or output condition",
             _resolve_indirect(output_intents[index]).get("/S"),
         )
         del output_intents[index]
@@ -175,6 +177,17 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
         document_colorspace=first_intent.document_colorspace,
         reason="Existing output conditions are compatible with PDF/A",
     )
+
+
+def _may_name_standard_condition(intent: Dictionary) -> bool:
+    """Return whether a profile-less intent can name a standard production condition.
+
+    No registry can be queried here, and /RegistryName is optional, so a name such as
+    FOGRA39 cannot be disproved. Custom and an empty value clearly name no standard
+    condition, so those have to embed their profile.
+    """
+    identifier = str(intent.get("/OutputConditionIdentifier"))
+    return identifier.strip().casefold() not in ("", "custom")
 
 
 def _remove_redundant_pdfa_intents(output_intents: Array) -> None:

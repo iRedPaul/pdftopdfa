@@ -215,6 +215,10 @@ def valid_trapnet(annotation, owner, annotations, index: int, count: int) -> boo
     return _version_objects(owner) == {_key(item) for item in version}
 
 
+# Besides its appearance, these entries decide whether and how an annotation prints.
+_ANNOTATION_RENDERING_KEYS = ("/AS", "/F", "/Rect", "/CA", "/ca", "/BM", "/OC")
+
+
 def _printed_appearance(annotation: Dictionary):
     """Reduce /AP to the normal appearance that printing and trapping depend on.
 
@@ -248,7 +252,12 @@ def _page_snapshot(page: Page) -> bytes:
         inherited.Rotate = 0
     annotations = page.get("/Annots", [])
     states = Array(
-        Array([item.get("/AS"), _printed_appearance(item)])
+        Array(
+            [
+                _printed_appearance(item),
+                *[item.get(key) for key in _ANNOTATION_RENDERING_KEYS],
+            ]
+        )
         for item in annotations
         if isinstance(item, Dictionary) and item.get("/Subtype") != Name.TrapNet
     )

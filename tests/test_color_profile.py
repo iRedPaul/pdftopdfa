@@ -1297,7 +1297,8 @@ class TestEmbedColorProfiles:
         oi2 = Dictionary(
             Type=Name.OutputIntent,
             S=Name("/GTS_PDFX"),
-            OutputConditionIdentifier=pikepdf.String("Custom"),
+            OutputConditionIdentifier=pikepdf.String("CGATS TR 001"),
+            RegistryName=pikepdf.String("http://www.color.org"),
         )
         pdf.Root.OutputIntents = Array([oi1, oi2])
 
@@ -1309,6 +1310,42 @@ class TestEmbedColorProfiles:
         assert len(pdf.Root.OutputIntents) == 2
         assert pdf.Root.OutputIntents[1].S == Name.GTS_PDFX
         assert "/DestOutputProfile" not in pdf.Root.OutputIntents[1]
+
+    @pytest.mark.parametrize(
+        "identifier",
+        ["Custom", "custom", " CUSTOM ", "", "  "],
+    )
+    def test_additional_intent_without_a_standard_condition_is_removed(
+        self, identifier
+    ) -> None:
+        """A non-standard condition must embed its profile, and others stay intact."""
+        pdf = new_pdf()
+        stream = pdf.make_stream(_make_icc_profile())
+        stream[Name.N] = 3
+        unregistered = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name.GTS_PDFX,
+            OutputConditionIdentifier=pikepdf.String(identifier),
+        )
+        pdf.Root.OutputIntents = Array(
+            [
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.GTS_PDFA1,
+                    OutputConditionIdentifier=pikepdf.String("Keep"),
+                    DestOutputProfile=stream,
+                ),
+                unregistered,
+            ]
+        )
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        assert [str(i.OutputConditionIdentifier) for i in pdf.Root.OutputIntents] == [
+            "Keep"
+        ]
 
     def test_same_family_different_content_detected(self, caplog) -> None:
         """Profiles with same color space family but different content are flagged.
@@ -4646,7 +4683,7 @@ class TestSMaskGFormDefaultColorSpaces:
         oi = Dictionary(
             Type=Name.OutputIntent,
             S=Name("/GTS_PDFX"),
-            OutputConditionIdentifier=pikepdf.String("Custom"),
+            OutputConditionIdentifier=pikepdf.String("FOGRA39"),
             DestOutputProfileRef=Dictionary(
                 URL=pikepdf.String("http://example.com/profile.icc"),
             ),
