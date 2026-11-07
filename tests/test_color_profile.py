@@ -751,6 +751,45 @@ class TestEmbedColorProfiles:
         with pytest.raises(ConversionError, match="invalid /WhitePoint"):
             embed_color_profiles(pdf, "2b", replace_existing=True)
 
+    @pytest.mark.parametrize("shared", [True, False])
+    def test_redundant_pdfa_intents_collapse_to_the_first(self, shared) -> None:
+        """Identical profiles keep one PDF/A intent and every other subtype."""
+        pdf = new_pdf()
+        pdf.add_blank_page(page_size=(612, 792))
+
+        def profile():
+            stream = pdf.make_stream(_make_icc_profile())
+            stream[Name.N] = 3
+            return pdf.make_indirect(stream)
+
+        def intent(subtype, identifier, destination):
+            return pdf.make_indirect(
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=subtype,
+                    OutputConditionIdentifier=pikepdf.String(identifier),
+                    DestOutputProfile=destination,
+                )
+            )
+
+        first = profile()
+        pdf.Root.OutputIntents = Array(
+            [
+                intent(Name.GTS_PDFX, "Press", first),
+                intent(Name.GTS_PDFA1, "First", first),
+                intent(Name.GTS_PDFA1, "Second", first if shared else profile()),
+                intent(Name.GTS_PDFA1, "Third", first if shared else profile()),
+            ]
+        )
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        intents = pdf.Root.OutputIntents
+        assert [
+            (str(item.S), str(item.OutputConditionIdentifier)) for item in intents
+        ] == [("/GTS_PDFX", "Press"), ("/GTS_PDFA1", "First")]
+        assert len({item.DestOutputProfile.objgen for item in intents}) == 1
+
     def test_valid_existing_srgb_output_intent_is_preserved(self) -> None:
         """Valid existing sRGB PDF/A OutputIntent is not replaced."""
         pdf = new_pdf()
@@ -915,8 +954,8 @@ class TestEmbedColorProfiles:
         assert str(replacement["/OutputConditionIdentifier"]) == "sRGB"
         assert bytes(replacement["/DestOutputProfile"].read_bytes()) != profile_rgb
 
-    def test_multiple_identical_output_intents_kept(self) -> None:
-        """Compatible OutputIntents survive with a shared profile object."""
+    def test_multiple_identical_output_intents_reduced(self) -> None:
+        """Identical PDF/A OutputIntents reduce to one retained entry."""
         pdf = new_pdf()
         profile_data = _make_icc_profile()
 
@@ -945,11 +984,8 @@ class TestEmbedColorProfiles:
 
         embed_color_profiles(pdf, "2b", replace_existing=True)
 
-        assert len(pdf.Root.OutputIntents) == 2
-        assert (
-            pdf.Root.OutputIntents[0].DestOutputProfile.objgen
-            == pdf.Root.OutputIntents[1].DestOutputProfile.objgen
-        )
+        assert len(pdf.Root.OutputIntents) == 1
+        assert pdf.Root.OutputIntents[0].S == Name.GTS_PDFA1
 
     def test_multiple_different_output_intents_reduced(self) -> None:
         """Conflicting PDF/A and PDF/X profiles require a replacement condition."""
@@ -1164,7 +1200,7 @@ class TestEmbedColorProfiles:
         )
         oi2 = Dictionary(
             Type=Name.OutputIntent,
-            S=Name.GTS_PDFA1,
+            S=Name.GTS_PDFX,
             OutputConditionIdentifier=pikepdf.String("sRGB"),
             DestOutputProfile=stream2,
         )
@@ -1191,12 +1227,12 @@ class TestEmbedColorProfiles:
         )
 
     @pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
-    @pytest.mark.parametrize("subtype", ["/GTS_PDFA1", "/GTS_PDFX", "/ISO_PDFE1"])
+    @pytest.mark.parametrize("subtype", ["/GTS_PDFX", "/ISO_PDFE1"])
     @pytest.mark.parametrize("separate_streams", [False, True])
     def test_compatible_intents_preserve_metadata_after_reopen(
         self, level, subtype, separate_streams
     ):
-        """Preserve every compatible intent and unify identical ICC references."""
+        """Preserve intents of other subtypes and unify identical ICC references."""
         pdf = new_pdf()
         page = pdf.add_blank_page(page_size=(200, 200))
         page.Contents = pdf.make_stream(b"0.5 g 0 0 200 200 re f")

@@ -4078,6 +4078,42 @@ class TestLanguageTags:
         result = self._copied(prop)
         assert not result.xpath("//@xml:lang[contains(., 'not a tag')]")
 
+    @pytest.mark.parametrize(
+        "prop,value",
+        [
+            ('<dc:source xml:lang="">origin</dc:source>', "origin"),
+            (
+                '<dc:subject><rdf:Bag><rdf:li xml:lang="">keyword</rdf:li></rdf:Bag>'
+                "</dc:subject>",
+                "keyword",
+            ),
+        ],
+    )
+    def test_empty_qualifier_is_removed_and_value_kept(self, prop, value) -> None:
+        """An empty xml:lang declares no language, so only the qualifier goes."""
+        result = self._copied(prop)
+        assert result.xpath(f"//*[text()='{value}']")
+        assert not result.xpath("//@xml:lang")
+
+    def test_empty_qualifier_is_removed_from_page_metadata(self) -> None:
+        """Non-catalog packets cannot publish an empty qualifier either."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        source = _build_xmp_with_extras('<dc:source xml:lang="">origin</dc:source>')
+        page.Metadata = pdf.make_stream(etree.tostring(source))
+        _sanitize_non_catalog_metadata(pdf)
+        result = _parse_xmp_bytes(page.Metadata.read_bytes())
+        assert result.xpath("//*[text()='origin']")
+        assert not result.xpath("//@xml:lang")
+
+    def test_empty_qualifier_cannot_stand_in_for_a_language_alternative(self) -> None:
+        """Language alternatives need a tag, so removal alone would not repair them."""
+        result = self._copied(
+            '<dc:rights><rdf:Alt><rdf:li xml:lang="">Text</rdf:li></rdf:Alt>'
+            "</dc:rights>"
+        )
+        assert not result.xpath("//dc:rights", namespaces=NAMESPACES)
+
     @pytest.mark.parametrize("tag", ["en", "en_US", "not a tag!", ""])
     def test_top_level_language_is_not_copied(self, tag) -> None:
         """Validators treat xml:lang on the packet description as a property."""

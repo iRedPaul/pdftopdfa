@@ -233,8 +233,10 @@ Malformed CalGray/CalRGB definitions trigger the original-input fallback with a
 warning rather than producing a PDF/A target with invalid calibration.
 Validation examines declared color spaces; unrelated private data is preserved.
 
-Compatible additional OutputIntents retain their printing information and share
-the embedded ICC profile when required. PDF/X, PDF/VT, and PDF/E identification
+Compatible additional OutputIntents of other subtypes, such as PDF/X, retain their
+printing information and share the embedded ICC profile when required. Several
+PDF/A OutputIntents with an identical profile reduce to the first one.
+PDF/X, PDF/VT, and PDF/E identification
 claims are still removed from XMP because conversion does not revalidate those
 standards.
 

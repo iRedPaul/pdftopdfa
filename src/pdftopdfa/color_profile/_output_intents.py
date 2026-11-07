@@ -46,7 +46,8 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
 
     Keep compatible intent dictionaries and their individual printing metadata.
     All embedded profiles must describe the same output condition. Byte-identical
-    profile streams are unified to the same indirect object (rule 6.2.3-2).
+    profile streams are unified to the same indirect object (rule 6.2.3-2), and
+    only the first PDF/A intent is kept.
     A PDF/A intent can be added using an existing compatible output profile.
     """
     output_intents = pdf.Root.get("/OutputIntents")
@@ -127,6 +128,9 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
     for valid_intent in profiled_intents:
         valid_intent.intent["/DestOutputProfile"] = shared_profile
 
+    if len(pdfa_intents) > 1:
+        _remove_redundant_pdfa_intents(output_intents)
+
     if not pdfa_intents:
         # Preserve a PDF/X (or other) output condition when converting to PDF/A;
         # adding its PDF/A counterpart does not require discarding that intent.
@@ -148,6 +152,25 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
         keep_existing=True,
         document_colorspace=first_intent.document_colorspace,
         reason="Existing output conditions are compatible with PDF/A",
+    )
+
+
+def _remove_redundant_pdfa_intents(output_intents: Array) -> None:
+    """Keep the first PDF/A intent when several describe the same output profile.
+
+    The profile is byte-identical, so only descriptive text can be lost. A single
+    PDF/A intent is unambiguous, and other subtypes such as PDF/X remain in place.
+    """
+    pdfa_positions = [
+        index
+        for index, entry in enumerate(output_intents)
+        if _resolve_indirect(entry).get("/S") == Name.GTS_PDFA1
+    ]
+    for index in reversed(pdfa_positions[1:]):
+        del output_intents[index]
+    logger.info(
+        "Removed %d redundant PDF/A OutputIntent(s) with an identical profile",
+        len(pdfa_positions) - 1,
     )
 
 

@@ -632,7 +632,11 @@ def _normalize_structural_properties(elem: etree._Element) -> None:
         if corrected is not None:
             elem.set(corrected, elem.attrib.pop(name))
     language = elem.get(_XML_LANG)
-    if language is not None:
+    if language == "":
+        # XML 1.0, 2.12: this only states that no language is known, which is
+        # equivalent to omitting a qualifier that XMP requires to be a tag.
+        del elem.attrib[_XML_LANG]
+    elif language is not None:
         elem.set(_XML_LANG, _normalize_language_tag(language))
     for child in elem:
         _normalize_structural_properties(child)
@@ -1719,7 +1723,8 @@ def _has_invalid_rdf_syntax(prop: etree._Element) -> bool:
     parseType="Resource", whose fields must be child properties. Node elements
     cannot carry rdf:parseType, property elements cannot carry rdf:about, and
     property attributes exclude nested content. XMP also requires language tags
-    in xml:lang qualifiers, although XML permits an empty value.
+    in xml:lang qualifiers. An empty value is not rejected here, because
+    _normalize_structural_properties() removes it from every copied property.
     """
     ns_rdf = NAMESPACES["rdf"]
     parse_type = f"{{{ns_rdf}}}parseType"

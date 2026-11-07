@@ -10,7 +10,7 @@
 
 - Preserve permitted soft-mask transfer functions and avoid changing valid overprint behavior in unrelated graphics contexts
 - Preserve annotation colors, valid opacity values, and PDF/A-2/3 TrapNet annotations
-- Retain PDF portfolios, article threads, and compatible additional OutputIntents
+- Retain PDF portfolios, article threads, and compatible additional OutputIntents of other subtypes such as PDF/X
 - Preserve custom DocInfo text fields, valid XMP provenance, translated titles/descriptions, and ordered author lists
 - Validate preserved XMP arrays, provenance fields, soft-mask transfer functions, calibrated color spaces, and additional OutputIntent dictionaries
 - Detect annotation color arrays when choosing profiles, normalize inline-image color abbreviations, and reuse equivalent overprint proofs for large documents
@@ -24,6 +24,7 @@
 - Leave calibrated color spaces unvalidated when `embed_color_profiles(replace_existing=False)` skips a document with existing OutputIntents
 - Repair `_` separators in XMP language tags such as `en_US`, reject other malformed tags, and stop copying `xml:lang` from the top-level `rdf:Description`, which validators report as an undeclared property
 - Remove collection sorting unless every `/S` field resolves in the collection schema
+- Remove empty `xml:lang` qualifiers while retaining their values
 
 ### Tests
 
