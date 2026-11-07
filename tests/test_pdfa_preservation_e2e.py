@@ -10,7 +10,7 @@ import pikepdf
 import pytest
 from conftest import new_pdf
 from lxml import etree
-from pikepdf import Array, Name, Pdf
+from pikepdf import Array, Dictionary, Name, Pdf
 
 from pdftopdfa.color_profile import (
     ColorSpaceType,
@@ -41,6 +41,42 @@ def _document(level: str, *, cmyk: bool = False) -> Pdf:
     intent = create_output_intent_for_colorspace(pdf, colorspace, profile, level)
     pdf.Root.OutputIntents = Array([pdf.make_indirect(intent)])
     return pdf
+
+
+@pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
+def test_full_conversion_preserves_overprint_on_an_unrelated_page(
+    source_level: str, target_level: str, tmp_path: Path
+) -> None:
+    """Keep unrelated valid overprint unchanged through full conversion."""
+    pdf = _document(source_level, cmyk=True)
+    first = pdf.pages[0]
+    first.Resources = Dictionary(
+        ExtGState=Dictionary(
+            GS=Dictionary(Type=Name.ExtGState, OP=True, op=True, OPM=1)
+        )
+    )
+    first.Contents = pdf.make_stream(
+        b"1 0 0 0 k 20 20 160 160 re f /GS gs 0 0 0 1 k 60 60 80 80 re f"
+    )
+    second = pdf.add_blank_page(page_size=(200, 200))
+    second.Resources = Dictionary(
+        ColorSpace=Dictionary(
+            ICC=Array([Name.ICCBased, pdf.Root.OutputIntents[0].DestOutputProfile])
+        )
+    )
+    second.Contents = pdf.make_stream(b"/ICC cs 0 1 0 0 scn 20 20 160 160 re f")
+    source = tmp_path / "source.pdf"
+    output = tmp_path / "output.pdf"
+    pdf.save(source, force_version="1.7")
+    original = validate_with_verapdf(source, flavour=source_level)
+    assert original.compliant, original
+    result = convert_to_pdfa(source, output, level=target_level, validate=True)
+    assert result.success and result.target_produced and not result.skipped, result
+    assert not result.validation_failed, result
+    with pikepdf.open(output) as restored:
+        gs = restored.pages[0].Resources.ExtGState.GS
+        assert gs.OPM == 1 and gs.OP is True and gs.op is True
+        assert restored.pages[0].Contents.read_bytes() == first.Contents.read_bytes()
 
 
 @pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
@@ -232,3 +268,108 @@ def test_full_conversion_repairs_xmp_language_tags(
             ("en-US", "Copyright Acme")
         ]
         assert tree.find(f".//{{{_RDF}}}Description").get(xml_lang) is None
+
+
+@pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
+def test_full_conversion_preserves_invisible_type3_overprint(
+    source_level, target_level, tmp_path
+):
+    """Invisible Type3 glyph paint cannot abort conversion before validation."""
+    pdf = _document(source_level, cmyk=True)
+    page = pdf.pages[0]
+    glyph_data = b"600 0 d0 /ICC cs 0 1 0 0 scn 0 0 600 600 re f"
+    font = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type3,
+            FontBBox=Array([0, 0, 600, 600]),
+            FontMatrix=Array([0.001, 0, 0, 0.001, 0, 0]),
+            CharProcs=Dictionary(A=pdf.make_stream(glyph_data)),
+            Encoding=Dictionary(Type=Name.Encoding, Differences=Array([65, Name.A])),
+            FirstChar=65,
+            LastChar=65,
+            Widths=Array([600]),
+            Resources=Dictionary(
+                ColorSpace=Dictionary(
+                    ICC=Array(
+                        [Name.ICCBased, pdf.Root.OutputIntents[0].DestOutputProfile]
+                    )
+                )
+            ),
+        )
+    )
+    page.Resources = Dictionary(
+        Font=Dictionary(F=font), ExtGState=Dictionary(GS=Dictionary(OP=True, OPM=1))
+    )
+    content = b"/GS gs BT /F 20 Tf 3 Tr 1 0 0 1 20 20 Tm (A) Tj ET"
+    page.Contents = pdf.make_stream(content)
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source, force_version="1.7")
+
+    # veraPDF 1.30.2 also checks paints in invisible glyphs. Isolate the
+    # converter's behavior here; external validation retains its usual fallback.
+    result = convert_to_pdfa(source, output, level=target_level, validate=False)
+    assert result.target_produced and not result.validation_failed, result
+    with pikepdf.open(output) as restored:
+        page = restored.pages[0]
+        assert page.Contents.read_bytes() == content
+        assert page.Resources.Font.F.CharProcs.A.read_bytes() == glyph_data
+        assert page.Resources.ExtGState.GS.OPM == 1
+
+
+@pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
+@pytest.mark.parametrize("kind", ["tiling", "shading"])
+def test_full_conversion_preserves_valid_pattern_overprint(
+    source_level: str, target_level: str, kind: str, tmp_path: Path
+) -> None:
+    """Validate allowed tiling and shading overprint through full conversion."""
+    pdf = _document(source_level, cmyk=True)
+    page = pdf.pages[0]
+    icc = Array([Name.ICCBased, pdf.Root.OutputIntents[0].DestOutputProfile])
+    page.Resources = Dictionary()
+    if kind == "tiling":
+        pattern = pdf.make_stream(b"/ICC cs 0 1 0 0 scn 0 0 20 20 re f")
+        pattern.PatternType = 1
+        pattern.PaintType = 1
+        pattern.TilingType = 1
+        pattern.BBox = Array([0, 0, 20, 20])
+        pattern.XStep = pattern.YStep = 20
+        pattern.Resources = Dictionary(ColorSpace=Dictionary(ICC=icc))
+        page.Resources.ExtGState = Dictionary(GS=Dictionary(OP=True, OPM=1))
+        content = b"/GS gs /Pattern cs /P scn 0 0 100 100 re f"
+    else:
+        pattern = Dictionary(
+            PatternType=2,
+            ExtGState=Dictionary(OP=True, op=False, OPM=1),
+            Shading=Dictionary(
+                ShadingType=2,
+                ColorSpace=icc,
+                Coords=Array([0, 0, 100, 0]),
+                Extend=Array([True, True]),
+                Function=Dictionary(
+                    FunctionType=2,
+                    Domain=Array([0, 1]),
+                    C0=Array([1, 0, 0, 0]),
+                    C1=Array([0, 1, 0, 0]),
+                    N=1,
+                ),
+            ),
+        )
+        content = b"/Pattern cs /P scn 0 0 100 100 re f"
+    page.Resources.Pattern = Dictionary(P=pattern)
+    page.Contents = pdf.make_stream(content)
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source, force_version="1.7")
+    original = validate_with_verapdf(source, flavour=source_level)
+    assert original.compliant, original
+    result = convert_to_pdfa(source, output, level=target_level, validate=True)
+    assert result.success and result.target_produced and not result.skipped, result
+    assert not result.validation_failed, result
+    with pikepdf.open(output) as restored:
+        assert restored.pages[0].Contents.read_bytes() == content
+        actual = restored.pages[0].Resources.Pattern.P
+        if kind == "tiling":
+            assert actual.read_bytes() == pattern.read_bytes()
+        else:
+            assert actual.ExtGState.OPM == 1
+            assert actual.ExtGState.OP is True and actual.ExtGState.op is False
