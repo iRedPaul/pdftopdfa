@@ -520,8 +520,14 @@ class _Analyzer:
                 raise _error(f"malformed {op} instruction") from exc
             for side, used in (("stroke", stroke), ("fill", fill)):
                 if used and getattr(painted, side) == "pattern":
-                    self.pattern(getattr(state, f"{side}_pattern"), ancestors)
-                    painted = replace(painted, **{side: "other"})
+                    selected = getattr(state, f"{side}_pattern")
+                    self.pattern(selected, ancestors)
+                    # An uncolored cell paints with its separately supplied color,
+                    # which the state at this operation applies to.
+                    uncolored = selected.definition.get("/PaintType") == 2
+                    painted = replace(
+                        painted, **{side: selected.base if uncolored else "other"}
+                    )
             repair = _needs_repair(painted, stroke=stroke, fill=fill)
             if (stroke or fill) and state.soft_mask is not None:
                 # A selected mask is evaluated for the actual painting state,

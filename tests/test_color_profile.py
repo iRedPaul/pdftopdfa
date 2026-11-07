@@ -848,6 +848,63 @@ class TestEmbedColorProfiles:
         assert bytes(preserved["/DestOutputProfile"].read_bytes()) == profile_data
         assert preserved["/DestOutputProfile"]["/N"] == 4
 
+    @pytest.mark.parametrize("with_profile", [False, True])
+    def test_undefined_intent_subtype_is_removed_alone(self, with_profile) -> None:
+        """Other output conditions stay, and its own profile causes no conflict."""
+        pdf = new_pdf()
+        stream = pdf.make_stream(_make_icc_profile())
+        stream[Name.N] = 3
+        other = bytearray(_make_icc_profile())
+        other[50:54] = b"diff"
+        undefined = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name.Bogus,
+            OutputConditionIdentifier=pikepdf.String("Undefined"),
+        )
+        if with_profile:
+            undefined.DestOutputProfile = pdf.make_stream(bytes(other))
+        pdf.Root.OutputIntents = Array(
+            [
+                undefined,
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.GTS_PDFA1,
+                    OutputConditionIdentifier=pikepdf.String("Keep"),
+                    DestOutputProfile=stream,
+                ),
+            ]
+        )
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        assert [str(i.OutputConditionIdentifier) for i in pdf.Root.OutputIntents] == [
+            "Keep"
+        ]
+
+    def test_only_undefined_intent_subtype_is_replaced(self) -> None:
+        """Without any defined condition, the document receives its PDF/A intent."""
+        pdf = new_pdf()
+        pdf.Root.OutputIntents = Array(
+            [
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.Bogus,
+                    OutputConditionIdentifier=pikepdf.String("Undefined"),
+                )
+            ]
+        )
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        assert [str(i.S) for i in pdf.Root.OutputIntents] == ["/GTS_PDFA1"]
+        assert "Undefined" not in [
+            str(i.OutputConditionIdentifier) for i in pdf.Root.OutputIntents
+        ]
+
     @pytest.mark.parametrize("load", [get_srgb_profile, get_cmyk_profile])
     def test_bundled_profiles_have_usable_tag_tables(self, load) -> None:
         """Real profiles satisfy the checks made for existing output intents."""

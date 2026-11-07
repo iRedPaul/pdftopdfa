@@ -34,7 +34,8 @@
 - Require a usable tag table before retaining an existing OutputIntent profile
 - Require custom XMP structure fields to use the namespace of their declared value type, and validate XMP numbers against their lexical forms
 - Reject non-integer text rendering modes during overprint analysis, and evaluate a soft mask at the invocation of a transparency group instead of at its inner paints
-- Require `stEvt:action` and `stEvt:when` in preserved XMP history events
+- Require `stEvt:action` and `stEvt:when` in preserved XMP history events, and move `x-default` to the front of language alternatives
+- Remove OutputIntents with an undefined subtype while retaining the others, and check uncolored tiling patterns under the overprint state at their painting operation
 - Restore the reading order of a page's article beads, and reject a TrapNet with an invalid annotation type
 - Validate calibrated color spaces that inline images declare directly
 - Remove collection item values without a matching schema field or with the wrong type, and a default document that is not an embedded file

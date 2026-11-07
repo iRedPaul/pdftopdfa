@@ -316,12 +316,19 @@ _CALCULATOR_UNARY = frozenset(
     "abs ceiling cos cvi cvr floor ln log neg round sin sqrt truncate".split()
 )
 _CALCULATOR_BINARY = frozenset("add atan bitshift div exp idiv mod mul sub".split())
-_CALCULATOR_COMPARISONS = frozenset("eq ge gt le lt ne".split())
+_CALCULATOR_COMPARISONS = {
+    "eq": lambda a, b: a == b,
+    "ge": lambda a, b: a >= b,
+    "gt": lambda a, b: a > b,
+    "le": lambda a, b: a <= b,
+    "lt": lambda a, b: a < b,
+    "ne": lambda a, b: a != b,
+}
 _CALCULATOR_LOGICAL = frozenset("and not or xor".split())
 _CALCULATOR_OPERATORS = (
     _CALCULATOR_UNARY
     | _CALCULATOR_BINARY
-    | _CALCULATOR_COMPARISONS
+    | frozenset(_CALCULATOR_COMPARISONS)
     | _CALCULATOR_LOGICAL
     | frozenset("copy dup exch false if ifelse index pop roll true".split())
 )
@@ -407,9 +414,19 @@ def _parse_calculator(data: bytes) -> list | None:
     return outer[0] if len(blocks) == 1 and len(outer) == 1 else None
 
 
+def _calculator_boolean(value) -> bool:
+    """Return whether a stack entry is a boolean, with a known value or not."""
+    return value is _CALCULATOR_BOOLEAN or isinstance(value, bool)
+
+
+def _calculator_known_integer(value) -> bool:
+    """Return whether a stack entry is an integer of known value."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _calculator_integer(value) -> bool:
-    """Return whether an abstract stack entry is certainly an integer."""
-    return isinstance(value, int) or value is _CALCULATOR_INTEGER
+    """Return whether a stack entry is certainly an integer."""
+    return _calculator_known_integer(value) or value is _CALCULATOR_INTEGER
 
 
 def _fold_calculator_operator(operator: str, operands: list):
@@ -443,7 +460,7 @@ def _apply_calculator_operator(token: bytes, stack: list) -> bool:
         stack.append(int(text) if re.fullmatch(r"[+-]?\d+", text) else float(text))
         return True
     if operator in ("true", "false"):
-        stack.append(_CALCULATOR_BOOLEAN)
+        stack.append(operator == "true")
         return True
     single = operator in _CALCULATOR_UNARY or operator in (
         "copy",
@@ -463,24 +480,25 @@ def _apply_calculator_operator(token: bytes, stack: list) -> bool:
         return True
     operands = stack[-pops:]
     del stack[-pops:]
-    booleans = [operand is _CALCULATOR_BOOLEAN for operand in operands]
+    booleans = [_calculator_boolean(operand) for operand in operands]
+    known = all(isinstance(operand, (int, float)) for operand in operands)
     if operator == "pop":
         return True
     if operator == "copy":
         count = operands[0]
-        if not isinstance(count, int) or not 0 <= count <= len(stack):
+        if not _calculator_known_integer(count) or not 0 <= count <= len(stack):
             return False
         stack.extend(stack[len(stack) - count :])
     elif operator == "index":
         offset = operands[0]
-        if not isinstance(offset, int) or not 0 <= offset < len(stack):
+        if not _calculator_known_integer(offset) or not 0 <= offset < len(stack):
             return False
         stack.append(stack[-1 - offset])
     elif operator == "roll":
         count, shift = operands
         if (
-            not isinstance(count, int)
-            or not isinstance(shift, int)
+            not _calculator_known_integer(count)
+            or not _calculator_known_integer(shift)
             or not 0 <= count <= len(stack)
         ):
             return False
@@ -491,9 +509,18 @@ def _apply_calculator_operator(token: bytes, stack: list) -> bool:
     elif operator in _CALCULATOR_COMPARISONS:
         if booleans[0] != booleans[1] or (booleans[0] and operator not in ("eq", "ne")):
             return False
-        stack.append(_CALCULATOR_BOOLEAN)
+        stack.append(
+            _CALCULATOR_COMPARISONS[operator](*operands)
+            if known
+            else _CALCULATOR_BOOLEAN
+        )
     elif all(booleans) and operator in _CALCULATOR_LOGICAL:
-        stack.append(_CALCULATOR_BOOLEAN)
+        if not known:
+            stack.append(_CALCULATOR_BOOLEAN)
+        elif operator == "not":
+            stack.append(not operands[0])
+        else:
+            stack.append(_CALCULATOR_INTEGER_FOLDS[operator](*operands))
     else:
         # The function input is a real number, so integer operators need a proof
         # such as cvi. Applying them to anything else is a run-time type error.
@@ -507,11 +534,12 @@ def _apply_calculator_operator(token: bytes, stack: list) -> bool:
 
 
 def _apply_calculator_block(block: list, stack: list) -> bool:
-    """Prove a block's effect on an abstract operand stack along each path.
+    """Prove a block's effect on an abstract operand stack along each possible path.
 
-    Entries are a known integer or real, None for an unknown number, or a marker for
-    a boolean or an integer of unknown value. Known integers let copy, index and roll
-    be proven; other operands cannot.
+    Entries are a known integer, real or boolean, None for an unknown number, or a
+    marker for a boolean or an integer of unknown value. Known integers let copy,
+    index and roll be proven; other operands cannot. A known condition takes only
+    its own path, and an unknown one has to be valid along both.
     """
     conditional: list[list] = []
     for item in block:
@@ -520,21 +548,31 @@ def _apply_calculator_block(block: list, stack: list) -> bool:
         elif item in (b"if", b"ifelse"):
             if len(conditional) != (1 if item == b"if" else 2):
                 return False
-            if not stack or stack.pop() is not _CALCULATOR_BOOLEAN:
+            if not stack or not _calculator_boolean(stack[-1]):
                 return False
+            condition = stack.pop()
+            if condition is not _CALCULATOR_BOOLEAN:
+                if condition or item == b"ifelse":
+                    taken = conditional[0] if condition else conditional[1]
+                    if not _apply_calculator_block(taken, stack):
+                        return False
+                conditional = []
+                continue
             outcomes = [list(stack) for _ in conditional]
             for branch, outcome in zip(conditional, outcomes, strict=True):
                 if not _apply_calculator_block(branch, outcome):
                     return False
             first, second = outcomes if len(outcomes) == 2 else (outcomes[0], stack)
             if len(first) != len(second) or any(
-                (a is _CALCULATOR_BOOLEAN) != (b is _CALCULATOR_BOOLEAN)
+                _calculator_boolean(a) != _calculator_boolean(b)
                 for a, b in zip(first, second, strict=True)
             ):
                 return False
             stack[:] = [
                 a
                 if type(a) is type(b) and a == b
+                else _CALCULATOR_BOOLEAN
+                if _calculator_boolean(a)
                 else _CALCULATOR_INTEGER
                 if _calculator_integer(a) and _calculator_integer(b)
                 else None
@@ -548,25 +586,34 @@ def _apply_calculator_block(block: list, stack: list) -> bool:
     return not conditional
 
 
-def _is_scalar_calculator(data: bytes) -> bool:
-    """Require a calculator program that provably maps one number to one number."""
+def _is_scalar_calculator(data: bytes, domain) -> bool:
+    """Require a calculator program that provably maps one number to one number.
+
+    The program must hold for any input. It also runs for the ends and the middle of
+    its domain, where actual conditions select the path, so a guarded { ln } passes
+    but an unguarded one fails at zero. This samples the domain and is not a proof.
+    """
     program = _parse_calculator(data)
     if program is None:
         return False
-    stack: list = [None]
+    low, high = float(domain[0]), float(domain[1])
     try:
-        return (
-            _apply_calculator_block(program, stack)
-            and len(stack) == 1
-            and stack[0] is not _CALCULATOR_BOOLEAN
-        )
+        for value in (None, low, high, (low + high) / 2):
+            stack: list = [value]
+            if (
+                not _apply_calculator_block(program, stack)
+                or len(stack) != 1
+                or _calculator_boolean(stack[0])
+            ):
+                return False
     except (ZeroDivisionError, OverflowError, ValueError):
-        # A literal division by zero or out-of-range number cannot run.
+        # An operation without a defined result, such as a division by zero.
         return False
+    return True
 
 
 def _is_scalar_transfer_function(function, ancestors=frozenset()) -> bool:
-    """Validate one-input, one-output PDF functions without executing their code."""
+    """Validate that a PDF function maps one input to one output, in each type."""
     if function == Name.Identity:
         return True
     if not isinstance(function, (Dictionary, Stream)) or len(ancestors) >= 64:
@@ -597,7 +644,7 @@ def _is_scalar_transfer_function(function, ancestors=frozenset()) -> bool:
         except (PdfError, RuntimeError):
             return False
         if kind == 4:
-            return _is_scalar_calculator(data)
+            return _is_scalar_calculator(data, domain)
         size = function.get("/Size")
         bits = function.get("/BitsPerSample")
         order = function.get("/Order", 1)

@@ -22,6 +22,10 @@ _ICC_SIGNATURE_TO_COLORSPACE: dict[bytes, tuple[int, ColorSpaceType]] = {
     b"CMYK": (4, ColorSpaceType.DEVICE_CMYK),
 }
 
+# ISO 32000-1, Table 365. Other keys would need an ISO 32000 extension declaration,
+# and the pipeline does not keep those for third-party extensions.
+_DEFINED_OUTPUT_INTENT_SUBTYPES = (Name.GTS_PDFA1, Name.GTS_PDFX, Name.ISO_PDFE1)
+
 # Tags that describe a color model without a lookup table, which CMYK requires.
 _ICC_MODEL_TAGS: dict[bytes, frozenset[bytes]] = {
     b"GRAY": frozenset({b"kTRC"}),
@@ -65,7 +69,8 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
 
     pdfa_intents: list[_ValidOutputIntent] = []
     profiled_intents: list[_ValidOutputIntent] = []
-    for intent_ref in output_intents:
+    undefined_subtypes: list[int] = []
+    for index, intent_ref in enumerate(output_intents):
         intent = _resolve_indirect(intent_ref)
         if not isinstance(intent, Dictionary):
             return OutputIntentPreparation(
@@ -79,6 +84,9 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
                 keep_existing=False,
                 reason="OutputIntent subtype is missing or is not a name",
             )
+        if subtype not in _DEFINED_OUTPUT_INTENT_SUBTYPES:
+            undefined_subtypes.append(index)
+            continue
         if (
             intent.get("/Type") not in (None, Name.OutputIntent)
             or not isinstance(intent.get("/OutputConditionIdentifier"), String)
@@ -110,6 +118,14 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
         profiled_intents.append(valid_intent)
         if subtype == Name.GTS_PDFA1:
             pdfa_intents.append(valid_intent)
+
+    # An undefined subtype cannot affect the output conditions that remain.
+    for index in reversed(undefined_subtypes):
+        logger.warning(
+            "Removed OutputIntent with undefined subtype %s",
+            _resolve_indirect(output_intents[index]).get("/S"),
+        )
+        del output_intents[index]
 
     if not profiled_intents:
         return OutputIntentPreparation(

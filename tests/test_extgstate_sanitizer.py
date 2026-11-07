@@ -1133,6 +1133,27 @@ class TestSoftMaskValidation:
         assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
         assert "/TR" not in pdf.pages[0].Resources.ExtGState.GS0.SMask
 
+    @pytest.mark.parametrize(
+        "domain,program,kept",
+        [
+            ([1, 2], b"{ ln }", True),
+            ([0, 1], b"{ ln }", False),
+            ([-1, 1], b"{ sqrt }", False),
+            ([0, 1], b"{ sqrt }", True),
+            ([1, 2], b"{ 1 exch div }", True),
+        ],
+    )
+    def test_calculator_is_checked_over_its_declared_domain(
+        self, domain, program, kept
+    ) -> None:
+        """Whether an operation has a defined result depends on the actual input."""
+        pdf = new_pdf()
+        mask = self._calculator_mask(pdf, program)
+        mask.TR.Domain = Array(domain)
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        sanitize_extgstate(pdf)
+        assert ("/TR" in pdf.pages[0].Resources.ExtGState.GS0.SMask) is kept
+
     @staticmethod
     def _calculator_mask(pdf: Pdf, program: bytes) -> Dictionary:
         """Create a soft mask whose transfer function runs the given program."""
@@ -1187,6 +1208,13 @@ class TestSoftMaskValidation:
             b"{ pop 90 sin }",
             b"{ 16 sqrt cvi 3 sub copy pop }",
             b"{ sqrt }",
+            b"{ 1 add ln }",
+            b"{ dup 0 gt { ln } { pop 0 } ifelse }",
+            b"{ dup 0 eq { pop 0 } { 1 exch div } ifelse }",
+            b"{ false { pop } if }",
+            b"{ true { 1 exch sub } if }",
+            b"{ true not { pop } if }",
+            b"{ 1 2 lt { 1 exch sub } { pop } ifelse }",
         ],
     )
     def test_calculator_with_one_numeric_result_is_preserved(self, program) -> None:
@@ -1244,6 +1272,17 @@ class TestSoftMaskValidation:
             b"{ pop 0 -1 exp }",
             b"{ pop -1 0.5 exp }",
             b"{ pop 0 0 atan }",
+            b"{ ln }",
+            b"{ log }",
+            b"{ 1 exch div }",
+            b"{ 0.5 sub ln }",
+            b"{ 0.5 sub 1 exch div }",
+            b"{ -1 exp }",
+            b"{ true { pop } if }",
+            b"{ false { 1 exch sub } { pop } ifelse }",
+            b"{ dup 1 gt { pop } if pop }",
+            b"{ true copy }",
+            b"{ true true roll }",
             b"{ cvi copy }",
             b"{ 1 0 idiv pop }",
             b"{ 1 0 div pop }",
@@ -1922,6 +1961,41 @@ class TestOverprintIccBasedCmyk:
         )
         assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
         assert page.Contents.read_bytes() == content
+
+    @pytest.mark.parametrize(
+        "base,paint_type,fixes",
+        [
+            ("icc", 2, 1),
+            ("device", 2, 0),
+            ("icc", 1, 0),
+        ],
+    )
+    def test_uncolored_pattern_is_checked_under_the_painting_state(
+        self, base, paint_type, fixes
+    ) -> None:
+        """Its separately supplied color is what the overprint state applies to."""
+        pdf = new_pdf()
+        content = b"/GS0 gs /PCS cs 0 0 0 1 /P scn 0 0 20 20 re f"
+        page = self._page(pdf, content, OPM=1, op=True)
+        page.Resources.ColorSpace.PCS = Array(
+            [
+                Name.Pattern,
+                page.Resources.ColorSpace.CS0 if base == "icc" else Name.DeviceCMYK,
+            ]
+        )
+        pattern = pdf.make_stream(b"0 0 20 20 re f")
+        pattern.PatternType = 1
+        pattern.PaintType = paint_type
+        pattern.TilingType = 1
+        pattern.BBox = Array([0, 0, 20, 20])
+        pattern.XStep = pattern.YStep = 20
+        pattern.Resources = Dictionary()
+        page.Resources.Pattern = Dictionary(P=pattern)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == fixes
+        if fixes:
+            self._assert_guard(page, "f")
+        else:
+            assert page.Contents.read_bytes() == content
 
     def _masked_form(self, pdf, page, form_data, mask_data, *, group):
         """Paint a Form under a soft mask, optionally as a transparency group."""

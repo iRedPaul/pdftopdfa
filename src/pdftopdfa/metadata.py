@@ -646,6 +646,16 @@ def _normalize_structural_properties(elem: etree._Element) -> None:
         elem.set(_XML_LANG, _normalize_language_tag(language))
     for child in elem:
         _normalize_structural_properties(child)
+    # XMP requires the default language, when present, to be the first alternative.
+    if elem.tag == f"{{{NAMESPACES['rdf']}}}Alt":
+        items = [item for item in elem if isinstance(item.tag, str)]
+        default = next(
+            (i for i in items if i.get(_XML_LANG, "").casefold() == "x-default"),
+            None,
+        )
+        if default is not None and default is not items[0]:
+            elem.remove(default)
+            elem.insert(0, default)
 
 
 def _clone_with_registered_namespaces(elem: etree._Element) -> etree._Element:

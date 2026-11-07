@@ -4116,6 +4116,38 @@ class TestLanguageTags:
             "Bericht",
         ]
 
+    @pytest.mark.parametrize("default", ["x-default", "X-Default", "x_default"])
+    def test_default_alternative_is_moved_to_the_front(self, default) -> None:
+        """XMP requires this order, and reordering loses no language or text."""
+        result = self._copied(
+            '<dc:rights><rdf:Alt><rdf:li xml:lang="de-DE">Rechte</rdf:li>'
+            f'<rdf:li xml:lang="{default}">Rights</rdf:li>'
+            '<rdf:li xml:lang="fr-FR">Droits</rdf:li></rdf:Alt></dc:rights>'
+        )
+        languages = self._languages(result, "rights")
+        assert languages[0].casefold() == "x-default" and languages[1:] == [
+            "de-DE",
+            "fr-FR",
+        ]
+        assert result.xpath("//dc:rights/*/rdf:li/text()", namespaces=NAMESPACES) == [
+            "Rights",
+            "Rechte",
+            "Droits",
+        ]
+
+    def test_default_alternative_is_moved_in_page_metadata(self) -> None:
+        """Non-catalog packets receive the same repair as the document packet."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        source = _build_xmp_with_extras(
+            '<dc:rights><rdf:Alt><rdf:li xml:lang="de-DE">Rechte</rdf:li>'
+            '<rdf:li xml:lang="x-default">Rights</rdf:li></rdf:Alt></dc:rights>'
+        )
+        page.Metadata = pdf.make_stream(etree.tostring(source))
+        _sanitize_non_catalog_metadata(pdf)
+        result = _parse_xmp_bytes(page.Metadata.read_bytes())
+        assert self._languages(result, "rights") == ["x-default", "de-DE"]
+
     def test_underscore_is_repaired_in_preserved_properties(self) -> None:
         """Rights statements and qualified array items keep their values."""
         result = self._copied(
