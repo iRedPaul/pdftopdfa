@@ -124,10 +124,34 @@ def test_collection_items_lose_all_fields_with_a_removed_schema():
     assert list(spec.CI.keys()) == ["/Type"]
 
 
-def test_collection_items_are_unchanged_when_the_schema_is_valid():
-    """Portfolio data stays intact unless a schema repair made it dangling."""
+def test_collection_items_lose_values_a_valid_schema_does_not_declare():
+    """Item keys must identify schema fields, even if no repair was needed."""
     pdf = new_pdf()
     spec = _portfolio(pdf, Dictionary(Good=Dictionary(Subtype=Name.S, N="Good")))
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert sorted(spec.CI.keys()) == ["/Good", "/Type"]
+    assert str(spec.CI.Good) == "keep"
+
+
+def test_collection_items_matching_the_schema_are_unchanged():
+    """Declared values stay intact."""
+    pdf = new_pdf()
+    spec = _portfolio(
+        pdf,
+        Dictionary(
+            Good=Dictionary(Subtype=Name.S, N="Good"),
+            Foo=Dictionary(Subtype=Name.S, N="Foo"),
+        ),
+    )
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert sorted(spec.CI.keys()) == ["/Foo", "/Good", "/Type"]
+
+
+def test_collection_items_are_unchanged_without_any_schema():
+    """Nothing identifies a dangling value if the source never declared a schema."""
+    pdf = new_pdf()
+    spec = _portfolio(pdf, Dictionary())
+    del pdf.Root.Collection.Schema
     assert remove_forbidden_catalog_entries(pdf) == 0
     assert sorted(spec.CI.keys()) == ["/Foo", "/Good", "/Type"]
 

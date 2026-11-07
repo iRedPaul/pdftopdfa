@@ -33,7 +33,7 @@ def _optional_type(owner, expected: Name) -> int:
 
 
 def _remove_dangling_collection_items(pdf: Pdf, schema) -> int:
-    """Remove item values whose collection schema fields were discarded."""
+    """Remove item values without a field in the collection schema."""
     names = pdf.Root.get("/Names")
     embedded = names.get("/EmbeddedFiles") if isinstance(names, Dictionary) else None
     if embedded is None:
@@ -63,11 +63,12 @@ def _sanitize_collection(pdf: Pdf) -> int:
     if collection.get("/D") is not None and not isinstance(collection.D, String):
         removed += _remove_entry(collection, "/D")
     schema = collection.get("/Schema")
-    schema_changed = False
+    # Without any schema there is nothing to compare item values with, unless it
+    # is removed here and so no longer describes the values that relied on it.
+    check_items = schema is not None
     if schema is not None and not isinstance(schema, Dictionary):
         removed += _remove_entry(collection, "/Schema")
         schema = None
-        schema_changed = True
     if isinstance(schema, Dictionary):
         removed += _optional_type(schema, Name.CollectionSchema)
         for key in list(schema.keys()):
@@ -90,7 +91,6 @@ def _sanitize_collection(pdf: Pdf) -> int:
                 or not isinstance(field.get("/N"), String)
             ):
                 removed += _remove_entry(schema, key)
-                schema_changed = True
                 continue
             removed += _optional_type(field, Name.CollectionField)
             for flag in ("/V", "/E"):
@@ -101,7 +101,7 @@ def _sanitize_collection(pdf: Pdf) -> int:
                 isinstance(order, bool) or not isinstance(order, int)
             ):
                 removed += _remove_entry(field, "/O")
-    if schema_changed:
+    if check_items:
         # Collection item keys identify fields of the collection schema.
         removed += _remove_dangling_collection_items(pdf, schema)
     sorting = collection.get("/Sort")

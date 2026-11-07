@@ -32,7 +32,7 @@
 - Analyze soft masks selected by a shading pattern's `/ExtGState` during overprint repair
 - Remove soft-mask calculator functions unless their stack effects provably yield one number
 - Validate calibrated color spaces that inline images declare directly
-- Remove collection item values whose schema fields were discarded
+- Remove collection item values without a matching field in the collection schema
 - Remove the PDF/X markers from DocInfo along with their XMP identification
 - Reject XMP containers with extra containers or elements other than `rdf:li`
 

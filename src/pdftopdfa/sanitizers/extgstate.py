@@ -339,7 +339,9 @@ _CALCULATOR_FOLDS = {
     "cvr": float,
     "ceiling": lambda a: type(a)(math.ceil(a)),
     "floor": lambda a: type(a)(math.floor(a)),
-    "round": lambda a: type(a)(math.floor(a + 0.5)),
+    # A negative tie is not treated as known, so that no rounding convention decides
+    # whether a stack operation is valid.
+    "round": lambda a: None if a < 0 and a % 1 == 0.5 else type(a)(math.floor(a + 0.5)),
     "truncate": lambda a: type(a)(math.trunc(a)),
     "add": lambda a, b: a + b,
     "sub": lambda a, b: a - b,
