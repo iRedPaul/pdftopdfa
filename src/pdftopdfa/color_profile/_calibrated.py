@@ -8,10 +8,19 @@ import logging
 import math
 from decimal import Decimal
 
-from pikepdf import Array, Dictionary, Name, Pdf, Stream
+from pikepdf import (
+    Array,
+    ContentStreamInlineImage,
+    Dictionary,
+    Name,
+    Page,
+    Pdf,
+    Stream,
+    parse_content_stream,
+)
 
 from ..exceptions import ConversionError
-from ..utils import iter_type3_fonts
+from ..utils import iter_type3_fonts, log_suppressed_error
 from ._types import ColorSpaceType
 
 logger = logging.getLogger(__name__)
@@ -69,6 +78,37 @@ def _validate_calibrated_space(cs) -> None:
         raise ConversionError("Malformed /CalRGB color space: invalid /Matrix")
 
 
+def _inline_image_spaces(owner) -> list:
+    """Return color spaces that inline images in a content stream declare directly.
+
+    Named spaces are found through resources. Only a stream that can contain both
+    an inline image and a calibrated space, possibly in a hex-escaped name, is parsed.
+    """
+    is_page = owner.get("/Type") == Name.Page
+    contents = owner.get("/Contents") if is_page else owner
+    streams = list(contents) if isinstance(contents, Array) else [contents]
+    try:
+        if not any(
+            b"BI" in (data := stream.read_bytes()) and (b"Cal" in data or b"#" in data)
+            for stream in streams
+            if isinstance(stream, Stream)
+        ):
+            return []
+        return [
+            space
+            for instruction in parse_content_stream(Page(owner) if is_page else owner)
+            if isinstance(instruction, ContentStreamInlineImage)
+            and isinstance(
+                space := instruction.iimage.obj.get("/ColorSpace"),
+                Array,
+            )
+        ]
+    except Exception as exc:
+        # Unreadable content is reported by the stages that have to interpret it.
+        log_suppressed_error(logger, exc, "Error reading inline images: %s", exc)
+        return []
+
+
 def validate_calibrated_colorspaces(pdf: Pdf) -> None:
     """Validate declared color spaces without interpreting unrelated private data.
 
@@ -109,7 +149,8 @@ def validate_calibrated_colorspaces(pdf: Pdf) -> None:
                 _validate_calibrated_space(value)
             elif value:
                 family = value[0]
-                if family in (Name.Indexed, Name.Pattern) and len(value) > 1:
+                # Inline images may abbreviate Indexed as /I.
+                if family in (Name.Indexed, Name.I, Name.Pattern) and len(value) > 1:
                     pending.append(("space", value[1]))
                 elif family in (Name.Separation, Name.DeviceN) and len(value) > 2:
                     pending.append(("space", value[2]))
@@ -149,6 +190,12 @@ def validate_calibrated_colorspaces(pdf: Pdf) -> None:
                         pending.append(("owner", mask.get("/G")))
             for _, font in iter_type3_fonts(value, fonts_seen):
                 pending.append(("resources", font.get("/Resources")))
+                glyphs = font.get("/CharProcs")
+                if isinstance(glyphs, Dictionary):
+                    for glyph in glyphs.values():
+                        pending.extend(
+                            ("space", space) for space in _inline_image_spaces(glyph)
+                        )
         elif kind == "appearances" and isinstance(value, Dictionary):
             pending.extend(("appearance", value.get(key)) for key in ("/N", "/R", "/D"))
         elif kind == "appearance":
@@ -173,6 +220,9 @@ def validate_calibrated_colorspaces(pdf: Pdf) -> None:
             )
             if form_or_page or kind == "tiling":
                 pending.append(("resources", value.get("/Resources")))
+                pending.extend(
+                    ("space", space) for space in _inline_image_spaces(value)
+                )
             group = value.get("/Group") if form_or_page else None
             if isinstance(group, Dictionary) and group.get("/S") == Name.Transparency:
                 pending.append(("space", group.get("/CS")))

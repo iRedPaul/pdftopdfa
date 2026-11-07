@@ -312,33 +312,164 @@ def _function_numbers(value, count: int) -> bool:
     )
 
 
-_CALCULATOR_OPERATORS = frozenset(
-    "abs add atan ceiling cos cvi cvr div exp floor idiv ln log mod mul neg round "
-    "sin sqrt sub truncate and bitshift eq false ge gt le lt ne not or true xor "
-    "if ifelse copy dup exch index pop roll".split()
+_CALCULATOR_UNARY = frozenset(
+    "abs ceiling cos cvi cvr floor ln log neg round sin sqrt truncate".split()
 )
+_CALCULATOR_BINARY = frozenset("add atan bitshift div exp idiv mod mul sub".split())
+_CALCULATOR_COMPARISONS = frozenset("eq ge gt le lt ne".split())
+_CALCULATOR_LOGICAL = frozenset("and not or xor".split())
+_CALCULATOR_OPERATORS = (
+    _CALCULATOR_UNARY
+    | _CALCULATOR_BINARY
+    | _CALCULATOR_COMPARISONS
+    | _CALCULATOR_LOGICAL
+    | frozenset("copy dup exch false if ifelse index pop roll true".split())
+)
+_CALCULATOR_BOOLEAN = object()
+_CALCULATOR_MAX_NESTING = 32
+_CALCULATOR_MAX_STACK = 100
 
 
-def _calculator_syntax(data: bytes) -> bool:
-    """Require a braced calculator program using PDF numbers and legal operators."""
-    data = re.sub(rb"%[^\r\n]*", b"", data.replace(b"\x00", b" ")).strip()
-    if not data.startswith(b"{") or not data.endswith(b"}"):
-        return False
-    depth = 0
-    tokens = re.findall(rb"[{}]|[^\s{}]+", data)
-    for index, token in enumerate(tokens):
+def _parse_calculator(data: bytes) -> list | None:
+    """Parse one braced calculator program into nested blocks, rejecting bad syntax."""
+    data = re.sub(rb"%[^\r\n]*", b"", data.replace(b"\x00", b" "))
+    outer: list = []
+    blocks = [outer]
+    for token in re.findall(rb"[{}]|[^\s{}]+", data):
         if token == b"{":
-            depth += 1
+            block: list = []
+            blocks[-1].append(block)
+            blocks.append(block)
+            if len(blocks) > _CALCULATOR_MAX_NESTING:
+                return None
         elif token == b"}":
-            depth -= 1
-            if depth < 0 or (depth == 0 and index != len(tokens) - 1):
-                return False
-        elif not (
+            blocks.pop()
+            if not blocks:
+                return None
+        elif len(blocks) > 1 and (
             token.decode("latin-1") in _CALCULATOR_OPERATORS
             or re.fullmatch(rb"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", token)
         ):
+            blocks[-1].append(token)
+        else:
+            return None
+    return outer[0] if len(blocks) == 1 and len(outer) == 1 else None
+
+
+def _apply_calculator_operator(token: bytes, stack: list) -> bool:
+    """Apply one number or non-conditional operator to an abstract operand stack."""
+    operator = token.decode("latin-1")
+    if operator not in _CALCULATOR_OPERATORS:
+        stack.append(int(token) if re.fullmatch(rb"[+-]?\d+", token) else None)
+        return True
+    if operator in ("true", "false"):
+        stack.append(_CALCULATOR_BOOLEAN)
+        return True
+    single = operator in _CALCULATOR_UNARY or operator in (
+        "copy",
+        "dup",
+        "index",
+        "not",
+        "pop",
+    )
+    pops = 1 if single else 2
+    if len(stack) < pops:
+        return False
+    if operator == "dup":
+        stack.append(stack[-1])
+        return True
+    if operator == "exch":
+        stack[-1], stack[-2] = stack[-2], stack[-1]
+        return True
+    operands = stack[-pops:]
+    del stack[-pops:]
+    booleans = [operand is _CALCULATOR_BOOLEAN for operand in operands]
+    if operator == "pop":
+        return True
+    if operator == "copy":
+        count = operands[0]
+        if not isinstance(count, int) or not 0 <= count <= len(stack):
             return False
-    return depth == 0
+        stack.extend(stack[len(stack) - count :])
+    elif operator == "index":
+        offset = operands[0]
+        if not isinstance(offset, int) or not 0 <= offset < len(stack):
+            return False
+        stack.append(stack[-1 - offset])
+    elif operator == "roll":
+        count, shift = operands
+        if (
+            not isinstance(count, int)
+            or not isinstance(shift, int)
+            or not 0 <= count <= len(stack)
+        ):
+            return False
+        if count:
+            shift %= count
+            rolled = stack[-count:]
+            stack[-count:] = rolled[-shift:] + rolled[:-shift]
+    elif operator in _CALCULATOR_UNARY or operator in _CALCULATOR_BINARY:
+        if any(booleans):
+            return False
+        stack.append(None)
+    elif operator in _CALCULATOR_COMPARISONS:
+        if booleans[0] != booleans[1] or (booleans[0] and operator not in ("eq", "ne")):
+            return False
+        stack.append(_CALCULATOR_BOOLEAN)
+    else:
+        if any(booleans) != all(booleans):
+            return False
+        stack.append(_CALCULATOR_BOOLEAN if booleans[0] else None)
+    return True
+
+
+def _apply_calculator_block(block: list, stack: list) -> bool:
+    """Prove a block's effect on an abstract operand stack along each path.
+
+    Entries are a literal integer, None for another number, or the boolean marker.
+    Literal operands let copy, index and roll be proven; computed ones cannot be.
+    """
+    conditional: list[list] = []
+    for item in block:
+        if isinstance(item, list):
+            conditional.append(item)
+        elif item in (b"if", b"ifelse"):
+            if len(conditional) != (1 if item == b"if" else 2):
+                return False
+            if not stack or stack.pop() is not _CALCULATOR_BOOLEAN:
+                return False
+            outcomes = [list(stack) for _ in conditional]
+            for branch, outcome in zip(conditional, outcomes, strict=True):
+                if not _apply_calculator_block(branch, outcome):
+                    return False
+            first, second = outcomes if len(outcomes) == 2 else (outcomes[0], stack)
+            if len(first) != len(second) or any(
+                (a is _CALCULATOR_BOOLEAN) != (b is _CALCULATOR_BOOLEAN)
+                for a, b in zip(first, second, strict=True)
+            ):
+                return False
+            stack[:] = [
+                a if a == b else None for a, b in zip(first, second, strict=True)
+            ]
+            conditional = []
+        elif conditional or not _apply_calculator_operator(item, stack):
+            return False
+        if len(stack) > _CALCULATOR_MAX_STACK:
+            return False
+    return not conditional
+
+
+def _is_scalar_calculator(data: bytes) -> bool:
+    """Require a calculator program that provably maps one number to one number."""
+    program = _parse_calculator(data)
+    if program is None:
+        return False
+    stack: list = [None]
+    return (
+        _apply_calculator_block(program, stack)
+        and len(stack) == 1
+        and stack[0] is not _CALCULATOR_BOOLEAN
+    )
 
 
 def _is_scalar_transfer_function(function, ancestors=frozenset()) -> bool:
@@ -373,7 +504,7 @@ def _is_scalar_transfer_function(function, ancestors=frozenset()) -> bool:
         except (PdfError, RuntimeError):
             return False
         if kind == 4:
-            return _calculator_syntax(data)
+            return _is_scalar_calculator(data)
         size = function.get("/Size")
         bits = function.get("/BitsPerSample")
         order = function.get("/Order", 1)

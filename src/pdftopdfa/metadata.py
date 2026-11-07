@@ -1612,26 +1612,39 @@ def _is_valid_simple_value(text: str, type_code: str) -> bool:
     return True  # "s" — any non-empty text
 
 
+def _container_items(
+    elem: etree._Element,
+    ns_rdf: str,
+    container: str,
+) -> list[etree._Element] | None:
+    """Return the items of a property's only container, rejecting other elements.
+
+    The whole subtree of a valid property is copied, so a skipped sibling or extra
+    container would reach the output. An empty list means an empty container.
+    """
+    children = [child for child in elem if isinstance(child.tag, str)]
+    if len(children) != 1 or children[0].tag != f"{{{ns_rdf}}}{container}":
+        return None
+    items = [item for item in children[0] if isinstance(item.tag, str)]
+    if any(item.tag != f"{{{ns_rdf}}}li" for item in items):
+        return None
+    return items
+
+
 def _validate_seq_items(
     elem: etree._Element,
     ns_rdf: str,
     item_type: str,
 ) -> bool:
     """Check that Seq items match the expected simple type."""
-    for child in elem:
-        if child.tag == f"{{{ns_rdf}}}Seq":
-            valid_items = 0
-            for li in child:
-                if li.tag != f"{{{ns_rdf}}}li":
-                    continue
-                text = _clean_metadata_text(li.text)
-                if text is None:
-                    return False
-                if not _is_valid_simple_value(text, item_type):
-                    return False
-                valid_items += 1
-            return valid_items > 0
-    return False  # No Seq found
+    items = _container_items(elem, ns_rdf, "Seq")
+    if not items:
+        return False
+    for li in items:
+        text = _clean_metadata_text(li.text)
+        if text is None or not _is_valid_simple_value(text, item_type):
+            return False
+    return True
 
 
 def _text_array_items(elem, ns_rdf: str, container: str):
@@ -1691,29 +1704,20 @@ def _validate_structured_container(
     container: str,
 ) -> bool:
     """Check that a structured container has at least one non-empty list item."""
-    container_tag = f"{{{ns_rdf}}}{container}"
-    li_tag = f"{{{ns_rdf}}}li"
     parse_type = f"{{{ns_rdf}}}parseType"
-
-    for child in elem:
-        if child.tag != container_tag:
-            continue
-        valid_items = 0
-        for li in child:
-            if li.tag != li_tag:
-                continue
-            has_child_content = any(isinstance(grand.tag, str) for grand in li)
-            has_value_attr = any(attr_name != parse_type for attr_name in li.attrib)
-            if (
-                not has_child_content
-                and not has_value_attr
-                and _clean_metadata_text(li.text) is None
-            ):
-                return False
-            valid_items += 1
-        return valid_items > 0
-
-    return False
+    items = _container_items(elem, ns_rdf, container)
+    if not items:
+        return False
+    for li in items:
+        has_child_content = any(isinstance(grand.tag, str) for grand in li)
+        has_value_attr = any(attr_name != parse_type for attr_name in li.attrib)
+        if (
+            not has_child_content
+            and not has_value_attr
+            and _clean_metadata_text(li.text) is None
+        ):
+            return False
+    return True
 
 
 def _has_invalid_rdf_syntax(prop: etree._Element) -> bool:
@@ -1838,41 +1842,27 @@ def _validate_extension_container_items(
     custom_types: dict[str, dict[str, str]],
 ) -> bool:
     """Validate items inside a Bag/Seq/Alt extension property."""
-    ns_rdf = NAMESPACES["rdf"]
-    container_tag = f"{{{ns_rdf}}}{expected_container}"
-    li_tag = f"{{{ns_rdf}}}li"
-    xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
-
-    for child in elem:
-        if child.tag != container_tag:
+    items = _container_items(elem, NAMESPACES["rdf"], expected_container)
+    if not items:
+        return False
+    for li in items:
+        if expected_container == "Alt" and item_value_type == "Lang Alt":
+            if li.get(_XML_LANG) is None:
+                return False
+        type_code = _EXTENSION_VALUE_TYPE_MAP.get(item_value_type)
+        if type_code is not None:
+            if any(isinstance(grand.tag, str) for grand in li):
+                return False
+            text = _clean_metadata_text(li.text)
+            if text is None or not _is_valid_simple_value(text, type_code):
+                return False
             continue
-        valid_items = 0
-        for li in child:
-            if li.tag != li_tag:
-                continue
-            if expected_container == "Alt" and item_value_type == "Lang Alt":
-                if li.get(xml_lang) is None:
-                    return False
-            type_code = _EXTENSION_VALUE_TYPE_MAP.get(item_value_type)
-            if type_code is not None:
-                if any(isinstance(grand.tag, str) for grand in li):
-                    return False
-                text = _clean_metadata_text(li.text)
-                if text is None or not _is_valid_simple_value(text, type_code):
-                    return False
-                valid_items += 1
-                continue
-            custom_field_types = custom_types.get(item_value_type)
-            if custom_field_types is None:
-                return False
-            if not _validate_extension_struct_fields(
-                li, custom_field_types, custom_types
-            ):
-                return False
-            valid_items += 1
-        return valid_items > 0
-
-    return False
+        custom_field_types = custom_types.get(item_value_type)
+        if custom_field_types is None:
+            return False
+        if not _validate_extension_struct_fields(li, custom_field_types, custom_types):
+            return False
+    return True
 
 
 def _is_valid_extension_property_value(
@@ -3366,6 +3356,11 @@ def _remove_identification_properties(
     return True
 
 
+# Formal PDF/X markers in DocInfo, which this pipeline does not revalidate. They are
+# removed like the XMP identification that remove_pdfx_identification() handles.
+_UNVALIDATED_DOCINFO_CLAIMS = frozenset({"/GTS_PDFXVersion", "/GTS_PDFXConformance"})
+
+
 def remove_pdfx_identification(pdf: pikepdf.Pdf) -> bool:
     """Remove PDF/X identification after its required OutputIntent is dropped."""
     return _remove_identification_properties(
@@ -4095,7 +4090,12 @@ def sync_metadata(
                 "/Trapped",
             }
             for key in list(docinfo.keys()):
-                if key not in standard_keys and not _is_pdf_text_string(docinfo[key]):
+                if key in _UNVALIDATED_DOCINFO_CLAIMS:
+                    del docinfo[key]
+                    logger.warning(
+                        "Removed DocInfo %s: conformance is not revalidated", key
+                    )
+                elif key not in standard_keys and not _is_pdf_text_string(docinfo[key]):
                     del docinfo[key]
                     logger.warning(
                         "Removed custom DocInfo entry %s with a non-text value", key

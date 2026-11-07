@@ -238,7 +238,7 @@ printing information and share the embedded ICC profile when required. Several
 PDF/A OutputIntents with an identical profile reduce to the first one.
 PDF/X, PDF/VT, and PDF/E identification
 claims are still removed from XMP because conversion does not revalidate those
-standards.
+standards. The formal PDF/X markers in DocInfo are removed along with them.
 
 ICCBased CMYK overprint is repaired at affected painting operations. If shared
 Forms, patterns, or Type3 glyphs require incompatible repairs in different

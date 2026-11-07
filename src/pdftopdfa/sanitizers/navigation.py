@@ -11,6 +11,7 @@ from decimal import Decimal
 from pikepdf import Array, Dictionary, Name, Pdf, String
 
 from ..exceptions import ConversionError
+from .files import _iter_name_tree_values
 from .trapnet import _date as _pdf_date
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,23 @@ def _optional_type(owner, expected: Name) -> int:
     )
 
 
+def _remove_dangling_collection_items(pdf: Pdf, schema) -> int:
+    """Remove item values whose collection schema fields were discarded."""
+    names = pdf.Root.get("/Names")
+    embedded = names.get("/EmbeddedFiles") if isinstance(names, Dictionary) else None
+    if embedded is None:
+        return 0
+    removed = 0
+    for filespec in _iter_name_tree_values(embedded):
+        item = filespec.get("/CI") if isinstance(filespec, Dictionary) else None
+        if not isinstance(item, Dictionary):
+            continue
+        for key in list(item.keys()):
+            if key != "/Type" and (schema is None or key not in schema):
+                removed += _remove_entry(item, key)
+    return removed
+
+
 def _sanitize_collection(pdf: Pdf) -> int:
     """Repair optional portfolio settings while preserving valid fields and sorting."""
     collection = pdf.Root.get("/Collection")
@@ -45,9 +63,11 @@ def _sanitize_collection(pdf: Pdf) -> int:
     if collection.get("/D") is not None and not isinstance(collection.D, String):
         removed += _remove_entry(collection, "/D")
     schema = collection.get("/Schema")
+    schema_changed = False
     if schema is not None and not isinstance(schema, Dictionary):
         removed += _remove_entry(collection, "/Schema")
         schema = None
+        schema_changed = True
     if isinstance(schema, Dictionary):
         removed += _optional_type(schema, Name.CollectionSchema)
         for key in list(schema.keys()):
@@ -70,6 +90,7 @@ def _sanitize_collection(pdf: Pdf) -> int:
                 or not isinstance(field.get("/N"), String)
             ):
                 removed += _remove_entry(schema, key)
+                schema_changed = True
                 continue
             removed += _optional_type(field, Name.CollectionField)
             for flag in ("/V", "/E"):
@@ -80,6 +101,9 @@ def _sanitize_collection(pdf: Pdf) -> int:
                 isinstance(order, bool) or not isinstance(order, int)
             ):
                 removed += _remove_entry(field, "/O")
+    if schema_changed:
+        # Collection item keys identify fields of the collection schema.
+        removed += _remove_dangling_collection_items(pdf, schema)
     sorting = collection.get("/Sort")
     if sorting is None:
         return removed

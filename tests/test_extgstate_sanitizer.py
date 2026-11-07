@@ -1133,6 +1133,80 @@ class TestSoftMaskValidation:
         assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
         assert "/TR" not in pdf.pages[0].Resources.ExtGState.GS0.SMask
 
+    @staticmethod
+    def _calculator_mask(pdf: Pdf, program: bytes) -> Dictionary:
+        """Create a soft mask whose transfer function runs the given program."""
+        transfer = pdf.make_stream(program)
+        transfer.FunctionType = 4
+        transfer.Domain = transfer.Range = Array([0, 1])
+        return Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=transfer)
+
+    @pytest.mark.parametrize(
+        "program",
+        [
+            b"{ 1 exch sub }",
+            b"{ % comment\n 0.5 mul }",
+            b"{ dup 0.5 lt { 2 mul } if }",
+            b"{ dup 0.5 gt { pop 1 } { pop 0 } ifelse }",
+            b"{ 0 eq { 1 } { 0 } ifelse }",
+            b"{ dup 0 gt true and { 1 exch sub } if }",
+            b"{ 1 1 index add exch pop }",
+            b"{ 1 2 1 roll pop }",
+            b"{ 2 mul 0 0 roll }",
+            b"{ dup 1 copy pop pop }",
+            b"{ 0 copy }",
+            b"{ cvi 1 and cvr }",
+            b"{ dup 0 gt { dup 1 gt { pop 1 } if } { pop 0 } ifelse }",
+        ],
+    )
+    def test_calculator_with_one_numeric_result_is_preserved(self, program) -> None:
+        """Conditionals and literal stack operands can be proven correct."""
+        pdf = new_pdf()
+        mask = self._calculator_mask(pdf, program)
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert pdf.pages[0].Resources.ExtGState.GS0.SMask.TR.read_bytes() == program
+
+    @pytest.mark.parametrize(
+        "program",
+        [
+            b"{ pop }",
+            b"{ dup }",
+            b"{ add }",
+            b"{ 1 }",
+            b"{ pop true }",
+            b"{ 0 gt }",
+            b"{ true add }",
+            b"{ true 1 eq pop }",
+            b"{ { 2 mul } if }",
+            b"{ 1 { 2 mul } if }",
+            b"{ { 2 mul } }",
+            b"{ dup 0 gt { pop } if }",
+            b"{ dup 0 gt { pop } { pop 1 } ifelse }",
+            b"{ dup 0 gt { 2 mul } { 3 mul } { 4 mul } ifelse }",
+            b"{ dup 0 gt { pop 1 } { pop true } ifelse }",
+            b"{ dup copy }",
+            b"{ 5 copy }",
+            b"{ 5 index }",
+            b"{ 3 1 roll }",
+            b"{ dup roll }",
+            b"{" + b" dup" * 150 + b" }",
+            b"{ " * 40 + b"}" * 40,
+            b"{ 1 exch sub } }",
+            b"{ 1 exch sub } { 1 exch sub }",
+            b"1 exch sub",
+        ],
+    )
+    def test_calculator_without_provable_result_is_removed(self, program) -> None:
+        """Malformed stack effects cannot produce a defined mask mapping."""
+        pdf = new_pdf()
+        mask = self._calculator_mask(pdf, program)
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        state = pdf.pages[0].Resources.ExtGState.GS0
+        assert "/TR" not in state.SMask
+        assert state.SMask.G == mask.G
+
     def test_smask_dict_invalid_bc_removed(self) -> None:
         """Removes malformed /BC (non-Array) from SMask dict."""
         pdf = new_pdf()

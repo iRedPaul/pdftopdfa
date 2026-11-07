@@ -788,6 +788,17 @@ class TestSyncMetadata:
             for key, value in custom_info.items():
                 assert str(reopened.docinfo[key]) == value
 
+    @pytest.mark.parametrize("key", ["/GTS_PDFXVersion", "/GTS_PDFXConformance"])
+    def test_sync_removes_pdfx_docinfo_markers(self, key: str) -> None:
+        """PDF/X cannot be advertised through DocInfo after conversion."""
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        pdf.docinfo[key] = "Claimed conformance"
+        pdf.docinfo["/Company"] = "Acme Corp"
+        sync_metadata(pdf, "3b")
+        assert key not in pdf.docinfo
+        assert str(pdf.docinfo["/Company"]) == "Acme Corp"
+
     @pytest.mark.parametrize(
         "invalid_value",
         [42, True, Name("/Acme"), Array([1, 2]), Dictionary(Value="Acme")],
@@ -4188,6 +4199,56 @@ class TestInvalidRdfSyntaxIsNotCopied:
         assert result.xpath(
             "//*[local-name()='MaxPageSize']/*[local-name()='unit']/text()"
         ) == ["inch"]
+
+    @pytest.mark.parametrize(
+        "body,expected",
+        [
+            ("<rdf:Bag><rdf:li>a</rdf:li></rdf:Bag>", True),
+            ("<rdf:Bag><!-- note --><rdf:li>a</rdf:li></rdf:Bag>", True),
+            ("<rdf:Bag><rdf:li>a</rdf:li><c:bad>b</c:bad></rdf:Bag>", False),
+            ("<rdf:Bag><c:bad>b</c:bad><rdf:li>a</rdf:li></rdf:Bag>", False),
+            (
+                "<rdf:Bag><rdf:li>a</rdf:li></rdf:Bag>"
+                "<rdf:Bag><rdf:li>b</rdf:li></rdf:Bag>",
+                False,
+            ),
+            ("<c:bad>x</c:bad><rdf:Bag><rdf:li>a</rdf:li></rdf:Bag>", False),
+            ("<rdf:Bag/>", False),
+        ],
+    )
+    def test_extension_container_cannot_hide_other_elements(
+        self, body, expected
+    ) -> None:
+        """The whole subtree gets copied, so every child element must be valid."""
+        elem = etree.fromstring(
+            f'<c:prop xmlns:c="urn:custom" xmlns:rdf="{NAMESPACES["rdf"]}">{body}'
+            "</c:prop>"
+        )
+        assert _is_valid_extension_property_value(elem, "Bag Text", {}) is expected
+
+    @pytest.mark.parametrize(
+        "prop",
+        [
+            '<xmpTPg:Fonts><rdf:Bag><rdf:li rdf:parseType="Resource">'
+            "<stFnt:fontName>A</stFnt:fontName></rdf:li><stFnt:bad>x</stFnt:bad>"
+            "</rdf:Bag></xmpTPg:Fonts>",
+            '<xmpTPg:Fonts><rdf:Bag><rdf:li rdf:parseType="Resource">'
+            "<stFnt:fontName>A</stFnt:fontName></rdf:li></rdf:Bag><rdf:Bag/>"
+            "</xmpTPg:Fonts>",
+        ],
+    )
+    def test_structured_container_cannot_hide_other_elements(self, prop) -> None:
+        """Predefined structured containers follow the same rule."""
+        result = self._copied(prop)
+        assert not result.xpath(f"//*[namespace-uri()='{self.PAGED_TEXT}']")
+
+    def test_valid_structured_container_is_retained(self) -> None:
+        """A container holding only list items survives unchanged."""
+        result = self._copied(
+            '<xmpTPg:Fonts><rdf:Bag><rdf:li rdf:parseType="Resource">'
+            "<stFnt:fontName>A</stFnt:fontName></rdf:li></rdf:Bag></xmpTPg:Fonts>"
+        )
+        assert result.xpath("//*[local-name()='fontName']/text()") == ["A"]
 
     @pytest.mark.parametrize(
         "attributes,fields,expected",

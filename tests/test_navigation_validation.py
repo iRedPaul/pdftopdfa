@@ -83,6 +83,55 @@ def test_collection_sort_fields_must_resolve_in_schema(schema, fields):
     assert pdf.Root.Collection.View == Name.D
 
 
+def _portfolio(pdf, schema):
+    """Create a portfolio with an item in a nested embedded-file name tree."""
+    pdf.add_blank_page()
+    spec = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Filespec,
+            F="a.txt",
+            UF="a.txt",
+            CI=Dictionary(Type=Name.CollectionItem, Good="keep", Foo="dangling"),
+        )
+    )
+    leaf = pdf.make_indirect(Dictionary(Names=Array(["a.txt", spec])))
+    pdf.Root.Names = Dictionary(EmbeddedFiles=Dictionary(Kids=Array([leaf])))
+    pdf.Root.Collection = Dictionary(Schema=schema)
+    return spec
+
+
+def test_collection_items_lose_only_discarded_schema_fields():
+    """A removed field cannot leave item values that no schema entry describes."""
+    pdf = new_pdf()
+    spec = _portfolio(
+        pdf,
+        Dictionary(
+            Good=Dictionary(Subtype=Name.S, N="Good"), Foo=Dictionary(Subtype=Name.S)
+        ),
+    )
+    remove_forbidden_catalog_entries(pdf)
+    assert "/Foo" not in pdf.Root.Collection.Schema
+    assert sorted(spec.CI.keys()) == ["/Good", "/Type"]
+    assert str(spec.CI.Good) == "keep"
+
+
+def test_collection_items_lose_all_fields_with_a_removed_schema():
+    """Without a schema, no item value identifies a field."""
+    pdf = new_pdf()
+    spec = _portfolio(pdf, Name.Bad)
+    remove_forbidden_catalog_entries(pdf)
+    assert "/Schema" not in pdf.Root.Collection
+    assert list(spec.CI.keys()) == ["/Type"]
+
+
+def test_collection_items_are_unchanged_when_the_schema_is_valid():
+    """Portfolio data stays intact unless a schema repair made it dangling."""
+    pdf = new_pdf()
+    spec = _portfolio(pdf, Dictionary(Good=Dictionary(Subtype=Name.S, N="Good")))
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert sorted(spec.CI.keys()) == ["/Foo", "/Good", "/Type"]
+
+
 @pytest.mark.parametrize("ascending", [[], [False], [True, False, True]])
 def test_collection_sort_array_lengths_need_not_match(ascending):
     """Table 158 permits extra directions and defaults missing ones to true."""

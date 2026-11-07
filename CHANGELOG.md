@@ -30,6 +30,11 @@
 - Rewrite real `/N` entries of retained OutputIntent profiles as integers
 - Accept article threads on pages that omit the optional `/B` array instead of using the original-input fallback
 - Analyze soft masks selected by a shading pattern's `/ExtGState` during overprint repair
+- Remove soft-mask calculator functions unless their stack effects provably yield one number
+- Validate calibrated color spaces that inline images declare directly
+- Remove collection item values whose schema fields were discarded
+- Remove the PDF/X markers from DocInfo along with their XMP identification
+- Reject XMP containers with extra containers or elements other than `rdf:li`
 
 ### Tests
 

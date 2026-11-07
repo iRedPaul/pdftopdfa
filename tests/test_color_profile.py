@@ -1450,6 +1450,81 @@ class TestPreservedColorValidation:
         with pytest.raises(ConversionError, match="invalid /WhitePoint"):
             embed_color_profiles(pdf)
 
+    @staticmethod
+    def _inline_image_owner(pdf, page, location, data):
+        """Place inline image content in the requested typed painting context."""
+        if location == "page":
+            page.Contents = pdf.make_stream(data)
+            return
+        program = pdf.make_stream(data)
+        if location == "form":
+            program.Subtype = Name.Form
+            program.BBox = Array([0, 0, 10, 10])
+            page.Resources.XObject = Dictionary(Fm=program)
+        elif location == "pattern":
+            program.PatternType = 1
+            program.PaintType = 1
+            program.TilingType = 1
+            program.BBox = Array([0, 0, 10, 10])
+            program.XStep = program.YStep = 10
+            program.Resources = Dictionary()
+            page.Resources.Pattern = Dictionary(P=program)
+        else:
+            page.Resources.Font = Dictionary(
+                F=Dictionary(
+                    Subtype=Name.Type3,
+                    FontBBox=Array([0, 0, 10, 10]),
+                    FontMatrix=Array([1, 0, 0, 1, 0, 0]),
+                    CharProcs=Dictionary(a=program),
+                    Encoding=Dictionary(Differences=Array([97, Name.a])),
+                    FirstChar=97,
+                    LastChar=97,
+                    Widths=Array([10]),
+                )
+            )
+
+    @pytest.mark.parametrize("location", ["page", "form", "pattern", "type3"])
+    @pytest.mark.parametrize(
+        "space",
+        [
+            b"[/CalRGB << >>]",
+            b"[/CalGray << >>]",
+            b"[/I [/CalRGB << >>] 0 <000000>]",
+            b"[/Indexed [/CalRGB << >>] 0 <000000>]",
+        ],
+    )
+    def test_invalid_calibration_in_inline_images_is_rejected(self, location, space):
+        """Directly declared inline-image spaces have no resource entry to check."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        self._inline_image_owner(
+            pdf,
+            page,
+            location,
+            b"BI /W 1 /H 1 /BPC 8 /CS " + space + b" ID \x80\x80\x80 EI",
+        )
+        with pytest.raises(ConversionError, match="invalid /WhitePoint"):
+            embed_color_profiles(pdf)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"BI /W 1 /H 1 /BPC 8 /CS /RGB ID \x80\x80\x80 EI",
+            b"BI /W 1 /H 1 /BPC 8 /CS [/I /RGB 0 <000000>] ID \x80 EI",
+            b"BI /W 1 /H 1 /BPC 8 /CS [/CalRGB << /WhitePoint [1 1 1] >>]"
+            b" ID \x80\x80\x80 EI",
+            b"(/CalRGB BI) Tj",
+            b"BI /CalRGB ( unterminated",
+        ],
+    )
+    def test_valid_or_unrelated_inline_content_is_accepted(self, data):
+        """Unrelated text and content that cannot be parsed are not calibrations."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        page.Contents = pdf.make_stream(data)
+        embed_color_profiles(pdf)
+        assert page.Contents.read_bytes() == data
+
     def test_private_array_survives_full_conversion(self, tmp_path):
         """Unrelated extension data cannot cause the original-input fallback."""
         from pdftopdfa.converter import convert_to_pdfa
