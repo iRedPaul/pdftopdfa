@@ -238,7 +238,10 @@ printing information and share the embedded ICC profile when required. Several
 PDF/A OutputIntents with an identical profile reduce to the first one.
 PDF/X, PDF/VT, and PDF/E identification
 claims are still removed from XMP because conversion does not revalidate those
-standards.
+standards. The formal PDF/X and PDF/E markers in DocInfo are removed along with them.
+
+Custom DocInfo strings are retained only with valid PDFDocEncoding or BOM-prefixed
+UTF-16BE text encoding; valid string bytes remain unchanged.
 
 To run OCR, provide both external model directories. The pair enables OCR;
 `ocr_languages` defaults to `["en"]`:
