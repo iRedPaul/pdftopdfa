@@ -215,8 +215,9 @@ def valid_trapnet(annotation, owner, annotations, index: int, count: int) -> boo
     return _version_objects(owner) == {_key(item) for item in version}
 
 
-# Besides its appearance, these entries decide whether and how an annotation prints.
-_ANNOTATION_RENDERING_KEYS = ("/AS", "/F", "/Rect", "/CA", "/ca", "/BM", "/OC")
+# Besides its appearance and state, these entries decide how an annotation prints.
+# PDF/A sanitization may change them, for example by setting the required Print flag.
+_ANNOTATION_RENDERING_KEYS = ("/F", "/Rect", "/CA", "/ca", "/BM", "/OC")
 
 
 def _printed_appearance(annotation: Dictionary):
@@ -250,16 +251,9 @@ def _page_snapshot(page: Page) -> bytes:
         inherited["/CropBox"] = cropbox
     if "/Rotate" not in inherited:
         inherited.Rotate = 0
-    annotations = page.get("/Annots", [])
     states = Array(
-        Array(
-            [
-                _printed_appearance(item),
-                *[item.get(key) for key in _ANNOTATION_RENDERING_KEYS],
-            ]
-        )
-        for item in annotations
-        if isinstance(item, Dictionary) and item.get("/Subtype") != Name.TrapNet
+        Array([item.get("/AS"), _printed_appearance(item)])
+        for item in _other_annotations(page)
     )
     description = Array(
         [
@@ -273,6 +267,30 @@ def _page_snapshot(page: Page) -> bytes:
             page.get("/SeparationInfo"),
         ]
     )
+    return _graph_digest(description)
+
+
+def _annotation_rendering_snapshot(page: Page) -> bytes:
+    """Hash the entries that decide how the other annotations of a page print."""
+    return _graph_digest(
+        Array(
+            Array([item.get(key) for key in _ANNOTATION_RENDERING_KEYS])
+            for item in _other_annotations(page)
+        )
+    )
+
+
+def _other_annotations(page: Page) -> list:
+    """Return the annotations of a page other than its trap network."""
+    return [
+        item
+        for item in page.get("/Annots", [])
+        if isinstance(item, Dictionary) and item.get("/Subtype") != Name.TrapNet
+    ]
+
+
+def _graph_digest(description: Array) -> bytes:
+    """Hash a PDF object graph independently of object numbers and stream encoding."""
     digest = hashlib.sha256()
 
     def record(data: bytes) -> None:
@@ -330,36 +348,45 @@ def _page_snapshot(page: Page) -> bytes:
     return digest.digest()
 
 
-def capture_trapnet_snapshots(pdf: Pdf) -> dict[int, bytes]:
+def capture_trapnet_snapshots(pdf: Pdf) -> dict[int, tuple[bytes, bytes]]:
     """Capture immutable page descriptions before any converter or OCR edits.
 
     Returns:
-        Page description hashes keyed by zero-based page index, including only
-        pages that currently contain TrapNet annotations. Pass these snapshots
-        to validate_preserved_trapnets after conversion.
+        Hashes of the page description and of the printing properties of its other
+        annotations, keyed by zero-based page index, including only pages that
+        currently contain TrapNet annotations. Pass these snapshots to
+        validate_preserved_trapnets after conversion.
     """
     return {
-        index: _page_snapshot(page)
+        index: (_page_snapshot(page), _annotation_rendering_snapshot(page))
         for index, page in enumerate(pdf.pages)
         if trapnet_count(page.get("/Annots", []))
     }
 
 
 def validate_preserved_trapnets(
-    pdf: Pdf, snapshots: dict[int, bytes] | None = None
-) -> None:
-    """Reject retained trap networks invalidated by later conversion edits.
+    pdf: Pdf, snapshots: dict[int, tuple[bytes, bytes]] | None = None
+) -> int:
+    """Reject or remove retained trap networks invalidated by conversion edits.
+
+    A required change to another annotation, such as setting its Print flag, only
+    makes the trapping of the page stale. Removing the trap network therefore keeps
+    the conversion, while changed page content still rejects it.
 
     Args:
-        pdf: Converted PDF to check without modification.
+        pdf: Converted PDF to check, whose stale trap networks are removed.
         snapshots: Page hashes from capture_trapnet_snapshots before conversion,
             using the same page indices. None is accepted only when no TrapNet
             annotations remain.
+
+    Returns:
+        Number of trap networks removed because another annotation changed.
 
     Raises:
         ConversionError: If a retained TrapNet is structurally invalid, its page
             snapshot is missing, or its tracked page description has changed.
     """
+    removed = 0
     for page_index, page in enumerate(pdf.pages):
         annotations = page.get("/Annots", [])
         if not isinstance(annotations, Array):
@@ -367,14 +394,24 @@ def validate_preserved_trapnets(
         count = trapnet_count(annotations)
         for index, annotation in enumerate(annotations):
             if (
-                isinstance(annotation, Dictionary)
-                and annotation.get("/Subtype") == Name.TrapNet
+                not isinstance(annotation, Dictionary)
+                or annotation.get("/Subtype") != Name.TrapNet
             ):
-                if (
-                    not valid_trapnet(annotation, page.obj, annotations, index, count)
-                    or snapshots is None
-                    or snapshots.get(page_index) != _page_snapshot(page)
-                ):
-                    raise ConversionError(
-                        "Conversion invalidated a preserved TrapNet annotation"
-                    )
+                continue
+            snapshot = snapshots.get(page_index) if snapshots is not None else None
+            if (
+                not valid_trapnet(annotation, page.obj, annotations, index, count)
+                or snapshot is None
+                or snapshot[0] != _page_snapshot(page)
+            ):
+                raise ConversionError(
+                    "Conversion invalidated a preserved TrapNet annotation"
+                )
+            if snapshot[1] != _annotation_rendering_snapshot(page):
+                # A valid trap network is the only one on its page, and the last entry.
+                del annotations[index]
+                if len(annotations) == 0:
+                    del page.obj["/Annots"]
+                removed += 1
+                break
+    return removed

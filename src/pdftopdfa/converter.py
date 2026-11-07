@@ -3104,7 +3104,12 @@ def convert_to_pdfa(
             )
 
         # Later content/resource edits must not leave a stale TrapNet snapshot.
-        validate_preserved_trapnets(pdf, source_trapnet_snapshots)
+        removed_trapnets = validate_preserved_trapnets(pdf, source_trapnet_snapshots)
+        if removed_trapnets:
+            warnings.append(
+                f"{removed_trapnets} TrapNet annotation(s) removed because conversion "
+                "changed how other annotations print, which makes their trapping stale"
+            )
 
         # 7. Create output directory if needed
         output_path.parent.mkdir(parents=True, exist_ok=True)

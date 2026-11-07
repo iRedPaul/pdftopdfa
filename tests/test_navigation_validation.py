@@ -118,13 +118,13 @@ def test_collection_items_lose_only_discarded_schema_fields():
     assert str(spec.CI.Good) == "keep"
 
 
-def test_collection_items_lose_all_fields_with_a_removed_schema():
-    """Without a schema, no item value identifies a field."""
+def test_collection_items_are_kept_with_a_removed_schema():
+    """Without a schema nothing contradicts a value, and PDF/A does not forbid it."""
     pdf = new_pdf()
     spec = _portfolio(pdf, Name.Bad)
     remove_forbidden_catalog_entries(pdf)
     assert "/Schema" not in pdf.Root.Collection
-    assert list(spec.CI.keys()) == ["/Type"]
+    assert sorted(spec.CI.keys()) == ["/Foo", "/Good", "/Type"]
 
 
 def test_collection_items_lose_values_a_valid_schema_does_not_declare():
@@ -250,13 +250,14 @@ def test_collection_default_is_rechecked_after_embedded_file_removal():
     assert "/D" not in pdf.Root.Collection
 
 
-def test_collection_items_lose_all_fields_without_any_schema():
-    """Item keys identify schema fields, so no schema leaves no valid value."""
+def test_collection_items_are_kept_without_any_schema():
+    """Portfolio metadata survives, because veraPDF accepts it without a schema."""
     pdf = new_pdf()
     spec = _portfolio(pdf, Dictionary())
     del pdf.Root.Collection.Schema
-    assert remove_forbidden_catalog_entries(pdf) == 2
-    assert list(spec.CI.keys()) == ["/Type"]
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert sorted(spec.CI.keys()) == ["/Foo", "/Good", "/Type"]
+    assert str(spec.CI.Good) == "keep"
 
 
 @pytest.mark.parametrize("ascending", [[], [False], [True, False, True]])

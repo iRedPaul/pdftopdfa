@@ -318,20 +318,46 @@ def test_non_normal_appearances_do_not_affect_snapshots(key):
         ("/OC", Dictionary(Type=Name.OCG, Name="Layer")),
     ],
 )
-def test_changed_rendering_property_invalidates_snapshots(key, value):
-    """These entries decide whether and how another annotation prints."""
+def test_changed_rendering_property_removes_only_the_trap_network(key, value):
+    """How another annotation prints makes trapping stale, not the whole page."""
     pdf = new_pdf()
     page, trap = _trap(pdf)
     sibling = _sibling_with_all_appearances(pdf)
     page.Annots = Array([sibling, trap])
     snapshots = capture_trapnet_snapshots(pdf)
     sibling[key] = value
+    assert validate_preserved_trapnets(pdf, snapshots) == 1
+    assert [annotation.objgen for annotation in page.Annots] == [sibling.objgen]
+
+
+def test_unchanged_rendering_properties_keep_the_trap_network():
+    """Nothing is removed while every printing property stays the same."""
+    pdf = new_pdf()
+    page, trap = _trap(pdf)
+    sibling = _sibling_with_all_appearances(pdf)
+    page.Annots = Array([sibling, trap])
+    snapshots = capture_trapnet_snapshots(pdf)
+    assert validate_preserved_trapnets(pdf, snapshots) == 0
+    assert page.Annots[-1].objgen == trap.objgen
+
+
+def test_changed_page_content_still_rejects_with_changed_rendering_property():
+    """Page content is the stronger evidence, so it decides over the sibling change."""
+    pdf = new_pdf()
+    page, trap = _trap(pdf)
+    sibling = _sibling_with_all_appearances(pdf)
+    page.Annots = Array([sibling, trap])
+    snapshots = capture_trapnet_snapshots(pdf)
+    sibling.F = 0
+    page.Contents.write(b"1 g 0 0 100 100 re f")
     with pytest.raises(ConversionError, match="invalidated a preserved TrapNet"):
         validate_preserved_trapnets(pdf, snapshots)
 
 
-def test_conversion_falls_back_when_a_sibling_gains_the_print_flag(tmp_path):
-    """Newly printed content makes the trap network stale."""
+def test_conversion_removes_trap_when_a_sibling_gains_the_print_flag(tmp_path):
+    """A required flag repair no longer costs the document its PDF/A conversion."""
+    from pikepdf import Pdf
+
     import pdftopdfa.converter as converter
 
     pdf = new_pdf()
@@ -343,9 +369,12 @@ def test_conversion_falls_back_when_a_sibling_gains_the_print_flag(tmp_path):
     source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
     pdf.save(source)
     result = converter.convert_to_pdfa(source, output, level="3b")
-    assert result.skipped and not result.target_produced, result
-    assert output.read_bytes() == source.read_bytes()
-    assert any("invalidated a preserved TrapNet" in w for w in result.warnings)
+    assert result.target_produced and not result.skipped, result
+    assert any("TrapNet annotation(s) removed" in w for w in result.warnings)
+    with Pdf.open(output) as converted:
+        annotations = converted.pages[0].Annots
+        assert [str(annotation.Subtype) for annotation in annotations] == ["/Square"]
+        assert int(annotations[0].F) & 4
 
 
 def test_changed_normal_appearance_still_invalidates_snapshots():

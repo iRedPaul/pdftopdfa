@@ -70,8 +70,8 @@ def _valid_item_value(value, subtype) -> bool:
 def _sanitize_collection_items(pdf: Pdf, schema) -> int:
     """Remove malformed item entries, and values that the schema does not describe.
 
-    Item keys identify schema fields, so a portfolio without a schema cannot have
-    any valid item values.
+    Without a schema there is nothing to compare the values with. PDF/A does not
+    require their removal, as veraPDF confirms, so a portfolio keeps this data.
     """
     removed = 0
     for _, filespec in _embedded_files(pdf):
@@ -86,10 +86,12 @@ def _sanitize_collection_items(pdf: Pdf, schema) -> int:
             item = pdf.make_indirect(item)
             filespec["/CI"] = item
         removed += _optional_type(item, Name.CollectionItem)
+        if schema is None:
+            continue
         for key in list(item.keys()):
             if key == "/Type":
                 continue
-            field = schema.get(key) if schema is not None else None
+            field = schema.get(key)
             if field is None or not _valid_item_value(item[key], field.get("/Subtype")):
                 removed += _remove_entry(item, key)
     return removed

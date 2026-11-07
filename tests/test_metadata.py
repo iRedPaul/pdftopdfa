@@ -3824,10 +3824,8 @@ class TestProvenancePreservation:
         assert result.xpath(
             "//stEvt:when/text() | //@stEvt:when", namespaces=NAMESPACES
         ) == ["2024-01-01T00:00:00Z"]
-        if structure != "attributes":
-            assert result.xpath(
-                "//stRef:alternatePaths/rdf:Seq/rdf:li/text()", namespaces=NAMESPACES
-            ) == ["file:///source.pdf", "https://example.org/source.pdf"]
+        # veraPDF does not accept this newer field, so only the field is removed.
+        assert not result.xpath("//stRef:alternatePaths", namespaces=NAMESPACES)
 
     @pytest.mark.parametrize("location", ["catalog", "page"])
     @pytest.mark.parametrize(
@@ -3901,10 +3899,6 @@ class TestProvenancePreservation:
             "<stEvt:when>2024-01-01</stEvt:when></rdf:li></rdf:Seq></xmpMM:History>",
             '<xmpMM:History><rdf:Seq><rdf:li stEvt:action="saved"/>'
             "</rdf:Seq></xmpMM:History>",
-            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
-            "<stEvt:action>saved</stEvt:action><stEvt:when>2024-01-01</stEvt:when>"
-            '</rdf:li><rdf:li rdf:parseType="Resource">'
-            "<stEvt:action>converted</stEvt:action></rdf:li></rdf:Seq></xmpMM:History>",
         ],
     )
     def test_malformed_provenance_is_not_retained(
@@ -3955,12 +3949,117 @@ class TestProvenancePreservation:
         """Absolute and relative references both satisfy the URI type."""
         tree = self._packet(
             '<xmpMM:DerivedFrom rdf:parseType="Resource">'
-            f"<stRef:filePath>{uri}</stRef:filePath></xmpMM:DerivedFrom>"
+            f"<stRef:manageTo>{uri}</stRef:manageTo></xmpMM:DerivedFrom>"
         )
         with new_pdf() as pdf:
             pdf.add_blank_page()
             result = self._roundtrip(pdf, tree, "2b", location, tmp_path / "uri.pdf")
-        assert result.xpath("//stRef:filePath/text()", namespaces=NAMESPACES) == [uri]
+        assert result.xpath("//stRef:manageTo/text()", namespaces=NAMESPACES) == [uri]
+
+    @pytest.mark.parametrize("location", ["catalog", "page"])
+    def test_invalid_history_event_is_removed_alone(self, location, tmp_path) -> None:
+        """One incomplete event cannot cost a document its whole history."""
+
+        def event(fields: str) -> str:
+            return f'<rdf:li rdf:parseType="Resource">{fields}</rdf:li>'
+
+        tree = self._packet(
+            "<xmpMM:History><rdf:Seq>"
+            + event(
+                "<stEvt:action>saved</stEvt:action><stEvt:when>2024-01-01</stEvt:when>"
+            )
+            + event("<stEvt:action>converted</stEvt:action>")
+            + event(
+                "<stEvt:action>cropped</stEvt:action><stEvt:when>2026-99-99</stEvt:when>"
+            )
+            + event("<stEvt:softwareAgent>Tool</stEvt:softwareAgent>")
+            + event(
+                "<stEvt:action>edited</stEvt:action><stEvt:when>2024-01-02</stEvt:when>"
+            )
+            + "</rdf:Seq></xmpMM:History>"
+        )
+        with new_pdf() as pdf:
+            pdf.add_blank_page()
+            result = self._roundtrip(pdf, tree, "2b", location, tmp_path / "event.pdf")
+        assert result.xpath(
+            "//xmpMM:History/rdf:Seq/rdf:li/stEvt:action/text()", namespaces=NAMESPACES
+        ) == ["saved", "edited"]
+
+    @pytest.mark.parametrize("location", ["catalog", "page"])
+    @pytest.mark.parametrize("attribute", [False, True])
+    def test_unsupported_event_field_is_removed_alone(
+        self, location, attribute, tmp_path
+    ) -> None:
+        """Adobe tools write stEvt:changed, which veraPDF does not accept."""
+        item = (
+            '<rdf:li><rdf:Description stEvt:action="saved" stEvt:when="2024-01-01" '
+            'stEvt:changed="/"/></rdf:li>'
+            if attribute
+            else '<rdf:li rdf:parseType="Resource"><stEvt:action>saved</stEvt:action>'
+            "<stEvt:when>2024-01-01</stEvt:when><stEvt:changed>/</stEvt:changed>"
+            "</rdf:li>"
+        )
+        tree = self._packet(f"<xmpMM:History><rdf:Seq>{item}</rdf:Seq></xmpMM:History>")
+        with new_pdf() as pdf:
+            pdf.add_blank_page()
+            result = self._roundtrip(pdf, tree, "2b", location, tmp_path / "field.pdf")
+        assert not result.xpath(
+            "//stEvt:changed | //@stEvt:changed", namespaces=NAMESPACES
+        )
+        assert result.xpath(
+            "//stEvt:action/text() | //@stEvt:action", namespaces=NAMESPACES
+        ) == ["saved"]
+
+    @pytest.mark.parametrize("location", ["catalog", "page"])
+    @pytest.mark.parametrize(
+        "field,local_name",
+        [
+            ("<stRef:filePath>file:///a.pdf</stRef:filePath>", "filePath"),
+            ("<stRef:filePath>not a uri</stRef:filePath>", "filePath"),
+            (
+                "<stRef:originalDocumentID>u</stRef:originalDocumentID>",
+                "originalDocumentID",
+            ),
+            (
+                "<stRef:lastModifyDate>2024-01-01</stRef:lastModifyDate>",
+                "lastModifyDate",
+            ),
+            ("<stRef:manageTo>not a uri</stRef:manageTo>", "manageTo"),
+            ("<stRef:notAField>x</stRef:notAField>", "notAField"),
+            (
+                "<stRef:alternatePaths><rdf:Seq><rdf:li>a</rdf:li></rdf:Seq>"
+                "</stRef:alternatePaths>",
+                "alternatePaths",
+            ),
+        ],
+    )
+    def test_unsupported_reference_field_is_removed_alone(
+        self, location, field, local_name, tmp_path
+    ) -> None:
+        """The other fields of a resource reference keep their provenance."""
+        tree = self._packet(
+            '<xmpMM:DerivedFrom rdf:parseType="Resource">'
+            f"<stRef:instanceID>uuid:source</stRef:instanceID>{field}"
+            "</xmpMM:DerivedFrom>"
+        )
+        with new_pdf() as pdf:
+            pdf.add_blank_page()
+            result = self._roundtrip(pdf, tree, "2b", location, tmp_path / "ref.pdf")
+        assert result.xpath("//stRef:instanceID/text()", namespaces=NAMESPACES) == [
+            "uuid:source"
+        ]
+        assert not result.xpath(f"//*[local-name()='{local_name}']")
+
+    def test_reference_without_any_supported_field_is_removed(self, tmp_path) -> None:
+        """An empty structure would not describe anything."""
+        tree = self._packet(
+            '<xmpMM:DerivedFrom rdf:parseType="Resource">'
+            "<stRef:filePath>file:///a.pdf</stRef:filePath></xmpMM:DerivedFrom>"
+        )
+        with new_pdf() as pdf:
+            pdf.add_blank_page()
+            result = self._roundtrip(pdf, tree, "2b", "catalog", tmp_path / "ref.pdf")
+        assert not result.xpath("//xmpMM:DerivedFrom", namespaces=NAMESPACES)
 
     @pytest.mark.parametrize("location", ["catalog", "page"])
     def test_structured_properties_cannot_be_plain_attributes(

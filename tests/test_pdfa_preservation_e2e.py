@@ -388,6 +388,83 @@ def test_full_conversion_synchronizes_first_creator(
 
 
 @pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
+def test_full_conversion_keeps_conforming_provenance_parts(
+    source_level, target_level, tmp_path
+):
+    """Fields and events PDF/A does not accept cannot cost the conforming rest."""
+    xmp_mm = "http://ns.adobe.com/xap/1.0/mm/"
+    st_ref = "http://ns.adobe.com/xap/1.0/sType/ResourceRef#"
+    st_evt = "http://ns.adobe.com/xap/1.0/sType/ResourceEvent#"
+    namespaces = {"xmpMM": xmp_mm, "stRef": st_ref, "stEvt": st_evt, "rdf": _RDF}
+    pdf = _document(source_level)
+    tree = etree.fromstring(pdf.Root.Metadata.read_bytes())
+    description = tree.find(f".//{{{_RDF}}}Description")
+    properties = etree.fromstring(
+        f'<w xmlns:xmpMM="{xmp_mm}" xmlns:stRef="{st_ref}" xmlns:stEvt="{st_evt}" '
+        f'xmlns:rdf="{_RDF}">'
+        '<xmpMM:DerivedFrom rdf:parseType="Resource">'
+        "<stRef:instanceID>uuid:source</stRef:instanceID>"
+        "<stRef:originalDocumentID>uuid:original</stRef:originalDocumentID>"
+        "<stRef:filePath>file:///source.pdf</stRef:filePath>"
+        "<stRef:manageTo>not a uri</stRef:manageTo>"
+        "</xmpMM:DerivedFrom><xmpMM:History><rdf:Seq>"
+        '<rdf:li stEvt:action="saved" stEvt:when="2024-01-01T00:00:00Z" '
+        'stEvt:softwareAgent="Tool" stEvt:changed="/"/>'
+        '<rdf:li stEvt:action="converted" stEvt:parameters="from A to B"/>'
+        "</rdf:Seq></xmpMM:History></w>"
+    )
+    for prop in properties:
+        description.append(prop)
+    pdf.Root.Metadata.write(etree.tostring(tree))
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source, force_version="1.7")
+
+    result = convert_to_pdfa(source, output, level=target_level, validate=True)
+    assert result.target_produced and not result.validation_failed, result
+    with pikepdf.open(output) as restored:
+        tree = etree.fromstring(restored.Root.Metadata.read_bytes())
+        assert tree.xpath("//stRef:instanceID/text()", namespaces=namespaces) == [
+            "uuid:source"
+        ]
+        assert not tree.xpath(
+            "//stRef:originalDocumentID | //stRef:filePath | //stRef:manageTo",
+            namespaces=namespaces,
+        )
+        assert tree.xpath("//@stEvt:action", namespaces=namespaces) == ["saved"]
+        assert not tree.xpath("//@stEvt:changed", namespaces=namespaces)
+
+
+def test_full_conversion_keeps_collection_items_without_a_schema(tmp_path):
+    """Portfolio metadata without a schema is compatible with PDF/A-3."""
+    pdf = _document("3b")
+    embedded = pdf.make_stream(b"text", Type=Name.EmbeddedFile)
+    embedded[Name.Subtype] = Name("/text/plain")
+    embedded.Params = Dictionary(ModDate="D:20240101000000Z", Size=4)
+    spec = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Filespec,
+            F="a.txt",
+            UF="a.txt",
+            Desc="Attachment",
+            AFRelationship=Name.Unspecified,
+            EF=Dictionary(F=embedded, UF=embedded),
+            CI=pdf.make_indirect(Dictionary(Type=Name.CollectionItem, Note="kept")),
+        )
+    )
+    pdf.Root.Names = Dictionary(EmbeddedFiles=Dictionary(Names=Array(["a.txt", spec])))
+    pdf.Root.AF = Array([spec])
+    pdf.Root.Collection = Dictionary(Type=Name.Collection, View=Name.D)
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source, force_version="1.7")
+
+    result = convert_to_pdfa(source, output, level="3b", validate=True)
+    assert result.target_produced and not result.validation_failed, result
+    with pikepdf.open(output) as restored:
+        filespec = restored.Root.Names.EmbeddedFiles.Names[1]
+        assert str(filespec.CI.Note) == "kept"
+
+
+@pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
 def test_full_conversion_repairs_xmp_language_tags(
     source_level, target_level, tmp_path
 ):

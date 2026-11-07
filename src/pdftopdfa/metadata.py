@@ -9,6 +9,7 @@ import copy
 import logging
 import re
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from itertools import chain
 from typing import Any
@@ -584,10 +585,12 @@ _STRUCTURAL_PROPERTY_CORRECTIONS: dict[str, str] = {
     f"{{{NAMESPACES['stEvt']}}}When": f"{{{NAMESPACES['stEvt']}}}when",
 }
 
+# The fields that PDF/A accepts in these predefined structures. veraPDF rejects newer
+# XMP fields such as stEvt:changed, stRef:filePath and stRef:originalDocumentID under
+# rule 6.6.2.3.1-2, even with valid values, so only such a field has to be removed.
 _PROVENANCE_FIELD_TYPES = {
     NAMESPACES["stEvt"]: {
         "action": "s",
-        "changed": "s",
         "instanceID": "s",
         "parameters": "s",
         "softwareAgent": "s",
@@ -596,20 +599,13 @@ _PROVENANCE_FIELD_TYPES = {
     NAMESPACES["stRef"]: {
         "documentID": "s",
         "instanceID": "s",
-        "filePath": "u",
         "renditionClass": "s",
         "renditionParams": "s",
-        "alternatePaths": "q",
-        "lastModifyDate": "d",
         "manager": "s",
         "managerVariant": "s",
         "manageTo": "u",
         "manageUI": "u",
         "versionID": "s",
-        "fromPart": "s",
-        "toPart": "s",
-        "partMapping": "s",
-        "maskMarkers": "s",
     },
 }
 
@@ -658,6 +654,10 @@ def _normalize_structural_properties(elem: etree._Element) -> None:
         if default is not None and default is not items[0]:
             elem.remove(default)
             elem.insert(0, default)
+    if elem.tag == f"{{{NAMESPACES['xmpMM']}}}DerivedFrom":
+        _prune_provenance_struct(elem, NAMESPACES["stRef"])
+    elif elem.tag == f"{{{NAMESPACES['xmpMM']}}}History":
+        _prune_history_events(elem)
 
 
 def _clone_with_registered_namespaces(elem: etree._Element) -> etree._Element:
@@ -1955,19 +1955,34 @@ def _get_extension_type_code(uri: str, local_name: str) -> str | None:
     return None
 
 
-def _is_valid_provenance_struct(elem: etree._Element, namespace: str) -> bool:
-    """Validate the fields of a ResourceRef or ResourceEvent struct.
+@dataclass(frozen=True)
+class _ProvenanceStruct:
+    """The fields of a provenance struct, split by whether they can be retained."""
+
+    source: etree._Element
+    kept: frozenset[str]
+    invalid_attributes: tuple[str, ...]
+    invalid_elements: tuple[etree._Element, ...]
+
+
+def _inspect_provenance_struct(
+    elem: etree._Element, namespace: str
+) -> _ProvenanceStruct | None:
+    """Classify the fields of a ResourceRef or ResourceEvent struct.
 
     XMP supports field elements under parseType="Resource", field elements or
     attributes on a nested rdf:Description, and field attributes on an empty
     element. These representations must not be mistaken for a simple string or
     a sequence of strings. _has_invalid_rdf_syntax() has already rejected the
     attribute combinations that RDF/XML forbids.
+
+    Returns None if the struct itself is malformed. A field that is merely unknown
+    or has an invalid value is reported separately, so it can be removed alone.
     """
     ns_rdf = NAMESPACES["rdf"]
     parse_type = f"{{{ns_rdf}}}parseType"
     if elem.get(parse_type) not in (None, "Resource"):
-        return False
+        return None
     children = [child for child in elem if isinstance(child.tag, str)]
     if len(children) == 1 and children[0].tag == f"{{{ns_rdf}}}Description":
         if (
@@ -1975,71 +1990,111 @@ def _is_valid_provenance_struct(elem: etree._Element, namespace: str) -> bool:
             or (children[0].tail or "").strip()
             or elem.get(parse_type) is not None
         ):
-            return False
+            return None
         source = children[0]
     else:
         source = elem
         if children and source.get(parse_type) != "Resource":
-            return False
+            return None
         if (
-            source.get(f"{{{ns_rdf}}}parseType") != "Resource"
+            source.get(parse_type) != "Resource"
             and not children
             and not any(key.startswith(f"{{{namespace}}}") for key in source.attrib)
         ):
-            return False
+            return None
 
     if (source.text or "").strip():
-        return False
-    fields: dict[str, str] = {}
-    for key, value in source.attrib.items():
-        if key in {f"{{{ns_rdf}}}parseType", f"{{{ns_rdf}}}about"}:
+        return None
+    types = _PROVENANCE_FIELD_TYPES[namespace]
+    seen: set[str] = set()
+    kept: set[str] = set()
+    invalid_attributes: list[str] = []
+    invalid_elements: list[etree._Element] = []
+    for name, value in source.attrib.items():
+        if name in {parse_type, f"{{{ns_rdf}}}about"}:
             continue
-        key = _STRUCTURAL_PROPERTY_CORRECTIONS.get(key, key)
-        if not key.startswith(f"{{{namespace}}}") or key in fields:
-            return False
-        value_type = _PROVENANCE_FIELD_TYPES[namespace].get(key.split("}", 1)[1])
-        if value_type is None or value_type == "q":
-            return False
-        if not _is_valid_simple_value(value.strip(), value_type):
-            return False
-        fields[key] = value
+        key = _STRUCTURAL_PROPERTY_CORRECTIONS.get(name, name)
+        if not key.startswith(f"{{{namespace}}}") or key in seen:
+            return None
+        seen.add(key)
+        value_type = types.get(key.split("}", 1)[1])
+        if value_type is not None and _is_valid_simple_value(value.strip(), value_type):
+            kept.add(key)
+        else:
+            invalid_attributes.append(name)
     for field in source:
         if not isinstance(field.tag, str):
             continue
         key = _STRUCTURAL_PROPERTY_CORRECTIONS.get(field.tag, field.tag)
-        if not key.startswith(f"{{{namespace}}}"):
-            return False
-        if (field.tail or "").strip():
-            return False
-        if key in fields:
-            return False
-        value_type = _PROVENANCE_FIELD_TYPES[namespace].get(key.split("}", 1)[1])
-        if value_type is None:
-            return False
-        if value_type == "q":
-            if not _validate_text_container(field, ns_rdf, "Seq"):
-                return False
-            fields[key] = ""
-            continue
-        if len(field) or set(field.attrib) - {f"{{{ns_rdf}}}resource"}:
-            return False
+        if (
+            not key.startswith(f"{{{namespace}}}")
+            or (field.tail or "").strip()
+            or key in seen
+        ):
+            return None
+        seen.add(key)
+        value_type = types.get(key.split("}", 1)[1])
         value = field.get(f"{{{ns_rdf}}}resource", field.text or "")
-        if not _is_valid_simple_value(value.strip(), value_type):
-            return False
-        fields[key] = value
-    # A ResourceEvent shall include these fields; the others need not be present.
-    return (
-        namespace != NAMESPACES["stEvt"]
-        or {
-            f"{{{namespace}}}action",
-            f"{{{namespace}}}when",
-        }
-        <= fields.keys()
+        if (
+            value_type is not None
+            and not len(field)
+            and not set(field.attrib) - {f"{{{ns_rdf}}}resource"}
+            and _is_valid_simple_value(value.strip(), value_type)
+        ):
+            kept.add(key)
+        else:
+            invalid_elements.append(field)
+    return _ProvenanceStruct(
+        source,
+        frozenset(kept),
+        tuple(invalid_attributes),
+        tuple(invalid_elements),
     )
 
 
+def _is_valid_provenance_struct(elem: etree._Element, namespace: str) -> bool:
+    """Check that a provenance struct has what remains valid after its repair."""
+    struct = _inspect_provenance_struct(elem, namespace)
+    if struct is None:
+        return False
+    if namespace == NAMESPACES["stEvt"]:
+        # A ResourceEvent shall include these fields; the others need not be present.
+        required = {f"{{{namespace}}}action", f"{{{namespace}}}when"}
+        return required <= struct.kept
+    return bool(struct.kept)
+
+
+def _prune_provenance_struct(elem: etree._Element, namespace: str) -> None:
+    """Remove the fields of a provenance struct that cannot be retained."""
+    struct = _inspect_provenance_struct(elem, namespace)
+    if struct is None:
+        return
+    for name in struct.invalid_attributes:
+        del struct.source.attrib[name]
+    for field in struct.invalid_elements:
+        struct.source.remove(field)
+
+
+def _prune_history_events(history: etree._Element) -> None:
+    """Remove the events of a history that cannot be retained, and invalid fields."""
+    for container in history:
+        if container.tag != f"{{{NAMESPACES['rdf']}}}Seq":
+            continue
+        for item in list(container):
+            if not isinstance(item.tag, str):
+                continue
+            if _is_valid_provenance_struct(item, NAMESPACES["stEvt"]):
+                _prune_provenance_struct(item, NAMESPACES["stEvt"])
+            else:
+                container.remove(item)
+
+
 def _is_valid_provenance_property(elem: etree._Element, local_name: str) -> bool:
-    """Check the defined ResourceRef / Seq ResourceEvent XMP value types."""
+    """Check the defined ResourceRef / Seq ResourceEvent XMP value types.
+
+    A property is valid if it keeps some content, because copying it then removes the
+    fields and history events that cannot be retained.
+    """
     if local_name == "DerivedFrom":
         return _is_valid_provenance_struct(elem, NAMESPACES["stRef"])
     ns_rdf = NAMESPACES["rdf"]
@@ -2057,11 +2112,9 @@ def _is_valid_provenance_property(elem: etree._Element, local_name: str) -> bool
         or (containers[0].tail or "").strip()
     ):
         return False
-    return all(
-        item.tag == f"{{{ns_rdf}}}li"
-        and _is_valid_provenance_struct(item, NAMESPACES["stEvt"])
-        for item in containers[0]
-        if isinstance(item.tag, str)
+    items = [item for item in containers[0] if isinstance(item.tag, str)]
+    return all(item.tag == f"{{{ns_rdf}}}li" for item in items) and any(
+        _is_valid_provenance_struct(item, NAMESPACES["stEvt"]) for item in items
     )
 
 

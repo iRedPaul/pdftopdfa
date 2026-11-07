@@ -32,15 +32,16 @@
 - Analyze soft masks selected by a shading pattern's `/ExtGState` during overprint repair
 - Remove soft-mask calculator functions unless their stack effects provably yield one number, and reject constant operations without a defined result
 - Require a usable tag table with permitted element types before retaining an existing OutputIntent profile
-- Validate URI-typed provenance fields and the range of XMP time zone offsets, and remove duplicate beads from a page's `/B` array
+- Remove URI-typed provenance fields with invalid values individually, validate the range of XMP time zone offsets, and remove duplicate beads from a page's `/B` array
 - Require custom XMP structure fields to use the namespace of their declared value type, and validate XMP numbers against their lexical forms
 - Reject non-integer text rendering modes during overprint analysis, and evaluate a soft mask at the invocation of a transparency group instead of at its inner paints
-- Require `stEvt:action` and `stEvt:when` in preserved XMP history events, and move `x-default` to the front of language alternatives
+- Remove XMP history events without `stEvt:action` and `stEvt:when` individually, keeping the rest of the history, and move `x-default` to the front of language alternatives
+- Remove fields from preserved XMP provenance that PDF/A does not accept, such as `stEvt:changed`, `stRef:filePath`, and `stRef:originalDocumentID`, instead of producing a non-conforming packet or dropping the whole structure
 - Remove OutputIntents with an undefined subtype or a non-standard condition without a profile while retaining the others, and check uncolored tiling patterns under the overprint state at their painting operation
-- Treat changes to the print flag, rectangle, opacity, blend mode, or optional content of other annotations as making a TrapNet stale
+- Remove a TrapNet with a warning, instead of using the original-input fallback, when conversion changes the print flag, rectangle, opacity, blend mode, or optional content of another annotation
 - Restore the reading order of a page's article beads, and reject a TrapNet with an invalid annotation type
 - Validate calibrated color spaces that inline images declare directly, and those in interactive form default resources
-- Remove collection item values without a matching schema field or with the wrong type, and a default document that is not an embedded file
+- Remove collection item values without a matching schema field or with the wrong type, keeping them when a portfolio has no schema, and a default document that is not an embedded file
 - Sanitize an `/ExtGState` stored directly on a shading pattern like other graphics states, and validate calibrated spaces in its soft mask
 - Remove the PDF/X markers from DocInfo along with their XMP identification
 - Reject XMP containers with extra containers or elements other than `rdf:li`
