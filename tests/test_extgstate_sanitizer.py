@@ -4,6 +4,8 @@
 
 """Tests for Extended Graphics State sanitization for PDF/A compliance."""
 
+from io import BytesIO
+
 import pikepdf
 import pytest
 from conftest import new_pdf
@@ -992,20 +994,315 @@ class TestSoftMaskValidation:
         assert result["extgstate_fixed"] == 1
         assert str(pdf.pages[0].Resources.ExtGState.GS0.SMask) == "/None"
 
-    def test_smask_dict_tr_removed(self) -> None:
-        """Removes /TR entry from SMask dict while keeping the SMask."""
+    @pytest.mark.parametrize(
+        "transfer_type",
+        ["identity", "exponential", "calculator", "sampled", "stitching"],
+    )
+    @pytest.mark.parametrize("with_extgstate_tr", [False, True])
+    def test_smask_transfer_function_preserved(
+        self, transfer_type: str, with_extgstate_tr: bool
+    ) -> None:
+        """Mask opacity mappings survive even when an ExtGState /TR is removed."""
         pdf = new_pdf()
-        tr_stream = pdf.make_stream(b"{ }")
-        smask_dict = Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=tr_stream)
+        if transfer_type == "identity":
+            transfer = Name.Identity
+        elif transfer_type == "exponential":
+            transfer = pdf.make_indirect(
+                Dictionary(
+                    FunctionType=2,
+                    Domain=Array([0, 1]),
+                    C0=Array([1]),
+                    C1=Array([0]),
+                    N=1,
+                )
+            )
+        elif transfer_type == "calculator":
+            transfer = pdf.make_stream(b"{ 1 exch sub }")
+            transfer.FunctionType = 4
+            transfer.Domain = Array([0, 1])
+            transfer.Range = Array([0, 1])
+        elif transfer_type == "sampled":
+            transfer = pdf.make_stream(b"\xff\x00")
+            transfer.FunctionType = 0
+            transfer.Domain = Array([0, 1])
+            transfer.Range = Array([0, 1])
+            transfer.Size = Array([2])
+            transfer.BitsPerSample = 8
+        else:
+            transfer = Dictionary(
+                FunctionType=3,
+                Domain=Array([0, 1]),
+                Functions=Array(
+                    [Dictionary(FunctionType=2, Domain=Array([0, 1]), N=1)]
+                ),
+                Bounds=Array(),
+                Encode=Array([1, 0]),
+            )
+        smask_dict = Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=transfer)
         gs = Dictionary(Type=Name.ExtGState, SMask=smask_dict)
+        if with_extgstate_tr:
+            gs.TR = transfer
         _make_pdf_with_extgstate(pdf, gs)
 
         result = sanitize_extgstate(pdf)
-        assert result["extgstate_fixed"] == 1
+        assert result["extgstate_fixed"] == int(with_extgstate_tr)
         gs_out = pdf.pages[0].Resources.ExtGState.GS0
-        # SMask should still be a dict (not replaced with /None)
-        assert isinstance(gs_out.SMask, Dictionary)
-        assert "/TR" not in gs_out.SMask
+        assert "/TR" not in gs_out
+        assert gs_out.SMask.TR == transfer
+
+        saved = BytesIO()
+        pdf.save(saved)
+        with pikepdf.open(saved) as reopened:
+            restored = reopened.pages[0].Resources.ExtGState.GS0.SMask.TR
+            if transfer_type == "identity":
+                assert restored == Name.Identity
+            elif transfer_type == "exponential":
+                assert restored.FunctionType == 2
+                assert list(restored.Domain) == [0, 1]
+                assert list(restored.C0) == [1]
+                assert list(restored.C1) == [0]
+                assert restored.N == 1
+            elif transfer_type == "calculator":
+                assert restored.FunctionType == 4
+                assert list(restored.Domain) == [0, 1]
+                assert list(restored.Range) == [0, 1]
+                assert restored.read_bytes() == b"{ 1 exch sub }"
+            elif transfer_type == "sampled":
+                assert restored.FunctionType == 0
+                assert restored.read_bytes() == b"\xff\x00"
+            else:
+                assert restored.FunctionType == 3
+                assert list(restored.Encode) == [1, 0]
+
+    @pytest.mark.parametrize(
+        "transfer",
+        [
+            42,
+            Name.Default,
+            Dictionary(FunctionType=2, N=1),
+            Dictionary(FunctionType=2, Domain=Array([0, 1]), N=Name.Bad),
+            Dictionary(FunctionType=2, Domain=Array([0, 1]), N=1, C0=Array([0, 1])),
+            Dictionary(
+                FunctionType=2, Domain=Array([0, 1]), N=1, Range=Array([0, 1, 0, 1])
+            ),
+            Dictionary(FunctionType=2, Domain=Array([0, 1]), N=-1),
+            Dictionary(FunctionType=7, Domain=Array([0, 1])),
+        ],
+    )
+    def test_invalid_soft_mask_transfer_uses_identity_default(self, transfer) -> None:
+        """Malformed transfers are removed without discarding the valid mask group."""
+        pdf = new_pdf()
+        mask = Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=transfer)
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        assert "/TR" not in pdf.pages[0].Resources.ExtGState.GS0.SMask
+        assert pdf.pages[0].Resources.ExtGState.GS0.SMask.G == mask.G
+
+    @pytest.mark.parametrize("kind", ["short_samples", "bad_calculator", "cycle"])
+    def test_invalid_transfer_programs_do_not_survive(self, kind) -> None:
+        """Check sampled payloads, calculator syntax, and recursive stitching graphs."""
+        pdf = new_pdf()
+        if kind == "cycle":
+            transfer = pdf.make_indirect(
+                Dictionary(
+                    FunctionType=3,
+                    Domain=Array([0, 1]),
+                    Bounds=Array(),
+                    Encode=Array([0, 1]),
+                )
+            )
+            transfer.Functions = Array([transfer])
+        else:
+            transfer = pdf.make_stream(
+                b"\x00" if kind == "short_samples" else b"{ bogus }"
+            )
+            transfer.FunctionType = 0 if kind == "short_samples" else 4
+            transfer.Domain = transfer.Range = Array([0, 1])
+            if kind == "short_samples":
+                transfer.Size = Array([2])
+                transfer.BitsPerSample = 8
+        _make_pdf_with_extgstate(
+            pdf,
+            Dictionary(
+                SMask=Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=transfer)
+            ),
+        )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        assert "/TR" not in pdf.pages[0].Resources.ExtGState.GS0.SMask
+
+    @pytest.mark.parametrize(
+        "domain,program,kept",
+        [
+            ([1, 2], b"{ ln }", True),
+            ([0, 1], b"{ ln }", False),
+            ([-1, 1], b"{ sqrt }", False),
+            ([0, 1], b"{ sqrt }", True),
+            ([1, 2], b"{ 1 exch div }", True),
+        ],
+    )
+    def test_calculator_is_checked_over_its_declared_domain(
+        self, domain, program, kept
+    ) -> None:
+        """Whether an operation has a defined result depends on the actual input."""
+        pdf = new_pdf()
+        mask = self._calculator_mask(pdf, program)
+        mask.TR.Domain = Array(domain)
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        sanitize_extgstate(pdf)
+        assert ("/TR" in pdf.pages[0].Resources.ExtGState.GS0.SMask) is kept
+
+    @staticmethod
+    def _calculator_mask(pdf: Pdf, program: bytes) -> Dictionary:
+        """Create a soft mask whose transfer function runs the given program."""
+        transfer = pdf.make_stream(program)
+        transfer.FunctionType = 4
+        transfer.Domain = transfer.Range = Array([0, 1])
+        return Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=transfer)
+
+    @pytest.mark.parametrize(
+        "program",
+        [
+            b"{ 1 exch sub }",
+            b"{ % comment\n 0.5 mul }",
+            b"{ dup 0.5 lt { 2 mul } if }",
+            b"{ dup 0.5 gt { pop 1 } { pop 0 } ifelse }",
+            b"{ 0 eq { 1 } { 0 } ifelse }",
+            b"{ dup 0 gt true and { 1 exch sub } if }",
+            b"{ 1 1 index add exch pop }",
+            b"{ 1 2 1 roll pop }",
+            b"{ 2 mul 0 0 roll }",
+            b"{ dup 1 copy pop pop }",
+            b"{ 0 copy }",
+            b"{ cvi 1 and cvr }",
+            b"{ dup 0 gt { dup 1 gt { pop 1 } if } { pop 0 } ifelse }",
+            b"{ 1 cvi copy pop }",
+            b"{ 1.9 cvi copy pop }",
+            b"{ -1.9 abs cvi copy pop }",
+            b"{ 2 1 sub copy pop }",
+            b"{ 0 0 add index exch pop }",
+            b"{ 3 2 idiv copy pop }",
+            b"{ 5 2 mod copy pop }",
+            b"{ 3 1 and copy pop }",
+            b"{ 1.5 floor cvi copy pop }",
+            b"{ 0.5 round cvi copy pop }",
+            b"{ -1.4 round cvi abs copy pop }",
+            b"{ -1.5 round add }",
+            b"{ 2 2 mul 3 sub copy pop }",
+            b"{ 3 2 div floor cvi copy pop }",
+            b"{ dup 0 gt { 1 } { 1 } ifelse copy pop }",
+            b"{ cvi 2 idiv cvr }",
+            b"{ cvi 2 mod cvr }",
+            b"{ cvi 1 bitshift cvr }",
+            b"{ cvi not cvr }",
+            b"{ cvi 1 add 1 and cvr }",
+            b"{ cvi dup 0 gt { pop 1 } if 1 and cvr }",
+            b"{ pop 3 2 xor }",
+            b"{ pop 4 sqrt }",
+            b"{ pop 1 ln }",
+            b"{ pop 100 log }",
+            b"{ pop 2 3 exp }",
+            b"{ pop 1 1 atan }",
+            b"{ pop 90 sin }",
+            b"{ 16 sqrt cvi 3 sub copy pop }",
+            b"{ sqrt }",
+            b"{ 1 add ln }",
+            b"{ dup 0 gt { ln } { pop 0 } ifelse }",
+            b"{ dup 0 eq { pop 0 } { 1 exch div } ifelse }",
+            b"{ false { pop } if }",
+            b"{ true { 1 exch sub } if }",
+            b"{ true not { pop } if }",
+            b"{ 1 2 lt { 1 exch sub } { pop } ifelse }",
+        ],
+    )
+    def test_calculator_with_one_numeric_result_is_preserved(self, program) -> None:
+        """Conditionals and literal stack operands can be proven correct."""
+        pdf = new_pdf()
+        mask = self._calculator_mask(pdf, program)
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert pdf.pages[0].Resources.ExtGState.GS0.SMask.TR.read_bytes() == program
+
+    @pytest.mark.parametrize(
+        "program",
+        [
+            b"{ pop }",
+            b"{ dup }",
+            b"{ add }",
+            b"{ 1 }",
+            b"{ pop true }",
+            b"{ 0 gt }",
+            b"{ true add }",
+            b"{ true 1 eq pop }",
+            b"{ { 2 mul } if }",
+            b"{ 1 { 2 mul } if }",
+            b"{ { 2 mul } }",
+            b"{ dup 0 gt { pop } if }",
+            b"{ dup 0 gt { pop } { pop 1 } ifelse }",
+            b"{ dup 0 gt { 2 mul } { 3 mul } { 4 mul } ifelse }",
+            b"{ dup 0 gt { pop 1 } { pop true } ifelse }",
+            b"{ dup copy }",
+            b"{ 5 copy }",
+            b"{ 5 index }",
+            b"{ 3 1 roll }",
+            b"{ dup roll }",
+            b"{ 1.0 copy pop }",
+            b"{ 1 cvr copy pop }",
+            b"{ -1.5 round cvi abs copy pop }",
+            b"{ -0.5 round cvi 1 add copy pop }",
+            b"{ pop 1.5 2 and }",
+            b"{ pop 1.5 2 or }",
+            b"{ pop 1.5 2 xor }",
+            b"{ pop 1.5 not }",
+            b"{ pop 1.5 2 idiv }",
+            b"{ 1 and }",
+            b"{ not }",
+            b"{ 2 idiv }",
+            b"{ 2 mod }",
+            b"{ 1 bitshift }",
+            b"{ cvi 1.5 or }",
+            b"{ cvr 1 and }",
+            b"{ pop true 1 and }",
+            b"{ pop -1 sqrt }",
+            b"{ pop 0 ln }",
+            b"{ pop -1 ln }",
+            b"{ pop 0 log }",
+            b"{ pop 0 -1 exp }",
+            b"{ pop -1 0.5 exp }",
+            b"{ pop 0 0 atan }",
+            b"{ ln }",
+            b"{ log }",
+            b"{ 1 exch div }",
+            b"{ 0.5 sub ln }",
+            b"{ 0.5 sub 1 exch div }",
+            b"{ -1 exp }",
+            b"{ true { pop } if }",
+            b"{ false { 1 exch sub } { pop } ifelse }",
+            b"{ dup 1 gt { pop } if pop }",
+            b"{ true copy }",
+            b"{ true true roll }",
+            b"{ cvi copy }",
+            b"{ 1 0 idiv pop }",
+            b"{ 1 0 div pop }",
+            b"{ 1 0 mod pop }",
+            b"{ 2147483647 1 add index }",
+            b"{ dup 0 gt { 1 } { 0 } ifelse copy pop }",
+            b"{ dup 0 gt { 1 } { 1.0 } ifelse copy pop }",
+            b"{" + b" dup" * 150 + b" }",
+            b"{ " * 40 + b"}" * 40,
+            b"{ 1 exch sub } }",
+            b"{ 1 exch sub } { 1 exch sub }",
+            b"1 exch sub",
+        ],
+    )
+    def test_calculator_without_provable_result_is_removed(self, program) -> None:
+        """Malformed stack effects cannot produce a defined mask mapping."""
+        pdf = new_pdf()
+        mask = self._calculator_mask(pdf, program)
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        state = pdf.pages[0].Resources.ExtGState.GS0
+        assert "/TR" not in state.SMask
+        assert state.SMask.G == mask.G
 
     def test_smask_dict_invalid_bc_removed(self) -> None:
         """Removes malformed /BC (non-Array) from SMask dict."""
