@@ -17,6 +17,20 @@
 - Require a usable tag table with permitted element types before retaining an existing OutputIntent profile
 - Remove OutputIntents with an undefined subtype or a non-standard condition without a profile while retaining the others
 - Preserve annotation colors and valid opacity values
+- Preserve custom DocInfo text fields, valid XMP provenance, translated titles/descriptions, and ordered author lists
+- Validate preserved XMP arrays and provenance fields
+- Match XMP default-language tags case-insensitively
+- Synchronize DocInfo Author with the first XMP creator, and move a DocInfo Author that matches a later XMP creator to the front instead of overwriting the first creator
+- Reject invalid text encodings in custom DocInfo strings
+- Reject impossible XMP dates and RDF/XML attribute forms that XMP parsers refuse, instead of copying them into the output metadata
+- Repair `_` separators in XMP language tags such as `en_US`, reject other malformed tags, and stop copying `xml:lang` from the top-level `rdf:Description`, which validators report as an undeclared property
+- Remove empty `xml:lang` qualifiers while retaining their values
+- Remove URI-typed provenance fields with invalid values individually, and validate the range of XMP time zone offsets
+- Require custom XMP structure fields to use the namespace of their declared value type, and validate XMP numbers against their lexical forms
+- Remove XMP history events without `stEvt:action` and `stEvt:when` individually, keeping the rest of the history, and move `x-default` to the front of language alternatives
+- Remove fields from preserved XMP provenance that PDF/A does not accept, such as `stEvt:changed`, `stRef:filePath`, and `stRef:originalDocumentID`, instead of producing a non-conforming packet or dropping the whole structure
+- Remove the PDF/X and PDF/E markers from DocInfo along with their XMP identification
+- Reject XMP containers with extra containers or elements other than `rdf:li`
 
 ## [0.9.25] - 2026-11-06
 
