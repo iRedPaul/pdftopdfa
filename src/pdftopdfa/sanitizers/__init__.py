@@ -280,10 +280,10 @@ def sanitize_for_pdfa(
     # Fix annotation flags (all levels)
     result["annotation_flags_fixed"] = fix_annotation_flags(pdf, level)
 
-    # Fix annotation-level /CA opacity (ISO 19005-2, 6.5.3)
+    # Preserve valid annotation opacity; repair only malformed /CA values.
     result["annotation_opacity_fixed"] = fix_annotation_opacity(pdf, level)
 
-    # Remove Device color arrays /C and /IC from annotations (ISO 19005-2)
+    # Preserve valid annotation colors; remove only malformed /C and /IC entries.
     result["annotation_colors_removed"] = remove_annotation_colors(pdf, level)
 
     # Validate color spaces (Separation/DeviceN preserved; ICC profiles validated)
