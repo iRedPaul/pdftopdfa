@@ -4,12 +4,15 @@
 
 """Repair malformed optional portfolios without corrupting article navigation."""
 
+from decimal import Decimal
+
 import pytest
 from conftest import new_pdf
 from pikepdf import Array, Dictionary, Name
 
 from pdftopdfa.converter import convert_to_pdfa
 from pdftopdfa.exceptions import ConversionError
+from pdftopdfa.sanitizers import sanitize_for_pdfa
 from pdftopdfa.sanitizers.catalog import remove_forbidden_catalog_entries
 
 
@@ -145,6 +148,85 @@ def test_collection_items_matching_the_schema_are_unchanged():
     )
     assert remove_forbidden_catalog_entries(pdf) == 0
     assert sorted(spec.CI.keys()) == ["/Foo", "/Good", "/Type"]
+
+
+@pytest.mark.parametrize(
+    "subtype,value,valid",
+    [
+        (Name.S, "text", True),
+        (Name.S, 42, False),
+        (Name.D, "D:20240101000000Z", True),
+        (Name.D, "not a date", False),
+        (Name.D, 42, False),
+        (Name.N, 42, True),
+        (Name.N, Decimal("1.5"), True),
+        (Name.N, True, False),
+        (Name.N, "42", False),
+        (Name.S, Dictionary(Type=Name.CollectionSubitem, D="text", P="Prefix "), True),
+        (Name.S, Dictionary(P="Prefix "), True),
+        (Name.S, Dictionary(D=42), False),
+        (Name.S, Dictionary(D="text", P=42), False),
+        (Name.S, Dictionary(Type=Name.Bad, D="text"), False),
+        (Name.Desc, "ignored", True),
+    ],
+)
+def test_collection_item_values_must_match_their_field_type(subtype, value, valid):
+    """A declared key is not enough when its value contradicts the schema."""
+    pdf = new_pdf()
+    spec = _portfolio(pdf, Dictionary(Field=Dictionary(Subtype=subtype, N="Field")))
+    spec.CI = Dictionary(Field=value)
+    remove_forbidden_catalog_entries(pdf)
+    assert ("/Field" in spec.CI) is valid
+
+
+@pytest.mark.parametrize("schema", [None, Dictionary()])
+def test_collection_item_markers_are_repaired_without_losing_values(schema):
+    """An invalid optional type marker or container is repaired on its own."""
+    pdf = new_pdf()
+    spec = _portfolio(pdf, Dictionary() if schema is None else schema)
+    if schema is None:
+        del pdf.Root.Collection.Schema
+    spec.CI = Dictionary(Type=Name.Bad)
+    remove_forbidden_catalog_entries(pdf)
+    assert "/Type" not in spec.CI
+
+    spec.CI = 42
+    remove_forbidden_catalog_entries(pdf)
+    assert "/CI" not in spec
+
+
+@pytest.mark.parametrize(
+    "default,kept",
+    [("a.txt", True), ("missing.txt", False), (42, False), (Name.Bad, False)],
+)
+def test_collection_default_must_name_an_embedded_file(default, kept):
+    """The initial document has to exist in the embedded-file name tree."""
+    pdf = new_pdf()
+    _portfolio(pdf, Dictionary(Good=Dictionary(Subtype=Name.S, N="Good")))
+    pdf.Root.Collection.D = default
+    remove_forbidden_catalog_entries(pdf)
+    assert ("/D" in pdf.Root.Collection) is kept
+
+
+def test_collection_default_without_embedded_files_is_removed():
+    """Without a name tree no initial document can exist."""
+    pdf = new_pdf()
+    pdf.add_blank_page()
+    pdf.Root.Collection = Dictionary(D="a.txt", View=Name.D)
+    remove_forbidden_catalog_entries(pdf)
+    assert "/D" not in pdf.Root.Collection
+    assert pdf.Root.Collection.View == Name.D
+
+
+def test_collection_default_is_rechecked_after_embedded_file_removal():
+    """PDF/A-2 may discard the file that the portfolio opened initially."""
+    pdf = new_pdf()
+    spec = _portfolio(pdf, Dictionary(Good=Dictionary(Subtype=Name.S, N="Good")))
+    spec.EF = Dictionary(F=pdf.make_stream(b"plain text", Type=Name.EmbeddedFile))
+    pdf.Root.Collection.D = "a.txt"
+    result = sanitize_for_pdfa(pdf, level="2b")
+    assert result["files_removed"] == 1
+    assert "/D" not in pdf.Root.Collection
 
 
 def test_collection_items_are_unchanged_without_any_schema():

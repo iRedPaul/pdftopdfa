@@ -326,6 +326,12 @@ _CALCULATOR_OPERATORS = (
     | frozenset("copy dup exch false if ifelse index pop roll true".split())
 )
 _CALCULATOR_BOOLEAN = object()
+# A number known to be an integer, although its value is not known.
+_CALCULATOR_INTEGER = object()
+_CALCULATOR_INTEGER_ONLY = frozenset("and bitshift idiv mod not or xor".split())
+_CALCULATOR_PRESERVES_INTEGER = frozenset(
+    "abs add ceiling floor mul neg round sub truncate".split()
+)
 _CALCULATOR_MAX_NESTING = 32
 _CALCULATOR_MAX_STACK = 100
 _CALCULATOR_MAX_INTEGER = 2**31 - 1
@@ -385,20 +391,32 @@ def _parse_calculator(data: bytes) -> list | None:
     return outer[0] if len(blocks) == 1 and len(outer) == 1 else None
 
 
+def _calculator_integer(value) -> bool:
+    """Return whether an abstract stack entry is certainly an integer."""
+    return isinstance(value, int) or value is _CALCULATOR_INTEGER
+
+
 def _fold_calculator_operator(operator: str, operands: list):
-    """Return the literal result of an operator, or None when it cannot be known."""
-    if any(operand is None for operand in operands):
-        return None
-    function = _CALCULATOR_FOLDS.get(operator)
-    if function is None:
-        function = _CALCULATOR_INTEGER_FOLDS.get(operator)
-        if function is None or not all(isinstance(a, int) for a in operands):
+    """Return the most specific abstract result that an operator's operands allow."""
+    function = _CALCULATOR_FOLDS.get(operator) or _CALCULATOR_INTEGER_FOLDS.get(
+        operator
+    )
+    if function is not None and all(isinstance(a, (int, float)) for a in operands):
+        result = function(*operands)
+        # Integer overflow produces an implementation-dependent real result.
+        if isinstance(result, int) and abs(result) > _CALCULATOR_MAX_INTEGER:
             return None
-    result = function(*operands)
-    # Integer overflow produces an implementation-dependent real result.
-    if isinstance(result, int) and abs(result) > _CALCULATOR_MAX_INTEGER:
-        return None
-    return result
+        return result
+    if (
+        operator == "cvi"
+        or operator in _CALCULATOR_INTEGER_ONLY
+        or (
+            operator in _CALCULATOR_PRESERVES_INTEGER
+            and all(_calculator_integer(a) for a in operands)
+        )
+    ):
+        return _CALCULATOR_INTEGER
+    return None
 
 
 def _apply_calculator_operator(token: bytes, stack: list) -> bool:
@@ -454,30 +472,30 @@ def _apply_calculator_operator(token: bytes, stack: list) -> bool:
             shift %= count
             rolled = stack[-count:]
             stack[-count:] = rolled[-shift:] + rolled[:-shift]
-    elif operator in _CALCULATOR_UNARY or operator in _CALCULATOR_BINARY:
-        if any(booleans):
-            return False
-        stack.append(_fold_calculator_operator(operator, operands))
     elif operator in _CALCULATOR_COMPARISONS:
         if booleans[0] != booleans[1] or (booleans[0] and operator not in ("eq", "ne")):
             return False
         stack.append(_CALCULATOR_BOOLEAN)
+    elif all(booleans) and operator in _CALCULATOR_LOGICAL:
+        stack.append(_CALCULATOR_BOOLEAN)
     else:
-        if any(booleans) != all(booleans):
+        # The function input is a real number, so integer operators need a proof
+        # such as cvi. Applying them to anything else is a run-time type error.
+        if any(booleans) or (
+            operator in _CALCULATOR_INTEGER_ONLY
+            and not all(_calculator_integer(a) for a in operands)
+        ):
             return False
-        stack.append(
-            _CALCULATOR_BOOLEAN
-            if booleans[0]
-            else _fold_calculator_operator(operator, operands)
-        )
+        stack.append(_fold_calculator_operator(operator, operands))
     return True
 
 
 def _apply_calculator_block(block: list, stack: list) -> bool:
     """Prove a block's effect on an abstract operand stack along each path.
 
-    Entries are a known integer or real, None for an unknown number, or the boolean
-    marker. Known integers let copy, index and roll be proven; other operands cannot.
+    Entries are a known integer or real, None for an unknown number, or a marker for
+    a boolean or an integer of unknown value. Known integers let copy, index and roll
+    be proven; other operands cannot.
     """
     conditional: list[list] = []
     for item in block:
@@ -499,7 +517,11 @@ def _apply_calculator_block(block: list, stack: list) -> bool:
             ):
                 return False
             stack[:] = [
-                a if type(a) is type(b) and a == b else None
+                a
+                if type(a) is type(b) and a == b
+                else _CALCULATOR_INTEGER
+                if _calculator_integer(a) and _calculator_integer(b)
+                else None
                 for a, b in zip(first, second, strict=True)
             ]
             conditional = []
@@ -1071,6 +1093,16 @@ def _process_resources(resources) -> int:
     extgstate = resources.get("/ExtGState")
     if extgstate:
         removed += _process_extgstate_dict(extgstate)
+
+    # A shading pattern holds its ExtGState directly, not in a resource table.
+    patterns = _resolve_indirect(resources.get("/Pattern"))
+    if isinstance(patterns, Dictionary):
+        for pattern in patterns.values():
+            pattern = _resolve_indirect(pattern)
+            if isinstance(pattern, (Dictionary, Stream)):
+                state = _resolve_indirect(pattern.get("/ExtGState"))
+                if isinstance(state, Dictionary):
+                    removed += _sanitize_gs_dict(state)
 
     # Remove /TR and /TR2 from Shading dictionaries (ISO 19005-2, §6.2.5)
     removed += _sanitize_shadings_in_resources(resources)

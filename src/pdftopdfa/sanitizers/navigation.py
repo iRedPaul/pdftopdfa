@@ -11,7 +11,7 @@ from decimal import Decimal
 from pikepdf import Array, Dictionary, Name, Pdf, String
 
 from ..exceptions import ConversionError
-from .files import _iter_name_tree_values
+from .files import _iter_name_tree_pairs
 from .trapnet import _date as _pdf_date
 
 logger = logging.getLogger(__name__)
@@ -32,21 +32,77 @@ def _optional_type(owner, expected: Name) -> int:
     )
 
 
-def _remove_dangling_collection_items(pdf: Pdf, schema) -> int:
-    """Remove item values without a field in the collection schema."""
+def _embedded_files(pdf: Pdf) -> list[tuple]:
+    """Return the name and file specification of each embedded file."""
     names = pdf.Root.get("/Names")
     embedded = names.get("/EmbeddedFiles") if isinstance(names, Dictionary) else None
-    if embedded is None:
-        return 0
+    if not isinstance(embedded, Dictionary):
+        return []
+    return [
+        (name, filespec)
+        for name, filespec in _iter_name_tree_pairs(embedded)
+        if isinstance(filespec, Dictionary)
+    ]
+
+
+def _valid_item_value(value, subtype) -> bool:
+    """Check a collection item value, or a subitem's data, against its field type."""
+    if isinstance(value, Dictionary):
+        if value.get("/Type") not in (None, Name.CollectionSubitem):
+            return False
+        if value.get("/P") is not None and not isinstance(value.P, String):
+            return False
+        value = value.get("/D")
+        if value is None:
+            return True
+    if subtype == Name.S:
+        return isinstance(value, String)
+    if subtype == Name.D:
+        return _pdf_date(value) is not None
+    if subtype == Name.N:
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float, Decimal))
+            and math.isfinite(value)
+        )
+    # Other field types take their data from the file specification itself.
+    return True
+
+
+def _sanitize_collection_items(pdf: Pdf, schema, check_fields: bool) -> int:
+    """Remove malformed item entries, and values that the schema does not describe."""
     removed = 0
-    for filespec in _iter_name_tree_values(embedded):
-        item = filespec.get("/CI") if isinstance(filespec, Dictionary) else None
+    for _, filespec in _embedded_files(pdf):
+        item = filespec.get("/CI")
+        if item is None:
+            continue
         if not isinstance(item, Dictionary):
+            removed += _remove_entry(filespec, "/CI")
+            continue
+        removed += _optional_type(item, Name.CollectionItem)
+        if not check_fields:
             continue
         for key in list(item.keys()):
-            if key != "/Type" and (schema is None or key not in schema):
+            if key == "/Type":
+                continue
+            field = schema.get(key) if schema is not None else None
+            if field is None or not _valid_item_value(item[key], field.get("/Subtype")):
                 removed += _remove_entry(item, key)
     return removed
+
+
+def remove_dangling_collection_default(pdf: Pdf) -> int:
+    """Remove the initial document of a portfolio unless it names an embedded file."""
+    collection = pdf.Root.get("/Collection")
+    if not isinstance(collection, Dictionary) or collection.get("/D") is None:
+        return 0
+    default = collection.D
+    if isinstance(default, String) and any(
+        isinstance(name, String) and bytes(name) == bytes(default)
+        for name, _ in _embedded_files(pdf)
+    ):
+        return 0
+    return _remove_entry(collection, "/D")
 
 
 def _sanitize_collection(pdf: Pdf) -> int:
@@ -60,12 +116,11 @@ def _sanitize_collection(pdf: Pdf) -> int:
     view = collection.get("/View")
     if view is not None and view not in (Name.D, Name.T, Name.H):
         removed += _remove_entry(collection, "/View")
-    if collection.get("/D") is not None and not isinstance(collection.D, String):
-        removed += _remove_entry(collection, "/D")
+    removed += remove_dangling_collection_default(pdf)
     schema = collection.get("/Schema")
     # Without any schema there is nothing to compare item values with, unless it
     # is removed here and so no longer describes the values that relied on it.
-    check_items = schema is not None
+    check_fields = schema is not None
     if schema is not None and not isinstance(schema, Dictionary):
         removed += _remove_entry(collection, "/Schema")
         schema = None
@@ -101,9 +156,7 @@ def _sanitize_collection(pdf: Pdf) -> int:
                 isinstance(order, bool) or not isinstance(order, int)
             ):
                 removed += _remove_entry(field, "/O")
-    if check_items:
-        # Collection item keys identify fields of the collection schema.
-        removed += _remove_dangling_collection_items(pdf, schema)
+    removed += _sanitize_collection_items(pdf, schema, check_fields)
     sorting = collection.get("/Sort")
     if sorting is None:
         return removed

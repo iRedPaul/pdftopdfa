@@ -1450,6 +1450,26 @@ class TestPreservedColorValidation:
         with pytest.raises(ConversionError, match="invalid /WhitePoint"):
             embed_color_profiles(pdf)
 
+    def test_invalid_calibration_in_shading_pattern_soft_mask_is_rejected(self):
+        """A pattern's ExtGState holds its mask group outside any resource table."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        mask = pdf.make_stream(b"0 0 20 20 re f")
+        mask.Subtype = Name.Form
+        mask.BBox = Array([0, 0, 20, 20])
+        mask.Resources = Dictionary(
+            ColorSpace=Dictionary(CS=Array([Name.CalRGB, Dictionary()]))
+        )
+        page.Resources.Pattern = Dictionary(
+            P=Dictionary(
+                PatternType=2,
+                ExtGState=Dictionary(SMask=Dictionary(S=Name.Alpha, G=mask)),
+                Shading=Dictionary(ShadingType=2, ColorSpace=Name.DeviceGray),
+            )
+        )
+        with pytest.raises(ConversionError, match="invalid /WhitePoint"):
+            embed_color_profiles(pdf)
+
     @staticmethod
     def _inline_image_owner(pdf, page, location, data):
         """Place inline image content in the requested typed painting context."""

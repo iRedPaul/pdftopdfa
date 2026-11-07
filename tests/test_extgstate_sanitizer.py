@@ -1172,6 +1172,13 @@ class TestSoftMaskValidation:
             b"{ 2 2 mul 3 sub copy pop }",
             b"{ 3 2 div floor cvi copy pop }",
             b"{ dup 0 gt { 1 } { 1 } ifelse copy pop }",
+            b"{ cvi 2 idiv cvr }",
+            b"{ cvi 2 mod cvr }",
+            b"{ cvi 1 bitshift cvr }",
+            b"{ cvi not cvr }",
+            b"{ cvi 1 add 1 and cvr }",
+            b"{ cvi dup 0 gt { pop 1 } if 1 and cvr }",
+            b"{ pop 3 2 xor }",
         ],
     )
     def test_calculator_with_one_numeric_result_is_preserved(self, program) -> None:
@@ -1209,6 +1216,19 @@ class TestSoftMaskValidation:
             b"{ 1 cvr copy pop }",
             b"{ -1.5 round cvi abs copy pop }",
             b"{ -0.5 round cvi 1 add copy pop }",
+            b"{ pop 1.5 2 and }",
+            b"{ pop 1.5 2 or }",
+            b"{ pop 1.5 2 xor }",
+            b"{ pop 1.5 not }",
+            b"{ pop 1.5 2 idiv }",
+            b"{ 1 and }",
+            b"{ not }",
+            b"{ 2 idiv }",
+            b"{ 2 mod }",
+            b"{ 1 bitshift }",
+            b"{ cvi 1.5 or }",
+            b"{ cvr 1 and }",
+            b"{ pop true 1 and }",
             b"{ cvi copy }",
             b"{ 1 0 idiv pop }",
             b"{ 1 0 div pop }",
@@ -1887,6 +1907,27 @@ class TestOverprintIccBasedCmyk:
         )
         assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
         assert page.Contents.read_bytes() == content
+
+    def test_shading_pattern_extgstate_is_sanitized(self) -> None:
+        """A pattern's own graphics state follows the same rules as a resource."""
+        pdf = new_pdf()
+        content = b"/Pattern cs /P scn 0 0 20 20 re f"
+        page = self._page(pdf, content)
+        state = Dictionary(
+            TR=Name.Identity, HTP=Array([0, 0]), OP=1, OPM=Decimal("1.0")
+        )
+        page.Resources.Pattern = Dictionary(
+            P=Dictionary(
+                PatternType=2,
+                ExtGState=state,
+                Shading=Dictionary(ShadingType=2, ColorSpace=Name.DeviceGray),
+            )
+        )
+        sanitize_extgstate(pdf)
+        cleaned = page.Resources.Pattern.P.ExtGState
+        assert "/TR" not in cleaned and "/HTP" not in cleaned
+        assert cleaned.OP is True
+        assert isinstance(cleaned.OPM, int) and cleaned.OPM == 1
 
     @pytest.mark.parametrize(
         "mask_paint,fixes",

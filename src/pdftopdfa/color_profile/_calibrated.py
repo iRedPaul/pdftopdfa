@@ -214,6 +214,10 @@ def validate_calibrated_colorspaces(pdf: Pdf) -> None:
                 pending.append(("tiling", value))
             elif value.get("/PatternType") == 2:
                 pending.append(("shading", value.get("/Shading")))
+                state = value.get("/ExtGState")
+                mask = state.get("/SMask") if isinstance(state, Dictionary) else None
+                if isinstance(mask, Dictionary):
+                    pending.append(("owner", mask.get("/G")))
         elif kind == "shading" and isinstance(value, (Dictionary, Stream)):
             pending.append(("space", value.get("/ColorSpace")))
         elif kind in ("owner", "tiling") and isinstance(value, (Dictionary, Stream)):
