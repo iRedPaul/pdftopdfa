@@ -3965,6 +3965,144 @@ class TestXmpDateValidation:
         assert not _is_valid_simple_value(value, "d")
 
 
+class TestLanguageTags:
+    """Copied xml:lang qualifiers must be language tags, repaired where unambiguous."""
+
+    @staticmethod
+    def _languages(result: etree._Element, property_name: str) -> list[str]:
+        """Read the language qualifiers of a Dublin Core property in document order."""
+        return result.xpath(
+            f"//dc:{property_name}/*/rdf:li/@xml:lang", namespaces=NAMESPACES
+        )
+
+    @staticmethod
+    def _copied(prop: str) -> etree._Element:
+        """Regenerate XMP from a source packet that contains the given property."""
+        tree = _build_xmp_with_extras(prop)
+        return _parse_xmp_bytes(create_xmp_metadata({}, 2, "B", existing_xmp_tree=tree))
+
+    @pytest.mark.parametrize(
+        "tag",
+        ["x-default", "X-Default", "en", "en-US", "de-1996", "zh-Hant-TW", "i-klingon"],
+    )
+    def test_well_formed_tags_are_accepted(self, tag) -> None:
+        """Language tags keep the spelling used in the source packet."""
+        result = self._copied(
+            f'<dc:rights><rdf:Alt><rdf:li xml:lang="{tag}">Text</rdf:li></rdf:Alt>'
+            "</dc:rights>"
+        )
+        assert self._languages(result, "rights") == [tag]
+
+    def test_underscore_separator_is_repaired_in_every_alternative(self) -> None:
+        """A POSIX locale separator cannot cost a document its translations."""
+        result = self._copied(
+            '<dc:title><rdf:Alt><rdf:li xml:lang="x-default">Report</rdf:li>'
+            '<rdf:li xml:lang="en_US">Report US</rdf:li>'
+            '<rdf:li xml:lang="de-DE">Bericht</rdf:li></rdf:Alt></dc:title>'
+        )
+        assert self._languages(result, "title") == ["x-default", "en-US", "de-DE"]
+        assert result.xpath("//dc:title/*/rdf:li/text()", namespaces=NAMESPACES) == [
+            "Report",
+            "Report US",
+            "Bericht",
+        ]
+
+    def test_underscore_default_language_is_recognized(self) -> None:
+        """The repaired spelling still identifies the default alternative."""
+        result = self._copied(
+            '<dc:title><rdf:Alt><rdf:li xml:lang="de-DE">Bericht</rdf:li>'
+            '<rdf:li xml:lang="x_default">Report</rdf:li></rdf:Alt></dc:title>'
+        )
+        assert self._languages(result, "title") == ["x-default", "de-DE"]
+        assert result.xpath("//dc:title/*/rdf:li/text()", namespaces=NAMESPACES) == [
+            "Report",
+            "Bericht",
+        ]
+
+    def test_underscore_is_repaired_in_preserved_properties(self) -> None:
+        """Rights statements and qualified array items keep their values."""
+        result = self._copied(
+            '<dc:rights><rdf:Alt><rdf:li xml:lang="en_US">Copyright Acme</rdf:li>'
+            "</rdf:Alt></dc:rights>"
+            '<dc:subject><rdf:Bag><rdf:li xml:lang="en_GB">keyword</rdf:li>'
+            "</rdf:Bag></dc:subject>"
+        )
+        assert self._languages(result, "rights") == ["en-US"]
+        assert self._languages(result, "subject") == ["en-GB"]
+        assert not result.xpath("//@xml:lang[contains(., '_')]")
+
+    def test_repaired_tags_cannot_collide(self) -> None:
+        """Uniqueness is judged after repair, because that is what gets published."""
+        result = self._copied(
+            '<dc:rights><rdf:Alt><rdf:li xml:lang="en_US">One</rdf:li>'
+            '<rdf:li xml:lang="en-us">Two</rdf:li></rdf:Alt></dc:rights>'
+        )
+        assert not result.xpath("//dc:rights", namespaces=NAMESPACES)
+
+    @pytest.mark.parametrize(
+        "tag",
+        [
+            "not a tag!",
+            "en US",
+            "123",
+            "en-",
+            "-en",
+            "en--US",
+            "toolonglanguage",
+            " en",
+        ],
+    )
+    def test_unrepairable_alternative_rebuilds_title_from_its_text(self, tag) -> None:
+        """A malformed tag cannot survive, but the document keeps its title text."""
+        result = self._copied(
+            f'<dc:title><rdf:Alt><rdf:li xml:lang="{tag}">Report</rdf:li></rdf:Alt>'
+            "</dc:title>"
+        )
+        assert self._languages(result, "title") == ["x-default"]
+        assert result.xpath("//dc:title/*/rdf:li/text()", namespaces=NAMESPACES) == [
+            "Report"
+        ]
+
+    @pytest.mark.parametrize(
+        "prop",
+        [
+            '<dc:rights><rdf:Alt><rdf:li xml:lang="not a tag!">Text</rdf:li></rdf:Alt>'
+            "</dc:rights>",
+            '<dc:subject><rdf:Bag><rdf:li xml:lang="not a tag!">Text</rdf:li></rdf:Bag>'
+            "</dc:subject>",
+            '<dc:source xml:lang="not a tag!">Text</dc:source>',
+        ],
+    )
+    def test_unrepairable_tags_are_not_copied(self, prop) -> None:
+        """Every preserved value is checked, not only language alternatives."""
+        result = self._copied(prop)
+        assert not result.xpath("//@xml:lang[contains(., 'not a tag')]")
+
+    @pytest.mark.parametrize("tag", ["en", "en_US", "not a tag!", ""])
+    def test_top_level_language_is_not_copied(self, tag) -> None:
+        """Validators treat xml:lang on the packet description as a property."""
+        tree = _build_xmp_with_extras("<dc:format>application/pdf</dc:format>")
+        description = tree.find(f".//{{{NAMESPACES['rdf']}}}Description")
+        description.set("{http://www.w3.org/XML/1998/namespace}lang", tag)
+        result = _parse_xmp_bytes(
+            create_xmp_metadata({}, 2, "B", existing_xmp_tree=tree)
+        )
+        assert not result.xpath("//@xml:lang")
+
+    def test_page_metadata_is_repaired(self) -> None:
+        """Non-catalog packets receive the same repair as the document packet."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        source = _build_xmp_with_extras(
+            '<dc:rights><rdf:Alt><rdf:li xml:lang="en_US">Copyright Acme</rdf:li>'
+            "</rdf:Alt></dc:rights>"
+        )
+        page.Metadata = pdf.make_stream(etree.tostring(source))
+        _sanitize_non_catalog_metadata(pdf)
+        result = _parse_xmp_bytes(page.Metadata.read_bytes())
+        assert self._languages(result, "rights") == ["en-US"]
+
+
 class TestInvalidRdfSyntaxIsNotCopied:
     """A copied form rejected by XMP parsers would invalidate the whole packet."""
 

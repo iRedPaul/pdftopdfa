@@ -22,6 +22,8 @@
 - Move a DocInfo Author that matches a later XMP creator to the front instead of overwriting the first creator
 - Reject impossible XMP dates and RDF/XML attribute forms that XMP parsers refuse, instead of copying them into the output metadata
 - Leave calibrated color spaces unvalidated when `embed_color_profiles(replace_existing=False)` skips a document with existing OutputIntents
+- Repair `_` separators in XMP language tags such as `en_US`, reject other malformed tags, and stop copying `xml:lang` from the top-level `rdf:Description`, which validators report as an undeclared property
+- Remove collection sorting unless every `/S` field resolves in the collection schema
 
 ### Tests
 

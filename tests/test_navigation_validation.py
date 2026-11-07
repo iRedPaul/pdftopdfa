@@ -59,6 +59,30 @@ def test_collection_repairs_keep_valid_fields():
     assert str(collection.AcmePrivate) == "keep"
 
 
+@pytest.mark.parametrize(
+    "schema,fields",
+    [
+        (None, Name.Foo),
+        (None, Array([Name.Foo])),
+        (Name.Bad, Name.Foo),
+        (Dictionary(), Name.Foo),
+        (Dictionary(A=Dictionary(Subtype=Name.S, N="A")), Array()),
+        (Dictionary(A=Dictionary(Subtype=Name.S, N="A")), Array([Name.A, Name.Foo])),
+        (Dictionary(A=Dictionary(Subtype=Name.S, N="A")), Name.Type),
+    ],
+)
+def test_collection_sort_fields_must_resolve_in_schema(schema, fields):
+    """Table 158 sort fields identify schema entries, so none may be left dangling."""
+    pdf = new_pdf()
+    pdf.add_blank_page()
+    pdf.Root.Collection = Dictionary(Sort=Dictionary(S=fields), View=Name.D)
+    if schema is not None:
+        pdf.Root.Collection.Schema = schema
+    remove_forbidden_catalog_entries(pdf)
+    assert "/Sort" not in pdf.Root.Collection
+    assert pdf.Root.Collection.View == Name.D
+
+
 @pytest.mark.parametrize("ascending", [[], [False], [True, False, True]])
 def test_collection_sort_array_lengths_need_not_match(ascending):
     """Table 158 permits extra directions and defaults missing ones to true."""

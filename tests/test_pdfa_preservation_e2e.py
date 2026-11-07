@@ -388,6 +388,38 @@ def test_full_conversion_synchronizes_first_creator(
 
 
 @pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
+def test_full_conversion_repairs_xmp_language_tags(
+    source_level, target_level, tmp_path
+):
+    """Malformed language qualifiers neither cost values nor conformance."""
+    xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
+    pdf = _document(source_level)
+    tree = etree.fromstring(pdf.Root.Metadata.read_bytes())
+    description = tree.find(f".//{{{_RDF}}}Description")
+    description.set(xml_lang, "en")
+    rights = etree.SubElement(description, f"{{{_DC}}}rights")
+    alternatives = etree.SubElement(rights, f"{{{_RDF}}}Alt")
+    item = etree.SubElement(alternatives, f"{{{_RDF}}}li")
+    item.set(xml_lang, "en_US")
+    item.text = "Copyright Acme"
+    pdf.Root.Metadata.write(etree.tostring(tree))
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source, force_version="1.7")
+
+    result = convert_to_pdfa(source, output, level=target_level, validate=True)
+    assert result.target_produced and not result.validation_failed, result
+    with pikepdf.open(output) as restored:
+        tree = etree.fromstring(restored.Root.Metadata.read_bytes())
+        items = tree.xpath(
+            "//dc:rights/rdf:Alt/rdf:li", namespaces={"dc": _DC, "rdf": _RDF}
+        )
+        assert [(item.get(xml_lang), item.text) for item in items] == [
+            ("en-US", "Copyright Acme")
+        ]
+        assert tree.find(f".//{{{_RDF}}}Description").get(xml_lang) is None
+
+
+@pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
 def test_full_conversion_preserves_invisible_type3_overprint(
     source_level, target_level, tmp_path
 ):

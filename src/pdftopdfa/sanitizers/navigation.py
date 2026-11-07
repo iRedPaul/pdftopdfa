@@ -88,11 +88,17 @@ def _sanitize_collection(pdf: Pdf) -> int:
     removed += _optional_type(sorting, Name.CollectionSort)
     fields = sorting.get("/S")
     fields = [fields] if isinstance(fields, Name) else fields
-    valid = isinstance(fields, (list, Array)) and all(
-        isinstance(field, Name) for field in fields
+    # ISO 32000-1 Table 158: each /S name identifies a field of the collection
+    # schema, so sorting cannot be valid without one.
+    valid = (
+        isinstance(schema, Dictionary)
+        and isinstance(fields, (list, Array))
+        and len(fields) > 0
+        and all(
+            isinstance(field, Name) and str(field) != "/Type" and str(field) in schema
+            for field in fields
+        )
     )
-    if valid and isinstance(schema, Dictionary):
-        valid = all(str(field) != "/Type" and str(field) in schema for field in fields)
     ascending = sorting.get("/A")
     # ISO 32000-1 Table 158 explicitly permits unequal /S and /A lengths.
     if ascending is not None and not (

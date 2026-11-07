@@ -606,8 +606,24 @@ _PROVENANCE_FIELD_TYPES = {
 }
 
 
+_XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
+
+# RFC 3066 language tag syntax, which also covers the reserved x-default.
+_LANGUAGE_TAG_RE = re.compile(r"[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*")
+
+
+def _normalize_language_tag(tag: str) -> str:
+    """Repair a POSIX locale separator, as in en_US, instead of losing the value."""
+    return tag.replace("_", "-")
+
+
+def _is_valid_language_tag(tag: str) -> bool:
+    """Check language tag syntax, allowing for the repair applied when copying."""
+    return _LANGUAGE_TAG_RE.fullmatch(_normalize_language_tag(tag)) is not None
+
+
 def _normalize_structural_properties(elem: etree._Element) -> None:
-    """Recursively correct non-standard property names in structural types."""
+    """Recursively correct non-standard names and language tags in copied values."""
     corrected = _STRUCTURAL_PROPERTY_CORRECTIONS.get(elem.tag)
     if corrected is not None:
         elem.tag = corrected
@@ -615,6 +631,9 @@ def _normalize_structural_properties(elem: etree._Element) -> None:
         corrected = _STRUCTURAL_PROPERTY_CORRECTIONS.get(name)
         if corrected is not None:
             elem.set(corrected, elem.attrib.pop(name))
+    language = elem.get(_XML_LANG)
+    if language is not None:
+        elem.set(_XML_LANG, _normalize_language_tag(language))
     for child in elem:
         _normalize_structural_properties(child)
 
@@ -1642,14 +1661,16 @@ def _text_array_items(elem, ns_rdf: str, container: str):
 
 
 def _validate_alt_lang(elem: etree._Element, ns_rdf: str) -> bool:
-    """Require a simple language array with unique, nonempty language tags."""
-    xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
+    """Require a simple language array with unique, well-formed language tags."""
     items = _text_array_items(elem, ns_rdf, "Alt")
     if items is None:
         return False
-    languages = [item.get(xml_lang, "").casefold() for item in items]
+    languages = [item.get(_XML_LANG, "") for item in items]
     # Empty strings and literal values such as "None" are valid translations.
-    return all(languages) and len(languages) == len(set(languages))
+    return all(_is_valid_language_tag(language) for language in languages) and (
+        len({_normalize_language_tag(language).casefold() for language in languages})
+        == len(languages)
+    )
 
 
 def _validate_text_container(elem: etree._Element, ns_rdf: str, container: str) -> bool:
@@ -1697,18 +1718,22 @@ def _has_invalid_rdf_syntax(prop: etree._Element) -> bool:
     RDF/XML 1.1, 7.2, permits only rdf:ID and rdf:parseType on an element with
     parseType="Resource", whose fields must be child properties. Node elements
     cannot carry rdf:parseType, property elements cannot carry rdf:about, and
-    property attributes exclude nested content.
+    property attributes exclude nested content. XMP also requires language tags
+    in xml:lang qualifiers, although XML permits an empty value.
     """
     ns_rdf = NAMESPACES["rdf"]
     parse_type = f"{{{ns_rdf}}}parseType"
     node_tags = {f"{{{ns_rdf}}}{name}" for name in ("Description", "Bag", "Seq", "Alt")}
-    ignored = {f"{{{ns_rdf}}}ID", "{http://www.w3.org/XML/1998/namespace}lang"}
+    ignored = {f"{{{ns_rdf}}}ID", _XML_LANG}
 
     pending = [prop]
     while pending:
         elem = pending.pop()
         children = [child for child in elem if isinstance(child.tag, str)]
         pending.extend(children)
+        language = elem.get(_XML_LANG)
+        if language and not _is_valid_language_tag(language):
+            return True
         if elem.tag in node_tags:
             if parse_type in elem.attrib:
                 return True
@@ -2376,6 +2401,10 @@ def _collect_preserved_elements(
                 # non-namespaced form which would conflict with rdf:about)
                 if attr_name in ("about", "ID", "nodeID"):
                     continue
+                # On this element, XMP parsers report xml:lang as a property
+                # that no schema declares, which violates rule 6.6.2.3.1.
+                if attr_name == _XML_LANG:
+                    continue
                 if attr_name in preserved_element_tags:
                     logger.debug(
                         "Stripping attribute duplicate of preserved property: %s",
@@ -2792,7 +2821,8 @@ def _extract_lang_alt_xmp_property(
                 cleaned = _clean_metadata_text(li.text)
                 if cleaned is None:
                     continue
-                if li.get(xml_lang, "x-default").casefold() == "x-default":
+                language = _normalize_language_tag(li.get(xml_lang, "x-default"))
+                if language.casefold() == "x-default":
                     return cleaned
                 if fallback is None:
                     fallback = cleaned
@@ -2845,7 +2875,9 @@ def _copy_valid_xmp_property(
     for description in _iter_top_level_xmp_descriptions(tree):
         for prop in description.findall(property_name):
             if _is_valid_preserved_property(prop, namespace, local_name):
-                return copy.deepcopy(prop)
+                copied = copy.deepcopy(prop)
+                _normalize_structural_properties(copied)
+                return copied
     return None
 
 
@@ -3424,6 +3456,7 @@ def _sanitize_non_catalog_xmp_tree(tree: etree._Element) -> None:
                 declared_value_type,
                 declared_custom_types.get(uri, {}),
             ):
+                _normalize_structural_properties(child)
                 continue
 
             desc.remove(child)
