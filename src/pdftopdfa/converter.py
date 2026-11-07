@@ -65,6 +65,7 @@ from .sanitizers import (
     sanitize_truetype_encoding,
 )
 from .sanitizers.catalog import _is_valid_bcp47
+from .sanitizers.extgstate import sanitize_overprint_usage
 from .staging import (
     copy_to_private_stage,
     private_staging_directory,
@@ -2745,6 +2746,18 @@ def convert_to_pdfa(
         embedded_spaces = embed_color_profiles(
             pdf, level, convert_calibrated=convert_calibrated
         )
+        # Installing DefaultCMYK may turn DeviceCMYK paints into ICCBased
+        # CMYK after the first sanitizer pass. Check their effective state
+        # again instead of publishing newly prohibited OPM=1 combinations.
+        late_overprint_fixes = sanitize_overprint_usage(pdf)
+        if late_overprint_fixes:
+            sanitize_result["extgstate_fixed"] = (
+                sanitize_result.get("extgstate_fixed", 0) + late_overprint_fixes
+            )
+            warnings.append(
+                f"{late_overprint_fixes} ICCBased CMYK overprint paint(s) repaired "
+                "after color-profile embedding"
+            )
         if len(embedded_spaces) > 1:
             warnings.append(
                 "Multiple color spaces handled: "

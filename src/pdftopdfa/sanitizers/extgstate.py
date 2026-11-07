@@ -16,6 +16,9 @@ ISO 19005-2, Section 6.4 constrains transparency-related entries:
 - /BM (blend mode) — must be a valid PDF blend mode name
 - /CA and /ca (opacity) — must be numeric in [0.0, 1.0]
 - /SMask (soft mask) — must be /None or a valid soft mask dictionary
+
+ISO 32000-1, Table 58 defines /OPM (overprint mode) as the integer 0 or 1, and
+/OP and /op (overprint) as booleans.
 """
 
 import itertools
@@ -28,6 +31,7 @@ from pikepdf import Array, Dictionary, Name, Pdf, PdfError, Stream
 
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
+from .overprint import sanitize_overprint
 from .rendering_intent import VALID_RENDERING_INTENTS
 from .structure_limits import MAX_REAL_MAGNITUDE, normalize_number
 
@@ -154,6 +158,25 @@ def _resources_use_iccbased_cmyk(
                 if cs and _colorspace_uses_iccbased_cmyk(cs, visited):
                     return True
 
+    shadings = resources.get("/Shading")
+    if isinstance(shadings, Dictionary):
+        for shading in shadings.values():
+            if isinstance(
+                shading, (Dictionary, Stream)
+            ) and _colorspace_uses_iccbased_cmyk(shading.get("/ColorSpace"), visited):
+                return True
+
+    patterns = resources.get("/Pattern")
+    if isinstance(patterns, Dictionary):
+        for pattern in patterns.values():
+            if not isinstance(pattern, Dictionary):
+                continue
+            shading = pattern.get("/Shading")
+            if isinstance(
+                shading, (Dictionary, Stream)
+            ) and _colorspace_uses_iccbased_cmyk(shading.get("/ColorSpace"), visited):
+                return True
+
     return False
 
 
@@ -214,9 +237,11 @@ def _overprint_enabled(gs_dict: Dictionary, key: str) -> bool:
 
 
 def _pdf_enables_overprint(pdf: Pdf) -> bool:
-    """Return True when any reachable graphics state enables overprint."""
+    """Return whether reachable state entries can enable overprint with OPM 1."""
     stack = [pdf.Root]
     visited: set[tuple[int, int]] = set()
+    overprint = False
+    mode_one = False
 
     while stack:
         try:
@@ -229,6 +254,10 @@ def _pdf_enables_overprint(pdf: Pdf) -> bool:
 
             if isinstance(obj, (Dictionary, Stream)):
                 if _overprint_enabled(obj, "/OP") or _overprint_enabled(obj, "/op"):
+                    overprint = True
+                if obj.get("/OPM") == 1:
+                    mode_one = True
+                if overprint and mode_one:
                     return True
                 stack.extend(obj.values())
             elif isinstance(obj, Array):
@@ -1060,7 +1089,7 @@ def _sanitize_halftone_dict(
     return fixes, True
 
 
-def _sanitize_gs_dict(gs_dict: Dictionary, reset_opm: bool) -> int:
+def _sanitize_gs_dict(gs_dict: Dictionary) -> int:
     """Check and remove forbidden entries from a single ExtGState dictionary.
 
     Args:
@@ -1071,27 +1100,41 @@ def _sanitize_gs_dict(gs_dict: Dictionary, reset_opm: bool) -> int:
     """
     removed = 0
 
+    # ISO 32000-1, Table 58 defines /OPM as the integer 0 or 1. A real with the
+    # same value selects the same mode, so this repair is also safe for shared
+    # dictionaries. Any other value selects no defined mode.
+    if "/OPM" in gs_dict:
+        opm = _resolve_indirect(gs_dict["/OPM"])
+        if isinstance(opm, Decimal) and opm in (0, 1):
+            gs_dict["/OPM"] = int(opm)
+            removed += 1
+            logger.debug("Normalized real /OPM to an integer in ExtGState")
+        elif isinstance(opm, bool) or not isinstance(opm, int) or opm not in (0, 1):
+            del gs_dict["/OPM"]
+            removed += 1
+            logger.debug("Removed undefined /OPM from ExtGState")
+
+    # The same table defines /OP and /op as booleans. Numeric 0 and 1 are
+    # unambiguous, and overprint analysis needs the type it can rely on.
+    for key in ("/OP", "/op"):
+        if key not in gs_dict:
+            continue
+        flag = _resolve_indirect(gs_dict[key])
+        if isinstance(flag, bool):
+            continue
+        if isinstance(flag, (int, Decimal)) and flag in (0, 1):
+            gs_dict[key] = bool(flag)
+            logger.debug("Normalized numeric %s to a boolean in ExtGState", key)
+        else:
+            del gs_dict[key]
+            logger.debug("Removed undefined %s from ExtGState", key)
+        removed += 1
+
     # /TR is always forbidden
     if "/TR" in gs_dict:
         del gs_dict["/TR"]
         removed += 1
         logger.debug("Removed forbidden /TR from ExtGState")
-
-    # PDF/A 6.2.4.2:
-    # OPM=1 is forbidden with ICCBased CMYK when overprint is enabled.
-    # Both the colour space and overprint flags are intentionally checked
-    # document-wide. Graphics-state parameters persist independently, so an
-    # /OPM value and /OP or /op may be supplied by different ExtGState
-    # dictionaries or inherited across a nested content stream.
-    if reset_opm and "/OPM" in gs_dict:
-        try:
-            opm = int(_resolve_indirect(gs_dict["/OPM"]))
-        except Exception:
-            opm = 0
-        if opm == 1:
-            gs_dict["/OPM"] = 0
-            removed += 1
-            logger.debug("Set /OPM to 0 due to ICCBased CMYK with overprint enabled")
 
     # /TR2 is forbidden unless value is /Default
     if "/TR2" in gs_dict:
@@ -1200,7 +1243,7 @@ def _sanitize_gs_dict(gs_dict: Dictionary, reset_opm: bool) -> int:
     return removed
 
 
-def _process_extgstate_dict(extgstate_dict, reset_opm: bool) -> int:
+def _process_extgstate_dict(extgstate_dict) -> int:
     """Iterate all entries in an /ExtGState resource dictionary.
 
     Args:
@@ -1218,7 +1261,7 @@ def _process_extgstate_dict(extgstate_dict, reset_opm: bool) -> int:
     for gs_name in list(extgstate_dict.keys()):
         gs = _resolve_indirect(extgstate_dict[gs_name])
         if isinstance(gs, Dictionary):
-            removed += _sanitize_gs_dict(gs, reset_opm)
+            removed += _sanitize_gs_dict(gs)
 
     return removed
 
@@ -1291,7 +1334,7 @@ def _sanitize_shadings_in_resources(resources) -> int:
     return removed
 
 
-def _process_resources(resources, reset_opm: bool) -> int:
+def _process_resources(resources) -> int:
     """Extract /ExtGState from a Resources dictionary and process it.
 
     Args:
@@ -1308,12 +1351,39 @@ def _process_resources(resources, reset_opm: bool) -> int:
 
     extgstate = resources.get("/ExtGState")
     if extgstate:
-        removed += _process_extgstate_dict(extgstate, reset_opm)
+        removed += _process_extgstate_dict(extgstate)
+
+    # A shading pattern holds its ExtGState directly, not in a resource table.
+    patterns = _resolve_indirect(resources.get("/Pattern"))
+    if isinstance(patterns, Dictionary):
+        for pattern in patterns.values():
+            pattern = _resolve_indirect(pattern)
+            if isinstance(pattern, (Dictionary, Stream)):
+                state = _resolve_indirect(pattern.get("/ExtGState"))
+                if isinstance(state, Dictionary):
+                    removed += _sanitize_gs_dict(state)
 
     # Remove /TR and /TR2 from Shading dictionaries (ISO 19005-2, §6.2.5)
     removed += _sanitize_shadings_in_resources(resources)
 
     return removed
+
+
+def sanitize_overprint_usage(pdf: Pdf) -> int:
+    """Repair actual ICCBased CMYK overprint, including newly installed defaults.
+
+    Modify affected painting streams and their resources in place.
+
+    Returns:
+        Number of painting operations repaired, or zero when no repair is needed.
+
+    Raises:
+        ConversionError: If content cannot be safely analyzed or shared graphics
+            contexts require incompatible repairs.
+    """
+    if _pdf_uses_iccbased_cmyk(pdf) and _pdf_enables_overprint(pdf):
+        return sanitize_overprint(pdf)
+    return 0
 
 
 def sanitize_extgstate(pdf: Pdf) -> dict[str, int]:
@@ -1337,15 +1407,24 @@ def sanitize_extgstate(pdf: Pdf) -> dict[str, int]:
         pdf: Opened pikepdf PDF object (modified in place).
 
     Returns:
-        Dictionary with key 'extgstate_fixed': number of entries removed.
+        Dictionary with key 'extgstate_fixed': total dictionary fixes and
+        repaired painting operations.
+
+    Raises:
+        ConversionError: If overprint analysis cannot determine a safe repair.
+            Resource dictionary cleanup errors are caught and skipped instead.
     """
-    reset_opm = _pdf_uses_iccbased_cmyk(pdf) and _pdf_enables_overprint(pdf)
     total_removed = 0
     for resources in _iter_resource_dictionaries(pdf):
         try:
-            total_removed += _process_resources(resources, reset_opm)
+            total_removed += _process_resources(resources)
         except Exception as e:
             log_suppressed_error(logger, e, "Error sanitizing ExtGState: %s", e)
+
+    # Resource presence is only a cheap preflight. The overprint pass resolves
+    # actual graphics state at each paint and never edits shared /OPM entries.
+    # Keep ConversionError outside the best-effort dictionary cleanup above.
+    total_removed += sanitize_overprint_usage(pdf)
 
     if total_removed > 0:
         logger.info("ExtGState sanitized: %d forbidden entries removed", total_removed)
