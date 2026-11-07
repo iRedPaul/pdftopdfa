@@ -358,8 +358,11 @@ def _ocr_execution_provider_callback(
 )
 @click.option(
     "--convert-calibrated/--no-convert-calibrated",
-    default=True,
-    help="Convert CalGray/CalRGB color spaces to ICCBased (default: enabled)",
+    default=False,
+    help=(
+        "Deprecated compatibility option; CalGray/CalRGB calibration is always "
+        "preserved. --convert-calibrated emits a warning."
+    ),
 )
 @click.option(
     "--preserve-stamps",
@@ -650,7 +653,7 @@ def _convert_single_file(
     ocr_execution_provider: str = "cpu",
     ocr_layout: bool = False,
     ocr_figure_text: bool = False,
-    convert_calibrated: bool = True,
+    convert_calibrated: bool = False,
     preserve_stamps: bool = False,
     skip_any_pdfa: bool = False,
     allow_signature_invalidation: bool = False,
@@ -682,7 +685,8 @@ def _convert_single_file(
         ocr_layout: If True, order OCR lines by detected page columns.
         ocr_figure_text: If True, generate review-required Figure ActualText
             from sufficiently confident OCR.
-        convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
+        convert_calibrated: Deprecated compatibility option. If True, warn and
+            preserve CalGray/CalRGB calibration unchanged.
         preserve_stamps: If True, convert known proprietary stamp annotations
             to standard PDF Stamp annotations instead of flattening them.
         skip_any_pdfa: If True, skip files that veraPDF validates as
@@ -810,7 +814,7 @@ def _convert_directory(
     ocr_execution_provider: str = "cpu",
     ocr_layout: bool = False,
     ocr_figure_text: bool = False,
-    convert_calibrated: bool = True,
+    convert_calibrated: bool = False,
     preserve_stamps: bool = False,
     skip_any_pdfa: bool = False,
     allow_signature_invalidation: bool = False,
@@ -842,7 +846,8 @@ def _convert_directory(
         ocr_layout: If True, order OCR lines by detected page columns.
         ocr_figure_text: If True, generate review-required Figure ActualText
             from sufficiently confident OCR.
-        convert_calibrated: If True, convert CalGray/CalRGB to ICCBased.
+        convert_calibrated: Deprecated compatibility option. If True, warn and
+            preserve CalGray/CalRGB calibration unchanged.
         preserve_stamps: If True, convert known proprietary stamp annotations
             to standard PDF Stamp annotations instead of flattening them.
         skip_any_pdfa: If True, skip files that veraPDF validates as

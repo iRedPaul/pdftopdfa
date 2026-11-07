@@ -4,6 +4,9 @@
 
 """Tests for color space management and ICC profiles."""
 
+from decimal import Decimal
+from io import BytesIO
+
 import pikepdf
 import pytest
 from conftest import new_pdf
@@ -27,6 +30,10 @@ from pdftopdfa.color_profile import (
     get_profile_for_colorspace,
     get_srgb_profile,
     has_output_intent,
+)
+from pdftopdfa.color_profile._output_intents import (
+    _ICC_TAG_TYPES,
+    _has_usable_tag_table,
 )
 from pdftopdfa.exceptions import ConversionError
 
@@ -96,6 +103,16 @@ class TestICCProfileLoading:
         assert get_profile_for_colorspace(cs_type) == loader()
 
 
+def _icc_tag_data(tags: tuple[bytes, ...]) -> bytes:
+    """Build an ICC tag table followed by minimal elements of a permitted type."""
+    data_start = 132 + 12 * len(tags)
+    table = len(tags).to_bytes(4, "big") + b"".join(
+        tag + (data_start + 8 * index).to_bytes(4, "big") + (8).to_bytes(4, "big")
+        for index, tag in enumerate(tags)
+    )
+    return table + b"".join(_ICC_TAG_TYPES[tag][0] + bytes(4) for tag in tags)
+
+
 def _make_icc_profile(**overrides: bytes | int) -> bytes:
     """Build a minimal 128-byte ICC profile with optional field overrides.
 
@@ -105,8 +122,8 @@ def _make_icc_profile(**overrides: bytes | int) -> bytes:
         device_class (bytes): 4-byte class at offset 12-15
         colorspace (bytes): 4-byte color space signature at offset 16-19
     """
-    profile = bytearray(128)
-    profile[0:4] = (128).to_bytes(4, "big")
+    profile = bytearray(128) + _icc_tag_data((b"desc", b"cprt", b"wtpt", b"A2B0"))
+    profile[0:4] = len(profile).to_bytes(4, "big")
     profile[8] = overrides.get("version", 2)
     profile[12:16] = overrides.get("device_class", b"mntr")
     profile[16:20] = overrides.get("colorspace", b"RGB ")
@@ -735,6 +752,59 @@ class TestEmbedColorProfiles:
 
         assert result == []
 
+    def test_skip_does_not_validate_calibration(self) -> None:
+        """The do-nothing mode only rejects calibration once it would edit the PDF."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        embed_color_profiles(pdf, "2b")
+        page.Resources.ColorSpace = Dictionary(Bad=Array([Name.CalRGB, Dictionary()]))
+        intents = pdf.Root.OutputIntents.unparse()
+
+        assert embed_color_profiles(pdf, "2b", replace_existing=False) == []
+        assert pdf.Root.OutputIntents.unparse() == intents
+
+        with pytest.raises(ConversionError, match="invalid /WhitePoint"):
+            embed_color_profiles(pdf, "2b", replace_existing=True)
+
+    @pytest.mark.parametrize("shared", [True, False])
+    def test_redundant_pdfa_intents_collapse_to_the_first(self, shared) -> None:
+        """Identical profiles keep one PDF/A intent and every other subtype."""
+        pdf = new_pdf()
+        pdf.add_blank_page(page_size=(612, 792))
+
+        def profile():
+            stream = pdf.make_stream(_make_icc_profile())
+            stream[Name.N] = 3
+            return pdf.make_indirect(stream)
+
+        def intent(subtype, identifier, destination):
+            return pdf.make_indirect(
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=subtype,
+                    OutputConditionIdentifier=pikepdf.String(identifier),
+                    DestOutputProfile=destination,
+                )
+            )
+
+        first = profile()
+        pdf.Root.OutputIntents = Array(
+            [
+                intent(Name.GTS_PDFX, "Press", first),
+                intent(Name.GTS_PDFA1, "First", first),
+                intent(Name.GTS_PDFA1, "Second", first if shared else profile()),
+                intent(Name.GTS_PDFA1, "Third", first if shared else profile()),
+            ]
+        )
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        intents = pdf.Root.OutputIntents
+        assert [
+            (str(item.S), str(item.OutputConditionIdentifier)) for item in intents
+        ] == [("/GTS_PDFX", "Press"), ("/GTS_PDFA1", "First")]
+        assert len({item.DestOutputProfile.objgen for item in intents}) == 1
+
     def test_valid_existing_srgb_output_intent_is_preserved(self) -> None:
         """Valid existing sRGB PDF/A OutputIntent is not replaced."""
         pdf = new_pdf()
@@ -784,6 +854,178 @@ class TestEmbedColorProfiles:
         assert str(preserved["/OutputConditionIdentifier"]) == "Custom CMYK"
         assert bytes(preserved["/DestOutputProfile"].read_bytes()) == profile_data
         assert preserved["/DestOutputProfile"]["/N"] == 4
+
+    @pytest.mark.parametrize("with_profile", [False, True])
+    def test_undefined_intent_subtype_is_removed_alone(self, with_profile) -> None:
+        """Other output conditions stay, and its own profile causes no conflict."""
+        pdf = new_pdf()
+        stream = pdf.make_stream(_make_icc_profile())
+        stream[Name.N] = 3
+        other = bytearray(_make_icc_profile())
+        other[50:54] = b"diff"
+        undefined = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name.Bogus,
+            OutputConditionIdentifier=pikepdf.String("Undefined"),
+        )
+        if with_profile:
+            undefined.DestOutputProfile = pdf.make_stream(bytes(other))
+        pdf.Root.OutputIntents = Array(
+            [
+                undefined,
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.GTS_PDFA1,
+                    OutputConditionIdentifier=pikepdf.String("Keep"),
+                    DestOutputProfile=stream,
+                ),
+            ]
+        )
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        assert [str(i.OutputConditionIdentifier) for i in pdf.Root.OutputIntents] == [
+            "Keep"
+        ]
+
+    def test_only_undefined_intent_subtype_is_replaced(self) -> None:
+        """Without any defined condition, the document receives its PDF/A intent."""
+        pdf = new_pdf()
+        pdf.Root.OutputIntents = Array(
+            [
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.Bogus,
+                    OutputConditionIdentifier=pikepdf.String("Undefined"),
+                )
+            ]
+        )
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        assert [str(i.S) for i in pdf.Root.OutputIntents] == ["/GTS_PDFA1"]
+        assert "Undefined" not in [
+            str(i.OutputConditionIdentifier) for i in pdf.Root.OutputIntents
+        ]
+
+    @pytest.mark.parametrize("load", [get_srgb_profile, get_cmyk_profile])
+    def test_bundled_profiles_have_usable_tag_tables(self, load) -> None:
+        """Real profiles satisfy the checks made for existing output intents."""
+        assert _has_usable_tag_table(load())
+
+    @pytest.mark.parametrize(
+        "damage",
+        [
+            "header_only",
+            "count_exceeds_data",
+            "offset_in_table",
+            "data_past_end",
+            "short_tag",
+            "missing_description",
+            "no_color_model",
+            "wrong_element_type",
+            "empty_element_type",
+        ],
+    )
+    def test_existing_output_intent_needs_a_usable_tag_table(self, damage) -> None:
+        """A plausible header alone cannot retain an existing output condition."""
+        profile = bytearray(_make_icc_profile())
+        if damage == "header_only":
+            profile = profile[:128]
+        elif damage == "count_exceeds_data":
+            profile[128:132] = (1000).to_bytes(4, "big")
+        elif damage == "offset_in_table":
+            profile[136:140] = (4).to_bytes(4, "big")
+        elif damage == "data_past_end":
+            profile[140:144] = (1000).to_bytes(4, "big")
+        elif damage == "short_tag":
+            profile[140:144] = (4).to_bytes(4, "big")
+        elif damage == "missing_description":
+            profile[132:136] = b"none"
+        elif damage == "no_color_model":
+            profile[168:172] = b"none"
+        elif damage == "wrong_element_type":
+            profile[180:184] = b"curv"
+        else:
+            profile[180:188] = bytes(8)
+        profile[0:4] = len(profile).to_bytes(4, "big")
+        pdf = new_pdf()
+        stream = pdf.make_stream(bytes(profile))
+        stream[Name.N] = 3
+        pdf.Root.OutputIntents = Array(
+            [
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.GTS_PDFA1,
+                    OutputConditionIdentifier=pikepdf.String("Damaged"),
+                    DestOutputProfile=stream,
+                )
+            ]
+        )
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        replacement = pdf.Root.OutputIntents[0]
+        assert str(replacement.OutputConditionIdentifier) != "Damaged"
+        assert replacement.DestOutputProfile.read_bytes() != bytes(profile)
+
+    @pytest.mark.parametrize(
+        "colorspace,tags,usable",
+        [
+            (b"GRAY", (b"kTRC",), True),
+            (b"GRAY", (), False),
+            (
+                b"RGB ",
+                (b"rXYZ", b"gXYZ", b"bXYZ", b"rTRC", b"gTRC", b"bTRC"),
+                True,
+            ),
+            (b"RGB ", (b"rXYZ", b"gXYZ", b"bXYZ", b"rTRC", b"gTRC"), False),
+            (b"CMYK", (b"A2B0",), True),
+            (b"CMYK", (b"kTRC",), False),
+        ],
+    )
+    def test_output_profile_needs_its_color_model_tags(
+        self, colorspace, tags, usable
+    ) -> None:
+        """A matrix or tone-curve model is an alternative to a lookup table only."""
+        profile = bytearray(128) + _icc_tag_data((b"desc", b"cprt", b"wtpt", *tags))
+        profile[16:20] = colorspace
+        assert _has_usable_tag_table(bytes(profile)) is usable
+
+    @pytest.mark.parametrize(
+        "value", [Decimal("3.0"), Decimal("3.5"), True, Name.Three, 3]
+    )
+    def test_existing_output_intent_n_must_be_an_integer(self, value) -> None:
+        """A real /N is rewritten instead of being truncated and retained."""
+        pdf = new_pdf()
+        stream = pdf.make_stream(_make_icc_profile())
+        stream[Name.N] = value
+        pdf.Root.OutputIntents = Array(
+            [
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.GTS_PDFA1,
+                    OutputConditionIdentifier=pikepdf.String("Keep"),
+                    DestOutputProfile=stream,
+                )
+            ]
+        )
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        preserved = pdf.Root.OutputIntents[0]
+        assert str(preserved.OutputConditionIdentifier) == "Keep"
+        components = preserved.DestOutputProfile.N
+        assert isinstance(components, int) and not isinstance(components, bool)
+        assert components == 3
 
     def test_existing_output_intent_n_is_repaired(self) -> None:
         """Missing or wrong /N is repaired from the ICC color-space signature."""
@@ -899,8 +1141,8 @@ class TestEmbedColorProfiles:
         assert str(replacement["/OutputConditionIdentifier"]) == "sRGB"
         assert bytes(replacement["/DestOutputProfile"].read_bytes()) != profile_rgb
 
-    def test_multiple_identical_output_intents_kept(self) -> None:
-        """Multiple compatible OutputIntents are reduced to one PDF/A intent."""
+    def test_multiple_identical_output_intents_reduced(self) -> None:
+        """Identical PDF/A OutputIntents reduce to one retained entry."""
         pdf = new_pdf()
         profile_data = _make_icc_profile()
 
@@ -929,11 +1171,11 @@ class TestEmbedColorProfiles:
 
         embed_color_profiles(pdf, "2b", replace_existing=True)
 
-        # Should complete without error — profiles were identical
-        assert has_output_intent(pdf)
+        assert len(pdf.Root.OutputIntents) == 1
+        assert pdf.Root.OutputIntents[0].S == Name.GTS_PDFA1
 
     def test_multiple_different_output_intents_reduced(self) -> None:
-        """Different ICC profiles across OutputIntents keeps only the first."""
+        """Conflicting PDF/A and PDF/X profiles require a replacement condition."""
         pdf = new_pdf()
 
         # Two profiles with different bytes (different content)
@@ -967,7 +1209,8 @@ class TestEmbedColorProfiles:
 
         embed_color_profiles(pdf, "2b", replace_existing=True)
 
-        assert has_output_intent(pdf)
+        assert len(pdf.Root.OutputIntents) == 1
+        assert pdf.Root.OutputIntents[0].S == Name.GTS_PDFA1
 
     def test_different_profiles_triggers_warning(self, caplog) -> None:
         """Different ICC profiles across OutputIntents logs a warning."""
@@ -1007,7 +1250,7 @@ class TestEmbedColorProfiles:
         assert any("different ICC profiles" in r.message for r in caplog.records)
 
     def test_different_profiles_keeps_first_only(self) -> None:
-        """When profiles differ, only the first OutputIntent survives pruning."""
+        """Conflicting output conditions are replaced, not silently unified."""
         pdf = new_pdf()
 
         profile_a = _make_icc_profile()
@@ -1038,12 +1281,14 @@ class TestEmbedColorProfiles:
 
         embed_color_profiles(pdf, "2b", replace_existing=True)
 
-        # After the conflict-resolution step, only 1 OutputIntent remains
-        # (the embed step will then replace it with its own)
-        assert has_output_intent(pdf)
+        assert len(pdf.Root.OutputIntents) == 1
+        assert bytes(pdf.Root.OutputIntents[0].DestOutputProfile.read_bytes()) not in {
+            profile_a,
+            profile_b,
+        }
 
-    def test_output_intent_missing_profile_pruned(self) -> None:
-        """OutputIntent without DestOutputProfile triggers pruning."""
+    def test_additional_output_intent_without_profile_preserved(self) -> None:
+        """An additional registered condition need not embed another profile."""
         pdf = new_pdf()
 
         profile_a = _make_icc_profile()
@@ -1059,7 +1304,8 @@ class TestEmbedColorProfiles:
         oi2 = Dictionary(
             Type=Name.OutputIntent,
             S=Name("/GTS_PDFX"),
-            OutputConditionIdentifier=pikepdf.String("Custom"),
+            OutputConditionIdentifier=pikepdf.String("CGATS TR 001"),
+            RegistryName=pikepdf.String("http://www.color.org"),
         )
         pdf.Root.OutputIntents = Array([oi1, oi2])
 
@@ -1068,7 +1314,90 @@ class TestEmbedColorProfiles:
 
         embed_color_profiles(pdf, "2b", replace_existing=True)
 
-        assert has_output_intent(pdf)
+        assert len(pdf.Root.OutputIntents) == 2
+        assert pdf.Root.OutputIntents[1].S == Name.GTS_PDFX
+        assert "/DestOutputProfile" not in pdf.Root.OutputIntents[1]
+
+    @pytest.mark.parametrize(
+        "identifier,registry",
+        [
+            ("Custom", None),
+            ("custom", "http://www.color.org"),
+            (" CUSTOM ", None),
+            ("", None),
+            ("  ", "http://www.color.org"),
+            ("NotARegistryEntry", None),
+            ("NotARegistryEntry", " "),
+            ("FOGRA39 extra", None),
+        ],
+    )
+    def test_additional_intent_without_a_standard_condition_is_removed(
+        self, identifier, registry
+    ) -> None:
+        """A non-standard condition must embed its profile, and others stay intact."""
+        pdf = new_pdf()
+        stream = pdf.make_stream(_make_icc_profile())
+        stream[Name.N] = 3
+        unregistered = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name.GTS_PDFX,
+            OutputConditionIdentifier=pikepdf.String(identifier),
+        )
+        if registry is not None:
+            unregistered.RegistryName = pikepdf.String(registry)
+        pdf.Root.OutputIntents = Array(
+            [
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.GTS_PDFA1,
+                    OutputConditionIdentifier=pikepdf.String("Keep"),
+                    DestOutputProfile=stream,
+                ),
+                unregistered,
+            ]
+        )
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        assert [str(i.OutputConditionIdentifier) for i in pdf.Root.OutputIntents] == [
+            "Keep"
+        ]
+
+    @pytest.mark.parametrize(
+        "identifier,registry",
+        [
+            ("FOGRA39", None),
+            ("fogra 51", None),
+            ("IFRA26", None),
+            ("CGATS TR 006", None),
+            ("JC200103", None),
+            ("JCW2003", None),
+            ("Regional press condition", "http://www.color.org"),
+        ],
+    )
+    def test_additional_intent_naming_a_standard_condition_is_retained(
+        self, identifier, registry
+    ) -> None:
+        """A known family or a stated registry can be used instead of a profile."""
+        pdf = new_pdf()
+        pdf.add_blank_page(page_size=(612, 792))
+        intent = Dictionary(
+            Type=Name.OutputIntent,
+            S=Name.GTS_PDFX,
+            OutputConditionIdentifier=pikepdf.String(identifier),
+        )
+        if registry is not None:
+            intent.RegistryName = pikepdf.String(registry)
+        pdf.Root.OutputIntents = Array([intent])
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        assert [str(i.S) for i in pdf.Root.OutputIntents] == [
+            "/GTS_PDFX",
+            "/GTS_PDFA1",
+        ]
 
     def test_same_family_different_content_detected(self, caplog) -> None:
         """Profiles with same color space family but different content are flagged.
@@ -1140,7 +1469,7 @@ class TestEmbedColorProfiles:
         )
         oi2 = Dictionary(
             Type=Name.OutputIntent,
-            S=Name.GTS_PDFA1,
+            S=Name.GTS_PDFX,
             OutputConditionIdentifier=pikepdf.String("sRGB"),
             DestOutputProfile=stream2,
         )
@@ -1154,6 +1483,7 @@ class TestEmbedColorProfiles:
         from pdftopdfa.utils import resolve_indirect as _ri
 
         objgens = set()
+        assert len(pdf.Root.OutputIntents) == 2
         for oi in pdf.Root.OutputIntents:
             oi = _ri(oi)
             dest = oi.get("/DestOutputProfile")
@@ -1164,6 +1494,487 @@ class TestEmbedColorProfiles:
             f"Expected all DestOutputProfile entries to share one"
             f" indirect object, got {objgens}"
         )
+
+    @pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
+    @pytest.mark.parametrize("subtype", ["/GTS_PDFX", "/ISO_PDFE1"])
+    @pytest.mark.parametrize("separate_streams", [False, True])
+    def test_compatible_intents_preserve_metadata_after_reopen(
+        self, level, subtype, separate_streams
+    ):
+        """Preserve intents of other subtypes and unify identical ICC references."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page(page_size=(200, 200))
+        page.Contents = pdf.make_stream(b"0.5 g 0 0 200 200 re f")
+        profile = pdf.make_stream(get_srgb_profile())
+        profile.N = 3
+        other_profile = profile
+        if separate_streams:
+            other_profile = pdf.make_stream(get_srgb_profile())
+            other_profile.N = 3
+        pdf.Root.OutputIntents = Array(
+            [
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.GTS_PDFA1,
+                    OutputConditionIdentifier="Archive",
+                    Info="Archival output condition",
+                    DestOutputProfile=profile,
+                ),
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name(subtype),
+                    OutputConditionIdentifier="Press proof",
+                    OutputCondition="Retain this printing condition",
+                    RegistryName="https://example.com/conditions",
+                    Info="Separate output metadata",
+                    DestOutputProfile=other_profile,
+                ),
+            ]
+        )
+        embed_color_profiles(pdf, level)
+        saved = BytesIO()
+        pdf.save(saved)
+        with Pdf.open(saved) as restored:
+            first, second = restored.Root.OutputIntents
+            assert str(first.OutputConditionIdentifier) == "Archive"
+            assert str(second.S) == subtype
+            assert str(second.OutputConditionIdentifier) == "Press proof"
+            assert str(second.OutputCondition) == "Retain this printing condition"
+            assert str(second.RegistryName) == "https://example.com/conditions"
+            assert str(second.Info) == "Separate output metadata"
+            assert first.DestOutputProfile.objgen == second.DestOutputProfile.objgen
+            assert first.DestOutputProfile.read_bytes() == get_srgb_profile()
+
+    def test_compatible_pdfx_external_reference_removed_without_dropping_intent(self):
+        """Remove only the forbidden profile reference, retaining embedded data."""
+        pdf = new_pdf()
+        pdf.add_blank_page(page_size=(200, 200))
+        intent = create_output_intent_for_colorspace(
+            pdf, ColorSpaceType.DEVICE_RGB, get_srgb_profile()
+        )
+        pdfx = Dictionary(intent)
+        pdfx.S = Name.GTS_PDFX
+        pdfx.DestOutputProfileRef = Dictionary(URL="https://example.com/profile.icc")
+        pdf.Root.OutputIntents = Array([intent, pdfx])
+        embed_color_profiles(pdf, "2b")
+        assert len(pdf.Root.OutputIntents) == 2
+        assert pdf.Root.OutputIntents[1].S == Name.GTS_PDFX
+        assert "/DestOutputProfileRef" not in pdf.Root.OutputIntents[1]
+
+    @pytest.mark.parametrize("level", ["2b", "3b"])
+    @pytest.mark.parametrize("existing_pdfa", [False, True])
+    def test_converter_adds_pdfa_intent_without_losing_pdfx_condition(
+        self, tmp_path, level, existing_pdfa
+    ):
+        """A source PDF/X output condition survives complete PDF/A conversion."""
+        from pdftopdfa.converter import convert_to_pdfa
+        from pdftopdfa.verapdf import is_verapdf_available, validate_with_verapdf
+
+        pdf = new_pdf()
+        page = pdf.add_blank_page(page_size=(200, 200))
+        page.Contents = pdf.make_stream(b"0.5 g 0 0 200 200 re f")
+        pdfx = create_output_intent_for_colorspace(
+            pdf, ColorSpaceType.DEVICE_RGB, get_srgb_profile()
+        )
+        pdfx.S = Name.GTS_PDFX
+        pdfx.OutputConditionIdentifier = "Original print condition"
+        pdfx.Info = "Keep original printing information"
+        pdf.Root.OutputIntents = Array([pdf.make_indirect(pdfx)])
+        if existing_pdfa:
+            pdfa = Dictionary(pdfx)
+            pdfa.S = Name.GTS_PDFA1
+            pdf.Root.OutputIntents.append(pdf.make_indirect(pdfa))
+        source = tmp_path / "source.pdf"
+        output = tmp_path / "output.pdf"
+        pdf.save(source)
+        result = convert_to_pdfa(source, output, level=level)
+        assert result.success and result.target_produced and not result.skipped, result
+        with Pdf.open(output) as restored:
+            first, second = restored.Root.OutputIntents
+            assert first.S == Name.GTS_PDFX
+            assert str(first.OutputConditionIdentifier) == "Original print condition"
+            assert str(first.Info) == "Keep original printing information"
+            assert second.S == Name.GTS_PDFA1
+            assert first.DestOutputProfile.objgen == second.DestOutputProfile.objgen
+            assert first.DestOutputProfile.read_bytes() == get_srgb_profile()
+        if is_verapdf_available():
+            validation = validate_with_verapdf(output, flavour=level)
+            assert validation.compliant, validation.failed_rules
+
+    @pytest.mark.parametrize("level", ["2b", "3b"])
+    @pytest.mark.parametrize("subtype", ["/GTS_PDFX", "/ISO_PDFE1"])
+    def test_converter_preserves_registered_output_condition(
+        self, tmp_path, level, subtype
+    ):
+        """Adding an embedded profile retains an existing registered condition."""
+        from pdftopdfa.converter import convert_to_pdfa
+        from pdftopdfa.verapdf import is_verapdf_available, validate_with_verapdf
+
+        pdf = new_pdf()
+        page = pdf.add_blank_page(page_size=(200, 200))
+        page.Contents = pdf.make_stream(b"0 1 0 0 k 0 0 200 200 re f")
+        pdf.Root.OutputIntents = Array(
+            [
+                pdf.make_indirect(
+                    Dictionary(
+                        Type=Name.OutputIntent,
+                        S=Name(subtype),
+                        OutputConditionIdentifier="FOGRA39",
+                        RegistryName="http://www.color.org",
+                        Info="Original registered printing condition",
+                    )
+                )
+            ]
+        )
+        source = tmp_path / "source.pdf"
+        output = tmp_path / "output.pdf"
+        pdf.save(source)
+
+        result = convert_to_pdfa(source, output, level=level)
+        assert result.success and result.target_produced and not result.skipped, result
+        with Pdf.open(output) as restored:
+            original, added = restored.Root.OutputIntents
+            assert str(original.S) == subtype
+            assert str(original.OutputConditionIdentifier) == "FOGRA39"
+            assert str(original.RegistryName) == "http://www.color.org"
+            assert str(original.Info) == "Original registered printing condition"
+            assert "/DestOutputProfile" not in original
+            assert added.S == Name.GTS_PDFA1
+            assert added.DestOutputProfile.N == 4
+        if is_verapdf_available():
+            validation = validate_with_verapdf(output, flavour=level)
+            assert validation.compliant, validation.failed_rules
+
+
+class TestPreservedColorValidation:
+    """Preserved dictionaries and color spaces still have to be well formed."""
+
+    @pytest.mark.parametrize(
+        "location", ["catalog", "resources", "calibration", "image"]
+    )
+    def test_private_arrays_are_not_interpreted_as_color_spaces(self, location):
+        """A color-like first name does not change private objects' semantics."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        payload = Array([Name.CalRGB, "Private data, not calibration"])
+        if location == "catalog":
+            pdf.Root.AcmePrivate = Dictionary(Payload=payload)
+        elif location == "resources":
+            page.Resources.AcmePrivate = Dictionary(Payload=payload)
+        elif location == "calibration":
+            cs = TestCalibratedPreservation._colorspace("CalRGB")
+            cs[1].AcmePrivate = payload
+            page.Resources.ColorSpace = Dictionary(Cal=cs)
+        else:
+            image = pdf.make_stream(b"\x80")
+            image.Subtype = Name.Image
+            image.ColorSpace = Name.DeviceGray
+            image.AcmePrivate = payload
+            image.Resources = Dictionary(ColorSpace=Dictionary(Private=payload))
+            page.Resources.XObject = Dictionary(Im=image)
+        expected = payload.unparse()
+        embed_color_profiles(pdf)
+        assert payload.unparse() == expected
+
+    @pytest.mark.parametrize(
+        "location",
+        ["shading", "type3", "page_group", "appearance_group", "indexed_image", "form"],
+    )
+    def test_invalid_calibration_is_found_in_typed_contexts(self, location):
+        """All actual nested color contexts retain calibration validation."""
+        pdf = new_pdf()
+        TestCalibratedPreservation._add_colorspace(
+            pdf, Array([Name.CalRGB, Dictionary()]), location
+        )
+        with pytest.raises(ConversionError, match="invalid /WhitePoint"):
+            embed_color_profiles(pdf)
+
+    @pytest.mark.parametrize("location", ["form", "field", "nested_field"])
+    def test_invalid_calibration_in_form_resources_is_rejected(self, location):
+        """Default form resources are reachable without any page referring to them."""
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        resources = Dictionary(
+            ColorSpace=Dictionary(CS=Array([Name.CalRGB, Dictionary()]))
+        )
+        field = pdf.make_indirect(Dictionary(T="Field"))
+        pdf.Root.AcroForm = Dictionary(Fields=Array([field]))
+        if location == "form":
+            pdf.Root.AcroForm.DR = resources
+        elif location == "field":
+            field.DR = resources
+        else:
+            child = pdf.make_indirect(Dictionary(T="Child", Parent=field, DR=resources))
+            field.Kids = Array([child])
+        with pytest.raises(ConversionError, match="invalid /WhitePoint"):
+            embed_color_profiles(pdf)
+
+    def test_valid_form_resources_and_cyclic_fields_are_accepted(self):
+        """Traversing the field tree terminates and does not reject valid resources."""
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        field = pdf.make_indirect(Dictionary(T="Field"))
+        field.Kids = Array([field])
+        pdf.Root.AcroForm = Dictionary(
+            Fields=Array([field]),
+            DR=Dictionary(
+                ColorSpace=Dictionary(
+                    CS=TestCalibratedPreservation._colorspace("CalRGB")
+                )
+            ),
+        )
+        embed_color_profiles(pdf)
+
+    def test_invalid_calibration_in_shading_pattern_soft_mask_is_rejected(self):
+        """A pattern's ExtGState holds its mask group outside any resource table."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        mask = pdf.make_stream(b"0 0 20 20 re f")
+        mask.Subtype = Name.Form
+        mask.BBox = Array([0, 0, 20, 20])
+        mask.Resources = Dictionary(
+            ColorSpace=Dictionary(CS=Array([Name.CalRGB, Dictionary()]))
+        )
+        page.Resources.Pattern = Dictionary(
+            P=Dictionary(
+                PatternType=2,
+                ExtGState=Dictionary(SMask=Dictionary(S=Name.Alpha, G=mask)),
+                Shading=Dictionary(ShadingType=2, ColorSpace=Name.DeviceGray),
+            )
+        )
+        with pytest.raises(ConversionError, match="invalid /WhitePoint"):
+            embed_color_profiles(pdf)
+
+    @staticmethod
+    def _inline_image_owner(pdf, page, location, data):
+        """Place inline image content in the requested typed painting context."""
+        if location == "page":
+            page.Contents = pdf.make_stream(data)
+            return
+        program = pdf.make_stream(data)
+        if location == "form":
+            program.Subtype = Name.Form
+            program.BBox = Array([0, 0, 10, 10])
+            page.Resources.XObject = Dictionary(Fm=program)
+        elif location == "pattern":
+            program.PatternType = 1
+            program.PaintType = 1
+            program.TilingType = 1
+            program.BBox = Array([0, 0, 10, 10])
+            program.XStep = program.YStep = 10
+            program.Resources = Dictionary()
+            page.Resources.Pattern = Dictionary(P=program)
+        else:
+            page.Resources.Font = Dictionary(
+                F=Dictionary(
+                    Subtype=Name.Type3,
+                    FontBBox=Array([0, 0, 10, 10]),
+                    FontMatrix=Array([1, 0, 0, 1, 0, 0]),
+                    CharProcs=Dictionary(a=program),
+                    Encoding=Dictionary(Differences=Array([97, Name.a])),
+                    FirstChar=97,
+                    LastChar=97,
+                    Widths=Array([10]),
+                )
+            )
+
+    @pytest.mark.parametrize("location", ["page", "form", "pattern", "type3"])
+    @pytest.mark.parametrize(
+        "space",
+        [
+            b"[/CalRGB << >>]",
+            b"[/CalGray << >>]",
+            b"[/I [/CalRGB << >>] 0 <000000>]",
+            b"[/Indexed [/CalRGB << >>] 0 <000000>]",
+        ],
+    )
+    def test_invalid_calibration_in_inline_images_is_rejected(self, location, space):
+        """Directly declared inline-image spaces have no resource entry to check."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        self._inline_image_owner(
+            pdf,
+            page,
+            location,
+            b"BI /W 1 /H 1 /BPC 8 /CS " + space + b" ID \x80\x80\x80 EI",
+        )
+        with pytest.raises(ConversionError, match="invalid /WhitePoint"):
+            embed_color_profiles(pdf)
+
+    def test_inline_image_divided_between_content_streams_is_checked(self):
+        """A page's /Contents array is interpreted as one concatenated stream."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        page.Contents = Array(
+            [
+                pdf.make_stream(b"q BI"),
+                pdf.make_stream(
+                    b"/W 1 /H 1 /BPC 8 /CS [/CalRGB << >>] ID \x80\x80\x80 EI Q"
+                ),
+            ]
+        )
+        with pytest.raises(ConversionError, match="invalid /WhitePoint"):
+            embed_color_profiles(pdf)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"BI /W 1 /H 1 /BPC 8 /CS /RGB ID \x80\x80\x80 EI",
+            b"BI /W 1 /H 1 /BPC 8 /CS [/I /RGB 0 <000000>] ID \x80 EI",
+            b"BI /W 1 /H 1 /BPC 8 /CS [/CalRGB << /WhitePoint [1 1 1] >>]"
+            b" ID \x80\x80\x80 EI",
+            b"(/CalRGB BI) Tj",
+            b"BI /CalRGB ( unterminated",
+        ],
+    )
+    def test_valid_or_unrelated_inline_content_is_accepted(self, data):
+        """Unrelated text and content that cannot be parsed are not calibrations."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        page.Contents = pdf.make_stream(data)
+        embed_color_profiles(pdf)
+        assert page.Contents.read_bytes() == data
+
+    def test_private_array_survives_full_conversion(self, tmp_path):
+        """Unrelated extension data cannot cause the original-input fallback."""
+        from pdftopdfa.converter import convert_to_pdfa
+
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        pdf.Root.AcmePrivate = Dictionary(Payload=Array([Name.CalGray, 42]))
+        source, output = tmp_path / "private.pdf", tmp_path / "converted.pdf"
+        pdf.save(source)
+        result = convert_to_pdfa(source, output)
+        assert result.target_produced and not result.skipped
+        with Pdf.open(output) as restored:
+            assert list(restored.Root.AcmePrivate.Payload) == [Name.CalGray, 42]
+
+    @pytest.mark.parametrize("profiled", [False, True])
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("/Type", Name.Other),
+            ("/OutputConditionIdentifier", None),
+            ("/OutputConditionIdentifier", 42),
+            ("/Info", Name.Bad),
+            ("/RegistryName", 42),
+        ],
+    )
+    def test_malformed_additional_intent_is_replaced(
+        self, profiled, key, value
+    ) -> None:
+        """A registered printing condition cannot bypass dictionary validation."""
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        intent = pdf.make_indirect(
+            Dictionary(
+                Type=Name.OutputIntent,
+                S=Name.GTS_PDFX,
+                OutputConditionIdentifier="Original",
+            )
+        )
+        if profiled:
+            intent.DestOutputProfile = pdf.make_stream(get_srgb_profile())
+            intent.DestOutputProfile.N = 3
+        if value is None:
+            del intent[key]
+        else:
+            intent[key] = value
+        pdf.Root.OutputIntents = Array([intent])
+        embed_color_profiles(pdf)
+        assert len(pdf.Root.OutputIntents) == 1
+        replacement = pdf.Root.OutputIntents[0]
+        assert replacement.objgen != intent.objgen
+        assert replacement.Type == Name.OutputIntent and replacement.S == Name.GTS_PDFA1
+        assert isinstance(replacement.OutputConditionIdentifier, pikepdf.String)
+
+    @pytest.mark.parametrize("profiled", [False, True])
+    def test_optional_output_intent_type_can_be_absent(self, profiled) -> None:
+        """ISO 32000-1 Table 365 permits an omitted OutputIntent /Type."""
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        intent = pdf.make_indirect(
+            Dictionary(S=Name.GTS_PDFX, OutputConditionIdentifier="FOGRA39")
+        )
+        if profiled:
+            intent.DestOutputProfile = pdf.make_stream(get_cmyk_profile())
+            intent.DestOutputProfile.N = 4
+        pdf.Root.OutputIntents = Array([intent])
+        embed_color_profiles(pdf)
+        assert len(pdf.Root.OutputIntents) == 2
+        assert pdf.Root.OutputIntents[0].objgen == intent.objgen
+        assert "/Type" not in pdf.Root.OutputIntents[0]
+
+    @pytest.mark.parametrize(
+        "kind,key,value",
+        [
+            ("CalGray", "/WhitePoint", None),
+            ("CalRGB", "/WhitePoint", Array([1, 1])),
+            ("CalGray", "/WhitePoint", Array([0, 1, 1])),
+            ("CalRGB", "/WhitePoint", Array([1, 2, 1])),
+            ("CalGray", "/BlackPoint", Array([-1, 0, 0])),
+            ("CalGray", "/Gamma", 0),
+            ("CalGray", "/Gamma", True),
+            ("CalRGB", "/Gamma", Array([1, 2])),
+            ("CalRGB", "/Gamma", Array([0, 1, 1])),
+            ("CalRGB", "/Gamma", Array([1, 1, -1])),
+            ("CalRGB", "/Matrix", Array([1, 2])),
+        ],
+    )
+    @pytest.mark.parametrize("option", [False, True])
+    def test_malformed_calibration_cannot_be_preserved(
+        self, kind, key, value, option
+    ) -> None:
+        """Both option paths reject invalid calibration before preserving it."""
+        pdf = new_pdf()
+        cs = TestCalibratedPreservation._colorspace(kind)
+        if value is None:
+            del cs[1][key]
+        else:
+            cs[1][key] = value
+        page = pdf.add_blank_page()
+        page.Resources.ColorSpace = Dictionary(Cal=cs)
+        with pytest.raises(ConversionError, match="Malformed /Cal"):
+            embed_color_profiles(pdf, convert_calibrated=option)
+
+    @pytest.mark.parametrize("kind", ["CalGray", "CalRGB"])
+    def test_invalid_calibration_uses_original_input_fallback(
+        self, kind, tmp_path
+    ) -> None:
+        """Report invalid calibration without publishing a claimed PDF/A target."""
+        from pdftopdfa.converter import convert_to_pdfa
+
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        page.Resources.ColorSpace = Dictionary(
+            Cal=Array([Name("/" + kind), Dictionary()])
+        )
+        page.Contents = pdf.make_stream(b"/Cal cs 0.5 scn 0 0 100 100 re f")
+        source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+        pdf.save(source)
+        result = convert_to_pdfa(source, output)
+        assert result.skipped and not result.target_produced
+        assert output.read_bytes() == source.read_bytes()
+        assert any("Malformed /Cal" in warning for warning in result.warnings)
+
+    @pytest.mark.parametrize(
+        "key,color,expected",
+        [
+            ("/C", [0, 1, 0, 0], ColorSpaceType.DEVICE_CMYK),
+            ("/IC", [0, 1, 0], ColorSpaceType.DEVICE_RGB),
+            ("/C", [0.5], ColorSpaceType.DEVICE_GRAY),
+        ],
+    )
+    def test_annotation_color_without_appearance_is_detected(
+        self, key, color, expected
+    ) -> None:
+        """Border and interior arrays contribute their device color space."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        annotation = Dictionary(Subtype=Name.Link if key == "/C" else Name.Square)
+        annotation[key] = Array(color)
+        page.Annots = Array([pdf.make_indirect(annotation)])
+        assert expected in detect_color_spaces(pdf).detected_spaces
 
 
 class TestDefaultColorSpaces:
@@ -3319,544 +4130,181 @@ class TestCalibratedColorSpaces:
         assert analysis.detected_spaces == set()
 
 
-class TestCalibratedConversion:
-    """Tests for CalGray/CalRGB → ICCBased conversion."""
+class TestCalibratedPreservation:
+    """PDF/A conversion must retain the actual CalGray/CalRGB calibration."""
 
-    def _make_cal_gray(self) -> Array:
-        """Create a CalGray color space array."""
-        return Array(
-            [
-                Name.CalGray,
-                Dictionary(WhitePoint=Array([1, 1, 1]), Gamma=1),
-            ]
+    @staticmethod
+    def _colorspace(kind):
+        """Build a calibrated space with nondefault gamma and colorimetry."""
+        params = Dictionary(
+            WhitePoint=Array([0.9505, 1, 1.089]),
+            BlackPoint=Array([0, 0, 0]),
         )
-
-    def _make_cal_rgb(self) -> Array:
-        """Create a CalRGB color space array."""
-        return Array(
-            [
-                Name.CalRGB,
-                Dictionary(
-                    WhitePoint=Array([1, 1, 1]),
-                    Matrix=Array([1, 0, 0, 0, 1, 0, 0, 0, 1]),
-                ),
-            ]
-        )
-
-    def test_cal_gray_image_converted(self):
-        """CalGray image color space is converted to ICCBased(N=1)."""
-        pdf = new_pdf()
-        image = pdf.make_stream(b"\x80")
-        image[Name.Type] = Name.XObject
-        image[Name.Subtype] = Name.Image
-        image[Name.Width] = 1
-        image[Name.Height] = 1
-        image[Name.ColorSpace] = self._make_cal_gray()
-        image[Name.BitsPerComponent] = 8
-
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(XObject=Dictionary(Im0=image)),
-        )
-        page_dict[Name.Contents] = pdf.make_stream(
-            b"q 100 0 0 100 100 600 cm /Im0 Do Q"
-        )
-        pdf.pages.append(pikepdf.Page(page_dict))
-
-        cache: dict[ColorSpaceType, pikepdf.Stream] = {}
-        replaced = _convert_calibrated_colorspaces(pdf, cache)
-        assert replaced == 1
-        cs = image[Name.ColorSpace]
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
-        assert int(cs[1][Name.N]) == 1
-
-    def test_cal_rgb_image_converted(self):
-        """CalRGB image color space is converted to ICCBased(N=3)."""
-        pdf = new_pdf()
-        image = pdf.make_stream(b"\x80\x80\x80")
-        image[Name.Type] = Name.XObject
-        image[Name.Subtype] = Name.Image
-        image[Name.Width] = 1
-        image[Name.Height] = 1
-        image[Name.ColorSpace] = self._make_cal_rgb()
-        image[Name.BitsPerComponent] = 8
-
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(XObject=Dictionary(Im0=image)),
-        )
-        page_dict[Name.Contents] = pdf.make_stream(
-            b"q 100 0 0 100 100 600 cm /Im0 Do Q"
-        )
-        pdf.pages.append(pikepdf.Page(page_dict))
-
-        cache: dict[ColorSpaceType, pikepdf.Stream] = {}
-        replaced = _convert_calibrated_colorspaces(pdf, cache)
-        assert replaced == 1
-        cs = image[Name.ColorSpace]
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
-        assert int(cs[1][Name.N]) == 3
-
-    def test_lab_unchanged(self):
-        """Lab color spaces are not converted."""
-        pdf = new_pdf()
-        lab_cs = Array(
-            [
-                Name.Lab,
-                Dictionary(WhitePoint=Array([1, 1, 1])),
-            ]
-        )
-        image = pdf.make_stream(b"\x80\x80\x80")
-        image[Name.Type] = Name.XObject
-        image[Name.Subtype] = Name.Image
-        image[Name.Width] = 1
-        image[Name.Height] = 1
-        image[Name.ColorSpace] = lab_cs
-        image[Name.BitsPerComponent] = 8
-
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(XObject=Dictionary(Im0=image)),
-        )
-        page_dict[Name.Contents] = pdf.make_stream(
-            b"q 100 0 0 100 100 600 cm /Im0 Do Q"
-        )
-        pdf.pages.append(pikepdf.Page(page_dict))
-
-        cache: dict[ColorSpaceType, pikepdf.Stream] = {}
-        replaced = _convert_calibrated_colorspaces(pdf, cache)
-        assert replaced == 0
-        cs = image[Name.ColorSpace]
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.Lab
-
-    def test_flag_disabled_no_conversion(self):
-        """When convert_calibrated is False, Cal* spaces are untouched."""
-        pdf = new_pdf()
-        image = pdf.make_stream(b"\x80\x80\x80")
-        image[Name.Type] = Name.XObject
-        image[Name.Subtype] = Name.Image
-        image[Name.Width] = 1
-        image[Name.Height] = 1
-        image[Name.ColorSpace] = self._make_cal_rgb()
-        image[Name.BitsPerComponent] = 8
-
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(XObject=Dictionary(Im0=image)),
-        )
-        page_dict[Name.Contents] = pdf.make_stream(
-            b"q 100 0 0 100 100 600 cm /Im0 Do Q"
-        )
-        pdf.pages.append(pikepdf.Page(page_dict))
-
-        embed_color_profiles(pdf, "3b", convert_calibrated=False)
-        cs = image[Name.ColorSpace]
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.CalRGB
-
-    def test_indexed_with_cal_base(self):
-        """Indexed color space with CalGray/CalRGB base is converted."""
-        pdf = new_pdf()
-        cal_rgb = self._make_cal_rgb()
-        indexed_cs = Array(
-            [
-                Name.Indexed,
-                cal_rgb,
-                1,
-                pdf.make_stream(b"\xff\x00\x00\x00\xff\x00"),
-            ]
-        )
-        image = pdf.make_stream(b"\x00")
-        image[Name.Type] = Name.XObject
-        image[Name.Subtype] = Name.Image
-        image[Name.Width] = 1
-        image[Name.Height] = 1
-        image[Name.ColorSpace] = indexed_cs
-        image[Name.BitsPerComponent] = 8
-
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(XObject=Dictionary(Im0=image)),
-        )
-        page_dict[Name.Contents] = pdf.make_stream(
-            b"q 100 0 0 100 100 600 cm /Im0 Do Q"
-        )
-        pdf.pages.append(pikepdf.Page(page_dict))
-
-        cache: dict[ColorSpaceType, pikepdf.Stream] = {}
-        replaced = _convert_calibrated_colorspaces(pdf, cache)
-        assert replaced == 1
-        cs = image[Name.ColorSpace]
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.Indexed
-        base = cs[1]
-        assert isinstance(base, Array)
-        assert base[0] == Name.ICCBased
-        assert int(base[1][Name.N]) == 3
-
-    def test_named_colorspace_entry(self):
-        """CalRGB in a named ColorSpace dictionary entry is converted."""
-        pdf = new_pdf()
-        cs_dict = Dictionary(CS0=self._make_cal_rgb())
-
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(ColorSpace=cs_dict),
-        )
-        page_dict[Name.Contents] = pdf.make_stream(b"")
-        pdf.pages.append(pikepdf.Page(page_dict))
-
-        cache: dict[ColorSpaceType, pikepdf.Stream] = {}
-        replaced = _convert_calibrated_colorspaces(pdf, cache)
-        assert replaced == 1
-        cs = cs_dict[Name("/CS0")]
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
-
-    def test_shading_colorspace(self):
-        """CalRGB in a Shading dictionary is converted."""
-        pdf = new_pdf()
-        shading = Dictionary(
-            ShadingType=2,
-            ColorSpace=self._make_cal_rgb(),
-            Coords=Array([0, 0, 100, 100]),
-            Function=Dictionary(
-                FunctionType=2,
-                Domain=Array([0, 1]),
-                C0=Array([1, 0, 0]),
-                C1=Array([0, 0, 1]),
-                N=1,
-            ),
-        )
-        shadings_dict = Dictionary(Sh0=shading)
-
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(Shading=shadings_dict),
-        )
-        page_dict[Name.Contents] = pdf.make_stream(b"")
-        pdf.pages.append(pikepdf.Page(page_dict))
-
-        cache: dict[ColorSpaceType, pikepdf.Stream] = {}
-        replaced = _convert_calibrated_colorspaces(pdf, cache)
-        assert replaced == 1
-        cs = shading[Name.ColorSpace]
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
-        assert int(cs[1][Name.N]) == 3
-
-    def test_cal_rgb_in_form_xobject(self):
-        """CalRGB inside a Form XObject's resources is converted."""
-        pdf = new_pdf()
-
-        # Create an image with CalRGB inside a Form XObject
-        image = pdf.make_stream(b"\x80\x80\x80")
-        image[Name.Type] = Name.XObject
-        image[Name.Subtype] = Name.Image
-        image[Name.Width] = 1
-        image[Name.Height] = 1
-        image[Name.ColorSpace] = self._make_cal_rgb()
-        image[Name.BitsPerComponent] = 8
-
-        form = pdf.make_stream(b"q 100 0 0 100 0 0 cm /Im0 Do Q")
-        form[Name.Type] = Name.XObject
-        form[Name.Subtype] = Name.Form
-        form[Name.BBox] = Array([0, 0, 100, 100])
-        form[Name.Resources] = Dictionary(
-            XObject=Dictionary(Im0=image),
-        )
-
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(XObject=Dictionary(Fm0=form)),
-        )
-        page_dict[Name.Contents] = pdf.make_stream(b"q 1 0 0 1 0 0 cm /Fm0 Do Q")
-        pdf.pages.append(pikepdf.Page(page_dict))
-
-        cache: dict[ColorSpaceType, pikepdf.Stream] = {}
-        replaced = _convert_calibrated_colorspaces(pdf, cache)
-        assert replaced == 1
-        cs = image[Name.ColorSpace]
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
-        assert int(cs[1][Name.N]) == 3
-
-    def test_cal_rgb_through_1200_alternating_resource_owners(self):
-        """Deep Form, Pattern, and Type3 resource graphs are iterative."""
-        pdf = new_pdf()
-        leaf_colorspaces = Dictionary(Deep=self._make_cal_rgb())
-        resources = Dictionary(ColorSpace=leaf_colorspaces)
-
-        for depth in range(1200):
-            owner_type = depth % 3
-            if owner_type == 0:
-                owner = pdf.make_stream(b"")
-                owner[Name.Type] = Name.XObject
-                owner[Name.Subtype] = Name.Form
-                owner[Name.BBox] = Array([0, 0, 1, 1])
-                owner[Name.Resources] = resources
-                resources = Dictionary(XObject=Dictionary(Node=owner))
-            elif owner_type == 1:
-                owner = pdf.make_stream(b"")
-                owner[Name.Type] = Name.Pattern
-                owner[Name.PatternType] = 1
-                owner[Name.Resources] = resources
-                resources = Dictionary(Pattern=Dictionary(Node=owner))
-            else:
-                owner = pdf.make_indirect(
-                    Dictionary(
-                        Type=Name.Font,
-                        Subtype=Name.Type3,
-                        Resources=resources,
-                    )
-                )
-                resources = Dictionary(Font=Dictionary(Node=owner))
-
-        page = pdf.add_blank_page()
-        page[Name.Resources] = resources
-
-        cache: dict[ColorSpaceType, pikepdf.Stream] = {}
-        replaced = _convert_calibrated_colorspaces(pdf, cache)
-
-        assert replaced == 1
-        assert leaf_colorspaces[Name.Deep][0] == Name.ICCBased
-
-    def test_alternating_resource_owner_cycle(self):
-        """Form, Pattern, and Type3 resource cycles terminate."""
-        pdf = new_pdf()
-        form = pdf.make_stream(b"")
-        form[Name.Type] = Name.XObject
-        form[Name.Subtype] = Name.Form
-        form[Name.BBox] = Array([0, 0, 1, 1])
-
-        pattern = pdf.make_stream(b"")
-        pattern[Name.Type] = Name.Pattern
-        pattern[Name.PatternType] = 1
-
-        font = pdf.make_indirect(
-            Dictionary(
-                Type=Name.Font,
-                Subtype=Name.Type3,
+        if kind == "CalGray":
+            params.Gamma = 1.6
+        else:
+            params.Gamma = Array([1.3, 1.8, 2.2])
+            params.Matrix = Array(
+                [0.4124, 0.2126, 0.0193, 0.3576, 0.7152, 0.1192, 0.1805, 0.0722, 0.9505]
             )
-        )
-        leaf_colorspaces = Dictionary(Deep=self._make_cal_rgb())
-        form[Name.Resources] = Dictionary(Pattern=Dictionary(Node=pattern))
-        pattern[Name.Resources] = Dictionary(Font=Dictionary(Node=font))
-        font[Name.Resources] = Dictionary(
-            ColorSpace=leaf_colorspaces,
-            XObject=Dictionary(Node=form),
-        )
+        return Array([Name("/" + kind), params])
 
+    @staticmethod
+    def _add_colorspace(pdf, cs, location):
+        """Install a calibrated space in the requested nested resource context."""
         page = pdf.add_blank_page()
-        page[Name.Resources] = Dictionary(XObject=Dictionary(Node=form))
+        if location == "named":
+            page.Resources.ColorSpace = Dictionary(CS0=cs)
+            return page.Resources.ColorSpace, Name.CS0
+        if location in ("image", "indexed_image", "form"):
+            image = pdf.make_stream(b"\x80\x40\x20")
+            image.Type = Name.XObject
+            image.Subtype = Name.Image
+            image.Width = 1
+            image.Height = 1
+            image.BitsPerComponent = 8
+            image.ColorSpace = cs
+            if location == "indexed_image":
+                image.ColorSpace = Array([Name.Indexed, cs, 0, "palette"])
+            if location == "form":
+                form = pdf.make_stream(b"/Im0 Do")
+                form.Type = Name.XObject
+                form.Subtype = Name.Form
+                form.BBox = Array([0, 0, 100, 100])
+                form.Resources = Dictionary(XObject=Dictionary(Im0=image))
+                page.Resources.XObject = Dictionary(Fm0=form)
+            else:
+                page.Resources.XObject = Dictionary(Im0=image)
+            if location == "indexed_image":
+                return image.ColorSpace, 1
+            return image, Name.ColorSpace
+        if location == "shading":
+            shading = Dictionary(ShadingType=2, ColorSpace=cs)
+            page.Resources.Shading = Dictionary(Sh0=shading)
+            return page.Resources.Shading.Sh0, Name.ColorSpace
+        if location == "type3":
+            font = pdf.make_indirect(
+                Dictionary(
+                    Type=Name.Font,
+                    Subtype=Name.Type3,
+                    Resources=Dictionary(ColorSpace=Dictionary(CS0=cs)),
+                )
+            )
+            page.Resources.Font = Dictionary(F0=font)
+            return font.Resources.ColorSpace, Name.CS0
+        if location == "page_group":
+            page.Group = Dictionary(S=Name.Transparency, CS=cs)
+            return page.Group, Name.CS
+        form = pdf.make_stream(b"q Q")
+        form.Type = Name.XObject
+        form.Subtype = Name.Form
+        form.BBox = Array([0, 0, 100, 100])
+        form.Group = Dictionary(S=Name.Transparency, CS=cs)
+        if location == "form_group":
+            page.Resources.XObject = Dictionary(Fm0=form)
+        else:
+            page.Annots = Array(
+                [
+                    pdf.make_indirect(
+                        Dictionary(
+                            Type=Name.Annot,
+                            Subtype=Name.Stamp,
+                            Rect=Array([0, 0, 100, 100]),
+                            AP=Dictionary(N=form),
+                        )
+                    )
+                ]
+            )
+        return form.Group, Name.CS
 
-        cache: dict[ColorSpaceType, pikepdf.Stream] = {}
-        replaced = _convert_calibrated_colorspaces(pdf, cache)
+    @pytest.mark.parametrize("kind", ["CalGray", "CalRGB"])
+    @pytest.mark.parametrize(
+        "location",
+        [
+            "named",
+            "image",
+            "indexed_image",
+            "form",
+            "shading",
+            "type3",
+            "page_group",
+            "form_group",
+            "appearance_group",
+        ],
+    )
+    @pytest.mark.parametrize("option", [None, False, True])
+    def test_embed_preserves_calibration(self, kind, location, option, caplog):
+        """No option may replace valid calibration with a generic ICC profile."""
+        pdf = new_pdf()
+        cs = self._colorspace(kind)
+        expected = cs.unparse()
+        owner, key = self._add_colorspace(pdf, cs, location)
+        kwargs = {} if option is None else {"convert_calibrated": option}
 
-        assert replaced == 1
-        assert leaf_colorspaces[Name.Deep][0] == Name.ICCBased
+        embed_color_profiles(pdf, "3b", **kwargs)
 
-    def test_integration_convert_to_pdfa(self, tmp_path):
-        """Integration: convert_calibrated=True converts CalRGB via convert_to_pdfa."""
+        assert owner[key].unparse() == expected
+        assert ("convert_calibrated=True is deprecated" in caplog.text) is (
+            option is True
+        )
+
+    def test_legacy_helper_preserves_pdf_and_cache(self, caplog):
+        """The re-exported compatibility function reports no replacements."""
+        pdf = new_pdf()
+        owner, key = self._add_colorspace(pdf, self._colorspace("CalRGB"), "image")
+        expected = owner[key].unparse()
+        cache = {ColorSpaceType.DEVICE_GRAY: pdf.make_stream(b"existing profile")}
+        existing_stream = cache[ColorSpaceType.DEVICE_GRAY].objgen
+        object_count = len(pdf.objects)
+
+        assert _convert_calibrated_colorspaces(pdf, cache) == 0
+
+        assert owner[key].unparse() == expected
+        assert len(pdf.objects) == object_count
+        assert set(cache) == {ColorSpaceType.DEVICE_GRAY}
+        assert cache[ColorSpaceType.DEVICE_GRAY].objgen == existing_stream
+        assert "are preserved" in caplog.text
+
+    @pytest.mark.parametrize("kind", ["CalGray", "CalRGB"])
+    @pytest.mark.parametrize("level", ["2b", "3b"])
+    @pytest.mark.parametrize("legacy_opt_in", [False, True])
+    def test_converter_preserves_calibration_and_color_values(
+        self, tmp_path, kind, level, legacy_opt_in
+    ):
+        """Exercise the default and legacy opt-in through the full pipeline."""
         from pdftopdfa.converter import convert_to_pdfa
 
         pdf = new_pdf()
-        image = pdf.make_stream(b"\x80\x80\x80")
-        image[Name.Type] = Name.XObject
-        image[Name.Subtype] = Name.Image
-        image[Name.Width] = 1
-        image[Name.Height] = 1
-        image[Name.ColorSpace] = self._make_cal_rgb()
-        image[Name.BitsPerComponent] = 8
-
-        page_dict = Dictionary(
-            Type=Name.Page,
-            MediaBox=Array([0, 0, 612, 792]),
-            Resources=Dictionary(XObject=Dictionary(Im0=image)),
+        cs = self._colorspace(kind)
+        expected = cs.unparse()
+        page = pdf.add_blank_page(page_size=(100, 100))
+        page.Resources.ColorSpace = Dictionary(CS0=cs)
+        values = b"0.5" if kind == "CalGray" else b"0.5 0.25 0.1"
+        page.Contents = pdf.make_stream(
+            b"q /CS0 cs " + values + b" sc 0 0 100 100 re f Q"
         )
-        page_dict[Name.Contents] = pdf.make_stream(
-            b"q 100 0 0 100 100 600 cm /Im0 Do Q"
+        original_content = pikepdf.unparse_content_stream(
+            pikepdf.parse_content_stream(page)
         )
-        pdf.pages.append(pikepdf.Page(page_dict))
+        source = tmp_path / "calibrated.pdf"
+        target = tmp_path / "calibrated-pdfa.pdf"
+        pdf.save(source)
+        kwargs = {"convert_calibrated": True} if legacy_opt_in else {}
 
-        input_file = tmp_path / "cal_rgb_test.pdf"
-        pdf.save(input_file)
+        result = convert_to_pdfa(source, target, level, **kwargs)
 
-        output_file = tmp_path / "cal_rgb_test_pdfa.pdf"
-        result = convert_to_pdfa(input_file, output_file, "3b", convert_calibrated=True)
         assert result.success
-
-        with Pdf.open(output_file) as out_pdf:
-            page = out_pdf.pages[0]
-            resources = page.get(Name.Resources)
-            xobjects = resources.get(Name.XObject)
-            im0 = xobjects[Name("/Im0")]
-            cs = im0.get(Name.ColorSpace)
-            assert isinstance(cs, Array)
-            assert cs[0] == Name.ICCBased
-
-
-class TestCalInTransparencyGroupCS:
-    """Tests for CalGray/CalRGB → ICCBased in transparency group /CS."""
-
-    def _make_cal_gray(self) -> Array:
-        """Create a CalGray color space array."""
-        return Array(
-            [
-                Name.CalGray,
-                Dictionary(WhitePoint=Array([1, 1, 1]), Gamma=1),
-            ]
-        )
-
-    def _make_cal_rgb(self) -> Array:
-        """Create a CalRGB color space array."""
-        return Array(
-            [
-                Name.CalRGB,
-                Dictionary(
-                    WhitePoint=Array([1, 1, 1]),
-                    Matrix=Array([1, 0, 0, 0, 1, 0, 0, 0, 1]),
-                ),
-            ]
-        )
-
-    def test_page_level_cal_gray_replaced(self):
-        """CalGray in page-level transparency group /CS is replaced."""
-        pdf = new_pdf()
-        page = pikepdf.Page(
-            Dictionary(
-                Type=Name.Page,
-                MediaBox=Array([0, 0, 612, 792]),
-                Group=Dictionary(S=Name.Transparency, CS=self._make_cal_gray()),
+        assert result.target_produced
+        assert not result.skipped
+        with Pdf.open(target) as converted:
+            output_page = converted.pages[0]
+            assert output_page.Resources.ColorSpace.CS0.unparse() == expected
+            assert (
+                pikepdf.unparse_content_stream(
+                    pikepdf.parse_content_stream(output_page)
+                )
+                == original_content
             )
-        )
-        pdf.pages.append(page)
-
-        cache: dict = {}
-        replaced = _convert_calibrated_colorspaces(pdf, cache)
-        assert replaced == 1
-        cs = pdf.pages[0][Name.Group][Name.CS]
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
-        assert int(cs[1][Name.N]) == 1
-
-    def test_page_level_cal_rgb_replaced(self):
-        """CalRGB in page-level transparency group /CS is replaced."""
-        pdf = new_pdf()
-        page = pikepdf.Page(
-            Dictionary(
-                Type=Name.Page,
-                MediaBox=Array([0, 0, 612, 792]),
-                Group=Dictionary(S=Name.Transparency, CS=self._make_cal_rgb()),
-            )
-        )
-        pdf.pages.append(page)
-
-        cache: dict = {}
-        replaced = _convert_calibrated_colorspaces(pdf, cache)
-        assert replaced == 1
-        cs = pdf.pages[0][Name.Group][Name.CS]
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
-        assert int(cs[1][Name.N]) == 3
-
-    def test_page_level_lab_unchanged(self):
-        """Lab in page-level transparency group /CS is not replaced."""
-        pdf = new_pdf()
-        lab_cs = Array([Name.Lab, Dictionary(WhitePoint=Array([1, 1, 1]))])
-        page = pikepdf.Page(
-            Dictionary(
-                Type=Name.Page,
-                MediaBox=Array([0, 0, 612, 792]),
-                Group=Dictionary(S=Name.Transparency, CS=lab_cs),
-            )
-        )
-        pdf.pages.append(page)
-
-        cache: dict = {}
-        replaced = _convert_calibrated_colorspaces(pdf, cache)
-        assert replaced == 0
-        cs = pdf.pages[0][Name.Group][Name.CS]
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.Lab
-
-    def test_form_xobject_cal_rgb_in_group_replaced(self):
-        """CalRGB in Form XObject transparency group /CS is replaced."""
-        pdf = new_pdf()
-        form = pdf.make_stream(b"q Q")
-        form[Name.Type] = Name.XObject
-        form[Name.Subtype] = Name.Form
-        form[Name.BBox] = Array([0, 0, 100, 100])
-        form[Name.Group] = Dictionary(
-            S=Name.Transparency,
-            CS=self._make_cal_rgb(),
-        )
-
-        page = pikepdf.Page(
-            Dictionary(
-                Type=Name.Page,
-                MediaBox=Array([0, 0, 612, 792]),
-                Resources=Dictionary(XObject=Dictionary(Fm0=form)),
-            )
-        )
-        pdf.pages.append(page)
-
-        cache: dict = {}
-        replaced = _convert_calibrated_colorspaces(pdf, cache)
-        assert replaced == 1
-        cs = form[Name.Group][Name.CS]
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
-        assert int(cs[1][Name.N]) == 3
-
-    def test_annotation_ap_cal_rgb_in_group_replaced(self):
-        """CalRGB in annotation AP transparency group /CS is replaced."""
-        pdf = new_pdf()
-        ap_stream = pdf.make_stream(b"q Q")
-        ap_stream[Name.Type] = Name.XObject
-        ap_stream[Name.Subtype] = Name.Form
-        ap_stream[Name.BBox] = Array([0, 0, 20, 20])
-        ap_stream[Name.Group] = Dictionary(
-            S=Name.Transparency,
-            CS=self._make_cal_rgb(),
-        )
-
-        annot = pdf.make_indirect(
-            Dictionary(
-                Type=Name.Annot,
-                Subtype=Name.Text,
-                Rect=Array([100, 700, 120, 720]),
-                AP=Dictionary(N=ap_stream),
-            )
-        )
-
-        page = pikepdf.Page(
-            Dictionary(
-                Type=Name.Page,
-                MediaBox=Array([0, 0, 612, 792]),
-            )
-        )
-        pdf.pages.append(page)
-        pdf.pages[0].Annots = Array([annot])
-
-        cache: dict = {}
-        replaced = _convert_calibrated_colorspaces(pdf, cache)
-        assert replaced == 1
-        cs = ap_stream[Name.Group][Name.CS]
-        assert isinstance(cs, Array)
-        assert cs[0] == Name.ICCBased
-        assert int(cs[1][Name.N]) == 3
 
 
 class TestApplyDefaultsToApEntryNoResources:
@@ -4297,7 +4745,7 @@ class TestSMaskGFormDefaultColorSpaces:
         oi = Dictionary(
             Type=Name.OutputIntent,
             S=Name("/GTS_PDFX"),
-            OutputConditionIdentifier=pikepdf.String("Custom"),
+            OutputConditionIdentifier=pikepdf.String("FOGRA39"),
             DestOutputProfileRef=Dictionary(
                 URL=pikepdf.String("http://example.com/profile.icc"),
             ),
@@ -4307,9 +4755,12 @@ class TestSMaskGFormDefaultColorSpaces:
 
         embed_color_profiles(pdf, "2b", replace_existing=True)
 
-        # The stripping modifies the indirect object in place before the
-        # OutputIntents array is replaced with a new PDF/A intent.
+        # The forbidden reference is removed while the registered condition
+        # remains alongside the newly added PDF/A intent.
         assert "/DestOutputProfileRef" not in oi_ref
+        assert len(pdf.Root.OutputIntents) == 2
+        assert pdf.Root.OutputIntents[0].objgen == oi_ref.objgen
+        assert pdf.Root.OutputIntents[1].S == Name.GTS_PDFA1
 
     def test_pdfa_dest_output_profile_ref_not_removed(self):
         """DestOutputProfileRef is kept on non-PDF/X OutputIntents."""
@@ -4338,3 +4789,95 @@ class TestSMaskGFormDefaultColorSpaces:
 
         # Non-PDF/X intents should not have DestOutputProfileRef stripped.
         assert "/DestOutputProfileRef" in oi_ref
+
+
+class TestPreservationBoundaries:
+    """Exercise preservation across repeated passes and nested color declarations."""
+
+    @pytest.mark.parametrize("kind", [Name.CalGray, Name.CalRGB])
+    @pytest.mark.parametrize(
+        "wrapper", ["pattern", "separation", "devicen", "process", "colorant", "icc"]
+    )
+    @pytest.mark.parametrize("valid", [False, True])
+    def test_nested_calibration_is_validated_without_rewriting(
+        self, kind, wrapper, valid
+    ):
+        """Alternate spaces and DeviceN attributes are declared color contexts."""
+        from pdftopdfa.color_profile._calibrated import validate_calibrated_colorspaces
+
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        params = Dictionary(WhitePoint=Array([1, 1, 1])) if valid else Dictionary()
+        calibrated = Array([kind, params])
+        tint = Dictionary(FunctionType=2, Domain=Array([0, 1]), N=1)
+        if wrapper == "pattern":
+            space = Array([Name.Pattern, calibrated])
+        elif wrapper == "separation":
+            space = Array([Name.Separation, Name.Spot, calibrated, tint])
+        elif wrapper == "icc":
+            profile = pdf.make_stream(b"profile")
+            profile.N = 3
+            profile.Alternate = calibrated
+            space = Array([Name.ICCBased, profile])
+        else:
+            attrs = Dictionary()
+            alternate = calibrated if wrapper == "devicen" else Name.DeviceRGB
+            if wrapper == "process":
+                attrs.Process = Dictionary(ColorSpace=calibrated)
+            elif wrapper == "colorant":
+                attrs.Colorants = Dictionary(
+                    Spot=Array([Name.Separation, Name.Spot, calibrated, tint])
+                )
+            space = Array([Name.DeviceN, Array([Name.Spot]), alternate, tint, attrs])
+        page.Resources.ColorSpace = Dictionary(CS=space)
+        before = space.unparse()
+        if valid:
+            validate_calibrated_colorspaces(pdf)
+        else:
+            with pytest.raises(ConversionError, match="invalid /WhitePoint"):
+                validate_calibrated_colorspaces(pdf)
+        assert space.unparse() == before
+
+    @pytest.mark.parametrize("existing_pdfa", [False, True])
+    def test_output_intent_preparation_is_idempotent(self, existing_pdfa):
+        """Repeated preparation preserves intent count and profile identity."""
+        from pdftopdfa.color_profile._output_intents import (
+            prepare_existing_output_intents,
+        )
+
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        profile_data = get_srgb_profile()
+        pdfx = pdf.make_indirect(
+            Dictionary(
+                S=Name.GTS_PDFX,
+                OutputConditionIdentifier="Original printing condition",
+                Info="Keep this printing metadata",
+                DestOutputProfile=pdf.make_stream(profile_data),
+            )
+        )
+        pdf.Root.OutputIntents = Array([pdfx])
+        if existing_pdfa:
+            pdf.Root.OutputIntents.append(
+                pdf.make_indirect(
+                    Dictionary(
+                        S=Name.GTS_PDFA1,
+                        OutputConditionIdentifier="Archival condition",
+                        DestOutputProfile=pdf.make_stream(profile_data),
+                    )
+                )
+            )
+        first = prepare_existing_output_intents(pdf)
+        assert first.keep_existing
+        assert first.document_colorspace == ColorSpaceType.DEVICE_RGB
+        assert len(pdf.Root.OutputIntents) == 2
+        before = pdf.Root.OutputIntents.unparse()
+        second = prepare_existing_output_intents(pdf)
+        assert second == first
+        assert pdf.Root.OutputIntents.unparse() == before
+        pdfa = pdf.Root.OutputIntents[1]
+        assert pdfa.S == Name.GTS_PDFA1
+        assert pdfx.DestOutputProfile.objgen == pdfa.DestOutputProfile.objgen
+        assert pdfa.DestOutputProfile.read_bytes() == profile_data
+        assert str(pdfx.Info) == "Keep this printing metadata"
+        assert "/Type" not in pdfx
