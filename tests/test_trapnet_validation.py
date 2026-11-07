@@ -212,6 +212,55 @@ def test_in_place_content_changes_also_invalidate_version_tracking():
         validate_preserved_trapnets(pdf, snapshots)
 
 
+def _sibling_with_all_appearances(pdf):
+    """Build an annotation that has normal, rollover, and down appearances."""
+
+    def form(content):
+        appearance = pdf.make_stream(content)
+        appearance.Type, appearance.Subtype = Name.XObject, Name.Form
+        appearance.BBox = Array([0, 0, 20, 20])
+        appearance.Resources = Dictionary()
+        return appearance
+
+    return pdf.make_indirect(
+        Dictionary(
+            Type=Name.Annot,
+            Subtype=Name.Square,
+            F=4,
+            Rect=Array([0, 0, 20, 20]),
+            AP=Dictionary(
+                N=form(b"0 g 0 0 20 20 re f"),
+                R=form(b"0.5 g 0 0 20 20 re f"),
+                D=form(b"1 g 0 0 20 20 re f"),
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize("key", ["/R", "/D"])
+def test_non_normal_appearances_do_not_affect_snapshots(key):
+    """Only the normal appearance of another annotation can affect trapping."""
+    pdf = new_pdf()
+    page, trap = _trap(pdf)
+    sibling = _sibling_with_all_appearances(pdf)
+    page.Annots = Array([sibling, trap])
+    snapshots = capture_trapnet_snapshots(pdf)
+    del sibling.AP[key]
+    validate_preserved_trapnets(pdf, snapshots)
+
+
+def test_changed_normal_appearance_still_invalidates_snapshots():
+    """Reducing /AP to /N must not hide a change to the printed appearance."""
+    pdf = new_pdf()
+    page, trap = _trap(pdf)
+    sibling = _sibling_with_all_appearances(pdf)
+    page.Annots = Array([sibling, trap])
+    snapshots = capture_trapnet_snapshots(pdf)
+    sibling.AP.N.write(b"1 g 0 0 20 20 re f")
+    with pytest.raises(ConversionError, match="invalidated a preserved TrapNet"):
+        validate_preserved_trapnets(pdf, snapshots)
+
+
 def test_snapshots_ignore_metadata_and_other_page_changes():
     """Unrelated edits cannot invalidate an unchanged page's date-tracked trap."""
     pdf = new_pdf()
@@ -274,6 +323,29 @@ def test_conversion_rejects_stale_date_traps_after_late_edits(
         assert result.skipped and not result.target_produced, result
         assert output.read_bytes() == source.read_bytes()
         assert any("invalidated a preserved TrapNet" in w for w in result.warnings)
+
+
+def test_conversion_keeps_trap_when_sibling_loses_non_normal_appearances(tmp_path):
+    """Required /R and /D removal must not fall back to copying the original input."""
+    from pikepdf import Pdf
+
+    import pdftopdfa.converter as converter
+
+    pdf = new_pdf()
+    page, trap = _trap(pdf)
+    trap.LastModified = "D:20990101000000Z"
+    page.Annots = Array([_sibling_with_all_appearances(pdf), trap])
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+
+    result = converter.convert_to_pdfa(source, output, level="3b")
+
+    assert result.target_produced and not result.skipped, result
+    with Pdf.open(output) as converted:
+        sibling, retained = converted.pages[0].Annots
+        assert sibling.Subtype == Name.Square
+        assert list(sibling.AP.keys()) == ["/N"]
+        assert retained.Subtype == Name.TrapNet
 
 
 @pytest.mark.parametrize("changed", [False, True])

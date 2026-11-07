@@ -18,6 +18,10 @@
 - Validate TrapNet appearances/tracking and collection/article structures before preserving them
 - Synchronize DocInfo Author with the first XMP creator and skip invisible Type3 glyphs during overprint analysis
 - Detect stale TrapNets after page/resource edits, including OCR and date-based tracking; reject invalid text encodings in custom DocInfo strings
+- Keep TrapNets when sanitization only removes rollover or down appearances from other annotations
+- Move a DocInfo Author that matches a later XMP creator to the front instead of overwriting the first creator
+- Reject impossible XMP dates and RDF/XML attribute forms that XMP parsers refuse, instead of copying them into the output metadata
+- Leave calibrated color spaces unvalidated when `embed_color_profiles(replace_existing=False)` skips a document with existing OutputIntents
 
 ### Tests
 

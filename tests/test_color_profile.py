@@ -737,6 +737,20 @@ class TestEmbedColorProfiles:
 
         assert result == []
 
+    def test_skip_does_not_validate_calibration(self) -> None:
+        """The do-nothing mode only rejects calibration once it would edit the PDF."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        embed_color_profiles(pdf, "2b")
+        page.Resources.ColorSpace = Dictionary(Bad=Array([Name.CalRGB, Dictionary()]))
+        intents = pdf.Root.OutputIntents.unparse()
+
+        assert embed_color_profiles(pdf, "2b", replace_existing=False) == []
+        assert pdf.Root.OutputIntents.unparse() == intents
+
+        with pytest.raises(ConversionError, match="invalid /WhitePoint"):
+            embed_color_profiles(pdf, "2b", replace_existing=True)
+
     def test_valid_existing_srgb_output_intent_is_preserved(self) -> None:
         """Valid existing sRGB PDF/A OutputIntent is not replaced."""
         pdf = new_pdf()

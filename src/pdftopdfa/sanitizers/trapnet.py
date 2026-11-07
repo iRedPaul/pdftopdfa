@@ -205,6 +205,16 @@ def valid_trapnet(annotation, owner, annotations, index: int, count: int) -> boo
     return _version_objects(owner) <= {_key(item) for item in version}
 
 
+def _printed_appearance(annotation: Dictionary):
+    """Reduce /AP to the normal appearance that printing and trapping depend on.
+
+    Rollover and down appearances only apply to interactive use, and PDF/A
+    sanitization removes them. Their removal cannot make a trap network stale.
+    """
+    appearance = annotation.get("/AP")
+    return appearance.get("/N") if isinstance(appearance, Dictionary) else appearance
+
+
 def _page_snapshot(page: Page) -> bytes:
     """Hash page content, resource graphs, geometry, and other annotation states."""
     from ..fonts.traversal import get_page_resources
@@ -228,7 +238,7 @@ def _page_snapshot(page: Page) -> bytes:
         inherited.Rotate = 0
     annotations = page.get("/Annots", [])
     states = Array(
-        Array([item.get("/AS"), item.get("/AP")])
+        Array([item.get("/AS"), _printed_appearance(item)])
         for item in annotations
         if isinstance(item, Dictionary) and item.get("/Subtype") != Name.TrapNet
     )

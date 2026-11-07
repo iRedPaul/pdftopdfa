@@ -31,6 +31,8 @@ from pdftopdfa.metadata import (
     _extract_extension_schema_blocks,
     _format_pdf_date,
     _has_undeclarable_structure,
+    _is_valid_extension_property_value,
+    _is_valid_simple_value,
     _normalize_structural_properties,
     _normalize_trapped,
     _parse_pdf_date,
@@ -1784,8 +1786,8 @@ class TestDublinCoreMultivaluePreservation:
         assert self._values(tree, "creator") == ["Alice", "Bob"]
 
     @pytest.mark.parametrize("level", ["2b", "3b"])
-    def test_author_matching_later_creator_updates_first(self, level) -> None:
-        """A later co-author cannot stand in for the synchronized first creator."""
+    def test_author_matching_later_creator_moves_to_first(self, level) -> None:
+        """Synchronize the first creator without losing or duplicating co-authors."""
         pdf = new_pdf()
         pdf.add_blank_page()
         embed_xmp_metadata(pdf, _reserialize_xmp(self._source_tree()))
@@ -1795,8 +1797,20 @@ class TestDublinCoreMultivaluePreservation:
             sync_metadata(pdf, level)
             tree = _extract_existing_xmp(pdf)
             assert tree is not None
-            assert self._values(tree, "creator") == ["Bob", "Bob"]
+            assert self._values(tree, "creator") == ["Bob", "Alice"]
             assert str(pdf.docinfo["/Author"]) == "Bob"
+
+    def test_moving_later_creator_keeps_remaining_order(self) -> None:
+        """Only the matching co-author changes position in a longer sequence."""
+        source = _build_xmp_with_extras(
+            "<dc:creator><rdf:Seq>"
+            "<rdf:li>Alice</rdf:li><rdf:li>Bob</rdf:li><rdf:li>Carol</rdf:li>"
+            "</rdf:Seq></dc:creator>"
+        )
+        result = _parse_xmp_bytes(
+            create_xmp_metadata({"author": "Carol"}, 2, "B", existing_xmp_tree=source)
+        )
+        assert self._values(result, "creator") == ["Carol", "Alice", "Bob"]
 
     @pytest.mark.parametrize("property_name", ["title", "description", "creator"])
     @pytest.mark.parametrize("malformation", ["sibling", "extra_container", "nested"])
@@ -3832,6 +3846,25 @@ class TestProvenancePreservation:
             "</rdf:li></rdf:Seq></xmpMM:History>",
             '<xmpMM:DerivedFrom rdf:parseType="Resource">'
             "<stRef:instanceID><rdf:Bag/></stRef:instanceID></xmpMM:DerivedFrom>",
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource" '
+            'stEvt:when="2024-01-01T00:00:00Z"/></rdf:Seq></xmpMM:History>',
+            '<xmpMM:DerivedFrom rdf:parseType="Resource" '
+            'stRef:instanceID="uuid:source"/>',
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:about="" stEvt:action="saved"/>'
+            "</rdf:Seq></xmpMM:History>",
+            '<xmpMM:History><rdf:Seq><rdf:li stEvt:action="saved">'
+            '<rdf:Description stEvt:when="2024-01-01"/></rdf:li>'
+            "</rdf:Seq></xmpMM:History>",
+            '<xmpMM:History><rdf:Seq><rdf:li><rdf:Description rdf:parseType="Resource">'
+            "<stEvt:action>saved</stEvt:action></rdf:Description></rdf:li>"
+            "</rdf:Seq></xmpMM:History>",
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
+            "<stEvt:when>2026-99-99</stEvt:when></rdf:li></rdf:Seq></xmpMM:History>",
+            '<xmpMM:History><rdf:Seq><rdf:li><rdf:Description stEvt:when="2023-02-29"/>'
+            "</rdf:li></rdf:Seq></xmpMM:History>",
+            '<xmpMM:DerivedFrom rdf:parseType="Resource">'
+            "<stRef:lastModifyDate>2024-01-01T25:00:00Z</stRef:lastModifyDate>"
+            "</xmpMM:DerivedFrom>",
         ],
     )
     def test_malformed_provenance_is_not_retained(
@@ -3855,7 +3888,7 @@ class TestProvenancePreservation:
         value = "2024-01-01T00:00:00Z"
         fields = f"<stEvt:When>{value}</stEvt:When>"
         item = (
-            f'<rdf:li rdf:parseType="Resource" stEvt:When="{value}"/>'
+            f'<rdf:li><rdf:Description stEvt:When="{value}"/></rdf:li>'
             if attribute
             else f'<rdf:li rdf:parseType="Resource">{fields}</rdf:li>'
         )
@@ -3882,6 +3915,126 @@ class TestProvenancePreservation:
             result = self._roundtrip(pdf, tree, "2b", location, tmp_path / "fixed.pdf")
         assert not result.xpath(
             "//@xmpMM:DerivedFrom | //@xmpMM:History", namespaces=NAMESPACES
+        )
+
+
+class TestXmpDateValidation:
+    """XMP date values must exist on the calendar, not merely look like dates."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "2024",
+            "2024-02",
+            "2024-02-29",
+            "2000-02-29",
+            "2024-12-31T23:59",
+            "2024-12-31T23:59Z",
+            "2024-12-31T23:59:59",
+            "2024-12-31T23:59:59.5+23:59",
+            "0000-01-01",
+        ],
+    )
+    def test_existing_dates_are_accepted(self, value) -> None:
+        """Every precision that the XMP date format defines remains valid."""
+        assert _is_valid_simple_value(value, "d")
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "2026-99-99",
+            "2024-00",
+            "2024-13",
+            "2024-01-00",
+            "2024-01-32",
+            "2023-02-29",
+            "1900-02-29",
+            "2024-04-31",
+            "2024-01-01T24:00",
+            "2024-01-01T23:60",
+            "2024-01-01T23:59:60",
+            "2024-01-01T00:00+24:00",
+            "2024-01-01T00:00-00:60",
+            "2024-01-01\n",
+            "٢٠٢٤",
+            "yesterday",
+        ],
+    )
+    def test_impossible_dates_are_rejected(self, value) -> None:
+        """Out-of-range components cannot pass because of their digit layout."""
+        assert not _is_valid_simple_value(value, "d")
+
+
+class TestInvalidRdfSyntaxIsNotCopied:
+    """A copied form rejected by XMP parsers would invalidate the whole packet."""
+
+    PAGED_TEXT = "http://ns.adobe.com/xap/1.0/t/pg/"
+
+    @classmethod
+    def _copied(cls, prop: str) -> etree._Element:
+        """Regenerate XMP from a source packet that contains the given property."""
+        namespaces = (
+            f'xmlns:xmpTPg="{cls.PAGED_TEXT}" '
+            'xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#" '
+            'xmlns:stFnt="http://ns.adobe.com/xap/1.0/sType/Font#"'
+        )
+        source = etree.fromstring(
+            f'<x:xmpmeta xmlns:x="adobe:ns:meta/" {namespaces}>'
+            f'<rdf:RDF xmlns:rdf="{NAMESPACES["rdf"]}">'
+            f'<rdf:Description rdf:about="">{prop}</rdf:Description>'
+            "</rdf:RDF></x:xmpmeta>"
+        )
+        return _parse_xmp_bytes(
+            create_xmp_metadata({}, 2, "B", existing_xmp_tree=source)
+        )
+
+    @pytest.mark.parametrize(
+        "prop",
+        [
+            '<xmpTPg:MaxPageSize rdf:parseType="Resource" stDim:w="1" stDim:h="1" '
+            'stDim:unit="inch"/>',
+            '<xmpTPg:MaxPageSize rdf:parseType="Resource" stDim:w="1"/>',
+            '<xmpTPg:Fonts><rdf:Bag><rdf:li rdf:parseType="Resource" stFnt:fontName="A"'
+            "/></rdf:Bag></xmpTPg:Fonts>",
+            '<xmpTPg:MaxPageSize rdf:parseType="Literal">1</xmpTPg:MaxPageSize>',
+        ],
+    )
+    def test_invalid_predefined_structures_are_dropped(self, prop) -> None:
+        """The guard also covers predefined structures outside provenance."""
+        result = self._copied(prop)
+        assert not result.xpath(f"//*[namespace-uri()='{self.PAGED_TEXT}']")
+
+    def test_valid_predefined_structure_is_retained(self) -> None:
+        """Field elements under parseType="Resource" remain the supported form."""
+        result = self._copied(
+            '<xmpTPg:MaxPageSize rdf:parseType="Resource">'
+            "<stDim:w>1</stDim:w><stDim:h>1</stDim:h><stDim:unit>inch</stDim:unit>"
+            "</xmpTPg:MaxPageSize>"
+        )
+        assert result.xpath(
+            "//*[local-name()='MaxPageSize']/*[local-name()='unit']/text()"
+        ) == ["inch"]
+
+    @pytest.mark.parametrize(
+        "attributes,fields,expected",
+        [
+            ('rdf:parseType="Resource"', "<c:w>1</c:w>", True),
+            ('rdf:parseType="Resource" c:w="1"', "", False),
+            ('c:w="1"', "<c:h>1</c:h>", False),
+            ('rdf:about=""', "<c:w>1</c:w>", False),
+        ],
+    )
+    def test_extension_structures_use_the_same_rules(
+        self, attributes, fields, expected
+    ) -> None:
+        """Declared extension values cannot bypass the RDF syntax check."""
+        elem = etree.fromstring(
+            f'<c:prop xmlns:c="urn:custom" xmlns:rdf="{NAMESPACES["rdf"]}" '
+            f"{attributes}>{fields}</c:prop>"
+        )
+        custom_types = {"Size": {"w": "Text", "h": "Text"}}
+        assert (
+            _is_valid_extension_property_value(elem, "Size", custom_types) is expected
         )
 
 

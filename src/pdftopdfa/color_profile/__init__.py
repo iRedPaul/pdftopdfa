@@ -171,27 +171,31 @@ def embed_color_profiles(
         ConversionError: If level is invalid or profiles cannot be embedded.
     """
     level = validate_pdfa_level(level)
+
+    has_existing_intents = has_output_intent(pdf)
+    if has_existing_intents and not replace_existing:
+        logger.debug("OutputIntents already present, skipping")
+        return []
+
+    # Validate before repairing OutputIntents so that a rejected document has
+    # not been partially modified.
     validate_calibrated_colorspaces(pdf)
 
     existing_output_intent_colorspace: ColorSpaceType | None = None
     retained_output_intents = Array()
-    if has_output_intent(pdf):
-        if replace_existing:
-            output_intent_preparation = prepare_existing_output_intents(pdf)
-            if output_intent_preparation.keep_existing:
-                retained_output_intents = pdf.Root.OutputIntents
-                existing_output_intent_colorspace = (
-                    output_intent_preparation.document_colorspace
-                )
-                logger.info("Keeping compatible existing OutputIntents")
-            else:
-                logger.info(
-                    "Replacing existing OutputIntents: %s",
-                    output_intent_preparation.reason,
-                )
+    if has_existing_intents:
+        output_intent_preparation = prepare_existing_output_intents(pdf)
+        if output_intent_preparation.keep_existing:
+            retained_output_intents = pdf.Root.OutputIntents
+            existing_output_intent_colorspace = (
+                output_intent_preparation.document_colorspace
+            )
+            logger.info("Keeping compatible existing OutputIntents")
         else:
-            logger.debug("OutputIntents already present, skipping")
-            return []
+            logger.info(
+                "Replacing existing OutputIntents: %s",
+                output_intent_preparation.reason,
+            )
 
     # Detect color spaces
     analysis = detect_color_spaces(pdf)

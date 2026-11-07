@@ -364,7 +364,7 @@ def test_full_conversion_rejects_binary_custom_docinfo(
 def test_full_conversion_synchronizes_first_creator(
     source_level, target_level, tmp_path
 ):
-    """An Author found later in the creator list still updates its first entry."""
+    """An Author found later in the creator list moves to the first entry."""
     pdf = _document(source_level)
     tree = etree.fromstring(pdf.Root.Metadata.read_bytes())
     description = tree.find(f".//{{{_RDF}}}Description")
@@ -383,7 +383,7 @@ def test_full_conversion_synchronizes_first_creator(
         tree = etree.fromstring(restored.Root.Metadata.read_bytes())
         assert tree.xpath(
             "//dc:creator/rdf:Seq/rdf:li/text()", namespaces={"dc": _DC, "rdf": _RDF}
-        ) == ["Bob", "Bob"]
+        ) == ["Bob", "Alice"]
         assert str(restored.docinfo["/Author"]) == "Bob"
 
 

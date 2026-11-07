@@ -4,6 +4,7 @@
 
 """XMP metadata handling for PDF/A conversion."""
 
+import calendar
 import copy
 import logging
 import re
@@ -30,15 +31,16 @@ _XML_ILLEGAL_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 # Regex for validating XMP Date (ISO 8601 subset)
 _XMP_DATE_RE = re.compile(
-    r"\d{4}"
-    r"(-\d{2}"
-    r"(-\d{2}"
-    r"(T\d{2}:\d{2}"
-    r"(:\d{2}(\.\d+)?)?"
-    r"(Z|[+-]\d{2}:\d{2})?"
+    r"(?P<year>\d{4})"
+    r"(?:-(?P<month>\d{2})"
+    r"(?:-(?P<day>\d{2})"
+    r"(?:T(?P<hour>\d{2}):(?P<minute>\d{2})"
+    r"(?::(?P<second>\d{2})(?:\.\d+)?)?"
+    r"(?:Z|[+-](?P<zone_hour>\d{2}):(?P<zone_minute>\d{2}))?"
     r")?"
     r")?"
-    r")?$"
+    r")?",
+    re.ASCII,
 )
 
 
@@ -1544,6 +1546,25 @@ def _has_undeclarable_structure(elem: etree._Element) -> bool:
     return False
 
 
+def _is_valid_xmp_date(text: str) -> bool:
+    """Require XMP date syntax whose components exist on the calendar and clock."""
+    match = _XMP_DATE_RE.fullmatch(text)
+    if match is None:
+        return False
+    month = int(match["month"] or 1)
+    if not 1 <= month <= 12:
+        return False
+    days_in_month = calendar.monthrange(int(match["year"]), month)[1]
+    return (
+        1 <= int(match["day"] or 1) <= days_in_month
+        and int(match["hour"] or 0) <= 23
+        and int(match["minute"] or 0) <= 59
+        and int(match["second"] or 0) <= 59
+        and int(match["zone_hour"] or 0) <= 23
+        and int(match["zone_minute"] or 0) <= 59
+    )
+
+
 def _is_valid_simple_value(text: str, type_code: str) -> bool:
     """Validate a simple text value against its expected type code."""
     if not text:
@@ -1562,7 +1583,7 @@ def _is_valid_simple_value(text: str, type_code: str) -> bool:
             return False
         return parts[0].lstrip("-").isdigit() and parts[1].lstrip("-").isdigit()
     if type_code == "d":
-        return bool(_XMP_DATE_RE.match(text))
+        return _is_valid_xmp_date(text)
     if type_code == "B":
         return text in ("True", "False")
     return True  # "s" — any non-empty text
@@ -1667,6 +1688,41 @@ def _validate_structured_container(
             valid_items += 1
         return valid_items > 0
 
+    return False
+
+
+def _has_invalid_rdf_syntax(prop: etree._Element) -> bool:
+    """Detect RDF/XML forms that make XMP parsers reject the whole packet.
+
+    RDF/XML 1.1, 7.2, permits only rdf:ID and rdf:parseType on an element with
+    parseType="Resource", whose fields must be child properties. Node elements
+    cannot carry rdf:parseType, property elements cannot carry rdf:about, and
+    property attributes exclude nested content.
+    """
+    ns_rdf = NAMESPACES["rdf"]
+    parse_type = f"{{{ns_rdf}}}parseType"
+    node_tags = {f"{{{ns_rdf}}}{name}" for name in ("Description", "Bag", "Seq", "Alt")}
+    ignored = {f"{{{ns_rdf}}}ID", "{http://www.w3.org/XML/1998/namespace}lang"}
+
+    pending = [prop]
+    while pending:
+        elem = pending.pop()
+        children = [child for child in elem if isinstance(child.tag, str)]
+        pending.extend(children)
+        if elem.tag in node_tags:
+            if parse_type in elem.attrib:
+                return True
+            continue
+        attributes = set(elem.attrib) - ignored
+        if parse_type in attributes:
+            if (
+                elem.get(parse_type) != "Resource"
+                or len(attributes) > 1
+                or any(child.tag in node_tags for child in children)
+            ):
+                return True
+        elif f"{{{ns_rdf}}}about" in attributes or (attributes and children):
+            return True
     return False
 
 
@@ -1795,6 +1851,8 @@ def _is_valid_extension_property_value(
     custom_types: dict[str, dict[str, str]],
 ) -> bool:
     """Validate an XMP property against its declared extension valueType."""
+    if _has_invalid_rdf_syntax(elem):
+        return False
     normalized = _normalize_extension_value_type(value_type)
     ns_rdf = NAMESPACES["rdf"]
     actual = _detect_structure(elem, ns_rdf)
@@ -1847,9 +1905,11 @@ def _get_extension_type_code(uri: str, local_name: str) -> str | None:
 def _is_valid_provenance_struct(elem: etree._Element, namespace: str) -> bool:
     """Validate the fields of a ResourceRef or ResourceEvent struct.
 
-    XMP supports both parseType="Resource" and nested rdf:Description,
-    with fields expressed as elements or attributes. These representations
-    must not be mistaken for a simple string or a sequence of strings.
+    XMP supports field elements under parseType="Resource", field elements or
+    attributes on a nested rdf:Description, and field attributes on an empty
+    element. These representations must not be mistaken for a simple string or
+    a sequence of strings. _has_invalid_rdf_syntax() has already rejected the
+    attribute combinations that RDF/XML forbids.
     """
     ns_rdf = NAMESPACES["rdf"]
     parse_type = f"{{{ns_rdf}}}parseType"
@@ -1875,8 +1935,6 @@ def _is_valid_provenance_struct(elem: etree._Element, namespace: str) -> bool:
         ):
             return False
 
-    if source.get(parse_type) not in (None, "Resource"):
-        return False
     if (source.text or "").strip():
         return False
     fields: dict[str, str] = {}
@@ -1957,6 +2015,9 @@ def _is_valid_preserved_property(
     Returns False if structure/value violates the expected type.
     """
     if (uri, local_name) in _PDF_A_UNSAFE_PRESERVED_PROPERTIES:
+        return False
+
+    if _has_invalid_rdf_syntax(elem):
         return False
 
     if uri == _XMPMM and local_name in {"DerivedFrom", "History"}:
@@ -2890,7 +2951,13 @@ def create_xmp_metadata(
             # first creator only. Never split arbitrary names on punctuation,
             # and keep independently listed co-authors. A textual reflection
             # of the existing list must not become a single combined creator.
-            creators[0] = author
+            # A later co-author moves to the front, because replacing the
+            # first creator would drop that name and list the author twice.
+            if author in creators:
+                creators.remove(author)
+                creators.insert(0, author)
+            else:
+                creators[0] = author
     if subject is None:
         subject = _extract_lang_alt_xmp_property(
             existing_xmp_tree, ns_dc, "description"
