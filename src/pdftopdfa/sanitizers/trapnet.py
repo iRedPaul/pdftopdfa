@@ -209,7 +209,8 @@ def valid_trapnet(annotation, owner, annotations, index: int, count: int) -> boo
             return False
         if other.get("/AS") != saved:
             return False
-    return _version_objects(owner) <= {_key(item) for item in version}
+    # An extra entry refers to an object that has since left the page description.
+    return _version_objects(owner) == {_key(item) for item in version}
 
 
 def _printed_appearance(annotation: Dictionary):

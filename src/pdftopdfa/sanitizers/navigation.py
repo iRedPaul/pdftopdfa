@@ -67,8 +67,12 @@ def _valid_item_value(value, subtype) -> bool:
     )
 
 
-def _sanitize_collection_items(pdf: Pdf, schema, check_fields: bool) -> int:
-    """Remove malformed item entries, and values that the schema does not describe."""
+def _sanitize_collection_items(pdf: Pdf, schema) -> int:
+    """Remove malformed item entries, and values that the schema does not describe.
+
+    Item keys identify schema fields, so a portfolio without a schema cannot have
+    any valid item values.
+    """
     removed = 0
     for _, filespec in _embedded_files(pdf):
         item = filespec.get("/CI")
@@ -82,8 +86,6 @@ def _sanitize_collection_items(pdf: Pdf, schema, check_fields: bool) -> int:
             item = pdf.make_indirect(item)
             filespec["/CI"] = item
         removed += _optional_type(item, Name.CollectionItem)
-        if not check_fields:
-            continue
         for key in list(item.keys()):
             if key == "/Type":
                 continue
@@ -120,9 +122,6 @@ def _sanitize_collection(pdf: Pdf) -> int:
         removed += _remove_entry(collection, "/View")
     removed += remove_dangling_collection_default(pdf)
     schema = collection.get("/Schema")
-    # Without any schema there is nothing to compare item values with, unless it
-    # is removed here and so no longer describes the values that relied on it.
-    check_fields = schema is not None
     if schema is not None and not isinstance(schema, Dictionary):
         removed += _remove_entry(collection, "/Schema")
         schema = None
@@ -158,7 +157,7 @@ def _sanitize_collection(pdf: Pdf) -> int:
                 isinstance(order, bool) or not isinstance(order, int)
             ):
                 removed += _remove_entry(field, "/O")
-    removed += _sanitize_collection_items(pdf, schema, check_fields)
+    removed += _sanitize_collection_items(pdf, schema)
     sorting = collection.get("/Sort")
     if sorting is None:
         return removed

@@ -185,6 +185,16 @@ def test_trap_order_and_cardinality_are_enforced(damage):
     )
 
 
+def test_stale_version_entry_invalidates_the_trap_network():
+    """An object that left the page description shows that the page has changed."""
+    pdf = new_pdf()
+    page, trap = _trap(pdf, version=True)
+    trap.Version.append(pdf.make_indirect(Dictionary(Unused=True)))
+    result = sanitize_for_pdfa(pdf)
+    assert result["non_compliant_annotations_flattened"] == 1
+    assert "/Annots" not in page.obj
+
+
 def test_annotation_removal_invalidates_saved_annotation_states():
     """Removing another annotation must not leave stale trap tracking behind."""
     pdf = new_pdf()

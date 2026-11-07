@@ -250,13 +250,13 @@ def test_collection_default_is_rechecked_after_embedded_file_removal():
     assert "/D" not in pdf.Root.Collection
 
 
-def test_collection_items_are_unchanged_without_any_schema():
-    """Nothing identifies a dangling value if the source never declared a schema."""
+def test_collection_items_lose_all_fields_without_any_schema():
+    """Item keys identify schema fields, so no schema leaves no valid value."""
     pdf = new_pdf()
     spec = _portfolio(pdf, Dictionary())
     del pdf.Root.Collection.Schema
-    assert remove_forbidden_catalog_entries(pdf) == 0
-    assert sorted(spec.CI.keys()) == ["/Foo", "/Good", "/Type"]
+    assert remove_forbidden_catalog_entries(pdf) == 2
+    assert list(spec.CI.keys()) == ["/Type"]
 
 
 @pytest.mark.parametrize("ascending", [[], [False], [True, False, True]])
