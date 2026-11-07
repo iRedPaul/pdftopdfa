@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Changes
+
+- Preserve CalGray/CalRGB calibration by default; retain `convert_calibrated=True` and `--convert-calibrated` as deprecated compatibility options that warn and preserve the original colors
+
+### Bug Fixes
+
+- Retain compatible additional OutputIntents of other subtypes such as PDF/X
+- Validate calibrated color spaces and additional OutputIntent dictionaries before preserving them, restricted to actual color contexts
+- Validate calibrated color spaces that inline images declare directly, those in interactive form default resources, and those in a shading pattern's soft mask
+- Detect annotation color arrays when choosing profiles
+- Leave calibrated color spaces unvalidated when `embed_color_profiles(replace_existing=False)` skips a document with existing OutputIntents
+- Rewrite real `/N` entries of retained OutputIntent profiles as integers
+- Require a usable tag table with permitted element types before retaining an existing OutputIntent profile
+- Remove OutputIntents with an undefined subtype or a non-standard condition without a profile while retaining the others
+
 ## [0.9.25] - 2026-11-06
 
 ### Changes

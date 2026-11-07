@@ -5,6 +5,8 @@
 """Color space detection and analysis."""
 
 import logging
+import math
+from decimal import Decimal
 
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
@@ -97,6 +99,27 @@ def _get_inline_image_device_cs(image) -> Name | None:
         pass
 
     return None
+
+
+def _detect_annotation_colors(
+    annot, analysis: ColorSpaceAnalysis, location: str
+) -> None:
+    """Count preserved annotation colors even when no appearance stream exists."""
+    spaces = {1: Name.DeviceGray, 3: Name.DeviceRGB, 4: Name.DeviceCMYK}
+    for key in ("/C", "/IC"):
+        color = annot.get(key)
+        if (
+            isinstance(color, Array)
+            and len(color) in spaces
+            and all(
+                not isinstance(value, bool)
+                and isinstance(value, (int, float, Decimal))
+                and math.isfinite(value)
+                and 0 <= value <= 1
+                for value in color
+            )
+        ):
+            _analyze_colorspace(spaces[len(color)], analysis, f"{location}{key}")
 
 
 def _parse_colorspace_array(cs) -> tuple[str | None, str | None]:
@@ -765,6 +788,9 @@ def detect_color_spaces(pdf: Pdf) -> ColorSpaceAnalysis:
             for i in range(len(annots)):
                 try:
                     annot = _resolve_indirect(annots[i])
+                    _detect_annotation_colors(
+                        annot, analysis, f"Page{page_num}/Annot[{i}]"
+                    )
                     ap = annot.get("/AP")
                     if ap is None:
                         continue
