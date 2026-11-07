@@ -33,6 +33,18 @@
 - Reject XMP containers with extra containers or elements other than `rdf:li`
 - Preserve permitted soft-mask transfer functions and remove malformed ones
 - Remove soft-mask calculator functions unless their stack effects provably yield one number, and reject constant operations without a defined result
+- Avoid changing valid overprint behavior in unrelated graphics contexts
+- Normalize inline-image color abbreviations and reuse equivalent overprint proofs for large documents
+- Skip invisible Type3 glyphs during overprint analysis
+- Store real `/OPM` values such as `1.0` as the required integers, store numeric `/OP` and `/op` values 0 and 1 as booleans, and remove other values without a defined meaning
+- Analyze soft masks selected by a shading pattern's `/ExtGState` during overprint repair
+- Reject non-integer text rendering modes during overprint analysis, and evaluate a soft mask at the invocation of a transparency group instead of at its inner paints
+- Check uncolored tiling patterns under the overprint state at their painting operation
+- Sanitize an `/ExtGState` stored directly on a shading pattern like other graphics states
+
+### Tests
+
+- Validate feature preservation through complete PDF/A-2b/PDF/A-3b conversions using the pinned veraPDF CI installation
 
 ## [0.9.25] - 2026-11-06
 
