@@ -37,6 +37,8 @@ ALLOWED_NAMED_ACTIONS = frozenset(
 
 # Annotation subtypes forbidden in PDF/A-1, PDF/A-2, PDF/A-3
 # Note: FileAttachment is handled separately in remove_embedded_files()
+# Note: ISO 19005-2/3, 6.3.1 does not forbid /TrapNet. It is listed on purpose,
+# because conversion can edit the page, which makes existing trapping stale.
 FORBIDDEN_ANNOTATION_SUBTYPES = frozenset(
     {
         "/Sound",
