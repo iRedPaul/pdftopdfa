@@ -67,7 +67,9 @@ def _validate_calibrated_space(cs) -> None:
                 and gamma > 0
             )
         else:
-            valid = _calibration_numbers(gamma, 3)
+            valid = _calibration_numbers(gamma, 3) and all(
+                number > 0 for number in gamma
+            )
         if not valid:
             raise ConversionError(f"Malformed {cs[0]} color space: invalid /Gamma")
     if (

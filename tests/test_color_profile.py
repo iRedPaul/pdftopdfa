@@ -1606,6 +1606,8 @@ class TestPreservedColorValidation:
             ("CalGray", "/Gamma", 0),
             ("CalGray", "/Gamma", True),
             ("CalRGB", "/Gamma", Array([1, 2])),
+            ("CalRGB", "/Gamma", Array([0, 1, 1])),
+            ("CalRGB", "/Gamma", Array([1, 1, -1])),
             ("CalRGB", "/Matrix", Array([1, 2])),
         ],
     )
