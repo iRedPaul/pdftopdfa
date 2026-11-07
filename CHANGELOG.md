@@ -31,6 +31,8 @@
 - Remove fields from preserved XMP provenance that PDF/A does not accept, such as `stEvt:changed`, `stRef:filePath`, and `stRef:originalDocumentID`, instead of producing a non-conforming packet or dropping the whole structure
 - Remove the PDF/X and PDF/E markers from DocInfo along with their XMP identification
 - Reject XMP containers with extra containers or elements other than `rdf:li`
+- Preserve permitted soft-mask transfer functions and remove malformed ones
+- Remove soft-mask calculator functions unless their stack effects provably yield one number, and reject constant operations without a defined result
 
 ## [0.9.25] - 2026-11-06
 
