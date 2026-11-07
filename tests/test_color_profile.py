@@ -4633,3 +4633,95 @@ class TestSMaskGFormDefaultColorSpaces:
 
         # Non-PDF/X intents should not have DestOutputProfileRef stripped.
         assert "/DestOutputProfileRef" in oi_ref
+
+
+class TestPreservationBoundaries:
+    """Exercise preservation across repeated passes and nested color declarations."""
+
+    @pytest.mark.parametrize("kind", [Name.CalGray, Name.CalRGB])
+    @pytest.mark.parametrize(
+        "wrapper", ["pattern", "separation", "devicen", "process", "colorant", "icc"]
+    )
+    @pytest.mark.parametrize("valid", [False, True])
+    def test_nested_calibration_is_validated_without_rewriting(
+        self, kind, wrapper, valid
+    ):
+        """Alternate spaces and DeviceN attributes are declared color contexts."""
+        from pdftopdfa.color_profile._calibrated import validate_calibrated_colorspaces
+
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        params = Dictionary(WhitePoint=Array([1, 1, 1])) if valid else Dictionary()
+        calibrated = Array([kind, params])
+        tint = Dictionary(FunctionType=2, Domain=Array([0, 1]), N=1)
+        if wrapper == "pattern":
+            space = Array([Name.Pattern, calibrated])
+        elif wrapper == "separation":
+            space = Array([Name.Separation, Name.Spot, calibrated, tint])
+        elif wrapper == "icc":
+            profile = pdf.make_stream(b"profile")
+            profile.N = 3
+            profile.Alternate = calibrated
+            space = Array([Name.ICCBased, profile])
+        else:
+            attrs = Dictionary()
+            alternate = calibrated if wrapper == "devicen" else Name.DeviceRGB
+            if wrapper == "process":
+                attrs.Process = Dictionary(ColorSpace=calibrated)
+            elif wrapper == "colorant":
+                attrs.Colorants = Dictionary(
+                    Spot=Array([Name.Separation, Name.Spot, calibrated, tint])
+                )
+            space = Array([Name.DeviceN, Array([Name.Spot]), alternate, tint, attrs])
+        page.Resources.ColorSpace = Dictionary(CS=space)
+        before = space.unparse()
+        if valid:
+            validate_calibrated_colorspaces(pdf)
+        else:
+            with pytest.raises(ConversionError, match="invalid /WhitePoint"):
+                validate_calibrated_colorspaces(pdf)
+        assert space.unparse() == before
+
+    @pytest.mark.parametrize("existing_pdfa", [False, True])
+    def test_output_intent_preparation_is_idempotent(self, existing_pdfa):
+        """Repeated preparation preserves intent count and profile identity."""
+        from pdftopdfa.color_profile._output_intents import (
+            prepare_existing_output_intents,
+        )
+
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        profile_data = get_srgb_profile()
+        pdfx = pdf.make_indirect(
+            Dictionary(
+                S=Name.GTS_PDFX,
+                OutputConditionIdentifier="Original printing condition",
+                Info="Keep this printing metadata",
+                DestOutputProfile=pdf.make_stream(profile_data),
+            )
+        )
+        pdf.Root.OutputIntents = Array([pdfx])
+        if existing_pdfa:
+            pdf.Root.OutputIntents.append(
+                pdf.make_indirect(
+                    Dictionary(
+                        S=Name.GTS_PDFA1,
+                        OutputConditionIdentifier="Archival condition",
+                        DestOutputProfile=pdf.make_stream(profile_data),
+                    )
+                )
+            )
+        first = prepare_existing_output_intents(pdf)
+        assert first.keep_existing
+        assert first.document_colorspace == ColorSpaceType.DEVICE_RGB
+        assert len(pdf.Root.OutputIntents) == 2
+        before = pdf.Root.OutputIntents.unparse()
+        second = prepare_existing_output_intents(pdf)
+        assert second == first
+        assert pdf.Root.OutputIntents.unparse() == before
+        pdfa = pdf.Root.OutputIntents[1]
+        assert pdfa.S == Name.GTS_PDFA1
+        assert pdfx.DestOutputProfile.objgen == pdfa.DestOutputProfile.objgen
+        assert pdfa.DestOutputProfile.read_bytes() == profile_data
+        assert str(pdfx.Info) == "Keep this printing metadata"
+        assert "/Type" not in pdfx

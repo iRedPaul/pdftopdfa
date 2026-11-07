@@ -840,6 +840,12 @@ class TestSyncMetadata:
             (b"\xfe\xff\x67\x71\x4e\xac", True),
             (b"\xfe\xff\xd8\x3d\xde\x00", True),
             (b"\xfe\xff\xff\xfd", True),
+            # UTF-16 control codepoints are valid text despite their byte values.
+            (b"\xfe\xff\x00\x00\x00\x01", True),
+            # A complete surrogate pair must not hide a trailing malformed unit.
+            (b"\xfe\xff\xd8\x3d\xde\x00\xdc\x00", False),
+            (b"\xfe\xff\xd8\x3d\xde\x00\x00", False),
+            (b"\xfe\xff\xdc\x00\xd8\x00", False),
             (b"bad\x00", False),
             (b"bad\x01", False),
             (b"bad\x07", False),

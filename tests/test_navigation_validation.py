@@ -447,3 +447,49 @@ def test_malformed_article_conversion_preserves_original_file(tmp_path):
     assert result.skipped and not result.target_produced
     assert output.read_bytes() == source.read_bytes()
     assert any("Malformed /Threads" in warning for warning in result.warnings)
+
+
+@pytest.mark.parametrize("key", ["/CreationDate", "/ModDate"])
+@pytest.mark.parametrize("value", ["not a date", 42, Name.Bad])
+def test_article_rejection_precedes_collection_repairs(key, value):
+    """A rejected article leaves even repairable portfolio settings untouched."""
+    pdf = new_pdf()
+    thread, _, _ = _article(pdf)
+    thread.I[key] = value
+    pdf.Root.Collection = Dictionary(View=Name.Invalid, Private="keep")
+    before = pdf.Root.Collection.unparse()
+    with pytest.raises(ConversionError, match="thread information"):
+        remove_forbidden_catalog_entries(pdf)
+    assert pdf.Root.Collection.unparse() == before
+
+
+def test_collection_repairs_are_idempotent():
+    """A second pass preserves the repaired schema, sorting and item references."""
+    pdf = new_pdf()
+    spec = _portfolio(pdf, Dictionary(Good=Dictionary(Subtype=Name.S, N="Good")))
+    pdf.Root.Collection.Sort = Dictionary(S=Name.Good, A="invalid")
+    assert remove_forbidden_catalog_entries(pdf) == 2
+    before = pdf.Root.Collection.unparse(), spec.CI.unparse(), spec.CI.objgen
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert (pdf.Root.Collection.unparse(), spec.CI.unparse(), spec.CI.objgen) == before
+
+
+@pytest.mark.parametrize("key", ["/N", "/V"])
+def test_article_rejects_nonreciprocal_links(key):
+    """Every edge must be reciprocal even when both beads belong to the article."""
+    pdf = new_pdf()
+    first, second, _ = _two_bead_article(pdf)
+    second[key] = second
+    with pytest.raises(ConversionError, match="inconsistent next/previous links"):
+        remove_forbidden_catalog_entries(pdf)
+    assert first.N.objgen == second.objgen
+
+
+def test_article_rejects_a_bead_listed_on_another_page():
+    """An otherwise valid cycle cannot leave an unrelated page destination."""
+    pdf = new_pdf()
+    _, bead, _ = _article(pdf)
+    other = pdf.add_blank_page()
+    other.B = Array([bead])
+    with pytest.raises(ConversionError, match="unrelated or malformed bead"):
+        remove_forbidden_catalog_entries(pdf)
