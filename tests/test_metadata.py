@@ -3883,6 +3883,13 @@ class TestProvenancePreservation:
             '<xmpMM:DerivedFrom rdf:parseType="Resource">'
             "<stRef:lastModifyDate>2024-01-01T25:00:00Z</stRef:lastModifyDate>"
             "</xmpMM:DerivedFrom>",
+            '<xmpMM:DerivedFrom rdf:parseType="Resource">'
+            "<stRef:filePath>not a uri</stRef:filePath></xmpMM:DerivedFrom>",
+            '<xmpMM:DerivedFrom rdf:parseType="Resource">'
+            "<stRef:manageTo>C:\\folder\\file.pdf</stRef:manageTo>"
+            "</xmpMM:DerivedFrom>",
+            '<xmpMM:DerivedFrom><rdf:Description stRef:manageUI="a b"/>'
+            "</xmpMM:DerivedFrom>",
             '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource"/>'
             "</rdf:Seq></xmpMM:History>",
             '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
@@ -3936,6 +3943,26 @@ class TestProvenancePreservation:
         ) == [value]
 
     @pytest.mark.parametrize("location", ["catalog", "page"])
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "file:///source%20file.pdf",
+            "https://example.org/a?b=c#d",
+            "relative/path.pdf",
+        ],
+    )
+    def test_uri_reference_fields_are_retained(self, location, uri, tmp_path) -> None:
+        """Absolute and relative references both satisfy the URI type."""
+        tree = self._packet(
+            '<xmpMM:DerivedFrom rdf:parseType="Resource">'
+            f"<stRef:filePath>{uri}</stRef:filePath></xmpMM:DerivedFrom>"
+        )
+        with new_pdf() as pdf:
+            pdf.add_blank_page()
+            result = self._roundtrip(pdf, tree, "2b", location, tmp_path / "uri.pdf")
+        assert result.xpath("//stRef:filePath/text()", namespaces=NAMESPACES) == [uri]
+
+    @pytest.mark.parametrize("location", ["catalog", "page"])
     def test_structured_properties_cannot_be_plain_attributes(
         self, location, tmp_path
     ) -> None:
@@ -3965,7 +3992,9 @@ class TestXmpDateValidation:
             "2024-12-31T23:59",
             "2024-12-31T23:59Z",
             "2024-12-31T23:59:59",
-            "2024-12-31T23:59:59.5+23:59",
+            "2024-12-31T23:59:59.5+13:59",
+            "2024-12-31T23:59:59.5+14:00",
+            "2024-12-31T23:59:59.5-14:00",
             "0000-01-01",
         ],
     )
@@ -3988,6 +4017,8 @@ class TestXmpDateValidation:
             "2024-01-01T23:60",
             "2024-01-01T23:59:60",
             "2024-01-01T00:00+24:00",
+            "2024-01-01T00:00+15:00",
+            "2024-01-01T00:00-14:01",
             "2024-01-01T00:00-00:60",
             "2024-01-01\n",
             "٢٠٢٤",

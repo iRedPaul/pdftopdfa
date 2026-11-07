@@ -48,6 +48,8 @@ _XMP_DATE_RE = re.compile(
 _XMP_INTEGER_RE = re.compile(r"[+-]?\d+", re.ASCII)
 _XMP_REAL_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", re.ASCII)
 _XMP_RATIONAL_RE = re.compile(r"[+-]?\d+/[+-]?\d+", re.ASCII)
+# Characters that RFC 3986 does not allow unencoded in a URI reference.
+_XMP_URI_RE = re.compile(r"[^\s<>\"{}|\\^`]+")
 
 
 def _sanitize_xml_text(text: str) -> str:
@@ -594,15 +596,15 @@ _PROVENANCE_FIELD_TYPES = {
     NAMESPACES["stRef"]: {
         "documentID": "s",
         "instanceID": "s",
-        "filePath": "s",
+        "filePath": "u",
         "renditionClass": "s",
         "renditionParams": "s",
         "alternatePaths": "q",
         "lastModifyDate": "d",
         "manager": "s",
         "managerVariant": "s",
-        "manageTo": "s",
-        "manageUI": "s",
+        "manageTo": "u",
+        "manageUI": "u",
         "versionID": "s",
         "fromPart": "s",
         "toPart": "s",
@@ -1609,8 +1611,12 @@ def _is_valid_xmp_date(text: str) -> bool:
         and int(match["hour"] or 0) <= 23
         and int(match["minute"] or 0) <= 59
         and int(match["second"] or 0) <= 59
-        and int(match["zone_hour"] or 0) <= 23
+        # The lexical date-time range ends at an offset of exactly 14 hours.
         and int(match["zone_minute"] or 0) <= 59
+        and (
+            int(match["zone_hour"] or 0) < 14
+            or (int(match["zone_hour"]) == 14 and int(match["zone_minute"]) == 0)
+        )
     )
 
 
@@ -1624,6 +1630,8 @@ def _is_valid_simple_value(text: str, type_code: str) -> bool:
         return _XMP_REAL_RE.fullmatch(text) is not None
     if type_code == "r":
         return _XMP_RATIONAL_RE.fullmatch(text) is not None
+    if type_code == "u":
+        return _XMP_URI_RE.fullmatch(text) is not None
     if type_code == "d":
         return _is_valid_xmp_date(text)
     if type_code == "B":

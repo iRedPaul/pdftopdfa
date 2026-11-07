@@ -31,7 +31,8 @@
 - Accept article threads on pages that omit the optional `/B` array instead of using the original-input fallback
 - Analyze soft masks selected by a shading pattern's `/ExtGState` during overprint repair
 - Remove soft-mask calculator functions unless their stack effects provably yield one number, and reject constant operations without a defined result
-- Require a usable tag table before retaining an existing OutputIntent profile
+- Require a usable tag table with permitted element types before retaining an existing OutputIntent profile
+- Validate URI-typed provenance fields and the range of XMP time zone offsets, and remove duplicate beads from a page's `/B` array
 - Require custom XMP structure fields to use the namespace of their declared value type, and validate XMP numbers against their lexical forms
 - Reject non-integer text rendering modes during overprint analysis, and evaluate a soft mask at the invocation of a transparency group instead of at its inner paints
 - Require `stEvt:action` and `stEvt:when` in preserved XMP history events, and move `x-default` to the front of language alternatives

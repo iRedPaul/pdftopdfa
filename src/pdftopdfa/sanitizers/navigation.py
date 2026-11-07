@@ -289,7 +289,7 @@ def _validate_threads(pdf: Pdf) -> None:
 
 
 def _order_page_beads(pdf: Pdf) -> int:
-    """List the beads of each thread on a page in the reading order of that thread.
+    """List the beads of each thread on a page once, in the order of that thread.
 
     ISO 32000-1, Table 30 requires natural reading order in /B. Only a thread defines
     an order for its own beads, so other threads keep their positions in the array.
@@ -311,7 +311,9 @@ def _order_page_beads(pdf: Pdf) -> int:
         listed = page.get("/B")
         if listed is None:
             continue
-        beads = list(listed)
+        original = list(listed)
+        # A dictionary keeps the first occurrence of a bead listed more than once.
+        beads = list({bead.objgen: bead for bead in original}.values())
         slots: dict[tuple[int, int], list[int]] = {}
         for index, bead in enumerate(beads):
             slots.setdefault(positions[bead.objgen][0], []).append(index)
@@ -323,10 +325,10 @@ def _order_page_beads(pdf: Pdf) -> int:
             )
             for index, bead in zip(indices, thread_beads, strict=True):
                 ordered[index] = bead
-        if [bead.objgen for bead in ordered] != [bead.objgen for bead in beads]:
+        if [bead.objgen for bead in ordered] != [bead.objgen for bead in original]:
             page.B = Array(ordered)
             reordered += 1
-            logger.warning("Restored the reading order of a page /B array")
+            logger.warning("Repaired the beads listed in a page /B array")
     return reordered
 
 

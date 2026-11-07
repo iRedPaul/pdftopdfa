@@ -31,7 +31,10 @@ from pdftopdfa.color_profile import (
     get_srgb_profile,
     has_output_intent,
 )
-from pdftopdfa.color_profile._output_intents import _has_usable_tag_table
+from pdftopdfa.color_profile._output_intents import (
+    _ICC_TAG_TYPES,
+    _has_usable_tag_table,
+)
 from pdftopdfa.exceptions import ConversionError
 
 
@@ -100,6 +103,16 @@ class TestICCProfileLoading:
         assert get_profile_for_colorspace(cs_type) == loader()
 
 
+def _icc_tag_data(tags: tuple[bytes, ...]) -> bytes:
+    """Build an ICC tag table followed by minimal elements of a permitted type."""
+    data_start = 132 + 12 * len(tags)
+    table = len(tags).to_bytes(4, "big") + b"".join(
+        tag + (data_start + 8 * index).to_bytes(4, "big") + (8).to_bytes(4, "big")
+        for index, tag in enumerate(tags)
+    )
+    return table + b"".join(_ICC_TAG_TYPES[tag][0] + bytes(4) for tag in tags)
+
+
 def _make_icc_profile(**overrides: bytes | int) -> bytes:
     """Build a minimal 128-byte ICC profile with optional field overrides.
 
@@ -109,13 +122,7 @@ def _make_icc_profile(**overrides: bytes | int) -> bytes:
         device_class (bytes): 4-byte class at offset 12-15
         colorspace (bytes): 4-byte color space signature at offset 16-19
     """
-    tags = (b"desc", b"cprt", b"wtpt", b"A2B0")
-    data_start = 132 + 12 * len(tags)
-    table = len(tags).to_bytes(4, "big") + b"".join(
-        tag + (data_start + 8 * index).to_bytes(4, "big") + (8).to_bytes(4, "big")
-        for index, tag in enumerate(tags)
-    )
-    profile = bytearray(128) + table + bytes(8 * len(tags))
+    profile = bytearray(128) + _icc_tag_data((b"desc", b"cprt", b"wtpt", b"A2B0"))
     profile[0:4] = len(profile).to_bytes(4, "big")
     profile[8] = overrides.get("version", 2)
     profile[12:16] = overrides.get("device_class", b"mntr")
@@ -920,6 +927,8 @@ class TestEmbedColorProfiles:
             "short_tag",
             "missing_description",
             "no_color_model",
+            "wrong_element_type",
+            "empty_element_type",
         ],
     )
     def test_existing_output_intent_needs_a_usable_tag_table(self, damage) -> None:
@@ -937,8 +946,12 @@ class TestEmbedColorProfiles:
             profile[140:144] = (4).to_bytes(4, "big")
         elif damage == "missing_description":
             profile[132:136] = b"none"
-        else:
+        elif damage == "no_color_model":
             profile[168:172] = b"none"
+        elif damage == "wrong_element_type":
+            profile[180:184] = b"curv"
+        else:
+            profile[180:188] = bytes(8)
         profile[0:4] = len(profile).to_bytes(4, "big")
         pdf = new_pdf()
         stream = pdf.make_stream(bytes(profile))
@@ -981,13 +994,7 @@ class TestEmbedColorProfiles:
         self, colorspace, tags, usable
     ) -> None:
         """A matrix or tone-curve model is an alternative to a lookup table only."""
-        all_tags = (b"desc", b"cprt", b"wtpt", *tags)
-        data_start = 132 + 12 * len(all_tags)
-        table = len(all_tags).to_bytes(4, "big") + b"".join(
-            tag + (data_start + 8 * index).to_bytes(4, "big") + (8).to_bytes(4, "big")
-            for index, tag in enumerate(all_tags)
-        )
-        profile = bytearray(128) + table + bytes(8 * len(all_tags))
+        profile = bytearray(128) + _icc_tag_data((b"desc", b"cprt", b"wtpt", *tags))
         profile[16:20] = colorspace
         assert _has_usable_tag_table(bytes(profile)) is usable
 
@@ -1790,6 +1797,21 @@ class TestPreservedColorValidation:
             page,
             location,
             b"BI /W 1 /H 1 /BPC 8 /CS " + space + b" ID \x80\x80\x80 EI",
+        )
+        with pytest.raises(ConversionError, match="invalid /WhitePoint"):
+            embed_color_profiles(pdf)
+
+    def test_inline_image_divided_between_content_streams_is_checked(self):
+        """A page's /Contents array is interpreted as one concatenated stream."""
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        page.Contents = Array(
+            [
+                pdf.make_stream(b"q BI"),
+                pdf.make_stream(
+                    b"/W 1 /H 1 /BPC 8 /CS [/CalRGB << >>] ID \x80\x80\x80 EI Q"
+                ),
+            ]
         )
         with pytest.raises(ConversionError, match="invalid /WhitePoint"):
             embed_color_profiles(pdf)

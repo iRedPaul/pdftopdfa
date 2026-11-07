@@ -33,6 +33,24 @@ _KNOWN_CONDITION_RE = re.compile(
     re.ASCII | re.IGNORECASE,
 )
 
+# Element types that ICC.1 permits for the tags required below. This checks the type
+# of each element but does not parse its content.
+_ICC_XYZ_TYPE = (b"XYZ ",)
+_ICC_CURVE_TYPES = (b"curv", b"para")
+_ICC_TAG_TYPES: dict[bytes, tuple[bytes, ...]] = {
+    b"desc": (b"desc", b"mluc"),
+    b"cprt": (b"text", b"mluc"),
+    b"wtpt": _ICC_XYZ_TYPE,
+    b"A2B0": (b"mft1", b"mft2", b"mAB "),
+    b"kTRC": _ICC_CURVE_TYPES,
+    b"rTRC": _ICC_CURVE_TYPES,
+    b"gTRC": _ICC_CURVE_TYPES,
+    b"bTRC": _ICC_CURVE_TYPES,
+    b"rXYZ": _ICC_XYZ_TYPE,
+    b"gXYZ": _ICC_XYZ_TYPE,
+    b"bXYZ": _ICC_XYZ_TYPE,
+}
+
 # Tags that describe a color model without a lookup table, which CMYK requires.
 _ICC_MODEL_TAGS: dict[bytes, frozenset[bytes]] = {
     b"GRAY": frozenset({b"kTRC"}),
@@ -235,11 +253,16 @@ def _has_usable_tag_table(profile_data: bytes) -> bool:
         return False
     tags = set()
     for position in range(132, data_start, 12):
+        signature = profile_data[position : position + 4]
         offset = int.from_bytes(profile_data[position + 4 : position + 8], "big")
         size = int.from_bytes(profile_data[position + 8 : position + 12], "big")
         if offset < data_start or size < 8 or offset + size > len(profile_data):
             return False
-        tags.add(profile_data[position : position + 4])
+        # Each element starts with its type, which the tag restricts for these tags.
+        allowed_types = _ICC_TAG_TYPES.get(signature)
+        if allowed_types and profile_data[offset : offset + 4] not in allowed_types:
+            return False
+        tags.add(signature)
     if not {b"desc", b"cprt", b"wtpt"} <= tags:
         return False
     model_tags = _ICC_MODEL_TAGS.get(profile_data[16:20])

@@ -399,6 +399,15 @@ def test_page_beads_out_of_reading_order_are_repaired():
     assert [bead.objgen for bead in page.B] == [first.objgen, second.objgen]
 
 
+def test_duplicate_page_beads_are_removed():
+    """A page lists each of its beads once, so the repair keeps all destinations."""
+    pdf = new_pdf()
+    first, second, page = _two_bead_article(pdf)
+    page.B = Array([first, second, first])
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert [bead.objgen for bead in page.B] == [first.objgen, second.objgen]
+
+
 def test_page_bead_repair_keeps_positions_of_other_threads():
     """No order between separate articles is defined, so they stay in place."""
     pdf = new_pdf()

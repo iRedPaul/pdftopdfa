@@ -109,15 +109,16 @@ def _inline_image_spaces(owner) -> list:
 
     Named spaces are found through resources. Only a stream that can contain both
     an inline image and a calibrated space, possibly in a hex-escaped name, is parsed.
+    A page's /Contents array counts as one stream for this purpose.
     """
     is_page = owner.get("/Type") == Name.Page
     contents = owner.get("/Contents") if is_page else owner
     streams = list(contents) if isinstance(contents, Array) else [contents]
     try:
-        if not any(
-            b"BI" in (data := stream.read_bytes()) and (b"Cal" in data or b"#" in data)
-            for stream in streams
-            if isinstance(stream, Stream)
+        # A page may divide an inline image between the streams of its /Contents.
+        data = [stream.read_bytes() for stream in streams if isinstance(stream, Stream)]
+        if not any(b"BI" in part for part in data) or not any(
+            b"Cal" in part or b"#" in part for part in data
         ):
             return []
         return [
