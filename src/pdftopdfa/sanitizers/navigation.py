@@ -55,18 +55,16 @@ def _valid_item_value(value, subtype) -> bool:
         value = value.get("/D")
         if value is None:
             return True
-    if subtype == Name.S:
+    if subtype in (Name.S, Name.F, Name.Desc):
         return isinstance(value, String)
-    if subtype == Name.D:
+    if subtype in (Name.D, Name.ModDate, Name.CreationDate):
         return _pdf_date(value) is not None
-    if subtype == Name.N:
-        return (
-            not isinstance(value, bool)
-            and isinstance(value, (int, float, Decimal))
-            and math.isfinite(value)
-        )
-    # Other field types take their data from the file specification itself.
-    return True
+    return (
+        subtype in (Name.N, Name.Size)
+        and not isinstance(value, bool)
+        and isinstance(value, (int, float, Decimal))
+        and math.isfinite(value)
+    )
 
 
 def _sanitize_collection_items(pdf: Pdf, schema, check_fields: bool) -> int:
@@ -79,6 +77,10 @@ def _sanitize_collection_items(pdf: Pdf, schema, check_fields: bool) -> int:
         if not isinstance(item, Dictionary):
             removed += _remove_entry(filespec, "/CI")
             continue
+        # A file specification refers to its collection item indirectly.
+        if item.objgen == (0, 0):
+            item = pdf.make_indirect(item)
+            filespec["/CI"] = item
         removed += _optional_type(item, Name.CollectionItem)
         if not check_fields:
             continue

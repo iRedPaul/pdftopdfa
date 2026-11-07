@@ -30,7 +30,10 @@
 - Rewrite real `/N` entries of retained OutputIntent profiles as integers
 - Accept article threads on pages that omit the optional `/B` array instead of using the original-input fallback
 - Analyze soft masks selected by a shading pattern's `/ExtGState` during overprint repair
-- Remove soft-mask calculator functions unless their stack effects provably yield one number
+- Remove soft-mask calculator functions unless their stack effects provably yield one number, and reject constant operations without a defined result
+- Require a usable tag table before retaining an existing OutputIntent profile
+- Require custom XMP structure fields to use the namespace of their declared value type, and validate XMP numbers against their lexical forms
+- Reject non-integer text rendering modes during overprint analysis
 - Validate calibrated color spaces that inline images declare directly
 - Remove collection item values without a matching schema field or with the wrong type, and a default document that is not an embedded file
 - Sanitize an `/ExtGState` stored directly on a shading pattern like other graphics states, and validate calibrated spaces in its soft mask

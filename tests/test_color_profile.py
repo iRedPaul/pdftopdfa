@@ -31,6 +31,7 @@ from pdftopdfa.color_profile import (
     get_srgb_profile,
     has_output_intent,
 )
+from pdftopdfa.color_profile._output_intents import _has_usable_tag_table
 from pdftopdfa.exceptions import ConversionError
 
 
@@ -108,8 +109,14 @@ def _make_icc_profile(**overrides: bytes | int) -> bytes:
         device_class (bytes): 4-byte class at offset 12-15
         colorspace (bytes): 4-byte color space signature at offset 16-19
     """
-    profile = bytearray(128)
-    profile[0:4] = (128).to_bytes(4, "big")
+    tags = (b"desc", b"cprt", b"wtpt", b"A2B0")
+    data_start = 132 + 12 * len(tags)
+    table = len(tags).to_bytes(4, "big") + b"".join(
+        tag + (data_start + 8 * index).to_bytes(4, "big") + (8).to_bytes(4, "big")
+        for index, tag in enumerate(tags)
+    )
+    profile = bytearray(128) + table + bytes(8 * len(tags))
+    profile[0:4] = len(profile).to_bytes(4, "big")
     profile[8] = overrides.get("version", 2)
     profile[12:16] = overrides.get("device_class", b"mntr")
     profile[16:20] = overrides.get("colorspace", b"RGB ")
@@ -840,6 +847,92 @@ class TestEmbedColorProfiles:
         assert str(preserved["/OutputConditionIdentifier"]) == "Custom CMYK"
         assert bytes(preserved["/DestOutputProfile"].read_bytes()) == profile_data
         assert preserved["/DestOutputProfile"]["/N"] == 4
+
+    @pytest.mark.parametrize("load", [get_srgb_profile, get_cmyk_profile])
+    def test_bundled_profiles_have_usable_tag_tables(self, load) -> None:
+        """Real profiles satisfy the checks made for existing output intents."""
+        assert _has_usable_tag_table(load())
+
+    @pytest.mark.parametrize(
+        "damage",
+        [
+            "header_only",
+            "count_exceeds_data",
+            "offset_in_table",
+            "data_past_end",
+            "short_tag",
+            "missing_description",
+            "no_color_model",
+        ],
+    )
+    def test_existing_output_intent_needs_a_usable_tag_table(self, damage) -> None:
+        """A plausible header alone cannot retain an existing output condition."""
+        profile = bytearray(_make_icc_profile())
+        if damage == "header_only":
+            profile = profile[:128]
+        elif damage == "count_exceeds_data":
+            profile[128:132] = (1000).to_bytes(4, "big")
+        elif damage == "offset_in_table":
+            profile[136:140] = (4).to_bytes(4, "big")
+        elif damage == "data_past_end":
+            profile[140:144] = (1000).to_bytes(4, "big")
+        elif damage == "short_tag":
+            profile[140:144] = (4).to_bytes(4, "big")
+        elif damage == "missing_description":
+            profile[132:136] = b"none"
+        else:
+            profile[168:172] = b"none"
+        profile[0:4] = len(profile).to_bytes(4, "big")
+        pdf = new_pdf()
+        stream = pdf.make_stream(bytes(profile))
+        stream[Name.N] = 3
+        pdf.Root.OutputIntents = Array(
+            [
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.GTS_PDFA1,
+                    OutputConditionIdentifier=pikepdf.String("Damaged"),
+                    DestOutputProfile=stream,
+                )
+            ]
+        )
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        replacement = pdf.Root.OutputIntents[0]
+        assert str(replacement.OutputConditionIdentifier) != "Damaged"
+        assert replacement.DestOutputProfile.read_bytes() != bytes(profile)
+
+    @pytest.mark.parametrize(
+        "colorspace,tags,usable",
+        [
+            (b"GRAY", (b"kTRC",), True),
+            (b"GRAY", (), False),
+            (
+                b"RGB ",
+                (b"rXYZ", b"gXYZ", b"bXYZ", b"rTRC", b"gTRC", b"bTRC"),
+                True,
+            ),
+            (b"RGB ", (b"rXYZ", b"gXYZ", b"bXYZ", b"rTRC", b"gTRC"), False),
+            (b"CMYK", (b"A2B0",), True),
+            (b"CMYK", (b"kTRC",), False),
+        ],
+    )
+    def test_output_profile_needs_its_color_model_tags(
+        self, colorspace, tags, usable
+    ) -> None:
+        """A matrix or tone-curve model is an alternative to a lookup table only."""
+        all_tags = (b"desc", b"cprt", b"wtpt", *tags)
+        data_start = 132 + 12 * len(all_tags)
+        table = len(all_tags).to_bytes(4, "big") + b"".join(
+            tag + (data_start + 8 * index).to_bytes(4, "big") + (8).to_bytes(4, "big")
+            for index, tag in enumerate(all_tags)
+        )
+        profile = bytearray(128) + table + bytes(8 * len(all_tags))
+        profile[16:20] = colorspace
+        assert _has_usable_tag_table(bytes(profile)) is usable
 
     @pytest.mark.parametrize(
         "value", [Decimal("3.0"), Decimal("3.5"), True, Name.Three, 3]

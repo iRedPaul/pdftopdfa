@@ -336,6 +336,14 @@ _CALCULATOR_MAX_NESTING = 32
 _CALCULATOR_MAX_STACK = 100
 _CALCULATOR_MAX_INTEGER = 2**31 - 1
 
+
+def _calculator_atan(numerator, denominator) -> float:
+    """Compute PostScript atan in degrees, in which 0 0 atan has no defined result."""
+    if numerator == 0 and denominator == 0:
+        raise ValueError("undefined angle")
+    return math.degrees(math.atan2(numerator, denominator)) % 360
+
+
 # Deterministic results of operators whose literal operands are known, which keep
 # later copy, index and roll operands provable. Other operators yield unknown numbers.
 _CALCULATOR_FOLDS = {
@@ -345,14 +353,22 @@ _CALCULATOR_FOLDS = {
     "cvr": float,
     "ceiling": lambda a: type(a)(math.ceil(a)),
     "floor": lambda a: type(a)(math.floor(a)),
-    # A negative tie is not treated as known, so that no rounding convention decides
-    # whether a stack operation is valid.
+    # PostScript rounds a tie to the greater value, so -1.5 becomes -1, but renderers
+    # may differ. Such a value is not treated as known in order to prove a stack effect.
     "round": lambda a: None if a < 0 and a % 1 == 0.5 else type(a)(math.floor(a + 0.5)),
     "truncate": lambda a: type(a)(math.trunc(a)),
     "add": lambda a, b: a + b,
     "sub": lambda a, b: a - b,
     "mul": lambda a, b: a * b,
     "div": lambda a, b: float(a) / b,
+    # These raise ValueError for an operand without a defined result, such as -1 sqrt.
+    "sqrt": math.sqrt,
+    "ln": math.log,
+    "log": math.log10,
+    "exp": math.pow,
+    "sin": lambda a: math.sin(math.radians(a)),
+    "cos": lambda a: math.cos(math.radians(a)),
+    "atan": _calculator_atan,
 }
 _CALCULATOR_INTEGER_FOLDS = {
     # idiv truncates toward zero, and mod takes the sign of the dividend.

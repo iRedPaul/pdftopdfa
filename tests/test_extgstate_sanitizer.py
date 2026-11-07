@@ -1179,6 +1179,14 @@ class TestSoftMaskValidation:
             b"{ cvi 1 add 1 and cvr }",
             b"{ cvi dup 0 gt { pop 1 } if 1 and cvr }",
             b"{ pop 3 2 xor }",
+            b"{ pop 4 sqrt }",
+            b"{ pop 1 ln }",
+            b"{ pop 100 log }",
+            b"{ pop 2 3 exp }",
+            b"{ pop 1 1 atan }",
+            b"{ pop 90 sin }",
+            b"{ 16 sqrt cvi 3 sub copy pop }",
+            b"{ sqrt }",
         ],
     )
     def test_calculator_with_one_numeric_result_is_preserved(self, program) -> None:
@@ -1229,6 +1237,13 @@ class TestSoftMaskValidation:
             b"{ cvi 1.5 or }",
             b"{ cvr 1 and }",
             b"{ pop true 1 and }",
+            b"{ pop -1 sqrt }",
+            b"{ pop 0 ln }",
+            b"{ pop -1 ln }",
+            b"{ pop 0 log }",
+            b"{ pop 0 -1 exp }",
+            b"{ pop -1 0.5 exp }",
+            b"{ pop 0 0 atan }",
             b"{ cvi copy }",
             b"{ 1 0 idiv pop }",
             b"{ 1 0 div pop }",
@@ -1905,6 +1920,24 @@ class TestOverprintIccBasedCmyk:
                 ),
             )
         )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert page.Contents.read_bytes() == content
+
+    @pytest.mark.parametrize("mode", [b"3.5", b"3.0", b"8", b"-1"])
+    def test_invalid_text_rendering_mode_fails_closed(self, mode) -> None:
+        """A truncated mode could hide Type3 paint from the overprint analysis."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs " + mode + b" Tr", OPM=1, OP=True)
+        with pytest.raises(ConversionError, match="invalid text rendering mode"):
+            sanitize_extgstate(pdf)
+        assert page.Resources.ExtGState.GS0.OPM == 1
+
+    @pytest.mark.parametrize("mode", [b"0", b"3", b"7"])
+    def test_valid_text_rendering_mode_is_accepted(self, mode) -> None:
+        """Every defined mode remains analyzable."""
+        pdf = new_pdf()
+        content = b"/GS0 gs " + mode + b" Tr"
+        page = self._page(pdf, content, OPM=1, OP=True)
         assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
         assert page.Contents.read_bytes() == content
 

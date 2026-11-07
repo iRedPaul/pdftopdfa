@@ -167,7 +167,17 @@ def test_collection_items_matching_the_schema_are_unchanged():
         (Name.S, Dictionary(D=42), False),
         (Name.S, Dictionary(D="text", P=42), False),
         (Name.S, Dictionary(Type=Name.Bad, D="text"), False),
-        (Name.Desc, "ignored", True),
+        (Name.F, "a.txt", True),
+        (Name.F, True, False),
+        (Name.Desc, "description", True),
+        (Name.Desc, Array([1]), False),
+        (Name.ModDate, "D:20240101000000Z", True),
+        (Name.ModDate, "yesterday", False),
+        (Name.CreationDate, "D:20240101000000Z", True),
+        (Name.CreationDate, Name.Bad, False),
+        (Name.Size, 42, True),
+        (Name.Size, Array([1, 2]), False),
+        (Name.Size, True, False),
     ],
 )
 def test_collection_item_values_must_match_their_field_type(subtype, value, valid):
@@ -177,6 +187,17 @@ def test_collection_item_values_must_match_their_field_type(subtype, value, vali
     spec.CI = Dictionary(Field=value)
     remove_forbidden_catalog_entries(pdf)
     assert ("/Field" in spec.CI) is valid
+
+
+def test_direct_collection_item_becomes_indirect_and_keeps_its_values():
+    """Making the reference indirect repairs the entry without losing any value."""
+    pdf = new_pdf()
+    spec = _portfolio(pdf, Dictionary(Good=Dictionary(Subtype=Name.S, N="Good")))
+    spec.CI = Dictionary(Good="keep")
+    assert spec.CI.objgen == (0, 0)
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert spec.CI.objgen != (0, 0)
+    assert str(spec.CI.Good) == "keep"
 
 
 @pytest.mark.parametrize("schema", [None, Dictionary()])

@@ -22,6 +22,12 @@ _ICC_SIGNATURE_TO_COLORSPACE: dict[bytes, tuple[int, ColorSpaceType]] = {
     b"CMYK": (4, ColorSpaceType.DEVICE_CMYK),
 }
 
+# Tags that describe a color model without a lookup table, which CMYK requires.
+_ICC_MODEL_TAGS: dict[bytes, frozenset[bytes]] = {
+    b"GRAY": frozenset({b"kTRC"}),
+    b"RGB ": frozenset({b"rXYZ", b"gXYZ", b"bXYZ", b"rTRC", b"gTRC", b"bTRC"}),
+}
+
 
 @dataclass(frozen=True)
 class OutputIntentPreparation:
@@ -174,6 +180,31 @@ def _remove_redundant_pdfa_intents(output_intents: Array) -> None:
     )
 
 
+def _has_usable_tag_table(profile_data: bytes) -> bool:
+    """Require tagged data that can describe colors, beyond a plausible header.
+
+    Besides the common description, copyright and white point tags, an output
+    profile needs a lookup table, or the tone curves and colorants of its model.
+    """
+    if len(profile_data) < 132:
+        return False
+    count = int.from_bytes(profile_data[128:132], "big")
+    data_start = 132 + 12 * count
+    if data_start > len(profile_data):
+        return False
+    tags = set()
+    for position in range(132, data_start, 12):
+        offset = int.from_bytes(profile_data[position + 4 : position + 8], "big")
+        size = int.from_bytes(profile_data[position + 8 : position + 12], "big")
+        if offset < data_start or size < 8 or offset + size > len(profile_data):
+            return False
+        tags.add(profile_data[position : position + 4])
+    if not {b"desc", b"cprt", b"wtpt"} <= tags:
+        return False
+    model_tags = _ICC_MODEL_TAGS.get(profile_data[16:20])
+    return b"A2B0" in tags or (model_tags is not None and model_tags <= tags)
+
+
 def _validate_pdfa_output_intent(intent: Dictionary) -> _ValidOutputIntent | None:
     """Check an embedded output profile and repair its deterministic component count."""
     dest_profile = intent.get("/DestOutputProfile")
@@ -193,6 +224,8 @@ def _validate_pdfa_output_intent(intent: Dictionary) -> _ValidOutputIntent | Non
     if not _validate_icc_profile(profile_data):
         return None
     if profile_data[12:16] not in {b"mntr", b"prtr"}:
+        return None
+    if not _has_usable_tag_table(profile_data):
         return None
 
     signature = profile_data[16:20]

@@ -44,6 +44,12 @@ _XMP_DATE_RE = re.compile(
 )
 
 
+# XMP numbers use plain decimal notation, without exponents, NaN or infinities.
+_XMP_INTEGER_RE = re.compile(r"[+-]?\d+", re.ASCII)
+_XMP_REAL_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", re.ASCII)
+_XMP_RATIONAL_RE = re.compile(r"[+-]?\d+/[+-]?\d+", re.ASCII)
+
+
 def _sanitize_xml_text(text: str) -> str:
     """Remove control characters that are illegal in XML 1.0."""
     return _XML_ILLEGAL_CTRL_RE.sub("", text)
@@ -1381,6 +1387,7 @@ def _collect_declared_extension_schema_details(
     name_tag = f"{{{_NS_PDFA_PROPERTY}}}name"
     value_type_tag = f"{{{_NS_PDFA_PROPERTY}}}valueType"
     type_name_tag = f"{{{_NS_PDFA_TYPE}}}type"
+    type_namespace_tag = f"{{{_NS_PDFA_TYPE}}}namespaceURI"
     type_field_tag = f"{{{_NS_PDFA_TYPE}}}field"
     field_name_tag = f"{{{_NS_PDFA_FIELD}}}name"
     field_value_type_tag = f"{{{_NS_PDFA_FIELD}}}valueType"
@@ -1423,9 +1430,16 @@ def _collect_declared_extension_schema_details(
             if not type_name:
                 continue
 
+            # A field belongs to its type's namespace, so it is keyed by Clark name.
+            type_namespace_elem = value_type_li.find(type_namespace_tag)
+            type_namespace = (
+                (type_namespace_elem.text or "").strip()
+                if type_namespace_elem is not None
+                else ""
+            )
             fields: dict[str, str] = {}
             type_field_elem = value_type_li.find(type_field_tag)
-            if type_field_elem is not None:
+            if type_field_elem is not None and type_namespace:
                 field_seq = type_field_elem.find(seq_tag)
                 if field_seq is not None:
                     for field_li in field_seq.findall(li_tag):
@@ -1442,7 +1456,9 @@ def _collect_declared_extension_schema_details(
                             else ""
                         )
                         if field_name and field_value_type:
-                            fields[field_name] = field_value_type
+                            fields[f"{{{type_namespace}}}{field_name}"] = (
+                                field_value_type
+                            )
 
             custom_types.setdefault(uri, {})[type_name] = fields
 
@@ -1593,18 +1609,11 @@ def _is_valid_simple_value(text: str, type_code: str) -> bool:
     if not text:
         return False
     if type_code == "i":
-        return text.lstrip("-").isdigit()
+        return _XMP_INTEGER_RE.fullmatch(text) is not None
     if type_code == "f":
-        try:
-            float(text)
-        except ValueError:
-            return False
-        return True
+        return _XMP_REAL_RE.fullmatch(text) is not None
     if type_code == "r":
-        parts = text.split("/")
-        if len(parts) != 2 or not parts[0] or not parts[1]:
-            return False
-        return parts[0].lstrip("-").isdigit() and parts[1].lstrip("-").isdigit()
+        return _XMP_RATIONAL_RE.fullmatch(text) is not None
     if type_code == "d":
         return _is_valid_xmp_date(text)
     if type_code == "B":
@@ -1807,10 +1816,9 @@ def _validate_extension_struct_fields(
     for attr_name, attr_value in source.attrib.items():
         if not attr_name.startswith("{"):
             return False
-        attr_uri, attr_local = attr_name[1:].split("}", 1)
-        if attr_uri == ns_rdf:
+        if attr_name.startswith(f"{{{ns_rdf}}}"):
             continue
-        declared_type = field_types.get(attr_local)
+        declared_type = field_types.get(attr_name)
         if declared_type is None:
             return False
         if not _validate_extension_attribute_value(attr_value, declared_type):
@@ -1819,10 +1827,9 @@ def _validate_extension_struct_fields(
     for child in source:
         if not isinstance(child.tag, str) or not child.tag.startswith("{"):
             return False
-        child_uri, child_local = child.tag[1:].split("}", 1)
-        if child_uri == ns_rdf:
+        if child.tag.startswith(f"{{{ns_rdf}}}"):
             return False
-        declared_type = field_types.get(child_local)
+        declared_type = field_types.get(child.tag)
         if declared_type is None:
             return False
         if not _is_valid_extension_property_value(

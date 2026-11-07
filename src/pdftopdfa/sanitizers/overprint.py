@@ -444,7 +444,15 @@ class _Analyzer:
                         },
                     )
                 elif op == "Tr":
-                    state = replace(state, text_mode=int(operands[0]))
+                    # Truncating 3.5 would also hide the paint of every Type3 glyph.
+                    mode = operands[0]
+                    if (
+                        isinstance(mode, bool)
+                        or not isinstance(mode, int)
+                        or not 0 <= mode <= 7
+                    ):
+                        raise _error("invalid text rendering mode")
+                    state = replace(state, text_mode=mode)
                 elif op == "Tf":
                     font = _resource(resources, "/Font", operands[0])
                     state = replace(

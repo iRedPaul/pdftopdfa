@@ -3976,6 +3976,70 @@ class TestXmpDateValidation:
         assert not _is_valid_simple_value(value, "d")
 
 
+class TestXmpNumberValidation:
+    """XMP numbers use plain decimal notation, unlike what Python can parse."""
+
+    @pytest.mark.parametrize(
+        "value", ["0", "1.5", "-1.5", "+1.5", ".5", "5.", "-.5", "007"]
+    )
+    def test_decimal_reals_are_accepted(self, value) -> None:
+        """Every decimal spelling with an optional sign and point stays valid."""
+        assert _is_valid_simple_value(value, "f")
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "NaN",
+            "nan",
+            "inf",
+            "-inf",
+            "Infinity",
+            "1e3",
+            "1E3",
+            " 1",
+            "1 ",
+            ".",
+            "1_000",
+        ],
+    )
+    def test_other_float_spellings_are_rejected(self, value) -> None:
+        """Python's float() accepts these, but XMP does not."""
+        assert not _is_valid_simple_value(value, "f")
+
+    @pytest.mark.parametrize(
+        "value,valid",
+        [
+            ("42", True),
+            ("-42", True),
+            ("+42", True),
+            ("--42", False),
+            ("4.2", False),
+            ("٤٢", False),
+            ("1_000", False),
+        ],
+    )
+    def test_integers_use_plain_digits(self, value, valid) -> None:
+        """Integers allow one sign and ASCII digits only."""
+        assert _is_valid_simple_value(value, "i") is valid
+
+    @pytest.mark.parametrize(
+        "value,valid",
+        [
+            ("1/2", True),
+            ("-1/2", True),
+            ("1/-2", True),
+            ("--1/2", False),
+            ("1/", False),
+            ("/2", False),
+            ("1/2/3", False),
+            ("1.5/2", False),
+        ],
+    )
+    def test_rationals_use_two_integers(self, value, valid) -> None:
+        """A rational consists of exactly two integers."""
+        assert _is_valid_simple_value(value, "r") is valid
+
+
 class TestLanguageTags:
     """Copied xml:lang qualifiers must be language tags, repaired where unambiguous."""
 
@@ -4201,6 +4265,27 @@ class TestInvalidRdfSyntaxIsNotCopied:
         ) == ["inch"]
 
     @pytest.mark.parametrize(
+        "field,expected",
+        [
+            ("<t:w>1</t:w>", True),
+            ("<o:w>1</o:w>", False),
+            ("<t:other>1</t:other>", False),
+        ],
+    )
+    def test_custom_type_fields_must_use_the_declared_namespace(
+        self, field, expected
+    ) -> None:
+        """veraPDF rejects a field outside of the namespace of its value type."""
+        elem = etree.fromstring(
+            f'<c:prop xmlns:c="urn:custom" xmlns:t="urn:type" xmlns:o="urn:other" '
+            f'xmlns:rdf="{NAMESPACES["rdf"]}" rdf:parseType="Resource">{field}</c:prop>'
+        )
+        custom_types = {"Size": {"{urn:type}w": "Text"}}
+        assert (
+            _is_valid_extension_property_value(elem, "Size", custom_types) is expected
+        )
+
+    @pytest.mark.parametrize(
         "body,expected",
         [
             ("<rdf:Bag><rdf:li>a</rdf:li></rdf:Bag>", True),
@@ -4267,7 +4352,7 @@ class TestInvalidRdfSyntaxIsNotCopied:
             f'<c:prop xmlns:c="urn:custom" xmlns:rdf="{NAMESPACES["rdf"]}" '
             f"{attributes}>{fields}</c:prop>"
         )
-        custom_types = {"Size": {"w": "Text", "h": "Text"}}
+        custom_types = {"Size": {"{urn:custom}w": "Text", "{urn:custom}h": "Text"}}
         assert (
             _is_valid_extension_property_value(elem, "Size", custom_types) is expected
         )
@@ -5210,13 +5295,14 @@ class TestNonCatalogExtensionInCatalogXMP:
             b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
             b'<rdf:Description rdf:about=""'
             b' xmlns:custom="http://example.com/custom/"'
+            b' xmlns:extype="http://example.com/types/"'
             b' xmlns:pdfaExtension="http://www.aiim.org/pdfa/ns/extension/"'
             b' xmlns:pdfaSchema="http://www.aiim.org/pdfa/ns/schema#"'
             b' xmlns:pdfaProperty="http://www.aiim.org/pdfa/ns/property#"'
             b' xmlns:pdfaType="http://www.aiim.org/pdfa/ns/type#"'
             b' xmlns:pdfaField="http://www.aiim.org/pdfa/ns/field#">'
             b'<custom:Foo rdf:parseType="Resource">'
-            b"<custom:Value>bar</custom:Value>"
+            b"<extype:Value>bar</extype:Value>"
             b"</custom:Foo>"
             b"<pdfaExtension:schemas><rdf:Bag>"
             b'<rdf:li rdf:parseType="Resource">'
