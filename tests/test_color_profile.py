@@ -4,6 +4,7 @@
 
 """Tests for color space management and ICC profiles."""
 
+from decimal import Decimal
 from io import BytesIO
 
 import pikepdf
@@ -839,6 +840,35 @@ class TestEmbedColorProfiles:
         assert str(preserved["/OutputConditionIdentifier"]) == "Custom CMYK"
         assert bytes(preserved["/DestOutputProfile"].read_bytes()) == profile_data
         assert preserved["/DestOutputProfile"]["/N"] == 4
+
+    @pytest.mark.parametrize(
+        "value", [Decimal("3.0"), Decimal("3.5"), True, Name.Three, 3]
+    )
+    def test_existing_output_intent_n_must_be_an_integer(self, value) -> None:
+        """A real /N is rewritten instead of being truncated and retained."""
+        pdf = new_pdf()
+        stream = pdf.make_stream(_make_icc_profile())
+        stream[Name.N] = value
+        pdf.Root.OutputIntents = Array(
+            [
+                Dictionary(
+                    Type=Name.OutputIntent,
+                    S=Name.GTS_PDFA1,
+                    OutputConditionIdentifier=pikepdf.String("Keep"),
+                    DestOutputProfile=stream,
+                )
+            ]
+        )
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Contents = pdf.make_stream(b"1 0 0 rg")
+
+        embed_color_profiles(pdf, "2b", replace_existing=True)
+
+        preserved = pdf.Root.OutputIntents[0]
+        assert str(preserved.OutputConditionIdentifier) == "Keep"
+        components = preserved.DestOutputProfile.N
+        assert isinstance(components, int) and not isinstance(components, bool)
+        assert components == 3
 
     def test_existing_output_intent_n_is_repaired(self) -> None:
         """Missing or wrong /N is repaired from the ICC color-space signature."""

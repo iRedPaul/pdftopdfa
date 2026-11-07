@@ -201,7 +201,13 @@ def _validate_pdfa_output_intent(intent: Dictionary) -> _ValidOutputIntent | Non
         return None
 
     expected_n, document_colorspace = profile_info
-    if _as_int(dest_profile.get("/N")) != expected_n:
+    # ISO 32000-1, Table 66 requires an integer, so 3.0 also needs rewriting.
+    components = dest_profile.get("/N")
+    if (
+        isinstance(components, bool)
+        or not isinstance(components, int)
+        or components != expected_n
+    ):
         dest_profile[Name.N] = expected_n
         logger.debug("Repaired DestOutputProfile /N to %d", expected_n)
 
@@ -210,11 +216,3 @@ def _validate_pdfa_output_intent(intent: Dictionary) -> _ValidOutputIntent | Non
         profile_data=profile_data,
         document_colorspace=document_colorspace,
     )
-
-
-def _as_int(value: object) -> int | None:
-    """Interpret a PDF numeric value without propagating invalid-field errors."""
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None

@@ -27,6 +27,9 @@
 - Remove empty `xml:lang` qualifiers while retaining their values
 - Remove TrapNets without a valid `/Rect` instead of retaining them or flattening their appearance at an undefined position
 - Store real `/OPM` values such as `1.0` as the required integers and remove values without a defined overprint mode
+- Rewrite real `/N` entries of retained OutputIntent profiles as integers
+- Accept article threads on pages that omit the optional `/B` array instead of using the original-input fallback
+- Analyze soft masks selected by a shading pattern's `/ExtGState` during overprint repair
 
 ### Tests
 

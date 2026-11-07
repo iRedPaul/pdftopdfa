@@ -316,11 +316,21 @@ class _Analyzer:
             shading = pattern.get("/Shading")
             if not isinstance(shading, (Dictionary, Stream)):
                 raise _error("invalid shading pattern")
-            kind = _colour_kind(shading.get("/ColorSpace"), resources)
-            pattern_state = replace(pattern_state, stroke=kind, fill=kind)
-            if _needs_repair(pattern_state, stroke=False, fill=True):
+            colour = _colour_kind(shading.get("/ColorSpace"), resources)
+            painted = replace(pattern_state, stroke=colour, fill=colour)
+            if _needs_repair(painted, stroke=False, fill=True):
                 raise _error(
                     "shading pattern needs invocation-specific overprint repair"
+                )
+            if pattern_state.soft_mask is not None:
+                # The pattern's ExtGState stays in effect while it paints, so a
+                # mask it selects is evaluated here, as walk() does for its paints.
+                self.form(
+                    pattern_state.soft_mask,
+                    resources,
+                    replace(pattern_state, soft_mask=None),
+                    ancestors,
+                    selected.initial,
                 )
         else:
             raise _error("unknown pattern type")

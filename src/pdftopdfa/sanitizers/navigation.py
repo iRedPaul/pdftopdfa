@@ -196,7 +196,10 @@ def _validate_threads(pdf: Pdf) -> None:
                 )
             ):
                 raise _thread_error("invalid bead rectangle")
-            if bead.objgen not in page_bead_ids.get(page_ref.objgen, ()):
+            # ISO 32000-1, Table 30: /B is optional and can be recovered from
+            # /Threads, so only an array that is present must list the bead.
+            listed_beads = page_bead_ids.get(page_ref.objgen)
+            if listed_beads is not None and bead.objgen not in listed_beads:
                 raise _thread_error("bead is missing from its page's /B array")
             all_beads[bead.objgen] = page_ref.objgen
             bead = following

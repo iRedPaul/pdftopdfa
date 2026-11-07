@@ -150,6 +150,50 @@ def test_valid_article_needs_no_optional_type_entries():
     assert page.B[0].objgen == bead.objgen
 
 
+def test_article_pages_may_omit_optional_bead_arrays():
+    """Table 30 makes page /B optional because /Threads can recreate it."""
+    pdf = new_pdf()
+    thread, _, page = _article(pdf)
+    del page.B
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert "/B" not in page.obj
+    assert pdf.Root.Threads[0].objgen == thread.objgen
+
+
+def test_each_page_decides_whether_its_bead_array_is_checked():
+    """A page's listing is only compared with the beads placed on that page."""
+    pdf = new_pdf()
+    thread, first, _ = _article(pdf)
+    other = pdf.add_blank_page()
+    second = pdf.make_indirect(
+        Dictionary(T=thread, P=other.obj, R=Array([0, 0, 100, 100]))
+    )
+    first.N = first.V = second
+    second.N = second.V = first
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert "/B" not in other.obj
+
+    other.B = Array()
+    with pytest.raises(ConversionError, match="missing from its page's /B"):
+        remove_forbidden_catalog_entries(pdf)
+
+
+def test_conversion_keeps_article_without_page_bead_arrays(tmp_path):
+    """A conforming article cannot force the original-input fallback."""
+    from pikepdf import Pdf
+
+    pdf = new_pdf()
+    _, _, page = _article(pdf)
+    del page.B
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    result = convert_to_pdfa(source, output)
+    assert result.target_produced and not result.skipped, result
+    with Pdf.open(output) as converted:
+        assert str(converted.Root.Threads[0].I.Title) == "Article"
+        assert "/B" not in converted.pages[0].obj
+
+
 def test_malformed_article_conversion_preserves_original_file(tmp_path):
     """A malformed graph cannot be published as a claimed PDF/A conversion."""
     pdf = new_pdf()

@@ -1726,6 +1726,58 @@ class TestOverprintIccBasedCmyk:
         assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
         assert page.Contents.read_bytes() == content
 
+    @pytest.mark.parametrize(
+        "mask_paint,fixes",
+        [(b"/CS0 cs 0 0 20 20 re f", 1), (b"0 g 0 0 20 20 re f", 0)],
+    )
+    def test_shading_pattern_soft_mask_is_analyzed(self, mask_paint, fixes) -> None:
+        """A mask selected by a shading pattern's ExtGState belongs to that paint."""
+        pdf = new_pdf()
+        content = b"/Pattern cs /P scn 0 0 20 20 re f"
+        page = self._page(pdf, content)
+        mask = pdf.make_stream(mask_paint)
+        mask.Subtype = Name.Form
+        mask.BBox = Array([0, 0, 20, 20])
+        mask.Resources = Dictionary(ColorSpace=page.Resources.ColorSpace)
+        page.Resources.Pattern = Dictionary(
+            P=Dictionary(
+                PatternType=2,
+                ExtGState=Dictionary(
+                    OP=True, op=True, OPM=1, SMask=Dictionary(S=Name.Alpha, G=mask)
+                ),
+                Shading=Dictionary(ShadingType=2, ColorSpace=Name.DeviceGray),
+            )
+        )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == fixes
+        assert page.Contents.read_bytes() == content
+        if fixes:
+            self._assert_guard(mask, "f")
+        else:
+            assert mask.read_bytes() == mask_paint
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+
+    def test_unused_shading_pattern_soft_mask_is_not_repaired(self) -> None:
+        """A selected but unpainted pattern does not count as an actual paint."""
+        pdf = new_pdf()
+        content = b"/Pattern cs /P scn"
+        page = self._page(pdf, content)
+        mask_data = b"/CS0 cs 0 0 20 20 re f"
+        mask = pdf.make_stream(mask_data)
+        mask.Subtype = Name.Form
+        mask.BBox = Array([0, 0, 20, 20])
+        mask.Resources = Dictionary(ColorSpace=page.Resources.ColorSpace)
+        page.Resources.Pattern = Dictionary(
+            P=Dictionary(
+                PatternType=2,
+                ExtGState=Dictionary(
+                    OP=True, op=True, OPM=1, SMask=Dictionary(S=Name.Alpha, G=mask)
+                ),
+                Shading=Dictionary(ShadingType=2, ColorSpace=Name.DeviceGray),
+            )
+        )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert mask.read_bytes() == mask_data
+
     def test_shading_direct_icc_without_colorspace_table_is_detected(self) -> None:
         """Find a shading ICC profile even without a named ColorSpace table."""
         pdf = new_pdf()
