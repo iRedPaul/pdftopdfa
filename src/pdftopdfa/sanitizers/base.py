@@ -35,7 +35,8 @@ ALLOWED_NAMED_ACTIONS = frozenset(
     }
 )
 
-# Annotation subtypes forbidden in PDF/A-1, PDF/A-2, PDF/A-3
+# Annotation subtypes forbidden in the supported PDF/A-2 and PDF/A-3 profiles.
+# /TrapNet is explicitly permitted by ISO 19005-2/3, 6.3.1.
 # Note: FileAttachment is handled separately in remove_embedded_files()
 FORBIDDEN_ANNOTATION_SUBTYPES = frozenset(
     {
@@ -44,7 +45,6 @@ FORBIDDEN_ANNOTATION_SUBTYPES = frozenset(
         "/Screen",
         "/3D",
         "/RichMedia",
-        "/TrapNet",
     }
 )
 

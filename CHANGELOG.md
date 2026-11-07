@@ -47,6 +47,12 @@
 - Accept article threads on pages that omit the optional `/B` array instead of using the original-input fallback
 - Remove duplicate beads from a page's `/B` array, and restore the reading order of a page's article beads
 - Remove collection item values without a matching schema field or with the wrong type, keeping them when a portfolio has no schema, and a default document that is not an embedded file
+- Preserve PDF/A-2/3 TrapNet annotations
+- Validate TrapNet appearances and tracking before preserving them, and reject a TrapNet with an invalid annotation type
+- Detect stale TrapNets after page/resource edits, including OCR and date-based tracking
+- Keep TrapNets when sanitization only removes rollover or down appearances from other annotations
+- Remove TrapNets without a valid `/Rect` instead of retaining them or flattening their appearance at an undefined position
+- Remove a TrapNet with a warning, instead of using the original-input fallback, when conversion changes the print flag, rectangle, opacity, blend mode, or optional content of another annotation
 
 ### Tests
 

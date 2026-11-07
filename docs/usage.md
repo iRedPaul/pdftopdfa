@@ -245,6 +245,15 @@ Forms, patterns, or Type3 glyphs require incompatible repairs in different
 contexts, conversion uses the original-input fallback described above and
 reports the reason in the result warnings.
 
+Valid TrapNet annotations retain their appearance and trapping data. Malformed
+instances are flattened when a usable appearance is available, or removed
+otherwise. If conversion or OCR changes the description of a page with a retained
+TrapNet, conversion uses the original-input fallback because its trapping may be
+stale. This check also covers date-based tracking without a page modification date.
+Removing rollover or down appearances from other annotations does not count as such
+a change, because trapping depends only on their normal appearances. If conversion
+changes how another annotation prints, for example by setting its required Print flag,
+only the TrapNet is removed, with a warning, and the document is still converted.
 Custom DocInfo strings are retained only with valid PDFDocEncoding or BOM-prefixed
 UTF-16BE text encoding; valid string bytes remain unchanged.
 Article threads are checked for complete bead cycles and page links;

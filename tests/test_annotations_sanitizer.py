@@ -44,7 +44,7 @@ class TestRemoveForbiddenAnnotations:
 
     @pytest.mark.parametrize(
         "subtype",
-        ["/Sound", "/Movie", "/Screen", "/3D", "/RichMedia", "/TrapNet"],
+        ["/Sound", "/Movie", "/Screen", "/3D", "/RichMedia"],
     )
     def test_removes_forbidden_annotation(self, make_pdf_with_page, subtype):
         """Forbidden annotation subtypes are removed."""
@@ -212,6 +212,70 @@ class TestRemoveForbiddenAnnotations:
         page_xobjects = resolve(page_resources.get("/XObject"))
         form_obj = resolve(page_xobjects.get("/Fm0"))
         assert form_obj.get("/Annots") is None
+
+
+class TestTrapNetPreservation:
+    """TrapNet is a permitted annotation, not a flattening fallback."""
+
+    @pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
+    def test_sanitization_preserves_trapnet_properties_and_appearance(
+        self, make_pdf_with_page, level
+    ):
+        """Retain valid TrapNet properties, appearance bytes, and page content."""
+        from pdftopdfa.sanitizers import sanitize_for_pdfa
+
+        pdf = make_pdf_with_page()
+        content = b"q 1 0 0 1 0 0 cm Q"
+        appearance_bytes = b"0.5 g 0 0 20 20 re f"
+        appearance = pdf.make_stream(appearance_bytes)
+        appearance.Type = Name.XObject
+        appearance.Subtype = Name.Form
+        appearance.BBox = Array([0, 0, 20, 20])
+        appearance.Resources = Dictionary()
+        appearance.PCM = Name.DeviceGray
+        trapnet = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name.TrapNet,
+                Rect=Array([20, 20, 40, 40]),
+                F=ANNOT_FLAG_PRINT | 64,
+                AS=Name.Normal,
+                NM="prepress-trap-net",
+                Contents="Trapping information",
+                LastModified="D:20261106000000Z",
+                AP=Dictionary(N=appearance),
+            )
+        )
+        sound = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name.Sound,
+                Rect=Array([50, 50, 70, 70]),
+            )
+        )
+        page = pdf.pages[0]
+        page.Contents = pdf.make_stream(content)
+        page.Annots = Array([sound, trapnet])
+        pdf = save_and_reopen(pdf)
+
+        result = sanitize_for_pdfa(pdf, level)
+
+        assert result["non_compliant_annotations_flattened"] == 0
+        assert result["forbidden_annotations_removed"] == 1
+        pdf = save_and_reopen(pdf)
+        page = pdf.pages[0]
+        assert page.Contents.read_bytes() == content
+        assert len(page.Annots) == 1
+        restored = page.Annots[0]
+        assert restored.Type == Name.Annot
+        assert restored.Subtype == Name.TrapNet
+        assert list(restored.Rect) == [20, 20, 40, 40]
+        assert restored.F == ANNOT_FLAG_PRINT | 64
+        assert str(restored.NM) == "prepress-trap-net"
+        assert str(restored.Contents) == "Trapping information"
+        assert str(restored.LastModified) == "D:20261106000000Z"
+        assert restored.AP.N.read_bytes() == appearance_bytes
+        assert list(restored.AP.N.BBox) == [0, 0, 20, 20]
 
 
 class TestFlattenNonCompliantAnnotations:

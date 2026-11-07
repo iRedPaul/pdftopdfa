@@ -25,6 +25,12 @@ from .base import (
     ANNOT_FLAG_TOGGLENOVIEW,
     FORBIDDEN_ANNOTATION_SUBTYPES,
 )
+from .trapnet import (
+    has_valid_rect,
+    trapnet_count,
+    usable_form_appearance,
+    valid_trapnet,
+)
 from .widget_appearance import (
     _color_array_to_ops,
     _format_pdf_number,
@@ -288,6 +294,7 @@ def flatten_non_compliant_annotations(pdf: Pdf, level: str = "3b") -> int:
         indices_to_remove: list[int] = []
         page_xobjects: Dictionary | None = None
 
+        traps = trapnet_count(annots)
         for index, annot in enumerate(annots):
             try:
                 resolved = _resolve_indirect(annot)
@@ -299,7 +306,13 @@ def flatten_non_compliant_annotations(pdf: Pdf, level: str = "3b") -> int:
                     continue
 
                 subtype_str = str(subtype)
-                if not _is_non_compliant_annotation_subtype(subtype_str):
+                malformed_trap = subtype == Name.TrapNet and not valid_trapnet(
+                    resolved, page.obj, annots, index, traps
+                )
+                if (
+                    not _is_non_compliant_annotation_subtype(subtype_str)
+                    and not malformed_trap
+                ):
                     continue
 
                 if _annotation_is_hidden(resolved):
@@ -308,6 +321,21 @@ def flatten_non_compliant_annotations(pdf: Pdf, level: str = "3b") -> int:
                 appearance = _extract_normal_appearance_stream(resolved)
                 if appearance is None:
                     continue
+                if malformed_trap:
+                    normal = resolved.get("/AP", Dictionary()).get("/N")
+                    # Without a rectangle the appearance has no defined position,
+                    # so flattening would paint it at the wrong place on the page.
+                    if (
+                        not has_valid_rect(resolved)
+                        or not usable_form_appearance(appearance)
+                        or not isinstance(normal, Stream)
+                        and (
+                            not isinstance(normal, Dictionary)
+                            or not isinstance(resolved.get("/AS"), Name)
+                            or str(resolved.AS) not in normal
+                        )
+                    ):
+                        continue
 
                 page_xobjects = (
                     page_xobjects
@@ -431,6 +459,7 @@ def remove_forbidden_annotations(pdf: Pdf, level: str = "3b") -> int:
     for owner, annots in _get_annotation_arrays(pdf):
         try:
             indices_to_remove = []
+            traps = trapnet_count(annots)
             for i, annot in enumerate(annots):
                 try:
                     resolved = _resolve_indirect(annot)
@@ -441,7 +470,10 @@ def remove_forbidden_annotations(pdf: Pdf, level: str = "3b") -> int:
                         continue
 
                     subtype_str = str(subtype)
-                    if _is_non_compliant_annotation_subtype(subtype_str):
+                    if _is_non_compliant_annotation_subtype(subtype_str) or (
+                        subtype == Name.TrapNet
+                        and not valid_trapnet(resolved, owner, annots, i, traps)
+                    ):
                         indices_to_remove.append(i)
                         logger.debug(
                             "Found non-compliant annotation subtype %s",

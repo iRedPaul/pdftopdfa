@@ -56,7 +56,7 @@ from .catalog import (
     remove_forbidden_viewer_preferences,
 )
 from .colorspaces import sanitize_colorspaces
-from .extgstate import sanitize_extgstate
+from .extgstate import sanitize_extgstate, sanitize_overprint_usage
 from .files import (
     ensure_af_relationships,
     ensure_embedded_file_params,
@@ -92,6 +92,7 @@ from .rendering_intent import sanitize_rendering_intent
 from .signatures import count_digital_signatures, sanitize_signatures
 from .structure_limits import sanitize_structure_limits
 from .tounicode_values import fill_tounicode_gaps, sanitize_tounicode_values
+from .trapnet import trapnet_count
 from .truetype_encoding import sanitize_truetype_encoding
 from .xfa import remove_xfa_forms
 from .xobjects import (
@@ -484,6 +485,16 @@ def sanitize_for_pdfa(
     ef_filter_result = sanitize_embedded_file_filters(pdf)
     result["embedded_file_lzw_converted"] = ef_filter_result["lzw_converted"]
     result["embedded_file_crypt_removed"] = ef_filter_result["crypt_removed"]
+
+    # Removing other annotations/content may invalidate trap tracking arrays.
+    if any(trapnet_count(page.get("/Annots", [])) for page in pdf.pages):
+        late_flattened = flatten_non_compliant_annotations(pdf, level)
+        result["non_compliant_annotations_flattened"] += late_flattened
+        result["forbidden_annotations_removed"] += remove_forbidden_annotations(
+            pdf, level
+        )
+        if late_flattened:
+            result["extgstate_fixed"] += sanitize_overprint_usage(pdf)
 
     # Log all statistics generically: only report keys with a non-zero
     # count (or a True flag), in pipeline order.

@@ -65,6 +65,7 @@ from .sanitizers import (
 )
 from .sanitizers.catalog import _is_valid_bcp47
 from .sanitizers.extgstate import sanitize_overprint_usage
+from .sanitizers.trapnet import capture_trapnet_snapshots, validate_preserved_trapnets
 from .staging import (
     copy_to_private_stage,
     private_staging_directory,
@@ -2112,6 +2113,7 @@ def convert_to_pdfa(
     pdf: pikepdf.Pdf | None = None
     source_info: dict | None = None
     source_xmp_tree = None
+    source_trapnet_snapshots: dict[int, tuple[bytes, bytes]] = {}
 
     if ocr_force and ocr_deskew:
         raise OCRError("Deskew cannot be combined with forced OCR")
@@ -2169,6 +2171,8 @@ def convert_to_pdfa(
                 )
             source_info = extract_pdf_info(check_pdf) if pdfa else None
             source_xmp_tree = _extract_existing_xmp(check_pdf) if pdfa else None
+            if pdfa:
+                source_trapnet_snapshots = capture_trapnet_snapshots(check_pdf)
             if pdfa and source_info is not None:
                 source_title = _clean_metadata_text(source_info.get("title"))
                 title_source = (
@@ -3097,6 +3101,14 @@ def convert_to_pdfa(
                         "contrast, and usability require human verification"
                     ),
                 )
+            )
+
+        # Later content/resource edits must not leave a stale TrapNet snapshot.
+        removed_trapnets = validate_preserved_trapnets(pdf, source_trapnet_snapshots)
+        if removed_trapnets:
+            warnings.append(
+                f"{removed_trapnets} TrapNet annotation(s) removed because conversion "
+                "changed how other annotations print, which makes their trapping stale"
             )
 
         # 7. Create output directory if needed
