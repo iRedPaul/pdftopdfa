@@ -16,6 +16,7 @@
 - Rewrite real `/N` entries of retained OutputIntent profiles as integers
 - Require a usable tag table with permitted element types before retaining an existing OutputIntent profile
 - Remove OutputIntents with an undefined subtype or a non-standard condition without a profile while retaining the others
+- Preserve annotation colors and valid opacity values
 
 ## [0.9.25] - 2026-11-06
 

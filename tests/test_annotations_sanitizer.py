@@ -1633,47 +1633,79 @@ class TestFixAnnotationOpacity:
         resolved = resolve(pdf.pages[0].Annots[0])
         assert resolved.get("/CA") is None
 
-    def test_ca_1_0_untouched(self, make_pdf_with_page):
-        """Annotations with /CA 1.0 are left unchanged."""
+    @pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
+    @pytest.mark.parametrize("ca_value", [0.0, 0.4, 1.0])
+    @pytest.mark.parametrize("with_appearance", [False, True])
+    def test_valid_opacity_preserved(
+        self, make_pdf_with_page, level, ca_value, with_appearance
+    ):
+        """Valid transparency and existing appearances survive save/reopen."""
         pdf = make_pdf_with_page()
         annot = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Link,
+                Subtype=Name.Square,
                 Rect=Array([0, 0, 100, 100]),
+                CA=ca_value,
             )
         )
-        annot[Name("/CA")] = 1.0
-        pdf.pages[0]["/Annots"] = Array([annot])
+        appearance_bytes = b"q /GS gs 1 0 0 rg 0 0 100 100 re f Q"
+        if with_appearance:
+            appearance = pdf.make_stream(appearance_bytes)
+            appearance.Type = Name.XObject
+            appearance.Subtype = Name.Form
+            appearance.BBox = Array([0, 0, 100, 100])
+            appearance.Resources = Dictionary(
+                ExtGState=Dictionary(GS=Dictionary(CA=ca_value, ca=ca_value))
+            )
+            annot.AP = Dictionary(N=appearance)
+        pdf.pages[0].Annots = Array([annot])
+
+        assert fix_annotation_opacity(pdf, level) == 0
         pdf = save_and_reopen(pdf)
-        result = fix_annotation_opacity(pdf)
-        assert result == 0
+        restored = pdf.pages[0].Annots[0]
+        assert float(restored.CA) == ca_value
+        if with_appearance:
+            assert restored.AP.N.read_bytes() == appearance_bytes
+            assert float(restored.AP.N.Resources.ExtGState.GS.CA) == ca_value
+            assert float(restored.AP.N.Resources.ExtGState.GS.ca) == ca_value
+        else:
+            assert "/AP" not in restored
 
     @pytest.mark.parametrize(
-        "ca_value",
-        [0.0, 0.5, 2.0],
-        ids=["zero", "below_1", "above_1"],
+        "ca_value,expected",
+        [
+            (-0.1, 0.0),
+            (2.0, 1.0),
+            ("0.4", 1.0),
+            ("bad", 1.0),
+            (Name.bad, 1.0),
+            (True, 1.0),
+            (False, 1.0),
+            (Array([0.4]), 1.0),
+            (Dictionary(), 1.0),
+        ],
     )
-    def test_ca_not_1_fixed(self, make_pdf_with_page, ca_value):
-        """Annotations with /CA != 1.0 are set to 1.0."""
+    def test_malformed_opacity_repaired(self, make_pdf_with_page, ca_value, expected):
+        """Only invalid values are repaired, including coercible non-number types."""
         pdf = make_pdf_with_page()
         annot = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
                 Subtype=Name.Link,
                 Rect=Array([0, 0, 100, 100]),
+                CA=ca_value,
             )
         )
-        annot[Name("/CA")] = ca_value
-        pdf.pages[0]["/Annots"] = Array([annot])
+        pdf.pages[0].Annots = Array([annot])
+        assert fix_annotation_opacity(pdf) == 1
         pdf = save_and_reopen(pdf)
-        result = fix_annotation_opacity(pdf)
-        assert result == 1
-        resolved = resolve(pdf.pages[0].Annots[0])
-        assert float(resolved.get("/CA")) == 1.0
+        restored = pdf.pages[0].Annots[0]
+        assert not isinstance(restored.CA, bool)
+        assert float(restored.CA) == expected
 
     def test_multiple_annotations(self, make_pdf_with_page):
-        """Multiple annotations with bad /CA are all fixed."""
+        """Valid opacities on multiple annotation types are all preserved."""
         pdf = make_pdf_with_page()
         a1 = pdf.make_indirect(
             Dictionary(
@@ -1702,7 +1734,7 @@ class TestFixAnnotationOpacity:
         pdf.pages[0]["/Annots"] = Array([a1, a2, a3])
         pdf = save_and_reopen(pdf)
         result = fix_annotation_opacity(pdf)
-        assert result == 2
+        assert result == 0
 
     def test_multiple_pages(self, make_pdf_with_page):
         """Annotations across multiple pages are processed."""
@@ -1728,10 +1760,10 @@ class TestFixAnnotationOpacity:
 
         pdf = save_and_reopen(pdf)
         result = fix_annotation_opacity(pdf)
-        assert result == 2
+        assert result == 0
 
-    def test_widget_annotation_ca_fixed(self, make_pdf_with_page):
-        """Widget annotations with /CA != 1.0 are also fixed."""
+    def test_widget_annotation_ca_preserved(self, make_pdf_with_page):
+        """Valid widget opacity is preserved as well."""
         pdf = make_pdf_with_page()
         annot = pdf.make_indirect(
             Dictionary(
@@ -1745,12 +1777,12 @@ class TestFixAnnotationOpacity:
         register_form_widget(pdf, annot)
         pdf = save_and_reopen(pdf)
         result = fix_annotation_opacity(pdf)
-        assert result == 1
+        assert result == 0
         resolved = resolve(pdf.pages[0].Annots[0])
-        assert float(resolved.get("/CA")) == 1.0
+        assert float(resolved.get("/CA")) == 0.5
 
     def test_integration_sanitize_for_pdfa(self, make_pdf_with_page):
-        """Integration: sanitize_for_pdfa fixes annotation /CA."""
+        """Integration preserves a permitted annotation opacity."""
         from pdftopdfa.sanitizers import sanitize_for_pdfa
 
         pdf = make_pdf_with_page()
@@ -1765,200 +1797,118 @@ class TestFixAnnotationOpacity:
         pdf.pages[0]["/Annots"] = Array([annot])
         pdf = save_and_reopen(pdf)
         result = sanitize_for_pdfa(pdf, "2b")
-        assert result["annotation_opacity_fixed"] == 1
+        assert result["annotation_opacity_fixed"] == 0
+        assert float(pdf.pages[0].Annots[0].CA) == 0.5
 
 
 class TestRemoveAnnotationColors:
-    """Tests for remove_annotation_colors()."""
+    """Valid PDF/A-2/3 annotation colors survive the legacy removal entry point."""
 
     def test_no_annotations(self, make_pdf_with_page):
-        """Returns 0 for page without annotations."""
+        """Leave pages without annotations unchanged."""
         pdf = make_pdf_with_page()
-        result = remove_annotation_colors(pdf)
-        assert result == 0
+        assert remove_annotation_colors(pdf) == 0
 
-    def test_no_color_keys(self, make_pdf_with_page):
-        """Returns 0 when annotations have no /C or /IC."""
-        pdf = make_pdf_with_page()
-        annot = pdf.make_indirect(
-            Dictionary(
-                Type=Name.Annot,
-                Subtype=Name.Link,
-                Rect=Array([0, 0, 100, 100]),
-            )
-        )
-        pdf.pages[0]["/Annots"] = Array([annot])
-        pdf = save_and_reopen(pdf)
-        result = remove_annotation_colors(pdf)
-        assert result == 0
-
-    def test_removes_c_rgb(self, make_pdf_with_page):
-        """/C with RGB array is removed."""
-        pdf = make_pdf_with_page()
-        annot = pdf.make_indirect(
-            Dictionary(
-                Type=Name.Annot,
-                Subtype=Name.Square,
-                Rect=Array([0, 0, 100, 100]),
-            )
-        )
-        annot[Name("/C")] = Array([1.0, 0.0, 0.0])
-        pdf.pages[0]["/Annots"] = Array([annot])
-        pdf = save_and_reopen(pdf)
-        result = remove_annotation_colors(pdf)
-        assert result == 1
-        resolved = resolve(pdf.pages[0].Annots[0])
-        assert resolved.get("/C") is None
-
-    def test_removes_c_gray(self, make_pdf_with_page):
-        """/C with grayscale array is removed."""
-        pdf = make_pdf_with_page()
-        annot = pdf.make_indirect(
-            Dictionary(
-                Type=Name.Annot,
-                Subtype=Name.Circle,
-                Rect=Array([0, 0, 100, 100]),
-            )
-        )
-        annot[Name("/C")] = Array([0.5])
-        pdf.pages[0]["/Annots"] = Array([annot])
-        pdf = save_and_reopen(pdf)
-        result = remove_annotation_colors(pdf)
-        assert result == 1
-        resolved = resolve(pdf.pages[0].Annots[0])
-        assert resolved.get("/C") is None
-
-    def test_removes_ic(self, make_pdf_with_page):
-        """/IC interior color array is removed."""
-        pdf = make_pdf_with_page()
-        annot = pdf.make_indirect(
-            Dictionary(
-                Type=Name.Annot,
-                Subtype=Name.Square,
-                Rect=Array([0, 0, 100, 100]),
-            )
-        )
-        annot[Name("/IC")] = Array([0.0, 1.0, 0.0])
-        pdf.pages[0]["/Annots"] = Array([annot])
-        pdf = save_and_reopen(pdf)
-        result = remove_annotation_colors(pdf)
-        assert result == 1
-        resolved = resolve(pdf.pages[0].Annots[0])
-        assert resolved.get("/IC") is None
-
-    def test_removes_both_c_and_ic(self, make_pdf_with_page):
-        """Both /C and /IC are removed from the same annotation."""
-        pdf = make_pdf_with_page()
-        annot = pdf.make_indirect(
-            Dictionary(
-                Type=Name.Annot,
-                Subtype=Name.Square,
-                Rect=Array([0, 0, 100, 100]),
-            )
-        )
-        annot[Name("/C")] = Array([1.0, 0.0, 0.0])
-        annot[Name("/IC")] = Array([0.0, 0.0, 1.0])
-        pdf.pages[0]["/Annots"] = Array([annot])
-        pdf = save_and_reopen(pdf)
-        result = remove_annotation_colors(pdf)
-        assert result == 2
-        resolved = resolve(pdf.pages[0].Annots[0])
-        assert resolved.get("/C") is None
-        assert resolved.get("/IC") is None
-
-    def test_multiple_annotations(self, make_pdf_with_page):
-        """Colors removed from multiple annotations."""
-        pdf = make_pdf_with_page()
-        annot1 = pdf.make_indirect(
-            Dictionary(
-                Type=Name.Annot,
-                Subtype=Name.Square,
-                Rect=Array([0, 0, 100, 100]),
-            )
-        )
-        annot1[Name("/C")] = Array([1.0, 0.0, 0.0])
-        annot2 = pdf.make_indirect(
-            Dictionary(
-                Type=Name.Annot,
-                Subtype=Name.Circle,
-                Rect=Array([0, 0, 50, 50]),
-            )
-        )
-        annot2[Name("/IC")] = Array([0.5])
-        pdf.pages[0]["/Annots"] = Array([annot1, annot2])
-        pdf = save_and_reopen(pdf)
-        result = remove_annotation_colors(pdf)
-        assert result == 2
-
-    def test_preserves_other_keys(self, make_pdf_with_page):
-        """Other annotation keys are preserved when /C is removed."""
-        pdf = make_pdf_with_page()
-        annot = pdf.make_indirect(
-            Dictionary(
-                Type=Name.Annot,
-                Subtype=Name.Square,
-                Rect=Array([0, 0, 100, 100]),
-            )
-        )
-        annot[Name("/C")] = Array([1.0, 0.0, 0.0])
-        pdf.pages[0]["/Annots"] = Array([annot])
-        pdf = save_and_reopen(pdf)
-        remove_annotation_colors(pdf)
-        resolved = resolve(pdf.pages[0].Annots[0])
-        assert str(resolved.get("/Subtype")) == "/Square"
-        assert resolved.get("/Rect") is not None
-
-    def test_empty_c_array_removed(self, make_pdf_with_page):
-        """An empty /C array is also removed."""
+    @pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
+    @pytest.mark.parametrize("color", [[], [0.5], [1, 0, 0], [0, 1, 0.5, 0]])
+    def test_link_color_without_appearance_preserved(
+        self, make_pdf_with_page, level, color
+    ):
+        """A Link's own border color survives even when it has no /AP."""
         pdf = make_pdf_with_page()
         annot = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
                 Subtype=Name.Link,
                 Rect=Array([0, 0, 100, 100]),
+                Border=Array([0, 0, 2]),
+                C=Array(color),
+                A=Dictionary(S=Name.URI, URI="https://example.com"),
             )
         )
-        annot[Name("/C")] = Array([])
-        pdf.pages[0]["/Annots"] = Array([annot])
+        pdf.pages[0].Annots = Array([annot])
+        assert remove_annotation_colors(pdf, level) == 0
         pdf = save_and_reopen(pdf)
-        result = remove_annotation_colors(pdf)
-        assert result == 1
+        restored = resolve(pdf.pages[0].Annots[0])
+        assert list(restored.C) == color
+        assert list(restored.Border) == [0, 0, 2]
+        assert "/AP" not in restored
 
-    def test_widget_colors_removed(self, make_pdf_with_page):
-        """Widget annotation /C is also removed."""
+    @pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
+    def test_edit_colors_and_existing_appearance_preserved(
+        self, make_pdf_with_page, level
+    ):
+        """An existing /AP does not make the original editing colors redundant."""
+        pdf = make_pdf_with_page()
+        appearance = pdf.make_stream(b"1 0 0 RG 0 1 0 rg 1 1 98 98 re B")
+        appearance.Type = Name.XObject
+        appearance.Subtype = Name.Form
+        appearance.BBox = Array([0, 0, 100, 100])
+        appearance.Resources = Dictionary()
+        annot = pdf.make_indirect(
+            Dictionary(
+                Type=Name.Annot,
+                Subtype=Name.Square,
+                Rect=Array([0, 0, 100, 100]),
+                C=Array([1, 0, 0]),
+                IC=Array([0, 1, 0]),
+                AP=Dictionary(N=appearance),
+            )
+        )
+        pdf.pages[0].Annots = Array([annot])
+        assert remove_annotation_colors(pdf, level) == 0
+        pdf = save_and_reopen(pdf)
+        restored = resolve(pdf.pages[0].Annots[0])
+        assert list(restored.C) == [1, 0, 0]
+        assert list(restored.IC) == [0, 1, 0]
+        assert restored.AP.N.read_bytes() == appearance.read_bytes()
+
+    @pytest.mark.parametrize(
+        "malformed",
+        ["red", [0, 1], [0, 0, 0, 0, 0], [-0.1], [1.1], [True], ["0.5"]],
+    )
+    def test_only_malformed_color_removed(self, make_pdf_with_page, malformed):
+        """Bad color entries do not cause valid sibling colors to be removed."""
         pdf = make_pdf_with_page()
         annot = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Widget,
+                Subtype=Name.Link,
                 Rect=Array([0, 0, 100, 100]),
+                C=Array(malformed) if isinstance(malformed, list) else malformed,
+                IC=Array([0, 1, 0]),
             )
         )
-        annot[Name("/C")] = Array([0.0, 0.0, 1.0])
-        pdf.pages[0]["/Annots"] = Array([annot])
-        register_form_widget(pdf, annot)
+        pdf.pages[0].Annots = Array([annot])
+        assert remove_annotation_colors(pdf) == 1
         pdf = save_and_reopen(pdf)
-        result = remove_annotation_colors(pdf)
-        assert result == 1
+        restored = resolve(pdf.pages[0].Annots[0])
+        assert "/C" not in restored
+        assert list(restored.IC) == [0, 1, 0]
 
-    def test_integration_sanitize_for_pdfa(self, make_pdf_with_page):
-        """Integration: sanitize_for_pdfa removes annotation colors."""
+    @pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
+    def test_integration_sanitize_for_pdfa(self, make_pdf_with_page, level):
+        """The full sanitizer keeps Link colors without fabricating an /AP."""
         from pdftopdfa.sanitizers import sanitize_for_pdfa
 
         pdf = make_pdf_with_page()
         annot = pdf.make_indirect(
             Dictionary(
                 Type=Name.Annot,
-                Subtype=Name.Square,
+                Subtype=Name.Link,
                 Rect=Array([0, 0, 100, 100]),
+                Border=Array([0, 0, 2]),
+                C=Array([1, 0, 0]),
+                A=Dictionary(S=Name.URI, URI="https://example.com"),
             )
         )
-        annot[Name("/C")] = Array([1.0, 0.0, 0.0])
-        annot[Name("/IC")] = Array([0.0, 1.0, 0.0])
-        pdf.pages[0]["/Annots"] = Array([annot])
+        pdf.pages[0].Annots = Array([annot])
+        result = sanitize_for_pdfa(pdf, level)
+        assert result["annotation_colors_removed"] == 0
         pdf = save_and_reopen(pdf)
-        result = sanitize_for_pdfa(pdf, "2b")
-        assert result["annotation_colors_removed"] == 2
+        restored = resolve(pdf.pages[0].Annots[0])
+        assert list(restored.C) == [1, 0, 0]
+        assert "/AP" not in restored
 
 
 # ===================================================================

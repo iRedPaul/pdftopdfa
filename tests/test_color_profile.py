@@ -1985,6 +1985,47 @@ class TestPreservedColorValidation:
         page.Annots = Array([pdf.make_indirect(annotation)])
         assert expected in detect_color_spaces(pdf).detected_spaces
 
+    @pytest.mark.parametrize("cmyk_border", [False, True])
+    def test_link_border_profiles_survive_full_conversion(
+        self, cmyk_border, tmp_path
+    ) -> None:
+        """Give a visible Link border a matching profile or contextual default."""
+        from pdftopdfa.converter import convert_to_pdfa
+        from pdftopdfa.verapdf import is_verapdf_available
+
+        pdf = new_pdf()
+        page = pdf.add_blank_page()
+        if not cmyk_border:
+            page.Contents = pdf.make_stream(b"0 1 0 0 k 0 0 100 100 re f")
+        color = [0, 1, 0, 0] if cmyk_border else [1, 0, 0]
+        page.Annots = Array(
+            [
+                pdf.make_indirect(
+                    Dictionary(
+                        Type=Name.Annot,
+                        Subtype=Name.Link,
+                        Rect=Array([20, 20, 100, 100]),
+                        C=Array(color),
+                        Border=Array([0, 0, 2]),
+                        F=4,
+                    )
+                )
+            ]
+        )
+        source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+        pdf.save(source)
+        result = convert_to_pdfa(
+            source, output, level="2b", validate=is_verapdf_available()
+        )
+        assert (
+            result.success and result.target_produced and not result.validation_failed
+        )
+        with Pdf.open(output) as restored:
+            assert list(restored.pages[0].Annots[0].C) == color
+            assert restored.Root.OutputIntents[0].DestOutputProfile.N == 4
+            if not cmyk_border:
+                assert restored.pages[0].Resources.ColorSpace.DefaultRGB[1].N == 3
+
 
 class TestDefaultColorSpaces:
     """Tests for context-dependent Default color space entries."""
