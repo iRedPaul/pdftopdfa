@@ -7,7 +7,7 @@
 from decimal import Decimal
 
 import pytest
-from conftest import new_pdf
+from conftest import new_pdf, pdf_object
 from pikepdf import Array, Dictionary, Name
 
 from pdftopdfa.converter import convert_to_pdfa
@@ -35,7 +35,7 @@ def test_non_dictionary_collection_is_removed(value):
     """Drop malformed portfolio containers while retaining the rest of the catalog."""
     pdf = new_pdf()
     pdf.add_blank_page()
-    pdf.Root.Collection = value
+    pdf.Root.Collection = pdf_object(value)
     assert remove_forbidden_catalog_entries(pdf) == 1
     assert "/Collection" not in pdf.Root
 
@@ -78,9 +78,9 @@ def test_collection_sort_fields_must_resolve_in_schema(schema, fields):
     """Table 158 sort fields identify schema entries, so none may be left dangling."""
     pdf = new_pdf()
     pdf.add_blank_page()
-    pdf.Root.Collection = Dictionary(Sort=Dictionary(S=fields), View=Name.D)
+    pdf.Root.Collection = Dictionary(Sort=Dictionary(S=pdf_object(fields)), View=Name.D)
     if schema is not None:
-        pdf.Root.Collection.Schema = schema
+        pdf.Root.Collection.Schema = pdf_object(schema)
     remove_forbidden_catalog_entries(pdf)
     assert "/Sort" not in pdf.Root.Collection
     assert pdf.Root.Collection.View == Name.D
@@ -184,7 +184,7 @@ def test_collection_item_values_must_match_their_field_type(subtype, value, vali
     """A declared key is not enough when its value contradicts the schema."""
     pdf = new_pdf()
     spec = _portfolio(pdf, Dictionary(Field=Dictionary(Subtype=subtype, N="Field")))
-    spec.CI = Dictionary(Field=value)
+    spec.CI = Dictionary(Field=pdf_object(value))
     remove_forbidden_catalog_entries(pdf)
     assert ("/Field" in spec.CI) is valid
 
@@ -204,7 +204,7 @@ def test_direct_collection_item_becomes_indirect_and_keeps_its_values():
 def test_collection_item_markers_are_repaired_without_losing_values(schema):
     """An invalid optional type marker or container is repaired on its own."""
     pdf = new_pdf()
-    spec = _portfolio(pdf, Dictionary() if schema is None else schema)
+    spec = _portfolio(pdf, Dictionary() if schema is None else pdf_object(schema))
     if schema is None:
         del pdf.Root.Collection.Schema
     spec.CI = Dictionary(Type=Name.Bad)
