@@ -35,13 +35,13 @@ _PDF_DATE = re.compile(
 )
 
 
-def _is_pdf_date(value) -> bool:
+def _is_pdf_date(text: str) -> bool:
     """Require complete PDF date syntax as well as valid calendar components.
 
     Omitted fields take their 7.9.4 defaults (01 for month and day, 00 otherwise);
     the month, the day of that month, the hour, minute and second must exist.
     """
-    match = isinstance(value, String) and _PDF_DATE.fullmatch(str(value))
+    match = _PDF_DATE.fullmatch(text)
     if not match:
         return False
     fields = [
@@ -53,6 +53,28 @@ def _is_pdf_date(value) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _check_date(owner, key: str) -> int | None:
+    """Validate a date entry, adding the D: prefix that ISO 32000-1 requires.
+
+    PDF Reference 1.7, 3.8.3 made the prefix optional ("The prefix D:, although
+    also optional, is strongly recommended"), whereas ISO 32000-1, 7.9.4 states
+    "The prefix D: shall be present". A date that is valid apart from the prefix
+    is therefore kept with the prefix added. Returns the number of repaired
+    entries, or None if the value is not a PDF date.
+    """
+    value = owner[key]
+    if not isinstance(value, String):
+        return None
+    text = str(value)
+    if text.startswith("D:"):
+        return 0 if _is_pdf_date(text) else None
+    if not _is_pdf_date(f"D:{text}"):
+        return None
+    owner[key] = String(f"D:{text}")
+    logger.warning("Added the D: prefix to navigation date %s", key)
+    return 1
 
 
 def _remove_entry(owner, key: str) -> int:
@@ -87,8 +109,10 @@ def _embedded_files(pdf: Pdf) -> list[tuple]:
     ]
 
 
-def _valid_item_value(value, subtype) -> bool:
+def _check_item_value(item, key: str, subtype) -> int | None:
     """Check a collection item value, or a subitem's data, against its field type.
+
+    Returns the number of repaired dates, or None if the value is to be removed.
 
     ISO 32000-1, Table 49 (and PDF Reference 1.7, Table 3.43) defines every entry
     of a collection subitem dictionary, /D included, as optional with no default,
@@ -97,24 +121,27 @@ def _valid_item_value(value, subtype) -> bool:
     A text string, the /P prefix included, needs a valid PDFDocEncoding or
     UTF-16BE encoding (7.9.2.2), as retained DocInfo values do.
     """
+    owner, value = item, item[key]
     if isinstance(value, Dictionary):
         if value.get("/Type") not in (None, Name.CollectionSubitem):
-            return False
+            return None
         if value.get("/P") is not None and not _is_pdf_text_string(value.P):
-            return False
-        value = value.get("/D")
-        if value is None:
-            return True
-    if subtype in (Name.S, Name.F, Name.Desc):
-        return _is_pdf_text_string(value)
-    if subtype in (Name.D, Name.ModDate, Name.CreationDate):
-        return _is_pdf_date(value)
-    return (
-        subtype in (Name.N, Name.Size)
+            return None
+        owner, key = value, "/D"
+        if value.get("/D") is None:
+            return 0
+        value = value.D
+    if subtype == Name.S:
+        return 0 if _is_pdf_text_string(value) else None
+    if subtype == Name.D:
+        return _check_date(owner, key)
+    valid = (
+        subtype == Name.N
         and not isinstance(value, bool)
         and isinstance(value, (int, float, Decimal))
         and math.isfinite(value)
     )
+    return 0 if valid else None
 
 
 def _sanitize_collection_items(pdf: Pdf, schema) -> int:
@@ -126,6 +153,12 @@ def _sanitize_collection_items(pdf: Pdf, schema) -> int:
     no values, so its items keep only their /Type. Only files of the EmbeddedFiles
     name tree belong to the collection (ISO 32000-1, 12.3.5), so the items of other
     file specifications are not checked against its schema.
+
+    ISO 32000-1, Table 157 lists only S, D and N as "the types of fields in the
+    collection item or collection subitem dictionary". The field data of the
+    file-related subtypes (F, Desc, ModDate, CreationDate, Size) "shall be" the
+    corresponding entry of the file specification or embedded file parameters,
+    so an item value under such a field's key is not field data and is removed.
     """
     removed = 0
     for _, filespec in _embedded_files(pdf):
@@ -146,8 +179,13 @@ def _sanitize_collection_items(pdf: Pdf, schema) -> int:
             if key == "/Type":
                 continue
             field = schema.get(key)
-            if field is None or not _valid_item_value(item[key], field.get("/Subtype")):
-                removed += _remove_entry(item, key)
+            subtype = field.get("/Subtype") if field is not None else None
+            repaired = (
+                _check_item_value(item, key, subtype)
+                if subtype in (Name.S, Name.D, Name.N)
+                else None
+            )
+            removed += _remove_entry(item, key) if repaired is None else repaired
     return removed
 
 
@@ -442,7 +480,8 @@ def _sanitize_thread_info(threads: list) -> int:
     dictionary (14.3.3). Like the conversion of DocInfo, each malformed entry is
     removed on its own, keeping its valid siblings and the article: a date that
     is not a PDF date, a /Trapped value other than the three names, and a text
-    string, standard or custom, whose encoding is invalid.
+    string, standard or custom, whose encoding is invalid. A date lacking only the
+    D: prefix gains it.
     """
     removed = 0
     for thread in threads:
@@ -463,7 +502,9 @@ def _sanitize_thread_info(threads: list) -> int:
                     Name.Unknown,
                 )
             elif key in ("/CreationDate", "/ModDate"):
-                valid = _is_pdf_date(value)
+                repaired = _check_date(info, key)
+                valid = repaired is not None
+                removed += repaired or 0
             else:
                 valid = _is_pdf_text_string(value)
             if not valid:

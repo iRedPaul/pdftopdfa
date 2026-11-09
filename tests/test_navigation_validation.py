@@ -163,8 +163,6 @@ def test_collection_items_matching_the_schema_are_unchanged():
         (Name.S, String(b"\xfe\xff\x00A\x00"), False),
         (Name.S, Dictionary(D="text", P=String(b"\x02")), False),
         (Name.S, Dictionary(D=String(b"\xfe\xff\xdc\x00"), P="Prefix "), False),
-        (Name.Desc, String(b"\x03"), False),
-        (Name.F, String(b"\xfe\xff\x00"), False),
         (Name.D, "D:20240101000000Z", True),
         (Name.D, "D:20240101000000Z00'00'", True),
         (Name.D, "D:20240101000000Z00'00", True),
@@ -208,7 +206,14 @@ def test_collection_items_matching_the_schema_are_unchanged():
         (Name.D, "D:20240101000000Z23'59'", False),
         (Name.D, "D:20240101000000-23'59'", True),
         (Name.D, "D:20240101000000-00'00'", True),
-        (Name.D, "20240101000000Z", False),
+        # ISO 32000-1, 7.9.4 requires the D: prefix, which PDF Reference 1.7,
+        # 3.8.3 made optional; it is added rather than accepted without it.
+        (Name.D, "20240101000000Z", True),
+        (Name.D, "2024Z", False),
+        (Name.D, "20241301", False),
+        (Name.D, "d:2024", False),
+        (Name.D, Dictionary(D="20240101000000Z00'00'", P="Sent "), True),
+        (Name.D, Dictionary(D="20240230", P="Sent "), False),
         (Name.D, "D:20241301", False),
         (Name.D, "not a date", False),
         (Name.D, 42, False),
@@ -228,17 +233,6 @@ def test_collection_items_matching_the_schema_are_unchanged():
         (Name.S, Dictionary(D=42), False),
         (Name.S, Dictionary(D="text", P=42), False),
         (Name.S, Dictionary(Type=Name.Bad, D="text"), False),
-        (Name.F, "a.txt", True),
-        (Name.F, True, False),
-        (Name.Desc, "description", True),
-        (Name.Desc, Array([1]), False),
-        (Name.ModDate, "D:20240101000000Z", True),
-        (Name.ModDate, "yesterday", False),
-        (Name.CreationDate, "D:20240101000000Z", True),
-        (Name.CreationDate, Name.Bad, False),
-        (Name.Size, 42, True),
-        (Name.Size, Array([1, 2]), False),
-        (Name.Size, True, False),
     ],
 )
 def test_collection_item_values_must_match_their_field_type(subtype, value, valid):
@@ -248,6 +242,72 @@ def test_collection_item_values_must_match_their_field_type(subtype, value, vali
     spec.CI = Dictionary(Field=pdf_object(value))
     remove_forbidden_catalog_entries(pdf)
     assert ("/Field" in spec.CI) is valid
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("20240101000000Z", "D:20240101000000Z"),
+        ("2024", "D:2024"),
+        ("20241231235959+05'30'", "D:20241231235959+05'30'"),
+        ("D:20240101000000Z", "D:20240101000000Z"),
+    ],
+)
+def test_collection_dates_gain_the_required_prefix(value, expected):
+    """A PDF 1.7 date without D: is kept with the prefix ISO 32000-1 requires."""
+    pdf = new_pdf()
+    spec = _portfolio(
+        pdf,
+        Dictionary(
+            Sent=Dictionary(Subtype=Name.D, N="Sent"),
+            Read=Dictionary(Subtype=Name.D, N="Read"),
+        ),
+    )
+    spec.CI = Dictionary(Sent=value, Read=Dictionary(D=value, P="Read "))
+    assert remove_forbidden_catalog_entries(pdf) == 2 * (value != expected)
+    assert str(spec.CI.Sent) == expected
+    assert str(spec.CI.Read.D) == expected and str(spec.CI.Read.P) == "Read "
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+@pytest.mark.parametrize(
+    "subtype", [Name.F, Name.Desc, Name.ModDate, Name.CreationDate, Name.Size]
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a.txt",
+        "D:20240101000000Z",
+        42,
+        Dictionary(D="a.txt", P="File "),
+        String(b"\x03"),
+        Name.Bad,
+    ],
+)
+def test_file_related_fields_take_no_collection_item_value(subtype, value):
+    """ISO 32000-1, Table 157 sources these fields from the file specification.
+
+    Only S, D and N identify fields of a collection item or subitem dictionary, so
+    a /CI value under a file-related field's key is removed. The field itself and
+    the file specification data it displays are unchanged.
+    """
+    pdf = new_pdf()
+    spec = _portfolio(
+        pdf,
+        Dictionary(
+            Field=Dictionary(Subtype=subtype, N="Field"),
+            Good=Dictionary(Subtype=Name.S, N="Good"),
+        ),
+    )
+    spec.Desc = "description"
+    spec.CI = Dictionary(Field=pdf_object(value), Good="keep")
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert sorted(spec.CI.keys()) == ["/Good"]
+    assert str(spec.CI.Good) == "keep"
+    assert pdf.Root.Collection.Schema.Field.Subtype == subtype
+    assert str(spec.F) == "a.txt" and str(spec.Desc) == "description"
+    assert remove_forbidden_catalog_entries(pdf) == 0
 
 
 def test_direct_collection_item_becomes_indirect_and_keeps_its_values():
@@ -780,12 +840,26 @@ def test_thread_information_accepts_every_iso_date_form(value):
     assert str(thread.I.ModDate) == value
 
 
+@pytest.mark.parametrize("key", ["/CreationDate", "/ModDate"])
+def test_thread_information_dates_gain_the_required_prefix(key):
+    """ISO 32000-1, 7.9.4 requires D:, which PDF Reference 1.7 left optional."""
+    pdf = new_pdf()
+    thread, _, _ = _article(pdf)
+    thread.I[key] = "20240101000000+05'30'"
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert str(thread.I[key]) == "D:20240101000000+05'30'"
+    assert str(thread.I.Title) == "Article"
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
 @pytest.mark.parametrize(
     "value",
     [
         "D:2024Z",
         "D:202401+05",
         "D:20240230000000Z",
+        "2024Z",
+        "20240230000000Z",
         "D:20240101000000Z05'00'",
         "D:20240101000000+24'00'",
         "not a date",
