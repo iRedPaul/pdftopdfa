@@ -18,6 +18,7 @@ ISO 19005-2, Section 6.4 constrains transparency-related entries:
 - /SMask (soft mask) — must be /None or a valid soft mask dictionary
 """
 
+import itertools
 import logging
 import math
 import re
@@ -349,6 +350,24 @@ _CALCULATOR_FOLDS = {
     "cos": lambda a: math.cos(math.radians(a)),
     "atan": _calculator_atan,
 }
+
+
+def _calculator_bitshift(value: int, shift: int):
+    """Fold bitshift where renderers agree on its 32-bit result.
+
+    A non-negative value shifted right, or left without losing bits or reaching the
+    sign bit, has one result. Renderers differ for negative values and long shifts
+    (arithmetic or logical shifts, and counts taken modulo 32), so those results
+    remain an integer of unknown value.
+    """
+    if value < 0 or not -31 <= shift <= 31:
+        return _CALCULATOR_INTEGER
+    if shift < 0:
+        return value >> -shift
+    result = value << shift
+    return result if result <= _CALCULATOR_MAX_INTEGER else _CALCULATOR_INTEGER
+
+
 _CALCULATOR_INTEGER_FOLDS = {
     # idiv truncates toward zero, and mod takes the sign of the dividend.
     "idiv": lambda a, b: (1 if (a < 0) == (b < 0) else -1) * (abs(a) // abs(b)),
@@ -357,6 +376,7 @@ _CALCULATOR_INTEGER_FOLDS = {
     "or": lambda a, b: a | b,
     "xor": lambda a, b: a ^ b,
     "not": lambda a: ~a,
+    "bitshift": _calculator_bitshift,
 }
 
 
@@ -437,7 +457,13 @@ def _apply_calculator_operator(token: bytes, stack: list) -> bool:
     operator = token.decode("latin-1")
     if operator not in _CALCULATOR_OPERATORS:
         text = token.decode("ascii")
-        stack.append(int(text) if re.fullmatch(r"[+-]?\d+", text) else float(text))
+        value = int(text) if re.fullmatch(r"[+-]?\d+", text) else float(text)
+        if isinstance(value, int) and not (
+            _CALCULATOR_MIN_INTEGER <= value <= _CALCULATOR_MAX_INTEGER
+        ):
+            # An integer literal beyond the implementation limit is read as a real.
+            value = float(value)
+        stack.append(value)
         return True
     if operator in ("true", "false"):
         stack.append(operator == "true")
@@ -567,6 +593,14 @@ def _apply_calculator_block(block: list, stack: list) -> bool:
 
 
 _CALCULATOR_SAMPLE_STEPS = 255
+# Tokens executed across all sampled runs of one program, which bounds the cost of
+# a long program with many distinct literals.
+_CALCULATOR_SAMPLE_BUDGET = 200_000
+# Grid steps from coarse to fine (8-bit reversal), so that a program which can only
+# afford a few samples still spreads them over the whole domain.
+_CALCULATOR_GRID_ORDER = sorted(
+    range(_CALCULATOR_SAMPLE_STEPS + 1), key=lambda step: int(f"{step:08b}"[::-1], 2)
+)
 
 
 def _calculator_literals(block: list) -> set[float]:
@@ -580,25 +614,40 @@ def _calculator_literals(block: list) -> set[float]:
     return literals
 
 
+def _calculator_size(block: list) -> int:
+    """Count the tokens of a parsed calculator program, including nested blocks."""
+    return sum(
+        _calculator_size(item) if isinstance(item, list) else 1 for item in block
+    )
+
+
 def _calculator_samples(program: list, low: float, high: float) -> list[float]:
     """Return the inputs at which a calculator program is run with actual values.
 
     The domain is sampled at 256 evenly spaced points, which include the entries of
     an 8-bit transfer lookup table. A result is commonly undefined where an input
     equals a constant of the program, as in { 0.25 sub 1 exch div }, so each literal
-    and its negation inside the domain are sampled as well.
+    and its negation inside the domain are sampled as well. The ends and the middle
+    of the domain come first; grid points and literals then alternate up to the
+    number of runs that _CALCULATOR_SAMPLE_BUDGET allows for the program's size.
     """
-    samples = {
+    grid = [
         low + (high - low) * step / _CALCULATOR_SAMPLE_STEPS
-        for step in range(_CALCULATOR_SAMPLE_STEPS + 1)
-    }
-    samples |= {
-        value
-        for literal in _calculator_literals(program)
-        for value in (literal, -literal)
-        if low <= value <= high
-    }
-    return sorted(samples)
+        for step in _CALCULATOR_GRID_ORDER
+    ]
+    literals = sorted(
+        {
+            value
+            for literal in _calculator_literals(program)
+            for value in (literal, -literal)
+            if low <= value <= high
+        }
+    )
+    ordered = [low, high, (low + high) / 2]
+    for pair in itertools.zip_longest(grid, literals):
+        ordered.extend(value for value in pair if value is not None)
+    limit = max(3, _CALCULATOR_SAMPLE_BUDGET // max(1, _calculator_size(program)))
+    return list(dict.fromkeys(ordered))[:limit]
 
 
 def _is_scalar_calculator(data: bytes, domain) -> bool:
@@ -694,7 +743,8 @@ def _check_scalar_transfer_function(function, ancestors, validated: dict) -> boo
             and not isinstance(order, bool)
             and isinstance(order, int)
             and order in (1, 3)
-            and len(data) >= (size[0] * bits + 7) // 8
+            # ISO 32000-1, 7.3.8.2: too little or too much data is an error.
+            and len(data) == (size[0] * bits + 7) // 8
             and all(
                 key not in function or _function_numbers(function[key], 2)
                 for key in ("/Encode", "/Decode")

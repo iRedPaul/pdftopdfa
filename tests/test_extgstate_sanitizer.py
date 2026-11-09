@@ -1102,9 +1102,16 @@ class TestSoftMaskValidation:
         assert "/TR" not in pdf.pages[0].Resources.ExtGState.GS0.SMask
         assert pdf.pages[0].Resources.ExtGState.GS0.SMask.G == mask.G
 
-    @pytest.mark.parametrize("kind", ["short_samples", "bad_calculator", "cycle"])
+    @pytest.mark.parametrize(
+        "kind",
+        ["short_samples", "surplus_samples", "bad_calculator", "cycle", "first_bound"],
+    )
     def test_invalid_transfer_programs_do_not_survive(self, kind) -> None:
-        """Check sampled payloads, calculator syntax, and recursive stitching graphs."""
+        """Check sampled payloads, calculator syntax, and recursive stitching graphs.
+
+        ISO 32000-1, 7.3.8.2 makes both too little and too much sample data an error,
+        and 7.10.4 requires Domain0 < Bounds0 (only the last bound may equal Domain1).
+        """
         pdf = new_pdf()
         if kind == "cycle":
             transfer = pdf.make_indirect(
@@ -1116,13 +1123,21 @@ class TestSoftMaskValidation:
                 )
             )
             transfer.Functions = Array([transfer])
-        else:
-            transfer = pdf.make_stream(
-                b"\x00" if kind == "short_samples" else b"{ bogus }"
+        elif kind == "first_bound":
+            identity = Dictionary(FunctionType=2, Domain=Array([0, 1]), N=1)
+            transfer = Dictionary(
+                FunctionType=3,
+                Domain=Array([0, 1]),
+                Functions=Array([identity, identity]),
+                Bounds=Array([0]),
+                Encode=Array([0, 1, 0, 1]),
             )
-            transfer.FunctionType = 0 if kind == "short_samples" else 4
+        else:
+            samples = {"short_samples": b"\x00", "surplus_samples": b"\x00\x80\xff"}
+            transfer = pdf.make_stream(samples.get(kind, b"{ bogus }"))
+            transfer.FunctionType = 0 if kind in samples else 4
             transfer.Domain = transfer.Range = Array([0, 1])
-            if kind == "short_samples":
+            if kind in samples:
                 transfer.Size = Array([2])
                 transfer.BitsPerSample = 8
         _make_pdf_with_extgstate(
@@ -1154,6 +1169,28 @@ class TestSoftMaskValidation:
         _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
         sanitize_extgstate(pdf)
         assert ("/TR" in pdf.pages[0].Resources.ExtGState.GS0.SMask) is kept
+
+    def test_calculator_sampling_is_bounded_by_program_size(self) -> None:
+        """Thousands of literals cannot make validation quadratic in the stream."""
+        literals = b" ".join(b"0.%05d pop" % step for step in range(1, 5001))
+        program = extgstate._parse_calculator(b"{ " + literals + b" }")
+        samples = extgstate._calculator_samples(program, 0.0, 1.0)
+        size = extgstate._calculator_size(program)
+        assert size == 10000
+        assert len(samples) * size <= extgstate._CALCULATOR_SAMPLE_BUDGET
+        assert samples[:3] == [0.0, 1.0, 0.5]
+
+        pdf = new_pdf()
+        mask = self._calculator_mask(pdf, b"{ " + literals + b" }")
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+
+    def test_small_calculator_keeps_every_sample(self) -> None:
+        """A short program runs on the whole grid and on all its literals."""
+        program = extgstate._parse_calculator(b"{ 0.3 sub 0.7 mul }")
+        samples = extgstate._calculator_samples(program, 0.0, 1.0)
+        assert len(samples) == len(set(samples))
+        assert {0.0, 1.0, 0.5, 0.3, 0.7, 1 / 255} <= set(samples)
 
     def test_shared_stitching_children_are_validated_once(self) -> None:
         """A deep graph that reuses each child twice is not walked exponentially."""
@@ -1248,6 +1285,11 @@ class TestSoftMaskValidation:
             # A guard at the singular input, which is sampled as a literal.
             b"{ dup 0.25 eq { pop 0 } { 0.25 sub 1 exch div } ifelse }",
             b"{ pop -2147483648.0 cvi }",
+            # Literal bit shifts are folded, so they can drive stack operators.
+            b"{ 1 1 bitshift 1 sub copy pop }",
+            b"{ 0 1 bitshift copy }",
+            b"{ 8 -3 bitshift copy pop }",
+            b"{ pop 2147483647 1 and cvr }",
             # Form feed, tab, CR and LF are PDF white-space characters.
             b"{\x0cpop\t1\r\n}",
         ],
@@ -1339,6 +1381,11 @@ class TestSoftMaskValidation:
             b"{ pop 2147483648.0 cvi }",
             b"{ pop -2147483649.0 cvi }",
             b"{ pop -2147483648 -1 idiv }",
+            # Renderers disagree on these shifts, so their result is not known.
+            b"{ -1 1 bitshift copy pop }",
+            b"{ 1 31 bitshift copy pop }",
+            # An integer literal beyond the 32-bit limit is a real.
+            b"{ pop 2147483648 1 and cvr }",
             # A vertical tab is not PDF white space, so this is one bad token.
             b"{ pop\x0b1 }",
         ],
