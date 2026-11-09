@@ -1015,6 +1015,10 @@ def _sanitize_extension_schema_blocks(
     result: dict[str, etree._Element] = {}
 
     for uri, li_elem in blocks.items():
+        # The block is rebuilt into a new pdfaExtension:schemas bag, so stray
+        # character data inside it or after it must not be carried along.
+        _strip_stray_text(li_elem)
+        li_elem.tail = None
         _strip_unexpected_attrs(li_elem, {f"{{{ns_rdf}}}parseType"})
         _strip_unexpected_children(
             li_elem,
@@ -1774,6 +1778,24 @@ def _has_stray_text(node: etree._Element) -> bool:
     )
 
 
+def _strip_stray_text(root: etree._Element) -> None:
+    """Remove character data that RDF/XML forbids between elements of a subtree.
+
+    An element with element content, such as rdf:RDF, rdf:Description, an RDF
+    container or a struct, may hold only whitespace around its children (RDF/XML
+    1.1, 7.2.2 to 7.2.4). Literal values have no element children and are kept.
+    The tail of root itself belongs to its parent and is left to the caller.
+    """
+    for elem in root.iter():
+        if not any(isinstance(child.tag, str) for child in elem):
+            continue
+        if (elem.text or "").strip():
+            elem.text = None
+        for child in elem:
+            if (child.tail or "").strip():
+                child.tail = None
+
+
 def _validate_seq_items(
     elem: etree._Element,
     ns_rdf: str,
@@ -1918,6 +1940,10 @@ def _has_invalid_rdf_syntax(prop: etree._Element) -> bool:
         elem = pending.pop()
         children = [child for child in elem if isinstance(child.tag, str)]
         pending.extend(children)
+        # Character data among child elements, at any depth of the value, would
+        # be copied with the property, where RDF/XML permits only whitespace.
+        if children and _has_stray_text(elem):
+            return True
         language = elem.get(_XML_LANG)
         if language and not _is_valid_language_tag(language):
             return True
@@ -3921,6 +3947,11 @@ def _sanitize_non_catalog_metadata(pdf: pikepdf.Pdf) -> tuple[int, int]:
                 continue
 
             _sanitize_non_catalog_xmp_tree(tree)
+            # The packet is written back as a whole, unlike the catalog packet,
+            # whose properties are copied into a new tree. Retained properties
+            # are free of stray text, but their tails and the text in rdf:RDF or
+            # an rdf:Description are not part of any property.
+            _strip_stray_text(tree)
 
             # Valid XMP — re-serialize cleanly and ensure uncompressed
             clean_bytes = _reserialize_xmp(tree)

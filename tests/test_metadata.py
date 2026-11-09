@@ -5018,6 +5018,212 @@ class TestInvalidRdfSyntaxIsNotCopied:
         )
 
 
+_STRAY_HISTORY = (
+    '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
+    "<stEvt:action>saved</stEvt:action><stEvt:when>2024-01-01</stEvt:when>"
+    "</rdf:li></rdf:Seq></xmpMM:History>"
+)
+_STRAY_WIDTH = "<tiff:ImageWidth>4096</tiff:ImageWidth>"
+
+
+def _stray_text_packet(
+    body: str,
+    *,
+    meta_text: str = "",
+    rdf_text: str = "",
+    desc_text: str = "",
+    desc_tail: str = "",
+) -> bytes:
+    """Build an XMP packet with optional text around its structural elements."""
+    namespaces = " ".join(
+        f'xmlns:{prefix}="{uri}"'
+        for prefix, uri in {
+            "rdf": NAMESPACES["rdf"],
+            "dc": NAMESPACES["dc"],
+            "xmpMM": NAMESPACES["xmpMM"],
+            "stEvt": NAMESPACES["stEvt"],
+            "stRef": NAMESPACES["stRef"],
+            "tiff": "http://ns.adobe.com/tiff/1.0/",
+            "xmpTPg": "http://ns.adobe.com/xap/1.0/t/pg/",
+            "stDim": "http://ns.adobe.com/xap/1.0/sType/Dimensions#",
+            "pdfaExtension": _NS_PDFA_EXTENSION,
+            "pdfaSchema": _NS_PDFA_SCHEMA,
+            "pdfaProperty": _NS_PDFA_PROPERTY,
+            "my": "http://example.com/my/",
+        }.items()
+    )
+    return (
+        f'<x:xmpmeta xmlns:x="adobe:ns:meta/">{meta_text}<rdf:RDF {namespaces}>'
+        f'{rdf_text}<rdf:Description rdf:about="">{desc_text}{body}'
+        f"</rdf:Description>{desc_tail}</rdf:RDF></x:xmpmeta>"
+    ).encode()
+
+
+def _stray_extension_schema(
+    *, item_text: str = "", field_tail: str = "", property_tail: str = ""
+) -> str:
+    """Build an extension schema for my:v with optional text inside the block."""
+    return (
+        '<pdfaExtension:schemas><rdf:Bag><rdf:li rdf:parseType="Resource">'
+        f"{item_text}<pdfaSchema:schema>My</pdfaSchema:schema>{field_tail}"
+        "<pdfaSchema:namespaceURI>http://example.com/my/</pdfaSchema:namespaceURI>"
+        "<pdfaSchema:prefix>my</pdfaSchema:prefix><pdfaSchema:property><rdf:Seq>"
+        '<rdf:li rdf:parseType="Resource"><pdfaProperty:name>v</pdfaProperty:name>'
+        "<pdfaProperty:valueType>Text</pdfaProperty:valueType>"
+        "<pdfaProperty:category>external</pdfaProperty:category>"
+        "<pdfaProperty:description>d</pdfaProperty:description>"
+        f"</rdf:li>{property_tail}</rdf:Seq></pdfaSchema:property></rdf:li>"
+        "</rdf:Bag></pdfaExtension:schemas>"
+    )
+
+
+def _stray_text_nodes(root: etree._Element) -> list[str]:
+    """List non-whitespace text that sits among the child elements of an element."""
+    found = []
+    for elem in root.iter():
+        if not any(isinstance(child.tag, str) for child in elem):
+            continue
+        found.extend(t for t in [elem.text] if (t or "").strip())
+        found.extend(c.tail for c in elem if (c.tail or "").strip())
+    return found
+
+
+def _sanitized_page_packet(packet: bytes) -> etree._Element:
+    """Run a page-level packet through the non-catalog sanitizer."""
+    pdf = new_pdf()
+    page = pdf.add_blank_page()
+    page.Metadata = pdf.make_stream(packet)
+    _sanitize_non_catalog_metadata(pdf)
+    return _parse_xmp_bytes(page.Metadata.read_bytes())
+
+
+class TestStrayTextBetweenRdfElements:
+    """RDF/XML permits only whitespace among elements, at any level of a packet."""
+
+    @pytest.mark.parametrize(
+        "packet,kept",
+        [
+            (
+                _stray_text_packet(_STRAY_HISTORY + "junk"),
+                "//*[local-name()='action']/text()",
+            ),
+            (
+                _stray_text_packet(
+                    '<xmpMM:DerivedFrom rdf:parseType="Resource">'
+                    "<stRef:instanceID>uuid:a</stRef:instanceID>"
+                    "</xmpMM:DerivedFrom>junk"
+                ),
+                "//*[local-name()='instanceID']/text()",
+            ),
+            (
+                _stray_text_packet(_STRAY_WIDTH + "junk"),
+                "//*[local-name()='ImageWidth']/text()",
+            ),
+            (
+                _stray_text_packet(
+                    '<dc:rights><rdf:Alt><rdf:li xml:lang="x-default">R</rdf:li>'
+                    "</rdf:Alt></dc:rights>junk"
+                ),
+                "//*[local-name()='rights']/*/*/text()",
+            ),
+            (
+                _stray_text_packet(_stray_extension_schema() + "<my:v>x</my:v>junk"),
+                "//*[local-name()='v']/text()",
+            ),
+            (
+                _stray_text_packet(_STRAY_WIDTH, desc_text="junk"),
+                "//*[local-name()='ImageWidth']/text()",
+            ),
+            (
+                _stray_text_packet(_STRAY_WIDTH, desc_tail="junk"),
+                "//*[local-name()='ImageWidth']/text()",
+            ),
+            (
+                _stray_text_packet(_STRAY_WIDTH, rdf_text="junk"),
+                "//*[local-name()='ImageWidth']/text()",
+            ),
+            (
+                _stray_text_packet(_STRAY_WIDTH, meta_text="junk"),
+                "//*[local-name()='ImageWidth']/text()",
+            ),
+        ],
+        ids=[
+            "history-tail",
+            "derived-from-tail",
+            "simple-tail",
+            "lang-alt-tail",
+            "extension-property-tail",
+            "description-text",
+            "description-tail",
+            "rdf-text",
+            "xmpmeta-text",
+        ],
+    )
+    def test_page_packet_drops_text_outside_properties(self, packet, kept) -> None:
+        """A retained property survives, but the text around it does not."""
+        result = _sanitized_page_packet(packet)
+        assert result.xpath(kept)
+        assert _stray_text_nodes(result) == []
+
+    def test_struct_field_tail_rejects_the_property(self) -> None:
+        """Text between struct fields is part of the value, so the value is invalid."""
+        fields = (
+            "<stDim:w>1</stDim:w>{}<stDim:h>2</stDim:h><stDim:unit>inch</stDim:unit>"
+        )
+        prop = '<xmpTPg:MaxPageSize rdf:parseType="Resource">{}</xmpTPg:MaxPageSize>'
+        valid = _stray_text_packet(prop.format(fields.format("")))
+        stray = _stray_text_packet(prop.format(fields.format("junk")))
+
+        assert _has_invalid_rdf_syntax(
+            etree.fromstring(stray).find(".//{*}MaxPageSize")
+        )
+        assert not _has_invalid_rdf_syntax(
+            etree.fromstring(valid).find(".//{*}MaxPageSize")
+        )
+        for packet, expected in ((valid, True), (stray, False)):
+            catalog = _parse_xmp_bytes(
+                create_xmp_metadata(
+                    {}, 2, "B", existing_xmp_tree=etree.fromstring(packet)
+                )
+            )
+            page = _sanitized_page_packet(packet)
+            for result in (catalog, page):
+                assert bool(result.xpath("//*[local-name()='MaxPageSize']")) is (
+                    expected
+                )
+                assert _stray_text_nodes(result) == []
+
+    def test_extension_struct_field_tail_rejects_the_property(self) -> None:
+        """Declared custom structs follow the same rule at every depth."""
+        elem = etree.fromstring(
+            f'<c:prop xmlns:c="urn:custom" xmlns:rdf="{NAMESPACES["rdf"]}" '
+            'rdf:parseType="Resource"><c:w>1</c:w>junk<c:h>1</c:h></c:prop>'
+        )
+        custom_types = {"Size": {"{urn:custom}w": "Text", "{urn:custom}h": "Text"}}
+        assert not _is_valid_extension_property_value(elem, "Size", custom_types)
+
+    @pytest.mark.parametrize(
+        "schema",
+        [
+            _stray_extension_schema(item_text="junk"),
+            _stray_extension_schema(field_tail="junk"),
+            _stray_extension_schema(property_tail="junk"),
+        ],
+        ids=["schema-item-text", "schema-field-tail", "property-item-tail"],
+    )
+    def test_extension_schema_blocks_drop_stray_text(self, schema) -> None:
+        """Copied schema blocks keep their declarations without the stray text."""
+        packet = _stray_text_packet(schema + "<my:v>x</my:v>")
+        catalog = _parse_xmp_bytes(
+            create_xmp_metadata({}, 2, "B", existing_xmp_tree=etree.fromstring(packet))
+        )
+        page = _sanitized_page_packet(packet)
+        for result in (catalog, page):
+            assert result.xpath("//*[local-name()='v' and text()='x']")
+            assert result.xpath("//*[local-name()='name']/text()") == ["v"]
+            assert _stray_text_nodes(result) == []
+
+
 class TestStructuralPropertyNormalization:
     """Tests for stEvt:When -> stEvt:when normalization."""
 
