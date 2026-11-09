@@ -12,7 +12,7 @@ from decimal import Decimal
 from pikepdf import Array, Dictionary, Name, Pdf, String
 
 from ..exceptions import ConversionError
-from .files import _iter_name_tree_pairs
+from .files import _is_filespec, _iter_name_tree_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,11 @@ def _optional_type(owner, expected: Name) -> int:
 
 
 def _embedded_files(pdf: Pdf) -> list[tuple]:
-    """Return the name and file specification of each embedded file."""
+    """Return the name and file specification of each embedded file.
+
+    Values that are not file specifications are skipped, as the name-tree
+    normalization of the embedded-file sanitizers later discards them.
+    """
     names = pdf.Root.get("/Names")
     embedded = names.get("/EmbeddedFiles") if isinstance(names, Dictionary) else None
     if not isinstance(embedded, Dictionary):
@@ -55,7 +59,7 @@ def _embedded_files(pdf: Pdf) -> list[tuple]:
     return [
         (name, filespec)
         for name, filespec in _iter_name_tree_pairs(embedded)
-        if isinstance(filespec, Dictionary)
+        if _is_filespec(filespec)
     ]
 
 
@@ -112,7 +116,11 @@ def _sanitize_collection_items(pdf: Pdf, schema) -> int:
 
 
 def remove_dangling_collection_default(pdf: Pdf) -> int:
-    """Remove the initial document of a portfolio unless it names an embedded file."""
+    """Remove the initial document of a portfolio unless it names an embedded file.
+
+    The sanitizer pipeline repeats this check after every embedded-file cleanup,
+    which can remove the file that /D names.
+    """
     collection = pdf.Root.get("/Collection")
     if not isinstance(collection, Dictionary) or collection.get("/D") is None:
         return 0
@@ -222,25 +230,20 @@ def _reference(value, expected: Name):
     return value
 
 
-def _validate_threads(pdf: Pdf) -> None:
-    """Validate bead cycles and page links without renumbering local Thread actions."""
+def _validate_threads(pdf: Pdf) -> dict[tuple[int, int], tuple]:
+    """Validate bead cycles and page links without renumbering local Thread actions.
+
+    Returns:
+        For each bead, in /Threads and reading order: its thread, position on that
+        thread, page and bead dictionary.
+    """
     threads = pdf.Root.get("/Threads")
     if threads is None:
-        return
+        return {}
     if not isinstance(threads, Array):
         raise _thread_error("expected an array")
-    pages = {page.objgen: page for page in pdf.pages}
-    page_bead_ids = {}
-    for page_id, page in pages.items():
-        listed = page.get("/B")
-        if listed is None:
-            continue
-        if not isinstance(listed, Array) or any(
-            not isinstance(bead, Dictionary) or bead.objgen == (0, 0) for bead in listed
-        ):
-            raise _thread_error("malformed page /B array")
-        page_bead_ids[page_id] = {bead.objgen for bead in listed}
-    all_beads = {}
+    pages = {page.objgen for page in pdf.pages}
+    beads = {}
     for value in threads:
         thread = _reference(value, Name.Thread)
         info = thread.get("/I")
@@ -290,74 +293,100 @@ def _validate_threads(pdf: Pdf) -> None:
                 )
             ):
                 raise _thread_error("invalid bead rectangle")
-            # ISO 32000-1, Table 30: /B is optional and can be recovered from
-            # /Threads, so only an array that is present must list the bead.
-            listed_beads = page_bead_ids.get(page_ref.objgen)
-            if listed_beads is not None and bead.objgen not in listed_beads:
-                raise _thread_error("bead is missing from its page's /B array")
-            all_beads[bead.objgen] = page_ref.objgen
+            # A thread listed twice in /Threads keeps the positions of its first
+            # traversal; separate threads cannot share beads, because the first
+            # bead of each one names its own thread.
+            beads.setdefault(
+                bead.objgen, (thread.objgen, len(seen) - 1, page_ref.objgen, bead)
+            )
             bead = following
         if bead.objgen != first.objgen:
             raise _thread_error("bead cycle does not return to the first bead")
-    for page_id, bead_ids in page_bead_ids.items():
-        if any(all_beads.get(bead_id) != page_id for bead_id in bead_ids):
-            raise _thread_error("page /B contains an unrelated or malformed bead")
+    return beads
 
 
-def _order_page_beads(pdf: Pdf) -> int:
-    """List the beads of each thread on a page once, in the order of that thread.
+def _make_threads_indirect(pdf: Pdf) -> int:
+    """ISO 32000-1, Table 28: the catalog /Threads array is an indirect object."""
+    threads = pdf.Root.get("/Threads")
+    if threads is None or threads.objgen != (0, 0):
+        return 0
+    pdf.Root.Threads = pdf.make_indirect(threads)
+    logger.warning("Made the catalog /Threads array an indirect object")
+    return 1
 
-    ISO 32000-1, Table 30 requires natural reading order in /B. Only a thread defines
-    an order for its own beads, so other threads keep their positions in the array.
-    Requires validated threads, whose bead cycles are complete.
+
+def _repair_page_beads(pdf: Pdf, beads: dict[tuple[int, int], tuple]) -> int:
+    """List exactly the beads of each page once, in the order of their threads.
+
+    ISO 32000-1, 12.4.3 requires a /B array on every page on which article beads
+    appear, and Table 30 notes that it can be recreated from /Threads. The validated
+    bead cycles define the beads of each page, so omitted, duplicated or unrelated
+    entries are repaired. Only a thread defines an order for its own beads (Table
+    30's natural reading order), so other threads keep their positions in the array,
+    and beads that the array omitted follow the listed ones.
     """
-    positions = {}
-    for thread in pdf.Root.get("/Threads", []):
-        first = bead = thread.F
-        position = 0
-        while True:
-            positions[bead.objgen] = (thread.objgen, position)
-            position += 1
-            bead = bead.N
-            if bead.objgen == first.objgen:
-                break
+    on_page: dict[tuple[int, int], dict[tuple[int, int], Dictionary]] = {}
+    for bead_id, (_, _, page_id, bead) in beads.items():
+        on_page.setdefault(page_id, {})[bead_id] = bead
 
-    reordered = 0
+    repaired = 0
     for page in pdf.pages:
+        expected = on_page.get(page.objgen, {})
         listed = page.get("/B")
-        if listed is None:
+        if listed is None and not expected:
             continue
-        original = list(listed)
-        # A dictionary keeps the first occurrence of a bead listed more than once.
-        beads = list({bead.objgen: bead for bead in original}.values())
+        original = list(listed) if isinstance(listed, Array) else None
+        # Direct dictionaries are never beads of a cycle, which requires indirect
+        # references, and a dictionary keeps the first occurrence of each bead.
+        kept = {
+            item.objgen: expected[item.objgen]
+            for item in original or []
+            if isinstance(item, Dictionary) and item.objgen in expected
+        }
+        kept.update({key: bead for key, bead in expected.items() if key not in kept})
+        ordered = list(kept.values())
         slots: dict[tuple[int, int], list[int]] = {}
-        for index, bead in enumerate(beads):
-            slots.setdefault(positions[bead.objgen][0], []).append(index)
-        ordered = list(beads)
+        for index, bead in enumerate(ordered):
+            slots.setdefault(beads[bead.objgen][0], []).append(index)
         for indices in slots.values():
             thread_beads = sorted(
-                (beads[index] for index in indices),
-                key=lambda bead: positions[bead.objgen][1],
+                (ordered[index] for index in indices),
+                key=lambda bead: beads[bead.objgen][1],
             )
             for index, bead in zip(indices, thread_beads, strict=True):
                 ordered[index] = bead
-        if [bead.objgen for bead in ordered] != [bead.objgen for bead in original]:
+        if (
+            original is not None
+            and len(original) == len(ordered)
+            and all(
+                isinstance(item, Dictionary) and item.objgen == bead.objgen
+                for item, bead in zip(original, ordered, strict=True)
+            )
+        ):
+            continue
+        if ordered:
             page.B = Array(ordered)
-            reordered += 1
-            logger.warning("Repaired the beads listed in a page /B array")
-    return reordered
+        else:
+            del page.obj["/B"]
+        repaired += 1
+        logger.warning("Repaired the beads listed in a page /B array")
+    return repaired
 
 
 def sanitize_catalog_navigation(pdf: Pdf) -> int:
     """Preserve portfolios/articles and reject ambiguous repairs of article graphs.
 
     Returns:
-        Number of /B arrays reordered and malformed collection entries removed in
-        place.
+        Number of article structures repaired (an inline /Threads array or a page
+        /B array) and malformed collection entries removed, all in place.
 
     Raises:
         ConversionError: If article navigation is malformed. Article validation
             precedes collection edits and leaves thread destinations unchanged.
     """
-    _validate_threads(pdf)
-    return _order_page_beads(pdf) + _sanitize_collection(pdf)
+    beads = _validate_threads(pdf)
+    return (
+        _make_threads_indirect(pdf)
+        + _repair_page_beads(pdf, beads)
+        + _sanitize_collection(pdf)
+    )

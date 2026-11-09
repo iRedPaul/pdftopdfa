@@ -463,10 +463,6 @@ def sanitize_for_pdfa(
         result["embedded_pdf_conversions_failed"] = embed_result.get(
             "conversion_failed", 0
         )
-        # The removed file may have been the portfolio's initial document.
-        result["forbidden_catalog_entries_removed"] += (
-            remove_dangling_collection_default(pdf)
-        )
 
     # Ensure AF relationships and embedded file metadata (PDF/A-2 and PDF/A-3)
     # PDF/A-2 (ISO 19005-2) and PDF/A-3 (ISO 19005-3) both require:
@@ -476,6 +472,11 @@ def sanitize_for_pdfa(
     # - /UF on FileSpec dicts
     # These are no-ops when no embedded files exist.
     result["af_relationships_fixed"] = ensure_af_relationships(pdf)
+    # PDF/A-2 file removal and the name-tree normalization of the call above may
+    # both have discarded the portfolio's initial document (ISO 32000-1, Table 155).
+    result["forbidden_catalog_entries_removed"] += remove_dangling_collection_default(
+        pdf
+    )
     result["embedded_file_subtypes_fixed"] = ensure_embedded_file_subtypes(pdf)
     result["embedded_file_params_fixed"] = ensure_embedded_file_params(pdf)
     result["filespec_uf_fixed"] = ensure_filespec_uf_entries(pdf)

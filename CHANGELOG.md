@@ -45,9 +45,10 @@
 - Retain PDF portfolios and article threads
 - Validate collection and article structures before preserving them
 - Remove collection sorting unless every `/S` field resolves in the collection schema
-- Accept article threads on pages that omit the optional `/B` array instead of using the original-input fallback
+- Rebuild a page's `/B` array from the article threads when it is missing, incomplete, malformed or lists beads of other pages, instead of using the original-input fallback
 - Remove duplicate beads from a page's `/B` array, and restore the reading order of a page's article beads
-- Remove collection item values without a matching schema field or with the wrong type, keeping them when a portfolio has no schema, and a default document that is not an embedded file
+- Make an inline catalog `/Threads` array an indirect object
+- Remove collection item values without a matching schema field or with the wrong type, keeping them when a portfolio has no schema, and a default document that is not an embedded file specification, rechecked after all embedded-file cleanup for PDF/A-2 and PDF/A-3
 
 ### Tests
 

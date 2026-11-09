@@ -26,7 +26,7 @@ def _article(pdf):
     bead.N = bead.V = bead
     thread.F = bead
     page.B = Array([bead])
-    pdf.Root.Threads = Array([thread])
+    pdf.Root.Threads = pdf.make_indirect(Array([thread]))
     return thread, bead, page
 
 
@@ -239,6 +239,62 @@ def test_collection_default_without_embedded_files_is_removed():
     assert pdf.Root.Collection.View == Name.D
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        Dictionary(),
+        Dictionary(Type=Name.Bad, F="a.txt"),
+        Dictionary(Desc="no file name or stream"),
+    ],
+)
+def test_collection_default_must_name_a_file_specification(value):
+    """A name-tree value that is no file specification cannot be the default."""
+    pdf = new_pdf()
+    pdf.add_blank_page()
+    pdf.Root.Names = Dictionary(
+        EmbeddedFiles=Dictionary(Names=Array(["a.txt", pdf.make_indirect(value)]))
+    )
+    pdf.Root.Collection = Dictionary(D="a.txt", View=Name.D)
+    remove_forbidden_catalog_entries(pdf)
+    assert "/D" not in pdf.Root.Collection
+    assert pdf.Root.Collection.View == Name.D
+
+
+@pytest.mark.parametrize("level", ["2b", "3b"])
+def test_collection_default_is_rechecked_after_name_tree_cleanup(level):
+    """Both PDF/A parts validate /D against the final embedded-file name tree."""
+    pdf = new_pdf()
+    pdf.add_blank_page()
+    spec = pdf.make_indirect(Dictionary(Type=Name.Filespec, F="a.txt", UF="a.txt"))
+    pdf.Root.Names = Dictionary(
+        EmbeddedFiles=Dictionary(
+            Names=Array(
+                ["a.txt", spec, "b.txt", pdf.make_indirect(Dictionary(Desc="none"))]
+            )
+        )
+    )
+    pdf.Root.Collection = Dictionary(D="b.txt", View=Name.D)
+    sanitize_for_pdfa(pdf, level=level)
+    assert "/D" not in pdf.Root.Collection
+    assert pdf.Root.Collection.View == Name.D
+
+
+def test_collection_default_survives_name_tree_cleanup():
+    """A default naming a kept file specification stays after the final check.
+
+    PDF/A-3 keeps any embedded file, unlike PDF/A-2, which removes this one.
+    """
+    pdf = new_pdf()
+    pdf.add_blank_page()
+    spec = pdf.make_indirect(Dictionary(Type=Name.Filespec, F="a.txt", UF="a.txt"))
+    pdf.Root.Names = Dictionary(
+        EmbeddedFiles=Dictionary(Names=Array(["a.txt", spec, "b.txt", 42]))
+    )
+    pdf.Root.Collection = Dictionary(D="a.txt")
+    sanitize_for_pdfa(pdf, level="3b")
+    assert str(pdf.Root.Collection.D) == "a.txt"
+
+
 def test_collection_default_is_rechecked_after_embedded_file_removal():
     """PDF/A-2 may discard the file that the portfolio opened initially."""
     pdf = new_pdf()
@@ -286,7 +342,6 @@ def test_collection_sort_array_lengths_need_not_match(ascending):
         "previous",
         "page",
         "rectangle",
-        "page_beads",
         "info",
     ],
 )
@@ -308,8 +363,6 @@ def test_invalid_article_graph_is_rejected_without_dropping_destinations(damage)
         bead.P = pdf.make_indirect(Dictionary(Type=Name.Page))
     elif damage == "rectangle":
         bead.R = Array([1, 2, True, 4])
-    elif damage == "page_beads":
-        page.B = Array()
     else:
         thread.I = 42
     pdf.Root.OpenAction = Dictionary(S=Name.Thread, D=thread)
@@ -327,35 +380,128 @@ def test_valid_article_needs_no_optional_type_entries():
     assert page.B[0].objgen == bead.objgen
 
 
-def test_article_pages_may_omit_optional_bead_arrays():
-    """Table 30 makes page /B optional because /Threads can recreate it."""
+def test_inline_threads_array_becomes_indirect():
+    """ISO 32000-1, Table 28 requires an indirect /Threads array."""
     pdf = new_pdf()
-    thread, _, page = _article(pdf)
-    del page.B
+    thread, _, _ = _article(pdf)
+    pdf.Root.Threads = Array([thread])
+    assert pdf.Root.Threads.objgen == (0, 0)
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert pdf.Root.Threads.objgen != (0, 0)
+    assert [item.objgen for item in pdf.Root.Threads] == [thread.objgen]
     assert remove_forbidden_catalog_entries(pdf) == 0
-    assert "/B" not in page.obj
-    assert pdf.Root.Threads[0].objgen == thread.objgen
 
 
-def test_each_page_decides_whether_its_bead_array_is_checked():
-    """A page's listing is only compared with the beads placed on that page."""
+def test_inline_threads_array_is_not_changed_for_a_rejected_article():
+    """Rejection leaves the article exactly as the source stored it."""
     pdf = new_pdf()
-    thread, first, _ = _article(pdf)
+    thread, _, _ = _article(pdf)
+    del thread.F
+    pdf.Root.Threads = Array([thread])
+    with pytest.raises(ConversionError, match="Malformed /Threads"):
+        remove_forbidden_catalog_entries(pdf)
+    assert pdf.Root.Threads.objgen == (0, 0)
+
+
+def test_conversion_writes_an_indirect_threads_array(tmp_path):
+    """The saved catalog refers to the /Threads array indirectly."""
+    from pikepdf import Pdf
+
+    pdf = new_pdf()
+    thread, _, _ = _article(pdf)
+    pdf.Root.Threads = Array([thread])
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    result = convert_to_pdfa(source, output)
+    assert result.target_produced and not result.skipped, result
+    with Pdf.open(output) as converted:
+        assert converted.Root.Threads.objgen != (0, 0)
+        assert str(converted.Root.Threads[0].I.Title) == "Article"
+
+
+def test_omitted_page_bead_array_is_rebuilt():
+    """ISO 32000-1, 12.4.3 requires /B on each page on which beads appear."""
+    pdf = new_pdf()
+    thread, bead, page = _article(pdf)
+    del page.B
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert [item.objgen for item in page.B] == [bead.objgen]
+    assert pdf.Root.Threads[0].objgen == thread.objgen
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+def test_rebuilt_page_bead_arrays_follow_the_thread():
+    """Each page lists only its own beads, in the order of their thread."""
+    pdf = new_pdf()
+    thread, first, page = _article(pdf)
+    other = pdf.add_blank_page()
+    beads = [first] + [
+        pdf.make_indirect(Dictionary(T=thread, P=target, R=Array([0, 0, 10, 10])))
+        for target in (other.obj, page.obj, other.obj)
+    ]
+    for index, bead in enumerate(beads):
+        bead.N = beads[(index + 1) % len(beads)]
+        bead.V = beads[index - 1]
+    del page.B
+    assert remove_forbidden_catalog_entries(pdf) == 2
+    assert [item.objgen for item in page.B] == [beads[0].objgen, beads[2].objgen]
+    assert [item.objgen for item in other.B] == [beads[1].objgen, beads[3].objgen]
+
+
+@pytest.mark.parametrize(
+    "listed",
+    ["empty", "malformed", "direct", "unrelated", "another_page"],
+)
+def test_incomplete_or_wrong_page_bead_arrays_are_rebuilt(listed):
+    """The validated bead cycles define the beads of every page unambiguously."""
+    pdf = new_pdf()
+    thread, first, page = _article(pdf)
     other = pdf.add_blank_page()
     second = pdf.make_indirect(
         Dictionary(T=thread, P=other.obj, R=Array([0, 0, 100, 100]))
     )
     first.N = first.V = second
     second.N = second.V = first
-    assert remove_forbidden_catalog_entries(pdf) == 0
+    other.B = Array([second])
+    if listed == "empty":
+        page.B = Array()
+    elif listed == "malformed":
+        page.B = 42
+    elif listed == "direct":
+        page.B = Array([Dictionary(R=Array([0, 0, 1, 1])), first])
+    elif listed == "unrelated":
+        page.B = Array([pdf.make_indirect(Dictionary(Type=Name.Bead)), first])
+    else:
+        page.B = Array([second, first])
+    pdf.Root.OpenAction = Dictionary(S=Name.Thread, D=thread, B=first)
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert [item.objgen for item in page.B] == [first.objgen]
+    assert [item.objgen for item in other.B] == [second.objgen]
+    assert pdf.Root.OpenAction.B.objgen == first.objgen
+
+
+def test_page_without_beads_loses_a_bead_array_listing_other_pages_beads():
+    """A page on which no bead appears cannot list a bead of another page."""
+    pdf = new_pdf()
+    _, bead, page = _article(pdf)
+    other = pdf.add_blank_page()
+    other.B = Array([bead])
+    assert remove_forbidden_catalog_entries(pdf) == 1
     assert "/B" not in other.obj
+    assert [item.objgen for item in page.B] == [bead.objgen]
 
+
+def test_page_without_beads_keeps_an_empty_bead_array():
+    """An empty array lists exactly the beads of a page without any."""
+    pdf = new_pdf()
+    _article(pdf)
+    other = pdf.add_blank_page()
     other.B = Array()
-    with pytest.raises(ConversionError, match="missing from its page's /B"):
-        remove_forbidden_catalog_entries(pdf)
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert len(other.B) == 0
 
 
-def test_conversion_keeps_article_without_page_bead_arrays(tmp_path):
+def test_conversion_rebuilds_omitted_page_bead_arrays(tmp_path):
     """A conforming article cannot force the original-input fallback."""
     from pikepdf import Pdf
 
@@ -368,7 +514,8 @@ def test_conversion_keeps_article_without_page_bead_arrays(tmp_path):
     assert result.target_produced and not result.skipped, result
     with Pdf.open(output) as converted:
         assert str(converted.Root.Threads[0].I.Title) == "Article"
-        assert "/B" not in converted.pages[0].obj
+        listed = converted.pages[0].B
+        assert [item.objgen for item in listed] == [converted.Root.Threads[0].F.objgen]
 
 
 def _two_bead_article(pdf):
@@ -493,13 +640,3 @@ def test_article_rejects_nonreciprocal_links(key):
     with pytest.raises(ConversionError, match="inconsistent next/previous links"):
         remove_forbidden_catalog_entries(pdf)
     assert first.N.objgen == second.objgen
-
-
-def test_article_rejects_a_bead_listed_on_another_page():
-    """An otherwise valid cycle cannot leave an unrelated page destination."""
-    pdf = new_pdf()
-    _, bead, _ = _article(pdf)
-    other = pdf.add_blank_page()
-    other.B = Array([bead])
-    with pytest.raises(ConversionError, match="unrelated or malformed bead"):
-        remove_forbidden_catalog_entries(pdf)

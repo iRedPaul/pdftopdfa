@@ -129,7 +129,7 @@ def _add_preserved_features(pdf: Pdf) -> None:
     bead.V = bead
     thread.F = bead
     page.B = Array([bead])
-    pdf.Root.Threads = Array([thread])
+    pdf.Root.Threads = pdf.make_indirect(Array([thread]))
     pdf.Root.OutputIntents.append(
         pdf.make_indirect(
             Dictionary(

@@ -309,16 +309,24 @@ def _iter_name_tree_pairs(node: object) -> Iterator[tuple[object, object]]:
                 pass
 
 
+def _is_filespec(obj: object) -> bool:
+    """Check whether a resolved object is a file specification dictionary.
+
+    This is the criterion that name-tree and /AF normalization keep entries by.
+    """
+    if not isinstance(obj, Dictionary):
+        return False
+    type_value = obj.get("/Type")
+    if type_value is not None and str(type_value) != "/Filespec":
+        return False
+    return any(obj.get(key) is not None for key in ("/F", "/UF", "/EF"))
+
+
 def _as_indirect_filespec(pdf: Pdf, obj: object) -> object | None:
     """Return a valid FileSpec as an indirect object."""
     try:
         resolved = _resolve_indirect(obj)
-        if not isinstance(resolved, Dictionary):
-            return None
-        type_value = resolved.get("/Type")
-        if type_value is not None and str(type_value) != "/Filespec":
-            return None
-        if not any(key in resolved for key in ("/F", "/UF", "/EF")):
+        if not _is_filespec(resolved):
             return None
         try:
             objgen = resolved.objgen

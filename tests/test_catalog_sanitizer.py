@@ -53,7 +53,7 @@ class TestRemoveForbiddenCatalogEntries:
         pdf.Root["/Requirements"] = pikepdf.Array()
         pdf.Root["/Collection"] = pikepdf.Dictionary()
         pdf.Root["/NeedsRendering"] = True
-        pdf.Root["/Threads"] = pikepdf.Array()
+        pdf.Root["/Threads"] = pdf.make_indirect(pikepdf.Array())
         pdf.Root["/SpiderInfo"] = pikepdf.Dictionary()
         assert remove_forbidden_catalog_entries(pdf) == 3
         assert "/Requirements" not in pdf.Root
@@ -397,7 +397,7 @@ class TestSanitizeForPdfaIntegration:
             bead.V = beads[1 - index]
             pages[index].B = pikepdf.Array([bead])
         thread.F = beads[0]
-        pdf.Root.Threads = pikepdf.Array([thread])
+        pdf.Root.Threads = pdf.make_indirect(pikepdf.Array([thread]))
         pdf.Root.OpenAction = pikepdf.Dictionary(S=pikepdf.Name.Thread, D=thread)
         pdf.Root.Requirements = pikepdf.Array()
 
