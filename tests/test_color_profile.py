@@ -9,7 +9,7 @@ from io import BytesIO
 
 import pikepdf
 import pytest
-from conftest import new_pdf
+from conftest import new_pdf, pdf_object
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from pdftopdfa.color_profile import (
@@ -1931,7 +1931,7 @@ class TestPreservedColorValidation:
         if value is None:
             del cs[1][key]
         else:
-            cs[1][key] = value
+            cs[1][key] = pdf_object(value)
         page = pdf.add_blank_page()
         page.Resources.ColorSpace = Dictionary(Cal=cs)
         with pytest.raises(ConversionError, match="Malformed /Cal"):
