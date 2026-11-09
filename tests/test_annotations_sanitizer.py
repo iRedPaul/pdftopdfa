@@ -964,6 +964,42 @@ class TestEnsureAppearanceStreams:
         with pytest.raises(ConversionError, match="invalid opacity"):
             ensure_appearance_streams(pdf)
 
+    @pytest.mark.parametrize(
+        "subtype, key, value, repaired",
+        [
+            (Name.Square, "/C", [2], None),
+            (Name.Square, "/IC", Name.bad, None),
+            (Name.Square, "/CA", 1.1, 1.0),
+            (Name.Text, "/C", [0, 1], None),
+            (Name.Text, "/CA", -0.1, 0.0),
+            (Name.FileAttachment, "/C", "bad", None),
+            (Name.FileAttachment, "/CA", Name.bad, 1.0),
+        ],
+    )
+    def test_sanitize_repairs_malformed_values_before_generating_appearance(
+        self, make_pdf_with_page, subtype, key, value, repaired
+    ):
+        """The full pipeline repairs what appearance generation would reject."""
+        from pdftopdfa.sanitizers import sanitize_for_pdfa
+
+        pdf = make_pdf_with_page()
+        annot = pdf.make_indirect(
+            Dictionary(Subtype=subtype, Rect=Array([0, 0, 100, 100]))
+        )
+        annot[key] = pdf_object(value)
+        pdf.pages[0].Annots = Array([annot])
+
+        result = sanitize_for_pdfa(pdf, "2b")
+
+        assert result["appearance_streams_added"] == 1
+        assert isinstance(annot.AP.N, pikepdf.Stream)
+        if repaired is None:
+            assert result["annotation_colors_removed"] == 1
+            assert key not in annot
+        else:
+            assert result["annotation_opacity_fixed"] == 1
+            assert float(annot.CA) == repaired
+
     @pytest.mark.parametrize("width", [Name.bad, "2", [2], True, -1])
     @pytest.mark.parametrize("legacy", [False, True])
     def test_square_malformed_bs_width_raises(self, make_pdf_with_page, width, legacy):

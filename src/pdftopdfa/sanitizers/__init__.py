@@ -265,6 +265,13 @@ def sanitize_for_pdfa(
     result["invalid_bpc_fixed"] = bpc_result["invalid_bpc_fixed"]
     result["mask_bpc_fixed"] = bpc_result["mask_bpc_fixed"]
 
+    # Preserve valid annotation opacity; repair only malformed /CA values.
+    # Appearance generation rejects malformed values, so repair them first.
+    result["annotation_opacity_fixed"] = fix_annotation_opacity(pdf, level)
+
+    # Preserve valid annotation colors; remove only malformed /C and /IC entries.
+    result["annotation_colors_removed"] = remove_annotation_colors(pdf, level)
+
     # Ensure annotation appearance streams (all levels)
     result["appearance_streams_added"] = ensure_appearance_streams(pdf, level)
 
@@ -279,12 +286,6 @@ def sanitize_for_pdfa(
 
     # Fix annotation flags (all levels)
     result["annotation_flags_fixed"] = fix_annotation_flags(pdf, level)
-
-    # Preserve valid annotation opacity; repair only malformed /CA values.
-    result["annotation_opacity_fixed"] = fix_annotation_opacity(pdf, level)
-
-    # Preserve valid annotation colors; remove only malformed /C and /IC entries.
-    result["annotation_colors_removed"] = remove_annotation_colors(pdf, level)
 
     # Validate color spaces (Separation/DeviceN preserved; ICC profiles validated)
     sanitize_colorspaces(pdf, level)
