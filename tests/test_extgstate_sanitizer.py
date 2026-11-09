@@ -8,7 +8,7 @@ from io import BytesIO
 
 import pikepdf
 import pytest
-from conftest import new_pdf
+from conftest import new_pdf, pdf_object
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from pdftopdfa.color_profile import get_cmyk_profile
@@ -1092,7 +1092,9 @@ class TestSoftMaskValidation:
     def test_invalid_soft_mask_transfer_uses_identity_default(self, transfer) -> None:
         """Malformed transfers are removed without discarding the valid mask group."""
         pdf = new_pdf()
-        mask = Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=transfer)
+        mask = Dictionary(
+            S=Name.Alpha, G=_make_form_stream(pdf), TR=pdf_object(transfer)
+        )
         _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
         assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
         assert "/TR" not in pdf.pages[0].Resources.ExtGState.GS0.SMask
