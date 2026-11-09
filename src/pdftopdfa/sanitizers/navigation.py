@@ -18,11 +18,19 @@ logger = logging.getLogger(__name__)
 
 
 def _pdf_date(value):
-    """Require complete PDF date syntax as well as valid calendar components."""
+    """Require complete PDF date syntax as well as valid calendar components.
+
+    ISO 32000-1, 7.9.4: D:YYYYMMDDHHmmSSOHH'mm, where O is +, - or Z, and each
+    field may be present only together with all of the preceding ones. A UT
+    offset may therefore follow Z as well (Z00'00'). The trailing apostrophe of
+    earlier PDF versions is tolerated.
+    """
     from ..metadata import _parse_pdf_date
 
     if not isinstance(value, String) or not re.fullmatch(
-        r"D:\d{4}(?:\d{2}){0,5}(?:Z|[+-]\d{2}(?:'\d{2}'?)?)?", str(value)
+        r"D:\d{4}(?:\d{2}){0,5}"
+        r"(?:[Z+-](?:(?:[01]\d|2[0-3])(?:'(?:[0-5]\d'?)?)?)?)?",
+        str(value),
     ):
         return None
     try:
@@ -64,7 +72,13 @@ def _embedded_files(pdf: Pdf) -> list[tuple]:
 
 
 def _valid_item_value(value, subtype) -> bool:
-    """Check a collection item value, or a subitem's data, against its field type."""
+    """Check a collection item value, or a subitem's data, against its field type.
+
+    ISO 32000-1, Table 49 (and PDF Reference 1.7, Table 3.43) defines every entry
+    of a collection subitem dictionary, /D included, as optional with no default,
+    so a subitem with only a /P prefix, or none at all, is well formed. A subitem
+    whose /Type, /P or /D contradicts the field is removed as one item value.
+    """
     if isinstance(value, Dictionary):
         if value.get("/Type") not in (None, Name.CollectionSubitem):
             return False
@@ -90,6 +104,10 @@ def _sanitize_collection_items(pdf: Pdf, schema) -> int:
 
     Without a schema there is nothing to compare the values with. PDF/A does not
     require their removal, as veraPDF confirms, so a portfolio keeps this data.
+    A schema left with no fields (Table 156 makes each of them optional) describes
+    no values, so its items keep only their /Type. Only files of the EmbeddedFiles
+    name tree belong to the collection (ISO 32000-1, 12.3.5), so the items of other
+    file specifications are not checked against its schema.
     """
     removed = 0
     for _, filespec in _embedded_files(pdf):

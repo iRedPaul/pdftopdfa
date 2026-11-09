@@ -156,6 +156,19 @@ def test_collection_items_matching_the_schema_are_unchanged():
         (Name.S, "text", True),
         (Name.S, 42, False),
         (Name.D, "D:20240101000000Z", True),
+        (Name.D, "D:20240101000000Z00'00'", True),
+        (Name.D, "D:20240101000000Z00'00", True),
+        (Name.D, "D:20240101000000+05'30'", True),
+        (Name.D, "D:20240101000000-08'", True),
+        (Name.D, "D:20240101000000-08", True),
+        (Name.D, "D:20240101000000+", True),
+        (Name.D, "D:2024", True),
+        (Name.D, "D:20240101000000+24'00'", False),
+        (Name.D, "D:20240101000000+05'60'", False),
+        (Name.D, "D:20240101000000+05'30'00", False),
+        (Name.D, "D:20240101000000Z0", False),
+        (Name.D, "20240101000000Z", False),
+        (Name.D, "D:20241301", False),
         (Name.D, "not a date", False),
         (Name.D, 42, False),
         (Name.N, 42, True),
@@ -163,7 +176,14 @@ def test_collection_items_matching_the_schema_are_unchanged():
         (Name.N, True, False),
         (Name.N, "42", False),
         (Name.S, Dictionary(Type=Name.CollectionSubitem, D="text", P="Prefix "), True),
+        # ISO 32000-1, Table 49: every subitem entry, /D included, is optional.
         (Name.S, Dictionary(P="Prefix "), True),
+        (Name.S, Dictionary(), True),
+        (Name.S, Dictionary(Type=Name.CollectionSubitem), True),
+        (Name.D, Dictionary(D="D:20240101000000Z00'00'", P="Sent "), True),
+        (Name.D, Dictionary(D="not a date", P="Sent "), False),
+        (Name.N, Dictionary(D=Decimal("1.5"), P="#"), True),
+        (Name.N, Dictionary(D="1.5"), False),
         (Name.S, Dictionary(D=42), False),
         (Name.S, Dictionary(D="text", P=42), False),
         (Name.S, Dictionary(Type=Name.Bad, D="text"), False),
@@ -314,6 +334,21 @@ def test_collection_items_are_kept_without_any_schema():
     assert remove_forbidden_catalog_entries(pdf) == 0
     assert sorted(spec.CI.keys()) == ["/Foo", "/Good", "/Type"]
     assert str(spec.CI.Good) == "keep"
+
+
+def test_collection_schema_emptied_by_repairs_describes_no_item_values():
+    """An emptied schema is well formed, but no item value or sort field remains."""
+    pdf = new_pdf()
+    spec = _portfolio(pdf, Dictionary(Good=Dictionary(Subtype=Name.Bad, N="Good")))
+    pdf.Root.Collection.Sort = Dictionary(S=Name.Good)
+    pdf.Root.Collection.View = Name.T
+    remove_forbidden_catalog_entries(pdf)
+    collection = pdf.Root.Collection
+    assert list(collection.Schema.keys()) == []
+    assert sorted(spec.CI.keys()) == ["/Type"]
+    assert "/Sort" not in collection
+    assert collection.View == Name.T
+    assert remove_forbidden_catalog_entries(pdf) == 0
 
 
 @pytest.mark.parametrize("ascending", [[], [False], [True, False, True]])
@@ -620,6 +655,18 @@ def test_article_rejection_precedes_collection_repairs(key, value):
     assert pdf.Root.Collection.unparse() == before
 
 
+@pytest.mark.parametrize(
+    "value", ["D:20240101000000Z00'00'", "D:20240101000000+05'", "D:2024"]
+)
+def test_thread_information_accepts_every_iso_date_form(value):
+    """ISO 32000-1, 7.9.4 permits an offset after Z and omitted trailing fields."""
+    pdf = new_pdf()
+    thread, _, _ = _article(pdf)
+    thread.I.ModDate = value
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert str(thread.I.ModDate) == value
+
+
 def test_collection_repairs_are_idempotent():
     """A second pass preserves the repaired schema, sorting and item references."""
     pdf = new_pdf()
@@ -774,3 +821,35 @@ def test_conversion_of_portfolio_with_malformed_name_tree_child(tmp_path):
         assert [str(key) for key in embedded.Names[::2]] == ["a.txt"]
         assert str(converted.Root.Collection.D) == "a.txt"
         assert str(embedded.Names[1].CI.Good) == "keep"
+
+
+def test_conversion_of_portfolio_with_invalid_subitems(tmp_path):
+    """Only the subitem that contradicts its field is dropped from the output."""
+    from pikepdf import Pdf
+
+    pdf = new_pdf()
+    spec = _portfolio(
+        pdf,
+        Dictionary(
+            Good=Dictionary(Subtype=Name.S, N="Good"),
+            Sent=Dictionary(Subtype=Name.D, N="Sent"),
+            Size=Dictionary(Subtype=Name.N, N="Size"),
+            Note=Dictionary(Subtype=Name.S, N="Note"),
+        ),
+    )
+    spec.CI.Sent = Dictionary(
+        Type=Name.CollectionSubitem, D="D:20240101000000Z00'00'", P="Sent "
+    )
+    spec.CI.Size = Dictionary(Type=Name.CollectionSubitem, D="large")
+    spec.CI.Note = Dictionary(Type=Name.CollectionSubitem, P="Prefix only")
+    pdf.Root.Collection.Sort = Dictionary(S=Array([Name.Sent, Name.Size]))
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    result = convert_to_pdfa(source, output, level="3b")
+    assert result.target_produced and not result.skipped, result
+    with Pdf.open(output) as converted:
+        item = converted.Root.Names.EmbeddedFiles.Names[1].CI
+        assert sorted(item.keys()) == ["/Good", "/Note", "/Sent", "/Type"]
+        assert str(item.Sent.D) == "D:20240101000000Z00'00'"
+        assert str(item.Note.P) == "Prefix only" and "/D" not in item.Note
+        assert list(converted.Root.Collection.Sort.S) == [Name.Sent, Name.Size]

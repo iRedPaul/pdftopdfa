@@ -49,6 +49,7 @@
 - Remove duplicate beads from a page's `/B` array, and restore the reading order of a page's article beads
 - Make an inline catalog `/Threads` array an indirect object
 - Remove collection item values without a matching schema field or with the wrong type, keeping them when a portfolio has no schema, and a default document that is not an embedded file specification, rechecked after all embedded-file cleanup for PDF/A-2 and PDF/A-3
+- Accept every ISO 32000-1 date form in collection items and thread information (a UT offset after `Z`, an hour offset without minutes) instead of removing the value or rejecting the article, and reject out-of-range UT offsets
 - Skip malformed `/EmbeddedFiles` name-tree nodes (non-dictionary `/Kids` entries, `/Names` or `/Kids` of the wrong type, non-string keys, cycles) when checking a portfolio, instead of aborting the conversion; embedded-file sanitizers share this single tolerant name-tree traversal
 
 ### Tests
