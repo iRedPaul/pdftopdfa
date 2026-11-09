@@ -1089,6 +1089,17 @@ class TestSoftMaskValidation:
             ),
             Dictionary(FunctionType=2, Domain=Array([0, 1]), N=-1),
             Dictionary(FunctionType=7, Domain=Array([0, 1])),
+            # Results beyond the real limit of ISO 32000-1, Table C.1.
+            Dictionary(FunctionType=2, Domain=Array([0, 2]), N=2000),
+            Dictionary(FunctionType=2, Domain=Array([0, 10]), N=39),
+            Dictionary(FunctionType=2, Domain=Array([0.001, 1]), N=-20),
+            Dictionary(
+                FunctionType=2,
+                Domain=Array([0, 2]),
+                N=1,
+                C0=Array([0]),
+                C1=Array([3e38]),
+            ),
         ],
     )
     def test_invalid_soft_mask_transfer_uses_identity_default(self, transfer) -> None:
@@ -1148,6 +1159,29 @@ class TestSoftMaskValidation:
         )
         assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
         assert "/TR" not in pdf.pages[0].Resources.ExtGState.GS0.SMask
+
+    @pytest.mark.parametrize(
+        "domain,exponent,c1",
+        [
+            ([0, 1], 2000, 1),
+            ([0, 10], 38, 1),
+            ([0.01, 1], -19, 1),
+            ([-2, 2], 3, -1),
+            ([0, 1], 1, 3e38),
+        ],
+    )
+    def test_exponential_with_large_finite_results_is_preserved(
+        self, domain, exponent, c1
+    ) -> None:
+        """Results that stay within the real limit keep an exponential transfer."""
+        pdf = new_pdf()
+        transfer = Dictionary(
+            FunctionType=2, Domain=Array(domain), N=exponent, C1=Array([c1])
+        )
+        mask = Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=transfer)
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert "/TR" in pdf.pages[0].Resources.ExtGState.GS0.SMask
 
     @pytest.mark.parametrize(
         "domain,program,kept",
@@ -1292,6 +1326,10 @@ class TestSoftMaskValidation:
             b"{ pop 2147483647 1 and cvr }",
             # Form feed, tab, CR and LF are PDF white-space characters.
             b"{\x0cpop\t1\r\n}",
+            # Large reals within the limit of ISO 32000-1, Table C.1.
+            b"{ pop 1" + b"0" * 38 + b".0 }",
+            b"{ 1" + b"0" * 18 + b".0 mul 1" + b"0" * 18 + b".0 mul }",
+            b"{ pop 10 38 exp }",
         ],
     )
     def test_calculator_with_one_numeric_result_is_preserved(self, program) -> None:
@@ -1388,6 +1426,17 @@ class TestSoftMaskValidation:
             b"{ pop 2147483648 1 and cvr }",
             # A vertical tab is not PDF white space, so this is one bad token.
             b"{ pop\x0b1 }",
+            # Non-finite values, and reals beyond the limit of ISO 32000-1, Table C.1.
+            b"{ pop " + b"1" * 400 + b".0 }",
+            b"{ pop " + b"1" * 400 + b" }",
+            b"{ pop 4" + b"0" * 38 + b".0 }",
+            b"{ pop 1" + b"0" * 200 + b".0 1" + b"0" * 200 + b".0 mul 0 mul }",
+            b"{ pop 1" + b"0" * 30 + b".0 dup mul }",
+            b"{ pop 1" + b"0" * 30 + b".0 0." + b"0" * 29 + b"1 div }",
+            b"{ pop 10 39 exp }",
+            b"{ pop 1" + b"0" * 38 + b".0 10 mul }",
+            b"{ pop -3" + b"0" * 38 + b".0 dup add }",
+            b"{ 1" + b"0" * 30 + b".0 mul 1" + b"0" * 30 + b".0 mul }",
         ],
     )
     def test_calculator_without_provable_result_is_removed(self, program) -> None:

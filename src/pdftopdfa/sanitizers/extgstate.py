@@ -270,6 +270,22 @@ def _clamp_opacity(gs_dict: Dictionary, key: str) -> int:
     return 0
 
 
+# The largest real magnitude of ISO 32000-1, Table C.1, to which structure_limits
+# later clamps the real objects of the file. A calculator value beyond it is an
+# undefinedresult or limitcheck error, and infinity on single-precision renderers.
+_FUNCTION_MAX_REAL = 3.403e38
+
+
+def _function_real(value) -> bool:
+    """Return whether a computed number is finite and within the real limit."""
+    return math.isfinite(value) and abs(value) <= _FUNCTION_MAX_REAL
+
+
+def _clamped_real(value) -> float:
+    """Read a finite function parameter as structure_limits will leave it."""
+    return min(max(float(value), -_FUNCTION_MAX_REAL), _FUNCTION_MAX_REAL)
+
+
 def _function_numbers(value, count: int) -> bool:
     """Check the dimensions and finite numeric entries of a function parameter."""
     return (
@@ -430,6 +446,10 @@ def _fold_calculator_operator(operator: str, operands: list):
     )
     if function is not None and all(isinstance(a, (int, float)) for a in operands):
         result = function(*operands)
+        if isinstance(result, float) and not _function_real(result):
+            # Python float arithmetic yields inf or NaN, or a value no renderer
+            # represents, without raising, as in 1e30 dup mul or inf 0 mul.
+            raise ValueError("real result out of range")
         if isinstance(result, int) and not (
             _CALCULATOR_MIN_INTEGER <= result <= _CALCULATOR_MAX_INTEGER
         ):
@@ -463,6 +483,9 @@ def _apply_calculator_operator(token: bytes, stack: list) -> bool:
         ):
             # An integer literal beyond the implementation limit is read as a real.
             value = float(value)
+        if not _function_real(value):
+            # float() reads a literal of hundreds of digits as inf without raising.
+            return False
         stack.append(value)
         return True
     if operator in ("true", "false"):
@@ -662,7 +685,9 @@ def _is_scalar_calculator(data: bytes, domain) -> bool:
     program = _parse_calculator(data)
     if program is None:
         return False
-    low, high = float(domain[0]), float(domain[1])
+    # Inputs are clipped to a Domain that structure_limits clamps to the real
+    # limit, which also keeps the sampling grid from overflowing.
+    low, high = _clamped_real(domain[0]), _clamped_real(domain[1])
     try:
         for value in (None, *_calculator_samples(program, low, high)):
             stack: list = [value]
@@ -701,6 +726,24 @@ def _is_scalar_transfer_function(
             function, ancestors | {key}, validated
         )
     return validated[key]
+
+
+def _is_bounded_exponential(function, domain, exponent) -> bool:
+    """Require C0 + x^N * (C1 - C0) to stay within the real limit over the Domain.
+
+    The Domain excludes 0 for a negative N, so |x|^N takes its largest value at an
+    end of the Domain in each case.
+    """
+    c0 = _clamped_real(function["/C0"][0]) if "/C0" in function else 0.0
+    c1 = _clamped_real(function["/C1"][0]) if "/C1" in function else 1.0
+    for bound in domain:
+        try:
+            power = math.pow(_clamped_real(bound), float(exponent))
+        except (OverflowError, ValueError):
+            return False
+        if not _function_real(power) or not _function_real(c0 + power * (c1 - c0)):
+            return False
+    return True
 
 
 def _check_scalar_transfer_function(function, ancestors, validated: dict) -> bool:
@@ -764,6 +807,7 @@ def _check_scalar_transfer_function(function, ancestors, validated: dict) -> boo
                 key not in function or _function_numbers(function[key], 1)
                 for key in ("/C0", "/C1")
             )
+            and _is_bounded_exponential(function, domain, exponent)
         )
     if kind == 3:
         functions = function.get("/Functions")
