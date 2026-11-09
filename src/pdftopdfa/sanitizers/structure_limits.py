@@ -260,7 +260,26 @@ def _sanitize_string(value: Any) -> tuple[Any, bool]:
         return value, False
     if len(raw) <= _MAX_STRING_BYTES:
         return value, False
-    return pikepdf.String(raw[:_MAX_STRING_BYTES]), True
+    return pikepdf.String(_truncate_string_bytes(raw)), True
+
+
+def _truncate_string_bytes(raw: bytes) -> bytes:
+    """Cut string bytes to the limit without splitting a UTF-16BE character.
+
+    ISO 32000-1, 7.9.2.2: a text string that begins with the byte order marker
+    FE FF is encoded in UTF-16BE, so it keeps an even length and no high
+    surrogate without its low surrogate. Other strings, PDFDocEncoding text and
+    byte strings, are cut at the limit; ISO 32000-1 defines no UTF-8 text
+    strings. A byte string that begins with FE FF by chance loses at most three
+    further bytes.
+    """
+    if not raw.startswith(b"\xfe\xff"):
+        return raw[:_MAX_STRING_BYTES]
+    end = _MAX_STRING_BYTES - _MAX_STRING_BYTES % 2
+    # The first byte of the last code unit; D8-DB start a high surrogate.
+    if 0xD8 <= raw[end - 2] <= 0xDB:
+        end -= 2
+    return raw[:end]
 
 
 def _fix_odd_hex_string(value: pikepdf.String) -> pikepdf.String:

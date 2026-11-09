@@ -365,6 +365,42 @@ class TestStructureLimitsSanitizer:
         assert len(bytes(text_op.operands[0])) == 32_767
         assert result["strings_truncated"] >= 2
 
+    @pytest.mark.parametrize(
+        "text,length",
+        [
+            # 16,383 BMP characters fill 32,768 bytes with the byte order mark;
+            # the even limit keeps 16,382 of them.
+            ("é" * 16_383, 32_766),
+            # A surrogate pair must not lose its low surrogate.
+            ("a" * 16_381 + "\U0001f600" * 2, 32_764),
+            # Pairs that end at the limit are kept whole.
+            ("\U0001f600" * 8_200, 32_766),
+        ],
+    )
+    def test_truncates_utf16_text_strings_at_a_character_boundary(
+        self, text: str, length: int
+    ) -> None:
+        """A UTF-16BE text string keeps whole code units and surrogate pairs."""
+        pdf = new_pdf()
+        raw = b"\xfe\xff" + text.encode("utf-16-be")
+        pdf.Root[Name("/LongText")] = pikepdf.String(raw)
+
+        result = sanitize_structure_limits(pdf)
+
+        truncated = bytes(pdf.Root["/LongText"])
+        assert len(truncated) == length
+        assert truncated == raw[:length]
+        assert text.startswith(truncated[2:].decode("utf-16-be", errors="strict"))
+        assert result["strings_truncated"] == 1
+
+    def test_byte_strings_are_truncated_at_the_byte_limit(self) -> None:
+        """Strings without the UTF-16BE byte order mark keep 32,767 bytes."""
+        pdf = new_pdf()
+        raw = b"\xef\xbb\xbf" + "é".encode() * 20_000
+        pdf.Root[Name("/LongBytes")] = pikepdf.String(raw)
+        sanitize_structure_limits(pdf)
+        assert bytes(pdf.Root["/LongBytes"]) == raw[:32_767]
+
     def test_fixes_utf8_name_and_numeric_limits(self) -> None:
         content = b"2157483648 0 Td 0.00000000000000000000000000000000000001173 g"
         pdf = _make_page_pdf(content)

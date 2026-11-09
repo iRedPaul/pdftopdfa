@@ -174,7 +174,8 @@ def _sanitize_collection_items(pdf: Pdf, schema) -> int:
     no values, so its items keep only their /Type. Only files of the EmbeddedFiles
     name tree belong to the collection (ISO 32000-1, 12.3.5), so the items of other
     file specifications are not checked against its schema. A file specification
-    or item that several names share is checked once.
+    or item that several names share is checked once; the two roles are tracked
+    separately.
 
     ISO 32000-1, Table 157 lists only S, D and N as "the types of fields in the
     collection item or collection subitem dictionary". The field data of the
@@ -182,21 +183,30 @@ def _sanitize_collection_items(pdf: Pdf, schema) -> int:
     corresponding entry of the file specification or embedded file parameters,
     so an item value under such a field's key is not field data and is removed.
     """
-    removed, seen = 0, set()
-    for _, filespec in _embedded_files(pdf):
-        if not _first_visit(filespec, seen):
+    entries = _embedded_files(pdf)
+    filespecs = {spec.objgen for _, spec in entries if spec.objgen != (0, 0)}
+    removed, seen_specs, seen_items = 0, set(), set()
+    for _, filespec in entries:
+        if not _first_visit(filespec, seen_specs):
             continue
         item = filespec.get("/CI")
         if item is None:
             continue
-        if not isinstance(item, Dictionary):
+        # A file specification of the name tree, or one typed as such (Table
+        # 44), is not a collection item (Table 155). Checking it as one would
+        # remove the entries that its file needs, so the reference is removed.
+        if (
+            not isinstance(item, Dictionary)
+            or item.objgen in filespecs
+            or item.get("/Type") == Name.Filespec
+        ):
             removed += _remove_entry(filespec, "/CI")
             continue
         # A file specification refers to its collection item indirectly.
         if item.objgen == (0, 0):
             item = pdf.make_indirect(item)
             filespec["/CI"] = item
-        if not _first_visit(item, seen):
+        if not _first_visit(item, seen_items):
             continue
         removed += _optional_type(item, Name.CollectionItem)
         if schema is None:
@@ -434,8 +444,9 @@ def _walk_actions(pdf: Pdf, remove=None) -> tuple[list, int]:
     Returns:
         The visited actions, and the number of removed references.
     """
-    actions, pending, seen, emptied = [], [], set(), set()
-    removed = 0
+    # A dictionary scanned as an /AA dictionary is still followed as an action.
+    actions, pending, seen_holders, seen_actions = [], [], set(), set()
+    emptied, removed = set(), 0
 
     def prune(holder, keys: list) -> bool:
         """Remove rejected actions from a container; True if that emptied it."""
@@ -455,7 +466,7 @@ def _walk_actions(pdf: Pdf, remove=None) -> tuple[list, int]:
 
     def emptied_container(holder, keys: list) -> bool:
         """Prune a shared /AA or /Next container once; report if it was emptied."""
-        if not _first_visit(holder, seen):
+        if not _first_visit(holder, seen_holders):
             return holder.objgen in emptied
         if not prune(holder, keys):
             return False
@@ -473,7 +484,7 @@ def _walk_actions(pdf: Pdf, remove=None) -> tuple[list, int]:
             del owner["/AA"]
     while pending:
         action = pending.pop()
-        if not isinstance(action, Dictionary) or not _first_visit(action, seen):
+        if not isinstance(action, Dictionary) or not _first_visit(action, seen_actions):
             continue
         actions.append(action)
         if "/Next" not in action.keys():
@@ -700,7 +711,9 @@ def _thread_action_filter(pdf: Pdf, found: dict):
     is missing, of another type, out of range, or not a valid thread is rejected.
     The optional bead (/B), a bead dictionary of that thread or its index in the
     thread, is removed if it is neither, so that the action opens the thread at
-    its first bead.
+    its first bead. In another file the bead can only be an index (a bead
+    dictionary requires the thread to be in the current file), which must not be
+    negative; its upper bound is not checked.
 
     Returns:
         The check, called with each action dictionary, and a one-element list
@@ -727,6 +740,13 @@ def _thread_action_filter(pdf: Pdf, found: dict):
         elif isinstance(target, bool) or not isinstance(target, (int, String)):
             thread_id = None
         elif "/F" in keys:
+            # The bead of a thread in another file can only be its index; the
+            # dictionary form requires the thread to be in the current file.
+            bead = action["/B"] if "/B" in keys else None
+            if bead is not None and (
+                isinstance(bead, bool) or not isinstance(bead, int) or bead < 0
+            ):
+                beads_removed[0] += _remove_entry(action, "/B")
             return False
         elif isinstance(target, int):
             thread_id = listed[target] if 0 <= target < len(listed) else None

@@ -1653,3 +1653,102 @@ def test_utf16_text_that_is_not_a_date_is_removed():
     thread.I.ModDate = _utf16("D:2024é")
     assert remove_forbidden_catalog_entries(pdf) == 1
     assert "/ModDate" not in thread.I
+
+
+@pytest.mark.parametrize("target", [7, "Elsewhere"])
+@pytest.mark.parametrize("bead", [-1, True, Decimal("0.5"), Name.Bad, "bead", "dict"])
+def test_thread_action_into_another_file_loses_an_invalid_bead(target, bead):
+    """Table 205: a bead of a thread in another file is given only by its index.
+
+    The bead dictionary form requires the thread to be in the current file, so
+    an invalid bead is removed on its own and the action opens the first bead.
+    """
+    pdf = new_pdf()
+    pdf.add_blank_page()
+    action = Dictionary(S=Name.Thread, F="other.pdf", D=target)
+    action.B = pdf.make_indirect(Dictionary(Type=Name.Bead)) if bead == "dict" else bead
+    pdf.Root.OpenAction = action
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert sorted(pdf.Root.OpenAction.keys()) == ["/D", "/F", "/S"]
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+def test_conversion_keeps_a_long_utf16_thread_title_valid(tmp_path):
+    """A title over the string limit is cut at a UTF-16BE character boundary."""
+    from pikepdf import Pdf
+
+    from pdftopdfa.metadata import _is_pdf_text_string
+
+    pdf = new_pdf()
+    thread, _, _ = _article(pdf)
+    title = "\U0001f600" + "\u00e9" * 20_000
+    thread.I.Title = _utf16(title)
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    result = convert_to_pdfa(source, output)
+    assert result.target_produced and not result.skipped, result
+    with Pdf.open(output) as converted:
+        written = converted.Root.Threads[0].I.Title
+        assert len(bytes(written)) <= 32_767 and _is_pdf_text_string(written)
+        assert title.startswith(str(written)) and len(str(written)) > 16_000
+
+
+def _two_file_portfolio(pdf):
+    """Create a portfolio of two file specifications with a schema."""
+    pdf.add_blank_page()
+    specs = [
+        pdf.make_indirect(Dictionary(Type=Name.Filespec, F=name, UF=name))
+        for name in ("a.txt", "b.txt")
+    ]
+    pdf.Root.Names = Dictionary(
+        EmbeddedFiles=Dictionary(Names=Array(["a.txt", specs[0], "b.txt", specs[1]]))
+    )
+    pdf.Root.Collection = Dictionary(
+        Schema=Dictionary(Good=Dictionary(Subtype=Name.S, N="Good"))
+    )
+    return specs
+
+
+@pytest.mark.parametrize("owner,shared", [(0, 1), (1, 0), (0, 0)])
+def test_collection_item_that_is_a_listed_file_specification_is_detached(owner, shared):
+    """A file specification is not a collection item, in whichever order.
+
+    The /CI entry is removed rather than the file specification checked as an
+    item, which would remove the entries that its embedded file needs.
+    """
+    pdf = new_pdf()
+    specs = _two_file_portfolio(pdf)
+    specs[owner].CI = specs[shared]
+    expected = {key: repr(specs[shared][key]) for key in ("/Type", "/F", "/UF")}
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert "/CI" not in specs[owner]
+    assert {key: repr(specs[shared][key]) for key in expected} == expected
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+def test_collection_item_typed_as_a_file_specification_is_detached():
+    """A file specification outside the name tree is left unchanged as well."""
+    pdf = new_pdf()
+    specs = _two_file_portfolio(pdf)
+    attached = pdf.make_indirect(Dictionary(Type=Name.Filespec, F="c.txt", Good="keep"))
+    specs[0].CI = attached
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert "/CI" not in specs[0]
+    assert sorted(attached.keys()) == ["/F", "/Good", "/Type"]
+
+
+def test_action_that_is_also_an_additional_actions_dictionary_is_checked():
+    """An object scanned as an /AA dictionary is still followed as an action."""
+    pdf = new_pdf()
+    shared = pdf.make_indirect(
+        Dictionary(
+            S=Name.Named,
+            N=Name.NextPage,
+            Next=Array([Dictionary(S=Name.Thread, D=99)]),
+        )
+    )
+    pdf.Root.OpenAction = shared
+    _link(pdf, pdf.add_blank_page(), AA=shared)
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert "/Next" not in shared
+    assert pdf.Root.OpenAction.objgen == shared.objgen
