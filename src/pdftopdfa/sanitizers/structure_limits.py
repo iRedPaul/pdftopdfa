@@ -212,6 +212,24 @@ def _sanitize_real(value: Any) -> tuple[Any, bool]:
     return value, False
 
 
+# The largest real magnitude of ISO 32000-1, Table C.1, as a float.
+MAX_REAL_MAGNITUDE = float(_MAX_REAL_MAGNITUDE)
+
+
+def normalize_number(value: Any) -> Any:
+    """Return a number object as sanitize_structure_limits() leaves it in the file.
+
+    This applies the same integer clamping and real normalization as the object
+    pass, so that an earlier pass can validate a value as it will be written,
+    such as a real below 1.175e-38 that becomes 0. Other values are returned
+    unchanged.
+    """
+    value, clamped = _sanitize_integer(value)
+    if clamped:
+        return value
+    return _sanitize_real(value)[0]
+
+
 def _sanitize_string(value: Any) -> tuple[Any, bool]:
     """Truncate string objects to the PDF/A implementation limit."""
     if not isinstance(value, pikepdf.String):

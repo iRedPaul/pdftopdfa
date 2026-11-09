@@ -13,11 +13,13 @@ from conftest import new_pdf, pdf_object
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from pdftopdfa.color_profile import get_cmyk_profile
+from pdftopdfa.converter import convert_to_pdfa
 from pdftopdfa.sanitizers import extgstate
 from pdftopdfa.sanitizers.extgstate import (
     _sanitize_shadings_in_resources,
     sanitize_extgstate,
 )
+from pdftopdfa.sanitizers.structure_limits import sanitize_structure_limits
 
 
 def _make_form_stream(pdf: Pdf):
@@ -1254,6 +1256,116 @@ class TestSoftMaskValidation:
             assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
         assert checked.call_count == 41
         assert pdf.pages[0].Resources.ExtGState.GS0.SMask.TR.objgen == child.objgen
+
+    # A real of magnitude 1e-40, which pikepdf keeps only when parsed: a Decimal
+    # assigned from Python is rounded to 0 before it reaches the file.
+    _TINY = b"0." + b"0" * 39 + b"1"
+    _IDENTITY = b"<< /FunctionType 2 /Domain [0 1] /N 1 >>"
+    _NORMALIZED_DICTIONARIES = {
+        # Bounds [0] once written, violating Domain0 < Bounds0 (7.10.4).
+        "first_bound": b"<< /FunctionType 3 /Domain [0 1] /Functions [ID ID]"
+        b" /Bounds [TINY] /Encode [0 1 0 1] >>",
+        # Domain [0 1] and Bounds [0] once written.
+        "stitching_domain": b"<< /FunctionType 3 /Domain [-TINY 1]"
+        b" /Functions [ID ID] /Bounds [0] /Encode [0 1 0 1] >>",
+        # Domain [0 1] once written, which a negative N must exclude.
+        "negative_exponent_domain": b"<< /FunctionType 2 /Domain [TINY 1] /N -1 >>",
+        # N becomes 0, which the Domain [0 1] permits, unlike a negative N.
+        "subnormal_exponent": b"<< /FunctionType 2 /Domain [0 1] /N -TINY >>",
+        # Domain [0 1] once written, which a non-integer N permits.
+        "fractional_exponent_domain": b"<< /FunctionType 2 /Domain [-TINY 1] /N 0.5 >>",
+        "subnormal_coefficients": b"<< /FunctionType 2 /Domain [0 1] /N 1"
+        b" /C0 [TINY] /C1 [-TINY] >>",
+        "subnormal_encode": b"<< /FunctionType 3 /Domain [0 1] /Functions [ID ID]"
+        b" /Bounds [0.5] /Encode [TINY 1 0 -TINY] >>",
+    }
+    _NORMALIZED_CALCULATORS = {
+        # Domain [0 1] once written, where { ln } is undefined at 0.
+        "calculator_domain": (b"[TINY 1]", b"{ ln }"),
+        # Domain [2147483647 2147483647] once written, where the program is
+        # undefined, although it is defined at every original input.
+        "clamped_domain": (b"[4294967296 4294967297]", b"{ 2147483648 sub ln }"),
+    }
+
+    @classmethod
+    def _normalized_transfer(cls, pdf: Pdf, case: str):
+        """Create a transfer function whose verdict depends on number normalization.
+
+        sanitize_structure_limits() sets a real below 1.175e-38 in magnitude to 0
+        and clamps integers to the 32-bit limits, so the validator must decide on
+        the values that pass writes, not on the original ones.
+        """
+        if case in cls._NORMALIZED_CALCULATORS:
+            domain, program = cls._NORMALIZED_CALCULATORS[case]
+            transfer = pdf.make_stream(program)
+            transfer.FunctionType = 4
+            transfer.Domain = pikepdf.Object.parse(domain.replace(b"TINY", cls._TINY))
+            transfer.Range = Array([-100, 100])
+            return transfer
+        text = cls._NORMALIZED_DICTIONARIES[case]
+        text = text.replace(b"ID", cls._IDENTITY).replace(b"TINY", cls._TINY)
+        return pikepdf.Object.parse(text)
+
+    _NORMALIZATION_CASES = [
+        ("calculator_domain", False),
+        ("first_bound", False),
+        ("stitching_domain", False),
+        ("negative_exponent_domain", False),
+        ("clamped_domain", False),
+        ("subnormal_exponent", True),
+        ("fractional_exponent_domain", True),
+        ("subnormal_coefficients", True),
+        ("subnormal_encode", True),
+    ]
+
+    @pytest.mark.parametrize("case,kept", _NORMALIZATION_CASES)
+    @pytest.mark.parametrize("limits_first", [False, True])
+    def test_transfer_is_validated_as_structure_limits_writes_it(
+        self, case, kept, limits_first
+    ) -> None:
+        """The /TR verdict holds for the written numbers, in either pass order."""
+        pdf = new_pdf()
+        mask = Dictionary(
+            S=Name.Alpha,
+            G=_make_form_stream(pdf),
+            TR=self._normalized_transfer(pdf, case),
+        )
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        if limits_first:
+            sanitize_structure_limits(pdf)
+        sanitize_extgstate(pdf)
+        sanitize_structure_limits(pdf)
+        smask = pdf.pages[0].Resources.ExtGState.GS0.SMask
+        assert ("/TR" in smask) is kept
+        if kept:
+            # The written function passes on its own, without normalization.
+            assert extgstate._is_scalar_transfer_function(smask.TR)
+
+    @pytest.mark.parametrize("case,kept", _NORMALIZATION_CASES)
+    def test_full_conversion_keeps_only_valid_written_transfers(
+        self, case, kept, tmp_path
+    ) -> None:
+        """After the whole pipeline, a soft-mask /TR is present only if valid."""
+        pdf = new_pdf()
+        mask = Dictionary(
+            S=Name.Alpha,
+            G=_make_form_stream(pdf),
+            TR=self._normalized_transfer(pdf, case),
+        )
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        pdf.pages[0].Contents = pdf.make_stream(b"/GS0 gs 0 0 10 10 re f")
+        source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+        pdf.save(source)
+
+        result = convert_to_pdfa(source, output, level="2b", validate=False)
+
+        assert result.success
+        with Pdf.open(output) as converted:
+            smask = converted.pages[0].Resources.ExtGState.GS0.SMask
+            assert isinstance(smask, Dictionary)
+            assert ("/TR" in smask) is kept
+            if kept:
+                assert extgstate._is_scalar_transfer_function(smask.TR)
 
     @staticmethod
     def _calculator_mask(pdf: Pdf, program: bytes) -> Dictionary:

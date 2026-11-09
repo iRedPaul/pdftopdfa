@@ -29,6 +29,7 @@ from pikepdf import Array, Dictionary, Name, Pdf, PdfError, Stream
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 from .rendering_intent import VALID_RENDERING_INTENTS
+from .structure_limits import MAX_REAL_MAGNITUDE, normalize_number
 
 # Valid blend modes per PDF Reference 1.7, Table 136
 VALID_BLEND_MODES = frozenset(
@@ -273,7 +274,7 @@ def _clamp_opacity(gs_dict: Dictionary, key: str) -> int:
 # The largest real magnitude of ISO 32000-1, Table C.1, to which structure_limits
 # later clamps the real objects of the file. A calculator value beyond it is an
 # undefinedresult or limitcheck error, and infinity on single-precision renderers.
-_FUNCTION_MAX_REAL = 3.403e38
+_FUNCTION_MAX_REAL = MAX_REAL_MAGNITUDE
 
 
 def _function_real(value) -> bool:
@@ -281,23 +282,37 @@ def _function_real(value) -> bool:
     return math.isfinite(value) and abs(value) <= _FUNCTION_MAX_REAL
 
 
-def _clamped_real(value) -> float:
-    """Read a finite function parameter as structure_limits will leave it."""
-    return min(max(float(value), -_FUNCTION_MAX_REAL), _FUNCTION_MAX_REAL)
+def _function_number(value) -> int | float | None:
+    """Read a numeric function parameter as it will be written, or None.
+
+    sanitize_structure_limits() runs after this sanitizer and rewrites every number
+    object of the file: it clamps integers to the 32-bit limits, clamps reals to
+    +-3.403e38 and sets a real below 1.175e-38 in magnitude to 0. A function is
+    validated with those values, since a check of the original ones can pass,
+    as for a Domain [1e-40 1] of { ln }, while the written function is undefined.
+    Normalizing again is a no-op, so the result is the same if that pass already
+    ran. Integers stay integers; reals are returned as floats.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        return None
+    if not isinstance(value, int) and not math.isfinite(value):
+        return None
+    value = normalize_number(value)
+    return value if isinstance(value, int) else float(value)
 
 
-def _function_numbers(value, count: int) -> bool:
-    """Check the dimensions and finite numeric entries of a function parameter."""
-    return (
-        isinstance(value, Array)
-        and len(value) == count
-        and all(
-            not isinstance(number, bool)
-            and isinstance(number, (int, float, Decimal))
-            and math.isfinite(number)
-            for number in value
-        )
-    )
+def _function_numbers(value, count: int) -> list | None:
+    """Read an array parameter of ``count`` numbers via _function_number()."""
+    if not isinstance(value, Array) or len(value) != count:
+        return None
+    numbers = [_function_number(number) for number in value]
+    return None if None in numbers else numbers
+
+
+def _function_integer(value) -> int | None:
+    """Read an integer function parameter via _function_number(), or None."""
+    number = _function_number(value)
+    return number if isinstance(number, int) else None
 
 
 _CALCULATOR_UNARY = frozenset(
@@ -685,9 +700,9 @@ def _is_scalar_calculator(data: bytes, domain) -> bool:
     program = _parse_calculator(data)
     if program is None:
         return False
-    # Inputs are clipped to a Domain that structure_limits clamps to the real
-    # limit, which also keeps the sampling grid from overflowing.
-    low, high = _clamped_real(domain[0]), _clamped_real(domain[1])
+    # The Domain is normalized by _function_numbers() as structure_limits writes
+    # it, so its real limit also keeps the sampling grid from overflowing.
+    low, high = float(domain[0]), float(domain[1])
     try:
         for value in (None, *_calculator_samples(program, low, high)):
             stack: list = [value]
@@ -728,17 +743,15 @@ def _is_scalar_transfer_function(
     return validated[key]
 
 
-def _is_bounded_exponential(function, domain, exponent) -> bool:
+def _is_bounded_exponential(domain, exponent, c0: float, c1: float) -> bool:
     """Require C0 + x^N * (C1 - C0) to stay within the real limit over the Domain.
 
     The Domain excludes 0 for a negative N, so |x|^N takes its largest value at an
-    end of the Domain in each case.
+    end of the Domain in each case. All values are normalized (_function_number()).
     """
-    c0 = _clamped_real(function["/C0"][0]) if "/C0" in function else 0.0
-    c1 = _clamped_real(function["/C1"][0]) if "/C1" in function else 1.0
     for bound in domain:
         try:
-            power = math.pow(_clamped_real(bound), float(exponent))
+            power = math.pow(float(bound), float(exponent))
         except (OverflowError, ValueError):
             return False
         if not _function_real(power) or not _function_real(c0 + power * (c1 - c0)):
@@ -747,76 +760,73 @@ def _is_bounded_exponential(function, domain, exponent) -> bool:
 
 
 def _check_scalar_transfer_function(function, ancestors, validated: dict) -> bool:
-    """Validate one function object; see _is_scalar_transfer_function()."""
-    kind = function.get("/FunctionType")
-    domain = function.get("/Domain")
-    limits = function.get("/Range")
-    if (
-        isinstance(kind, bool)
-        or not isinstance(kind, int)
-        or not _function_numbers(domain, 2)
-        or domain[0] > domain[1]
-    ):
+    """Validate one function object; see _is_scalar_transfer_function().
+
+    Every numeric parameter is read through _function_number(), so the checks
+    apply to the values that sanitize_structure_limits() writes to the output.
+    """
+    kind = _function_integer(function.get("/FunctionType"))
+    domain = _function_numbers(function.get("/Domain"), 2)
+    if kind is None or domain is None or domain[0] > domain[1]:
         return False
-    if "/Range" in function and (
-        not _function_numbers(limits, 2) or limits[0] > limits[1]
-    ):
-        return False
+    limits = None
+    if "/Range" in function:
+        limits = _function_numbers(function.get("/Range"), 2)
+        if limits is None or limits[0] > limits[1]:
+            return False
     if kind in (0, 4):
-        if not isinstance(function, Stream) or not _function_numbers(limits, 2):
+        if not isinstance(function, Stream) or limits is None:
             return False
         try:
             data = function.read_bytes()
         except (PdfError, RuntimeError):
             return False
         if kind == 4:
+            # structure_limits rewrites number objects and content streams, not
+            # the literals of a calculator stream, so these are read as they are.
             return _is_scalar_calculator(data, domain)
-        size = function.get("/Size")
-        bits = function.get("/BitsPerSample")
-        order = function.get("/Order", 1)
+        size = _function_numbers(function.get("/Size"), 1)
+        bits = _function_integer(function.get("/BitsPerSample"))
+        order = _function_integer(function.get("/Order", 1))
         return (
-            isinstance(size, Array)
-            and len(size) == 1
-            and not isinstance(size[0], bool)
+            size is not None
             and isinstance(size[0], int)
             and size[0] > 0
-            and not isinstance(bits, bool)
-            and isinstance(bits, int)
             and bits in (1, 2, 4, 8, 12, 16, 24, 32)
-            and not isinstance(order, bool)
-            and isinstance(order, int)
             and order in (1, 3)
             # ISO 32000-1, 7.3.8.2: too little or too much data is an error.
             and len(data) == (size[0] * bits + 7) // 8
             and all(
-                key not in function or _function_numbers(function[key], 2)
+                key not in function or _function_numbers(function[key], 2) is not None
                 for key in ("/Encode", "/Decode")
             )
         )
     if not isinstance(function, Dictionary):
         return False
     if kind == 2:
-        exponent = function.get("/N")
+        exponent = _function_number(function.get("/N"))
+        coefficients = [
+            _function_numbers(function[key], 1) if key in function else [default]
+            for key, default in (("/C0", 0.0), ("/C1", 1.0))
+        ]
         return (
-            not isinstance(exponent, bool)
-            and isinstance(exponent, (int, float, Decimal))
-            and math.isfinite(exponent)
+            exponent is not None
+            and None not in coefficients
             and (int(exponent) == exponent or domain[0] >= 0)
             and (exponent >= 0 or not domain[0] <= 0 <= domain[1])
-            and all(
-                key not in function or _function_numbers(function[key], 1)
-                for key in ("/C0", "/C1")
+            and _is_bounded_exponential(
+                domain, exponent, coefficients[0][0], coefficients[1][0]
             )
-            and _is_bounded_exponential(function, domain, exponent)
         )
     if kind == 3:
         functions = function.get("/Functions")
         if not isinstance(functions, Array) or not functions:
             return False
         count = len(functions)
-        bounds = function.get("/Bounds")
-        if not _function_numbers(bounds, count - 1) or not _function_numbers(
-            function.get("/Encode"), 2 * count
+        bounds = _function_numbers(function.get("/Bounds"), count - 1)
+        if (
+            bounds is None
+            or _function_numbers(function.get("/Encode"), 2 * count) is None
         ):
             return False
         if any(a >= b for a, b in zip([domain[0], *bounds], [*bounds, domain[1]])):
