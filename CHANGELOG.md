@@ -49,7 +49,10 @@
 - Remove duplicate beads from a page's `/B` array, keeping the drawing order of the listed beads and appending omitted beads in reading order; a complete `/B` array is left unchanged
 - Make an inline catalog `/Threads` array an indirect object
 - Remove collection item values without a matching schema field or with the wrong type, keeping them when a portfolio has no schema, and a default document that is not an embedded file specification, rechecked after all embedded-file cleanup for PDF/A-2 and PDF/A-3
-- Accept every ISO 32000-1 date form in collection items and thread information (a UT offset after `Z`, an hour offset without minutes) instead of removing the value or rejecting the article, and reject out-of-range UT offsets, a UT relationship without the complete date and time, and dates that do not exist
+- Accept every ISO 32000-1 date form in collection items and thread information (a zero UT offset after `Z`, an hour offset without minutes) instead of removing the value, and reject a nonzero offset after `Z`, out-of-range UT offsets, a UT relationship without the complete date and time, and dates that do not exist
+- Keep the page beads of valid threads that the catalog `/Threads` array does not list but a Thread action or a page `/B` array refers to, and rebuild the `/B` arrays of their pages, instead of removing them as unrelated beads
+- Remove malformed thread information entries (text strings with an invalid PDFDocEncoding or UTF-16BE encoding, invalid dates or `/Trapped` values) individually, and a `/I` entry that is not a dictionary, like custom DocInfo values, instead of rejecting the article
+- Require valid PDFDocEncoding or UTF-16BE text encoding for collection item text values, subitem prefixes and schema field names
 - Skip malformed `/EmbeddedFiles` name-tree nodes (non-dictionary `/Kids` entries, `/Names` or `/Kids` of the wrong type, non-string keys, cycles) when checking a portfolio, instead of aborting the conversion; embedded-file sanitizers share this single tolerant name-tree traversal
 
 ### Tests

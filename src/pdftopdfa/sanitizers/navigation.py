@@ -9,23 +9,28 @@ import math
 import re
 from datetime import datetime
 from decimal import Decimal
+from itertools import chain
 
 from pikepdf import Array, Dictionary, Name, Pdf, String
 
 from ..exceptions import ConversionError
+from ..metadata import _is_pdf_text_string
 from .files import _is_filespec, _iter_name_tree_pairs
 
 logger = logging.getLogger(__name__)
 
+_THREAD = Name.Thread
+
 
 # ISO 32000-1, 7.9.4: D:YYYYMMDDHHmmSSOHH'mm. Each field may be present only
 # together with all of the preceding ones, so the relationship to UT (O) needs a
-# complete date and time. A UT offset may follow Z as well (Z00'00'), an hour
-# offset may end with its apostrophe, and the trailing apostrophe of PDF 1.7 and
-# earlier versions (HH'mm') is tolerated.
+# complete date and time. An hour offset may end with its apostrophe, and the
+# trailing apostrophe of PDF 1.7 and earlier versions (HH'mm') is tolerated. Z
+# denotes equality with UT, so an offset may follow it only as zero (Z00'00').
 _PDF_DATE = re.compile(
     r"D:([0-9]{4})(?:([0-9]{2})(?:([0-9]{2})(?:([0-9]{2})(?:([0-9]{2})(?:([0-9]{2})"
-    r"(?:[Z+-](?:(?:[01][0-9]|2[0-3])(?:'(?:[0-5][0-9]'?)?)?)?)?"
+    r"(?:Z(?:00(?:'(?:00'?)?)?)?"
+    r"|[+-](?:(?:[01][0-9]|2[0-3])(?:'(?:[0-5][0-9]'?)?)?)?)?"
     r")?)?)?)?)?"
 )
 
@@ -89,17 +94,19 @@ def _valid_item_value(value, subtype) -> bool:
     of a collection subitem dictionary, /D included, as optional with no default,
     so a subitem with only a /P prefix, or none at all, is well formed. A subitem
     whose /Type, /P or /D contradicts the field is removed as one item value.
+    A text string, the /P prefix included, needs a valid PDFDocEncoding or
+    UTF-16BE encoding (7.9.2.2), as retained DocInfo values do.
     """
     if isinstance(value, Dictionary):
         if value.get("/Type") not in (None, Name.CollectionSubitem):
             return False
-        if value.get("/P") is not None and not isinstance(value.P, String):
+        if value.get("/P") is not None and not _is_pdf_text_string(value.P):
             return False
         value = value.get("/D")
         if value is None:
             return True
     if subtype in (Name.S, Name.F, Name.Desc):
-        return isinstance(value, String)
+        return _is_pdf_text_string(value)
     if subtype in (Name.D, Name.ModDate, Name.CreationDate):
         return _is_pdf_date(value)
     return (
@@ -197,7 +204,7 @@ def _sanitize_collection(pdf: Pdf) -> int:
                     Name.CreationDate,
                     Name.Size,
                 )
-                or not isinstance(field.get("/N"), String)
+                or not _is_pdf_text_string(field.get("/N"))
             ):
                 removed += _remove_entry(schema, key)
                 continue
@@ -264,76 +271,204 @@ def _reference(value, expected: Name):
     return value
 
 
-def _validate_threads(pdf: Pdf) -> dict[tuple[int, int], tuple]:
-    """Validate bead cycles and page links without renumbering local Thread actions.
+def _thread_beads(thread, pages: set) -> list[tuple]:
+    """Validate the bead cycle of one thread and its page links.
 
     Returns:
-        For each bead, in /Threads and reading order: its page and bead dictionary.
+        The id, page id and dictionary of each bead, in reading order.
+    """
+    thread = _reference(thread, Name.Thread)
+    first = _reference(thread.get("/F"), Name.Bead)
+    beads, bead, seen = [], first, set()
+    while bead.objgen not in seen:
+        seen.add(bead.objgen)
+        owner = bead.get("/T")
+        if owner is not None or bead.objgen == first.objgen:
+            if _reference(owner, Name.Thread).objgen != thread.objgen:
+                raise _thread_error("bead belongs to a different thread")
+        following = _reference(bead.get("/N"), Name.Bead)
+        previous = _reference(bead.get("/V"), Name.Bead)
+        if (
+            _reference(following.get("/V"), Name.Bead).objgen != bead.objgen
+            or _reference(previous.get("/N"), Name.Bead).objgen != bead.objgen
+        ):
+            raise _thread_error("inconsistent next/previous links")
+        page_ref = bead.get("/P")
+        if not isinstance(page_ref, Dictionary) or page_ref.objgen not in pages:
+            raise _thread_error("bead refers to a nonexistent page")
+        rectangle = bead.get("/R")
+        if (
+            not isinstance(rectangle, Array)
+            or len(rectangle) != 4
+            or not all(
+                not isinstance(number, bool)
+                and isinstance(number, (int, float, Decimal))
+                and math.isfinite(number)
+                for number in rectangle
+            )
+        ):
+            raise _thread_error("invalid bead rectangle")
+        beads.append((bead.objgen, page_ref.objgen, bead))
+        bead = following
+    if bead.objgen != first.objgen:
+        raise _thread_error("bead cycle does not return to the first bead")
+    return beads
+
+
+def _action_threads(pdf: Pdf):
+    """Yield the threads that Thread actions name directly by their dictionary.
+
+    ISO 32000-1, 12.6.4.6 lets a Thread action refer to a thread of the same file
+    by its dictionary, so the thread need not appear in the optional catalog
+    /Threads array. Actions of the document, its pages, annotations and outline
+    items are searched, including the actions that follow them (/Next).
+
+    The keys of each dictionary are listed once: with pikepdf, looking up an
+    absent key costs far more, which matters for the many annotations of a large
+    document.
+    """
+    owners = [pdf.Root]
+    for page in pdf.pages:
+        owners.append(page.obj)
+        if "/Annots" in page.obj.keys() and isinstance(page.obj.Annots, Array):
+            owners.extend(
+                item for item in page.obj.Annots if isinstance(item, Dictionary)
+            )
+    outlines = pdf.Root.get("/Outlines")
+    items = [outlines] if isinstance(outlines, Dictionary) else []
+    visited = set()
+    while items:
+        item = items.pop()
+        if not isinstance(item, Dictionary) or item.objgen in visited:
+            continue
+        if item.objgen != (0, 0):
+            visited.add(item.objgen)
+        keys = item.keys()
+        if item is not outlines:
+            owners.append(item)
+        items.extend(item[key] for key in ("/First", "/Next") if key in keys)
+    pending = [pdf.Root.get("/OpenAction")]
+    for owner in owners:
+        keys = owner.keys()
+        if "/A" in keys:
+            pending.append(owner["/A"])
+        if "/AA" in keys and isinstance(owner["/AA"], Dictionary):
+            pending.extend(owner["/AA"].values())
+    visited = set()
+    while pending:
+        action = pending.pop()
+        if not isinstance(action, Dictionary) or action.objgen in visited:
+            continue
+        if action.objgen != (0, 0):
+            visited.add(action.objgen)
+        keys = action.keys()
+        if (
+            "/S" in keys
+            and "/D" in keys
+            and action["/S"] == _THREAD
+            and isinstance(action["/D"], Dictionary)
+        ):
+            yield action["/D"]
+        if "/Next" in keys:
+            following = action["/Next"]
+            pending.extend(following if isinstance(following, Array) else [following])
+
+
+def _listed_bead_threads(pdf: Pdf):
+    """Yield the thread of each bead cycle that a page /B array refers to.
+
+    Only the first bead of a thread has to name it (/T), so each cycle is followed
+    until a bead does; no bead is followed twice.
+    """
+    visited = set()
+    for page in pdf.pages:
+        listed = page.obj.get("/B")
+        for bead in listed if isinstance(listed, Array) else []:
+            while (
+                isinstance(bead, Dictionary)
+                and bead.objgen != (0, 0)
+                and bead.objgen not in visited
+            ):
+                visited.add(bead.objgen)
+                owner = bead.get("/T")
+                if isinstance(owner, Dictionary):
+                    yield owner
+                    break
+                bead = bead.get("/N")
+
+
+def _validate_threads(pdf: Pdf) -> tuple[list, dict[tuple[int, int], tuple]]:
+    """Validate bead cycles and page links without renumbering local Thread actions.
+
+    Every thread of the catalog /Threads array must be valid. A thread that a
+    Thread action or a page /B array refers to without being listed there (the
+    catalog array is optional, Table 28) supplies its beads when it is valid.
+
+    Returns:
+        The valid threads, and for each of their beads, in /Threads and reading
+        order: its page and bead dictionary.
     """
     threads = pdf.Root.get("/Threads")
-    if threads is None:
-        return {}
-    if not isinstance(threads, Array):
+    if threads is not None and not isinstance(threads, Array):
         raise _thread_error("expected an array")
     pages = {page.objgen for page in pdf.pages}
-    beads = {}
-    for value in threads:
-        thread = _reference(value, Name.Thread)
+    found, beads = {}, {}
+    for thread in threads if threads is not None else []:
+        for bead_id, page_id, bead in _thread_beads(thread, pages):
+            # A thread listed twice keeps the place of its first traversal;
+            # separate threads cannot share beads, because the first bead of
+            # each one names its own thread.
+            beads.setdefault(bead_id, (page_id, bead))
+        found.setdefault(thread.objgen, thread)
+    tried = set(found)
+    for thread in chain(_action_threads(pdf), _listed_bead_threads(pdf)):
+        if thread.objgen in tried:
+            continue
+        tried.add(thread.objgen)
+        try:
+            cycle = _thread_beads(thread, pages)
+        except ConversionError:
+            continue
+        found[thread.objgen] = thread
+        for bead_id, page_id, bead in cycle:
+            beads.setdefault(bead_id, (page_id, bead))
+    return list(found.values()), beads
+
+
+def _sanitize_thread_info(threads: list) -> int:
+    """Remove the thread information entries that DocInfo could not contain.
+
+    ISO 32000-1, Table 160 gives /I the syntax of the document information
+    dictionary (14.3.3). Like the conversion of DocInfo, each malformed entry is
+    removed on its own, keeping its valid siblings and the article: a date that
+    is not a PDF date, a /Trapped value other than the three names, and a text
+    string, standard or custom, whose encoding is invalid.
+    """
+    removed = 0
+    for thread in threads:
         info = thread.get("/I")
-        if info is not None:
-            if not isinstance(info, Dictionary) or any(
-                item is not None
-                and not (
-                    item in (Name("/True"), Name("/False"), Name.Unknown)
-                    if key == "/Trapped"
-                    else isinstance(item, String)
+        if info is None:
+            continue
+        if not isinstance(info, Dictionary):
+            removed += _remove_entry(thread, "/I")
+            continue
+        for key in list(info.keys()):
+            value = info.get(key)
+            if value is None:
+                continue
+            if key == "/Trapped":
+                valid = isinstance(value, Name) and value in (
+                    Name("/True"),
+                    Name("/False"),
+                    Name.Unknown,
                 )
-                for key, item in info.items()
-            ):
-                raise _thread_error("invalid thread information dictionary")
-            if any(
-                info.get(key) is not None and not _is_pdf_date(info[key])
-                for key in ("/CreationDate", "/ModDate")
-            ):
-                raise _thread_error("invalid thread information date")
-        first = _reference(thread.get("/F"), Name.Bead)
-        bead, seen = first, set()
-        while bead.objgen not in seen:
-            seen.add(bead.objgen)
-            owner = bead.get("/T")
-            if owner is not None or bead.objgen == first.objgen:
-                if _reference(owner, Name.Thread).objgen != thread.objgen:
-                    raise _thread_error("bead belongs to a different thread")
-            following = _reference(bead.get("/N"), Name.Bead)
-            previous = _reference(bead.get("/V"), Name.Bead)
-            if (
-                _reference(following.get("/V"), Name.Bead).objgen != bead.objgen
-                or _reference(previous.get("/N"), Name.Bead).objgen != bead.objgen
-            ):
-                raise _thread_error("inconsistent next/previous links")
-            page_ref = bead.get("/P")
-            if not isinstance(page_ref, Dictionary) or page_ref.objgen not in pages:
-                raise _thread_error("bead refers to a nonexistent page")
-            rectangle = bead.get("/R")
-            if (
-                not isinstance(rectangle, Array)
-                or len(rectangle) != 4
-                or not all(
-                    not isinstance(number, bool)
-                    and isinstance(number, (int, float, Decimal))
-                    and math.isfinite(number)
-                    for number in rectangle
-                )
-            ):
-                raise _thread_error("invalid bead rectangle")
-            # A thread listed twice in /Threads keeps the place of its first
-            # traversal; separate threads cannot share beads, because the first
-            # bead of each one names its own thread.
-            beads.setdefault(bead.objgen, (page_ref.objgen, bead))
-            bead = following
-        if bead.objgen != first.objgen:
-            raise _thread_error("bead cycle does not return to the first bead")
-    return beads
+            elif key in ("/CreationDate", "/ModDate"):
+                valid = _is_pdf_date(value)
+            else:
+                valid = _is_pdf_text_string(value)
+            if not valid:
+                removed += _remove_entry(info, key)
+    return removed
 
 
 def _make_threads_indirect(pdf: Pdf) -> int:
@@ -350,9 +485,11 @@ def _repair_page_beads(pdf: Pdf, beads: dict[tuple[int, int], tuple]) -> int:
     """List exactly the beads of each page once, keeping the order of the array.
 
     ISO 32000-1, 12.4.3 requires a /B array on every page on which article beads
-    appear, and Table 30 notes that it can be recreated from /Threads. The validated
-    bead cycles define the beads of each page, so omitted, duplicated or unrelated
-    entries are repaired. The array lists the beads in drawing order (12.4.3),
+    appear, and Table 30 notes that it can be recreated from /Threads. The valid
+    bead cycles define the beads of each page, including those of threads that
+    only actions or /B arrays refer to, so omitted and duplicated beads are
+    repaired and only entries that belong to no valid cycle or to another page
+    are removed. The array lists the beads in drawing order (12.4.3),
     which the threads do not record and which can differ from their reading order,
     so the listed beads keep their relative order, and a complete array stays
     unchanged. Beads that the array omitted follow, in /Threads and reading order.
@@ -400,15 +537,18 @@ def sanitize_catalog_navigation(pdf: Pdf) -> int:
 
     Returns:
         Number of article structures repaired (an inline /Threads array or a page
-        /B array) and malformed collection entries removed, all in place.
+        /B array) and malformed thread information and collection entries
+        removed, all in place.
 
     Raises:
-        ConversionError: If article navigation is malformed. Article validation
-            precedes collection edits and leaves thread destinations unchanged.
+        ConversionError: If an article of the catalog /Threads array is malformed.
+            Article validation precedes all edits and leaves thread destinations
+            unchanged.
     """
-    beads = _validate_threads(pdf)
+    threads, beads = _validate_threads(pdf)
     return (
         _make_threads_indirect(pdf)
         + _repair_page_beads(pdf, beads)
+        + _sanitize_thread_info(threads)
         + _sanitize_collection(pdf)
     )

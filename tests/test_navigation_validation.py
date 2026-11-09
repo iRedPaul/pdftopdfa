@@ -8,7 +8,7 @@ from decimal import Decimal
 
 import pytest
 from conftest import new_pdf, pdf_object
-from pikepdf import Array, Dictionary, Name
+from pikepdf import Array, Dictionary, Name, String
 
 from pdftopdfa.converter import convert_to_pdfa
 from pdftopdfa.exceptions import ConversionError
@@ -155,6 +155,16 @@ def test_collection_items_matching_the_schema_are_unchanged():
     [
         (Name.S, "text", True),
         (Name.S, 42, False),
+        # ISO 32000-1, 7.9.2.2: text strings use PDFDocEncoding or UTF-16BE.
+        (Name.S, String(b"\xfe\xff\x00A\x00b"), True),
+        (Name.S, String(b"caf\xe9"), True),
+        (Name.S, String(b"\x01undefined"), False),
+        (Name.S, String(b"\xfe\xff\xd8\x00"), False),
+        (Name.S, String(b"\xfe\xff\x00A\x00"), False),
+        (Name.S, Dictionary(D="text", P=String(b"\x02")), False),
+        (Name.S, Dictionary(D=String(b"\xfe\xff\xdc\x00"), P="Prefix "), False),
+        (Name.Desc, String(b"\x03"), False),
+        (Name.F, String(b"\xfe\xff\x00"), False),
         (Name.D, "D:20240101000000Z", True),
         (Name.D, "D:20240101000000Z00'00'", True),
         (Name.D, "D:20240101000000Z00'00", True),
@@ -189,6 +199,15 @@ def test_collection_items_matching_the_schema_are_unchanged():
         (Name.D, "D:20240101000000+05'60'", False),
         (Name.D, "D:20240101000000+05'30'00", False),
         (Name.D, "D:20240101000000Z0", False),
+        # Z denotes equality with UT, so an offset after it can only be zero.
+        (Name.D, "D:20240101000000Z00'", True),
+        (Name.D, "D:20240101000000Z00", True),
+        (Name.D, "D:20240101000000Z05'00'", False),
+        (Name.D, "D:20240101000000Z00'30'", False),
+        (Name.D, "D:20240101000000Z01", False),
+        (Name.D, "D:20240101000000Z23'59'", False),
+        (Name.D, "D:20240101000000-23'59'", True),
+        (Name.D, "D:20240101000000-00'00'", True),
         (Name.D, "20240101000000Z", False),
         (Name.D, "D:20241301", False),
         (Name.D, "not a date", False),
@@ -427,7 +446,6 @@ def test_sort_direction_boolean_is_kept(fields):
         "previous",
         "page",
         "rectangle",
-        "info",
     ],
 )
 def test_invalid_article_graph_is_rejected_without_dropping_destinations(damage):
@@ -446,10 +464,8 @@ def test_invalid_article_graph_is_rejected_without_dropping_destinations(damage)
         bead.V = Name.Bad
     elif damage == "page":
         bead.P = pdf.make_indirect(Dictionary(Type=Name.Page))
-    elif damage == "rectangle":
-        bead.R = Array([1, 2, True, 4])
     else:
-        thread.I = 42
+        bead.R = Array([1, 2, True, 4])
     pdf.Root.OpenAction = Dictionary(S=Name.Thread, D=thread)
     with pytest.raises(ConversionError, match="Malformed /Threads"):
         remove_forbidden_catalog_entries(pdf)
@@ -732,25 +748,31 @@ def test_malformed_article_conversion_preserves_original_file(tmp_path):
     assert any("Malformed /Threads" in warning for warning in result.warnings)
 
 
-@pytest.mark.parametrize("key", ["/CreationDate", "/ModDate"])
-@pytest.mark.parametrize("value", ["not a date", 42, Name.Bad])
-def test_article_rejection_precedes_collection_repairs(key, value):
-    """A rejected article leaves even repairable portfolio settings untouched."""
+def test_article_rejection_precedes_all_repairs():
+    """A rejected article leaves even repairable information and portfolios."""
     pdf = new_pdf()
     thread, _, _ = _article(pdf)
-    thread.I[key] = value
+    thread.I.ModDate = "not a date"
+    del thread.F
     pdf.Root.Collection = Dictionary(View=Name.Invalid, Private="keep")
-    before = pdf.Root.Collection.unparse()
-    with pytest.raises(ConversionError, match="thread information"):
+    before = pdf.Root.Collection.unparse(), thread.I.unparse()
+    with pytest.raises(ConversionError, match="Malformed /Threads"):
         remove_forbidden_catalog_entries(pdf)
-    assert pdf.Root.Collection.unparse() == before
+    assert (pdf.Root.Collection.unparse(), thread.I.unparse()) == before
 
 
 @pytest.mark.parametrize(
-    "value", ["D:20240101000000Z00'00'", "D:20240101000000+05'", "D:2024"]
+    "value",
+    [
+        "D:20240101000000Z00'00'",
+        "D:20240101000000Z00'",
+        "D:20240101000000Z00",
+        "D:20240101000000+05'",
+        "D:2024",
+    ],
 )
 def test_thread_information_accepts_every_iso_date_form(value):
-    """ISO 32000-1, 7.9.4 permits an offset after Z and omitted trailing fields."""
+    """ISO 32000-1, 7.9.4 permits a zero offset after Z and omitted fields."""
     pdf = new_pdf()
     thread, _, _ = _article(pdf)
     thread.I.ModDate = value
@@ -758,14 +780,260 @@ def test_thread_information_accepts_every_iso_date_form(value):
     assert str(thread.I.ModDate) == value
 
 
-@pytest.mark.parametrize("value", ["D:2024Z", "D:202401+05", "D:20240230000000Z"])
-def test_thread_information_rejects_incomplete_or_impossible_dates(value):
-    """A UT relationship needs every preceding field, and the date must exist."""
+@pytest.mark.parametrize(
+    "value",
+    [
+        "D:2024Z",
+        "D:202401+05",
+        "D:20240230000000Z",
+        "D:20240101000000Z05'00'",
+        "D:20240101000000+24'00'",
+        "not a date",
+        42,
+        Name.Bad,
+    ],
+)
+@pytest.mark.parametrize("key", ["/CreationDate", "/ModDate"])
+def test_thread_information_loses_invalid_dates(key, value):
+    """Like DocInfo, a malformed date is removed without its article or siblings."""
+    pdf = new_pdf()
+    thread, bead, _ = _article(pdf)
+    thread.I[key] = value
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert key not in thread.I
+    assert str(thread.I.Title) == "Article"
+    assert pdf.Root.Threads[0].F.objgen == bead.objgen
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("/Title", String(b"\x01undefined")),
+        ("/Author", String(b"\xfe\xff\xd8\x00")),
+        ("/Subject", String(b"\xfe\xff\x00A\x00")),
+        ("/Keywords", 42),
+        ("/Creator", Name.Bad),
+        ("/Producer", Array(["a"])),
+        ("/Custom", String(b"\x02")),
+        ("/Custom", Dictionary()),
+        ("/Trapped", String("True")),
+        ("/Trapped", Name.Maybe),
+        ("/Trapped", True),
+    ],
+)
+def test_thread_information_loses_invalid_entries(key, value):
+    """Each /I entry keeps the syntax that retained DocInfo values have."""
     pdf = new_pdf()
     thread, _, _ = _article(pdf)
-    thread.I.CreationDate = value
-    with pytest.raises(ConversionError, match="thread information date"):
-        remove_forbidden_catalog_entries(pdf)
+    thread.I.Keep = String(b"\xfe\xff\x00o\x00k")
+    thread.I[key] = pdf_object(value)
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert sorted(thread.I.keys()) == sorted({"/Keep", "/Title"} - {key})
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("/Title", String(b"caf\xe9")),
+        ("/Author", String(b"\xfe\xff\x00A")),
+        ("/Custom", "text"),
+        ("/Trapped", Name.Unknown),
+        ("/Trapped", Name("/False")),
+    ],
+)
+def test_thread_information_keeps_valid_entries(key, value):
+    """Valid text strings and /Trapped names are preserved byte for byte."""
+    pdf = new_pdf()
+    thread, _, _ = _article(pdf)
+    thread.I[key] = pdf_object(value)
+    before = thread.I.unparse()
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert thread.I.unparse() == before
+
+
+@pytest.mark.parametrize("value", [42, Name.Bad, Array([1]), "Article"])
+def test_malformed_thread_information_is_removed_without_the_article(value):
+    """Thread information is optional; removing it changes no destination."""
+    pdf = new_pdf()
+    thread, bead, page = _article(pdf)
+    thread.I = pdf_object(value)
+    pdf.Root.OpenAction = Dictionary(S=Name.Thread, D=thread)
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert "/I" not in thread
+    assert pdf.Root.OpenAction.D.objgen == thread.objgen
+    assert [item.objgen for item in page.B] == [bead.objgen]
+
+
+def test_conversion_writes_only_valid_thread_information(tmp_path):
+    """The converted article keeps its valid information next to removed entries."""
+    from pikepdf import Pdf
+
+    pdf = new_pdf()
+    thread, _, _ = _article(pdf)
+    thread.I.Author = String(b"\x01undefined")
+    thread.I.ModDate = "D:20240101000000Z05'00'"
+    thread.I.Subject = String(b"\xfe\xff\x00S\x00u\x00b")
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    result = convert_to_pdfa(source, output)
+    assert result.target_produced and not result.skipped, result
+    with Pdf.open(output) as converted:
+        info = converted.Root.Threads[0].I
+        assert sorted(info.keys()) == ["/Subject", "/Title"]
+        assert str(info.Subject) == "Sub"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [String(b"\x01undefined"), String(b"\xfe\xff\xd8\x00"), String(b"\xfe\xff\x00")],
+)
+def test_collection_field_names_need_a_valid_text_encoding(name):
+    """Table 156 defines the field name /N as a text string."""
+    pdf = new_pdf()
+    spec = _portfolio(
+        pdf,
+        Dictionary(
+            Good=Dictionary(Subtype=Name.S, N="Good"),
+            Foo=Dictionary(Subtype=Name.S, N=name),
+        ),
+    )
+    remove_forbidden_catalog_entries(pdf)
+    assert sorted(pdf.Root.Collection.Schema.keys()) == ["/Good"]
+    assert sorted(spec.CI.keys()) == ["/Good", "/Type"]
+
+
+def _unlisted_article(pdf):
+    """Create a two-page article that the catalog /Threads array does not list."""
+    thread, first, page = _article(pdf)
+    del pdf.Root.Threads
+    other = pdf.add_blank_page()
+    second = pdf.make_indirect(Dictionary(P=other.obj, R=Array([0, 0, 50, 50])))
+    first.N = first.V = second
+    second.N = second.V = first
+    other.B = Array([second])
+    return thread, first, second, page, other
+
+
+def test_unlisted_thread_keeps_its_page_beads():
+    """A thread that only a Thread action names still owns the beads of its pages."""
+    pdf = new_pdf()
+    thread, first, second, page, other = _unlisted_article(pdf)
+    pdf.Root.OpenAction = Dictionary(S=Name.Thread, D=thread, B=second)
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert [item.objgen for item in page.B] == [first.objgen]
+    assert [item.objgen for item in other.B] == [second.objgen]
+    assert "/Threads" not in pdf.Root
+
+
+def test_thread_found_through_page_beads_rebuilds_other_pages():
+    """A bead without /T leads to its thread, whose other pages regain /B."""
+    pdf = new_pdf()
+    _, first, second, page, other = _unlisted_article(pdf)
+    del page.B
+    other.B = Array([second, second])
+    assert remove_forbidden_catalog_entries(pdf) == 2
+    assert [item.objgen for item in page.B] == [first.objgen]
+    assert [item.objgen for item in other.B] == [second.objgen]
+
+
+def _annotation_action(pdf, page, action):
+    annotation = pdf.make_indirect(
+        Dictionary(Type=Name.Annot, Subtype=Name.Link, Rect=Array([0, 0, 1, 1]))
+    )
+    annotation.A = action
+    page.Annots = Array([annotation])
+
+
+def _outline_action(pdf, page, action):
+    item = pdf.make_indirect(Dictionary(Title="Article"))
+    item.A = action
+    pdf.Root.Outlines = pdf.make_indirect(Dictionary(First=item, Last=item, Count=1))
+    item.Parent = pdf.Root.Outlines
+
+
+@pytest.mark.parametrize(
+    "location", ["open", "document", "page", "annotation", "outline", "next"]
+)
+def test_threads_of_thread_actions_regain_their_page_beads(location):
+    """Pages of a thread that an action names get /B although /Threads omits it."""
+    pdf = new_pdf()
+    thread, first, second, page, other = _unlisted_article(pdf)
+    del page.B, other.B
+    action = Dictionary(S=Name.Thread, D=thread)
+    if location == "open":
+        pdf.Root.OpenAction = action
+    elif location == "document":
+        pdf.Root.AA = Dictionary(WC=action)
+    elif location == "page":
+        other.AA = Dictionary(O=action)
+    elif location == "annotation":
+        _annotation_action(pdf, other, action)
+    elif location == "outline":
+        _outline_action(pdf, page, action)
+    else:
+        pdf.Root.OpenAction = Dictionary(
+            S=Name.URI, URI="https://example.org", Next=Array([action])
+        )
+    assert remove_forbidden_catalog_entries(pdf) == 2
+    assert [item.objgen for item in page.B] == [first.objgen]
+    assert [item.objgen for item in other.B] == [second.objgen]
+
+
+def test_unlisted_threads_follow_the_listed_ones():
+    """Beads of listed and unlisted threads share a page in their drawing order."""
+    pdf = new_pdf()
+    thread, first, second, page, other = _unlisted_article(pdf)
+    listed, bead, _ = _article(pdf)
+    bead.P = page.obj
+    pdf.Root.Threads = pdf.make_indirect(Array([listed]))
+    page.B = Array([first, bead])
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert [item.objgen for item in page.B] == [first.objgen, bead.objgen]
+    assert "/B" not in pdf.pages[2].obj
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+@pytest.mark.parametrize("damage", ["next", "owner", "page"])
+def test_malformed_unlisted_thread_leaves_only_valid_beads(damage):
+    """A cycle no catalog entry needs is not rejected; its entries are not beads."""
+    pdf = new_pdf()
+    thread, first, second, page, other = _unlisted_article(pdf)
+    pdf.Root.OpenAction = Dictionary(S=Name.Thread, D=thread)
+    thread.I.Title = String(b"\x01undefined")
+    if damage == "next":
+        second.N = second
+    elif damage == "owner":
+        first.T = pdf.make_indirect(Dictionary(I=Dictionary(Title=String(b"\x01"))))
+    else:
+        second.P = pdf.make_indirect(Dictionary(Type=Name.Page))
+    assert remove_forbidden_catalog_entries(pdf) == 2
+    assert "/B" not in page.obj and "/B" not in other.obj
+    # Information of a thread that is not valid is left as the source stored it.
+    assert bytes(thread.I.Title) == b"\x01undefined"
+    assert pdf.Root.OpenAction.D.objgen == thread.objgen
+
+
+def test_conversion_keeps_beads_of_an_action_thread(tmp_path):
+    """A thread outside /Threads keeps its beads and /B arrays in the output."""
+    from pikepdf import Pdf
+
+    pdf = new_pdf()
+    thread, _, second, page, other = _unlisted_article(pdf)
+    del page.B
+    pdf.Root.OpenAction = Dictionary(S=Name.Thread, D=thread, B=second)
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    result = convert_to_pdfa(source, output)
+    assert result.target_produced and not result.skipped, result
+    with Pdf.open(output) as converted:
+        action = converted.Root.OpenAction
+        first = action.D.F
+        assert str(action.D.I.Title) == "Article"
+        assert [bead.objgen for bead in converted.pages[0].B] == [first.objgen]
+        assert [bead.objgen for bead in converted.pages[1].B] == [first.N.objgen]
+        assert action.B.objgen == first.N.objgen
 
 
 def test_collection_repairs_are_idempotent():

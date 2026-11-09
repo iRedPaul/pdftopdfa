@@ -252,7 +252,11 @@ choice, because conversion can edit the page, which makes existing trapping stal
 Custom DocInfo strings are retained only with valid PDFDocEncoding or BOM-prefixed
 UTF-16BE text encoding; valid string bytes remain unchanged.
 Article threads are checked for complete bead cycles and page links;
-malformed graphs use the original-input fallback to preserve navigation targets.
+malformed graphs of the catalog `/Threads` array use the original-input fallback
+to preserve navigation targets. Threads that only actions or page `/B` arrays
+refer to keep their beads when their cycles are valid. Malformed thread
+information entries are removed individually, with the same text-string check
+as custom DocInfo strings.
 
 To run OCR, provide both external model directories. The pair enables OCR;
 `ocr_languages` defaults to `["en"]`:
