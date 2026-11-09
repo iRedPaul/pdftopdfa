@@ -313,6 +313,7 @@ _CALCULATOR_PRESERVES_INTEGER = frozenset(
 _CALCULATOR_MAX_NESTING = 32
 _CALCULATOR_MAX_STACK = 100
 _CALCULATOR_MAX_INTEGER = 2**31 - 1
+_CALCULATOR_MIN_INTEGER = -(2**31)
 
 
 def _calculator_atan(numerator, denominator) -> float:
@@ -364,7 +365,9 @@ def _parse_calculator(data: bytes) -> list | None:
     data = re.sub(rb"%[^\r\n]*", b"", data.replace(b"\x00", b" "))
     outer: list = []
     blocks = [outer]
-    for token in re.findall(rb"[{}]|[^\s{}]+", data):
+    # Only the PDF white-space characters (ISO 32000-1, Table 1) separate tokens;
+    # Python's \s would also accept a vertical tab, which is a regular character.
+    for token in re.findall(rb"[{}]|[^\x00\t\n\x0c\r {}]+", data):
         if token == b"{":
             block: list = []
             blocks[-1].append(block)
@@ -407,8 +410,14 @@ def _fold_calculator_operator(operator: str, operands: list):
     )
     if function is not None and all(isinstance(a, (int, float)) for a in operands):
         result = function(*operands)
-        # Integer overflow produces an implementation-dependent real result.
-        if isinstance(result, int) and abs(result) > _CALCULATOR_MAX_INTEGER:
+        if isinstance(result, int) and not (
+            _CALCULATOR_MIN_INTEGER <= result <= _CALCULATOR_MAX_INTEGER
+        ):
+            if operator == "cvi" or operator in _CALCULATOR_INTEGER_ONLY:
+                # These operators can only return an integer, so a value outside
+                # its range is a rangecheck error rather than an unknown number.
+                raise ValueError("integer result out of range")
+            # Integer overflow produces an implementation-dependent real result.
             return None
         return result
     if (
@@ -557,19 +566,56 @@ def _apply_calculator_block(block: list, stack: list) -> bool:
     return not conditional
 
 
+_CALCULATOR_SAMPLE_STEPS = 255
+
+
+def _calculator_literals(block: list) -> set[float]:
+    """Collect the numeric literals of a parsed calculator program."""
+    literals: set[float] = set()
+    for item in block:
+        if isinstance(item, list):
+            literals |= _calculator_literals(item)
+        elif item.decode("latin-1") not in _CALCULATOR_OPERATORS:
+            literals.add(float(item))
+    return literals
+
+
+def _calculator_samples(program: list, low: float, high: float) -> list[float]:
+    """Return the inputs at which a calculator program is run with actual values.
+
+    The domain is sampled at 256 evenly spaced points, which include the entries of
+    an 8-bit transfer lookup table. A result is commonly undefined where an input
+    equals a constant of the program, as in { 0.25 sub 1 exch div }, so each literal
+    and its negation inside the domain are sampled as well.
+    """
+    samples = {
+        low + (high - low) * step / _CALCULATOR_SAMPLE_STEPS
+        for step in range(_CALCULATOR_SAMPLE_STEPS + 1)
+    }
+    samples |= {
+        value
+        for literal in _calculator_literals(program)
+        for value in (literal, -literal)
+        if low <= value <= high
+    }
+    return sorted(samples)
+
+
 def _is_scalar_calculator(data: bytes, domain) -> bool:
     """Require a calculator program that provably maps one number to one number.
 
-    The program must hold for any input. It also runs for the ends and the middle of
-    its domain, where actual conditions select the path, so a guarded { ln } passes
-    but an unguarded one fails at zero. This samples the domain and is not a proof.
+    The program must hold for any input. It also runs for actual inputs, where
+    conditions select the path, so a guarded { ln } passes but an unguarded one fails
+    at zero. These inputs are a sample of the domain (_calculator_samples()), so an
+    undefined result elsewhere is not excluded: sound interval reasoning would also
+    reject such guarded programs and replace their valid transfer functions.
     """
     program = _parse_calculator(data)
     if program is None:
         return False
     low, high = float(domain[0]), float(domain[1])
     try:
-        for value in (None, low, high, (low + high) / 2):
+        for value in (None, *_calculator_samples(program, low, high)):
             stack: list = [value]
             if (
                 not _apply_calculator_block(program, stack)
@@ -583,8 +629,15 @@ def _is_scalar_calculator(data: bytes, domain) -> bool:
     return True
 
 
-def _is_scalar_transfer_function(function, ancestors=frozenset()) -> bool:
-    """Validate that a PDF function maps one input to one output, in each type."""
+def _is_scalar_transfer_function(
+    function, ancestors=frozenset(), validated: dict | None = None
+) -> bool:
+    """Validate that a PDF function maps one input to one output, in each type.
+
+    A function's validity does not depend on the path that reaches it, so results
+    are memoized in ``validated``. Otherwise a stitching graph that reuses a child
+    in every level would be checked an exponential number of times.
+    """
     if function == Name.Identity:
         return True
     if not isinstance(function, (Dictionary, Stream)) or len(ancestors) >= 64:
@@ -592,7 +645,17 @@ def _is_scalar_transfer_function(function, ancestors=frozenset()) -> bool:
     key = function.objgen if function.objgen != (0, 0) else function.unparse()
     if key in ancestors:
         return False
-    ancestors = ancestors | {key}
+    if validated is None:
+        validated = {}
+    if key not in validated:
+        validated[key] = _check_scalar_transfer_function(
+            function, ancestors | {key}, validated
+        )
+    return validated[key]
+
+
+def _check_scalar_transfer_function(function, ancestors, validated: dict) -> bool:
+    """Validate one function object; see _is_scalar_transfer_function()."""
     kind = function.get("/FunctionType")
     domain = function.get("/Domain")
     limits = function.get("/Range")
@@ -671,7 +734,7 @@ def _is_scalar_transfer_function(function, ancestors=frozenset()) -> bool:
                 return False
         return all(
             isinstance(child, (Dictionary, Stream))
-            and _is_scalar_transfer_function(child, ancestors)
+            and _is_scalar_transfer_function(child, ancestors, validated)
             for child in functions
         )
     return False

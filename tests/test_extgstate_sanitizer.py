@@ -5,6 +5,7 @@
 """Tests for Extended Graphics State sanitization for PDF/A compliance."""
 
 from io import BytesIO
+from unittest.mock import patch
 
 import pikepdf
 import pytest
@@ -12,6 +13,7 @@ from conftest import new_pdf, pdf_object
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from pdftopdfa.color_profile import get_cmyk_profile
+from pdftopdfa.sanitizers import extgstate
 from pdftopdfa.sanitizers.extgstate import (
     _sanitize_shadings_in_resources,
     sanitize_extgstate,
@@ -1153,6 +1155,35 @@ class TestSoftMaskValidation:
         sanitize_extgstate(pdf)
         assert ("/TR" in pdf.pages[0].Resources.ExtGState.GS0.SMask) is kept
 
+    def test_shared_stitching_children_are_validated_once(self) -> None:
+        """A deep graph that reuses each child twice is not walked exponentially."""
+        pdf = new_pdf()
+        child = pdf.make_indirect(Dictionary(FunctionType=2, Domain=Array([0, 1]), N=1))
+        for _ in range(40):
+            child = pdf.make_indirect(
+                Dictionary(
+                    FunctionType=3,
+                    Domain=Array([0, 1]),
+                    Functions=Array([child, child]),
+                    Bounds=Array([0.5]),
+                    Encode=Array([0, 1, 0, 1]),
+                )
+            )
+        _make_pdf_with_extgstate(
+            pdf,
+            Dictionary(
+                SMask=Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=child)
+            ),
+        )
+        with patch.object(
+            extgstate,
+            "_check_scalar_transfer_function",
+            wraps=extgstate._check_scalar_transfer_function,
+        ) as checked:
+            assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert checked.call_count == 41
+        assert pdf.pages[0].Resources.ExtGState.GS0.SMask.TR.objgen == child.objgen
+
     @staticmethod
     def _calculator_mask(pdf: Pdf, program: bytes) -> Dictionary:
         """Create a soft mask whose transfer function runs the given program."""
@@ -1214,6 +1245,11 @@ class TestSoftMaskValidation:
             b"{ true { 1 exch sub } if }",
             b"{ true not { pop } if }",
             b"{ 1 2 lt { 1 exch sub } { pop } ifelse }",
+            # A guard at the singular input, which is sampled as a literal.
+            b"{ dup 0.25 eq { pop 0 } { 0.25 sub 1 exch div } ifelse }",
+            b"{ pop -2147483648.0 cvi }",
+            # Form feed, tab, CR and LF are PDF white-space characters.
+            b"{\x0cpop\t1\r\n}",
         ],
     )
     def test_calculator_with_one_numeric_result_is_preserved(self, program) -> None:
@@ -1294,6 +1330,17 @@ class TestSoftMaskValidation:
             b"{ 1 exch sub } }",
             b"{ 1 exch sub } { 1 exch sub }",
             b"1 exch sub",
+            # Undefined between the ends and the middle of the domain.
+            b"{ 0.25 sub 1 exch div }",
+            b"{ -0.25 add 1 exch div }",
+            b"{ 3 mul 1 sub 1 exch div }",
+            b"{ 0.3 sub ln }",
+            # cvi and integer-only operators cannot leave the integer range.
+            b"{ pop 2147483648.0 cvi }",
+            b"{ pop -2147483649.0 cvi }",
+            b"{ pop -2147483648 -1 idiv }",
+            # A vertical tab is not PDF white space, so this is one bad token.
+            b"{ pop\x0b1 }",
         ],
     )
     def test_calculator_without_provable_result_is_removed(self, program) -> None:
