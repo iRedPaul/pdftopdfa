@@ -61,7 +61,8 @@ _URI_PCT_ENCODED = r"%[0-9A-Fa-f]{2}"
 _URI_PLAIN = r"A-Za-z0-9\-._~!$&'()*+,;="
 _URI_USERINFO_RE = re.compile(rf"(?:[{_URI_PLAIN}:]|{_URI_PCT_ENCODED})*", re.ASCII)
 _URI_REG_NAME_RE = re.compile(rf"(?:[{_URI_PLAIN}]|{_URI_PCT_ENCODED})*", re.ASCII)
-_URI_IPV_FUTURE_RE = re.compile(rf"v[0-9A-Fa-f]+\.[{_URI_PLAIN}:]+", re.ASCII)
+# RFC 3986, 3.2.2: the version flag "v" is case-insensitive like all ABNF strings.
+_URI_IPV_FUTURE_RE = re.compile(rf"[vV][0-9A-Fa-f]+\.[{_URI_PLAIN}:]+", re.ASCII)
 _URI_PORT_RE = re.compile(r"[0-9]*", re.ASCII)
 _URI_PATH_RE = re.compile(rf"(?:[{_URI_PLAIN}:@/]|{_URI_PCT_ENCODED})*", re.ASCII)
 _URI_QUERY_RE = re.compile(rf"(?:[{_URI_PLAIN}:@/?]|{_URI_PCT_ENCODED})*", re.ASCII)
@@ -2122,11 +2123,7 @@ def _inspect_provenance_struct(
         return None
     children = [child for child in elem if isinstance(child.tag, str)]
     if len(children) == 1 and children[0].tag == f"{{{ns_rdf}}}Description":
-        if (
-            (elem.text or "").strip()
-            or (children[0].tail or "").strip()
-            or elem.get(parse_type) is not None
-        ):
+        if _has_stray_text(elem) or elem.get(parse_type) is not None:
             return None
         source = children[0]
     else:
@@ -2140,7 +2137,9 @@ def _inspect_provenance_struct(
         ):
             return None
 
-    if (source.text or "").strip():
+    # Character data between the fields, including after a comment, would be
+    # copied into the struct, where RDF/XML permits none.
+    if _has_stray_text(source):
         return None
     types = _PROVENANCE_FIELD_TYPES[namespace]
     seen: set[str] = set()
@@ -2163,11 +2162,7 @@ def _inspect_provenance_struct(
         if not isinstance(field.tag, str):
             continue
         key = _STRUCTURAL_PROPERTY_CORRECTIONS.get(field.tag, field.tag)
-        if (
-            not key.startswith(f"{{{namespace}}}")
-            or (field.tail or "").strip()
-            or key in seen
-        ):
+        if not key.startswith(f"{{{namespace}}}") or key in seen:
             return None
         seen.add(key)
         value_type = types.get(key.split("}", 1)[1])

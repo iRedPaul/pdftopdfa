@@ -4030,6 +4030,16 @@ class TestProvenancePreservation:
             '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
             "<stEvt:action>saved</stEvt:action><stEvt:when> 2024-01-01 </stEvt:when>"
             "</rdf:li></rdf:Seq></xmpMM:History>",
+            # Character data after a comment inside a struct is still copied.
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
+            "<!-- note -->junk<stEvt:action>saved</stEvt:action>"
+            "<stEvt:when>2024-01-01</stEvt:when></rdf:li></rdf:Seq></xmpMM:History>",
+            "<xmpMM:History><rdf:Seq><rdf:li><rdf:Description>"
+            "<stEvt:action>saved</stEvt:action><stEvt:when>2024-01-01</stEvt:when>"
+            "<!-- note -->junk</rdf:Description></rdf:li></rdf:Seq></xmpMM:History>",
+            "<xmpMM:DerivedFrom><!-- note -->junk<rdf:Description>"
+            "<stRef:documentID>uuid:source</stRef:documentID>"
+            "</rdf:Description></xmpMM:DerivedFrom>",
         ],
     )
     def test_malformed_provenance_is_not_retained(
@@ -4364,6 +4374,7 @@ class TestXmpUriValidation:
             "http://[::1]/",
             "http://[2001:db8::7]:80/a",
             "http://[v1.fe80::a+en1]/",
+            "http://[V1.example]/",
             "urn:uuid:6e8bc430-9c3a-11d9-9669-0800200c9a66",
             "mailto:a@example.org",
             "relative/path.pdf",
@@ -4388,6 +4399,7 @@ class TestXmpUriValidation:
             "http://[::1]x/",
             "http://[fe80::1%25eth0]/",
             "http://[v1.]/",
+            "http://[w1.example]/",
             "http://example.com:80a/",
             "http://a@b@example.com/",
             "http://exa mple.com/",
