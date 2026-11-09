@@ -12,6 +12,7 @@ from pikepdf import Array, Dictionary, Name, String
 
 from pdftopdfa.converter import convert_to_pdfa
 from pdftopdfa.exceptions import ConversionError
+from pdftopdfa.metadata import _is_pdf_text_string
 from pdftopdfa.sanitizers import sanitize_for_pdfa
 from pdftopdfa.sanitizers.catalog import remove_forbidden_catalog_entries
 
@@ -1490,6 +1491,47 @@ def test_thread_action_with_a_null_file_is_in_the_current_file(target, kept):
     action = Object.parse(b"<< /S /Thread /F null >>")
     action.D = target
     pdf.Root.OpenAction = action
+    assert remove_forbidden_catalog_entries(pdf) == (0 if kept else 1)
+    assert ("/OpenAction" in pdf.Root) == kept
+
+
+_TITLE_ENCODINGS = [
+    (String("Article"), True),
+    (String("Caf\xe9"), True),
+    (String(b"\xfe\xff" + "Article \U0001f600".encode("utf-16-be")), True),
+    # 0x7F is undefined in PDFDocEncoding (ISO 32000-1, Table D.2), as are
+    # 0x01-0x08.
+    (String(b"Article\x7f"), False),
+    (String(b"Article\x01"), False),
+    # Odd-length UTF-16BE and a lone high surrogate.
+    (String(b"\xfe\xff" + "Article".encode("utf-16-be") + b"\x00"), False),
+    (String(b"\xfe\xff\xd8\x3d\x00A"), False),
+]
+
+
+@pytest.mark.parametrize("title,kept", _TITLE_ENCODINGS)
+def test_thread_title_into_another_file_must_be_a_text_string(title, kept):
+    """Table 205: a title /D is a text string, also for a thread in another file."""
+    pdf = new_pdf()
+    _article(pdf)
+    pdf.Root.OpenAction = Dictionary(S=Name.Thread, F="other.pdf", D=title)
+    assert remove_forbidden_catalog_entries(pdf) == (0 if kept else 1)
+    assert ("/OpenAction" in pdf.Root) == kept
+
+
+@pytest.mark.parametrize("title,kept", _TITLE_ENCODINGS)
+def test_thread_title_in_this_file_must_be_a_text_string(title, kept):
+    """A malformed title /D never matches a thread title, even if it decodes."""
+    pdf = new_pdf()
+    thread, _, _ = _article(pdf)
+    # A malformed /D decodes leniently, for instance odd-length UTF-16BE
+    # "Article" to "Article"; the thread carries that title where it is valid.
+    decoded = String(str(title))
+    if kept:
+        thread.I.Title = title
+    elif _is_pdf_text_string(decoded):
+        thread.I.Title = decoded
+    pdf.Root.OpenAction = Dictionary(S=Name.Thread, D=title)
     assert remove_forbidden_catalog_entries(pdf) == (0 if kept else 1)
     assert ("/OpenAction" in pdf.Root) == kept
 

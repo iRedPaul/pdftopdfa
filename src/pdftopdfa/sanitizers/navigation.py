@@ -729,9 +729,10 @@ def _thread_action_filter(pdf: Pdf, found: dict):
     array, or by the title of its thread information dictionary, the first
     thread of the catalog array with that title being used. With a file
     specification (/F) only the dictionary form refers to the current file; an
-    index or a title in another file is not checked. A null /F is an absent one,
-    and an action whose /F is not a file specification, or whose destination is
-    missing, of another type, out of range, or not a valid thread, is rejected.
+    index or a title in another file is not looked up. A null /F is an absent
+    one, and an action whose /F is not a file specification, or whose destination
+    is missing, of another type, a title that is not a valid text string, out of
+    range, or not a valid thread, is rejected.
     The optional bead (/B), a bead dictionary of that thread or its index in the
     thread, is removed if it is neither, so that the action opens the thread at
     its first bead. In another file the bead can only be an index (a bead
@@ -764,7 +765,12 @@ def _thread_action_filter(pdf: Pdf, found: dict):
             return True
         if isinstance(target, Dictionary):
             thread_id = target.objgen if target.objgen in found else None
-        elif isinstance(target, bool) or not isinstance(target, (int, String)):
+        elif (
+            isinstance(target, bool)
+            or not isinstance(target, (int, String))
+            or (isinstance(target, String) and not _is_pdf_text_string(target))
+        ):
+            # A title is a text string (Table 205), here or in another file.
             thread_id = None
         elif file is not None:
             # The bead of a thread in another file can only be its index; the
