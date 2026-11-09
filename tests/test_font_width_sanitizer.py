@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pikepdf
 import pytest
-from conftest import new_pdf, open_pdf, register_form_widget, resolve
+from conftest import new_pdf, open_pdf, pdf_object, register_form_widget, resolve
 from fontTools.ttLib import TTFont
 from pikepdf import Array, Dictionary, Name, Pdf
 
@@ -2284,7 +2284,7 @@ class TestWinAnsiAlternateCodes:
         self, encoding: pikepdf.Object
     ) -> None:
         """Widths matching space/hyphen are kept for codes 160 and 173."""
-        fixed, widths = self._sanitized_widths(encoding, 250, 333)
+        fixed, widths = self._sanitized_widths(pdf_object(encoding), 250, 333)
 
         assert fixed == 0
         assert (widths[0], widths[-1]) == (250, 333)

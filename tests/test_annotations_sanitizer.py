@@ -6,7 +6,7 @@
 
 import pikepdf
 import pytest
-from conftest import register_form_widget, resolve, save_and_reopen
+from conftest import pdf_object, register_form_widget, resolve, save_and_reopen
 from pikepdf import Array, Dictionary, Name
 
 from pdftopdfa.exceptions import ConversionError
@@ -31,20 +31,6 @@ from pdftopdfa.sanitizers.base import (
     ANNOT_FLAG_PRINT,
     ANNOT_FLAG_TOGGLENOVIEW,
 )
-
-
-def _pdf_value(value):
-    """Build a fresh PDF object from a plain Python parameter value.
-
-    Parametrized values are shared by every case, and since pikepdf 10.18 a
-    direct container assigned into one Pdf cannot be assigned into another, so
-    containers are given as lists and dicts and built per test.
-    """
-    if isinstance(value, list):
-        return Array([_pdf_value(item) for item in value])
-    if isinstance(value, dict):
-        return Dictionary({key: _pdf_value(item) for key, item in value.items()})
-    return value
 
 
 class TestRemoveForbiddenAnnotations:
@@ -826,7 +812,7 @@ class TestEnsureAppearanceStreams:
         annot = pdf.make_indirect(
             Dictionary(Subtype=Name.Square, Rect=Array([0, 0, 100, 100]))
         )
-        dash = _pdf_value(dash)
+        dash = pdf_object(dash)
         if legacy:
             annot.Border = Array([0, 0, 1, dash])
         else:
@@ -857,7 +843,7 @@ class TestEnsureAppearanceStreams:
             Dictionary(
                 Subtype=Name.Square,
                 Rect=Array([0, 0, 100, 100]),
-                Border=_pdf_value(border),
+                Border=pdf_object(border),
             )
         )
         pdf.pages[0].Annots = Array([annot])
@@ -921,7 +907,7 @@ class TestEnsureAppearanceStreams:
                 Rect=Array([0, 0, 100, 100]),
             )
         )
-        annot[key] = _pdf_value(color)
+        annot[key] = pdf_object(color)
         pdf.pages[0].Annots = Array([annot])
 
         with pytest.raises(ConversionError, match="invalid .* color array"):
@@ -970,7 +956,7 @@ class TestEnsureAppearanceStreams:
             Dictionary(
                 Subtype=subtype,
                 Rect=Array([0, 0, 100, 100]),
-                CA=_pdf_value(opacity),
+                CA=pdf_object(opacity),
             )
         )
         pdf.pages[0].Annots = Array([annot])
@@ -986,7 +972,7 @@ class TestEnsureAppearanceStreams:
             Dictionary(
                 Subtype=Name.Square,
                 Rect=Array([0, 0, 100, 100]),
-                BS=Dictionary(W=_pdf_value(width)),
+                BS=Dictionary(W=pdf_object(width)),
             )
         )
         if legacy:
@@ -1004,7 +990,7 @@ class TestEnsureAppearanceStreams:
             Dictionary(
                 Subtype=Name.Square,
                 Rect=Array([0, 0, 100, 100]),
-                BS=_pdf_value(border),
+                BS=pdf_object(border),
             )
         )
         pdf.pages[0].Annots = Array([annot])
@@ -1376,7 +1362,7 @@ class TestEnsureAppearanceStreams:
                 FT=Name.Tx,
                 V="Visible field value",
                 Rect=Array([0, 0, 200, 30]),
-                AP=Dictionary(N=_pdf_value(normal)),
+                AP=Dictionary(N=pdf_object(normal)),
             )
         )
         pdf.pages[0].Annots = Array([annot])

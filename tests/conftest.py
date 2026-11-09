@@ -43,6 +43,21 @@ def open_pdf(source, **kwargs) -> Pdf:
     return pdf
 
 
+def pdf_object(value):
+    """Build a fresh direct PDF object from a parametrized test value.
+
+    Parametrized values are shared by every case. Since pikepdf 10.18, a direct
+    container that already belongs to one Pdf cannot be placed in another, so a
+    test must not reuse it. Lists, dicts and pikepdf containers are rebuilt
+    recursively; scalars are returned unchanged.
+    """
+    if isinstance(value, list | Array):
+        return Array([pdf_object(item) for item in value])
+    if isinstance(value, dict | Dictionary):
+        return Dictionary({key: pdf_object(item) for key, item in value.items()})
+    return value
+
+
 # -- Fixtures --
 
 

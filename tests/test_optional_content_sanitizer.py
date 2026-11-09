@@ -9,7 +9,7 @@ from io import BytesIO
 
 import pikepdf
 import pytest
-from conftest import new_pdf
+from conftest import new_pdf, pdf_object
 from pikepdf import Array, Dictionary, Name, Pdf
 
 import pdftopdfa.sanitizers.optional_content as optional_content
@@ -223,7 +223,7 @@ class TestDefaultVisibility:
         pdf, _on, _off = _visibility_pdf()
 
         with pytest.raises(ValueError, match="Optional-content"):
-            _default_optional_content_visibility(pdf).is_visible(membership)
+            _default_optional_content_visibility(pdf).is_visible(pdf_object(membership))
 
     def test_rejects_unregistered_ocg(self) -> None:
         pdf, _on, _off = _visibility_pdf()
@@ -480,7 +480,7 @@ class TestIntentCorrection:
         ocg = pdf.make_indirect(Dictionary(Type=Name.OCG, Name="Layer"))
         pdf.Root.OCProperties = Dictionary(
             OCGs=Array([ocg]),
-            D=Dictionary(Name="Default", Intent=intent),
+            D=Dictionary(Name="Default", Intent=pdf_object(intent)),
         )
 
         result = sanitize_optional_content(pdf)
@@ -507,7 +507,7 @@ class TestIntentCorrection:
         alternate = Dictionary(Name="Alternate", Intent=Name.Design)
         pdf.Root.OCProperties = Dictionary(
             OCGs=Array([ocg]),
-            D=Dictionary(Name="Default", Intent=intent),
+            D=Dictionary(Name="Default", Intent=pdf_object(intent)),
             Configs=Array([alternate]),
         )
 

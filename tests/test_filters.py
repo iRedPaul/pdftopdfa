@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pikepdf
 import pytest
-from conftest import new_pdf, open_pdf
+from conftest import new_pdf, open_pdf, pdf_object
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from pdftopdfa.sanitizers.filters import (
@@ -446,7 +446,7 @@ class TestHasExternalStreamKeys:
     )
     def test_single_external_key(self, pdf: Pdf, key: str, value) -> None:
         stream = pdf.make_indirect(Stream(pdf, b"data"))
-        stream[key] = value
+        stream[key] = pdf_object(value)
         assert _has_external_stream_keys(stream) == [key]
 
     def test_all_three_keys(self, pdf: Pdf) -> None:
@@ -487,7 +487,7 @@ class TestRemoveExternalStreamKeys:
     )
     def test_removes_single_key(self, pdf: Pdf, key: str, value) -> None:
         stream = pdf.make_indirect(Stream(pdf, b"data"))
-        stream[key] = value
+        stream[key] = pdf_object(value)
         assert remove_external_stream_keys(pdf) == 1
         assert stream.get(key) is None
 
