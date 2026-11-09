@@ -7,6 +7,7 @@
 import logging
 import math
 import re
+from datetime import datetime
 from decimal import Decimal
 
 from pikepdf import Array, Dictionary, Name, Pdf, String
@@ -17,26 +18,36 @@ from .files import _is_filespec, _iter_name_tree_pairs
 logger = logging.getLogger(__name__)
 
 
-def _pdf_date(value):
+# ISO 32000-1, 7.9.4: D:YYYYMMDDHHmmSSOHH'mm. Each field may be present only
+# together with all of the preceding ones, so the relationship to UT (O) needs a
+# complete date and time. A UT offset may follow Z as well (Z00'00'), an hour
+# offset may end with its apostrophe, and the trailing apostrophe of PDF 1.7 and
+# earlier versions (HH'mm') is tolerated.
+_PDF_DATE = re.compile(
+    r"D:([0-9]{4})(?:([0-9]{2})(?:([0-9]{2})(?:([0-9]{2})(?:([0-9]{2})(?:([0-9]{2})"
+    r"(?:[Z+-](?:(?:[01][0-9]|2[0-3])(?:'(?:[0-5][0-9]'?)?)?)?)?"
+    r")?)?)?)?)?"
+)
+
+
+def _is_pdf_date(value) -> bool:
     """Require complete PDF date syntax as well as valid calendar components.
 
-    ISO 32000-1, 7.9.4: D:YYYYMMDDHHmmSSOHH'mm, where O is +, - or Z, and each
-    field may be present only together with all of the preceding ones. A UT
-    offset may therefore follow Z as well (Z00'00'). The trailing apostrophe of
-    earlier PDF versions is tolerated.
+    Omitted fields take their 7.9.4 defaults (01 for month and day, 00 otherwise);
+    the month, the day of that month, the hour, minute and second must exist.
     """
-    from ..metadata import _parse_pdf_date
-
-    if not isinstance(value, String) or not re.fullmatch(
-        r"D:\d{4}(?:\d{2}){0,5}"
-        r"(?:[Z+-](?:(?:[01]\d|2[0-3])(?:'(?:[0-5]\d'?)?)?)?)?",
-        str(value),
-    ):
-        return None
+    match = isinstance(value, String) and _PDF_DATE.fullmatch(str(value))
+    if not match:
+        return False
+    fields = [
+        int(field) if field else default
+        for field, default in zip(match.groups(), (0, 1, 1, 0, 0, 0), strict=True)
+    ]
     try:
-        return _parse_pdf_date(str(value))
-    except (ValueError, OverflowError):
-        return None
+        datetime(*fields)
+    except ValueError:
+        return False
+    return True
 
 
 def _remove_entry(owner, key: str) -> int:
@@ -90,7 +101,7 @@ def _valid_item_value(value, subtype) -> bool:
     if subtype in (Name.S, Name.F, Name.Desc):
         return isinstance(value, String)
     if subtype in (Name.D, Name.ModDate, Name.CreationDate):
-        return _pdf_date(value) is not None
+        return _is_pdf_date(value)
     return (
         subtype in (Name.N, Name.Size)
         and not isinstance(value, bool)
@@ -207,7 +218,8 @@ def _sanitize_collection(pdf: Pdf) -> int:
         return removed + _remove_entry(collection, "/Sort")
     removed += _optional_type(sorting, Name.CollectionSort)
     fields = sorting.get("/S")
-    fields = [fields] if isinstance(fields, Name) else fields
+    scalar = isinstance(fields, Name)
+    fields = [fields] if scalar else fields
     # ISO 32000-1 Table 158: each /S name identifies a field of the collection
     # schema, so sorting cannot be valid without one.
     valid = (
@@ -220,10 +232,14 @@ def _sanitize_collection(pdf: Pdf) -> int:
         )
     )
     ascending = sorting.get("/A")
-    # ISO 32000-1 Table 158 explicitly permits unequal /S and /A lengths.
+    # ISO 32000-1 Table 158 explicitly permits unequal /S and /A lengths. Each
+    # element of an /A array refers to the entry at the same index of an /S
+    # array, so a single /S name takes a single boolean; without /A it is sorted
+    # in ascending order.
     if ascending is not None and not (
         isinstance(ascending, bool)
-        or isinstance(ascending, Array)
+        or not scalar
+        and isinstance(ascending, Array)
         and all(isinstance(item, bool) for item in ascending)
     ):
         removed += _remove_entry(sorting, "/A")
@@ -252,8 +268,7 @@ def _validate_threads(pdf: Pdf) -> dict[tuple[int, int], tuple]:
     """Validate bead cycles and page links without renumbering local Thread actions.
 
     Returns:
-        For each bead, in /Threads and reading order: its thread, position on that
-        thread, page and bead dictionary.
+        For each bead, in /Threads and reading order: its page and bead dictionary.
     """
     threads = pdf.Root.get("/Threads")
     if threads is None:
@@ -277,7 +292,7 @@ def _validate_threads(pdf: Pdf) -> dict[tuple[int, int], tuple]:
             ):
                 raise _thread_error("invalid thread information dictionary")
             if any(
-                info.get(key) is not None and _pdf_date(info[key]) is None
+                info.get(key) is not None and not _is_pdf_date(info[key])
                 for key in ("/CreationDate", "/ModDate")
             ):
                 raise _thread_error("invalid thread information date")
@@ -311,12 +326,10 @@ def _validate_threads(pdf: Pdf) -> dict[tuple[int, int], tuple]:
                 )
             ):
                 raise _thread_error("invalid bead rectangle")
-            # A thread listed twice in /Threads keeps the positions of its first
+            # A thread listed twice in /Threads keeps the place of its first
             # traversal; separate threads cannot share beads, because the first
             # bead of each one names its own thread.
-            beads.setdefault(
-                bead.objgen, (thread.objgen, len(seen) - 1, page_ref.objgen, bead)
-            )
+            beads.setdefault(bead.objgen, (page_ref.objgen, bead))
             bead = following
         if bead.objgen != first.objgen:
             raise _thread_error("bead cycle does not return to the first bead")
@@ -334,17 +347,18 @@ def _make_threads_indirect(pdf: Pdf) -> int:
 
 
 def _repair_page_beads(pdf: Pdf, beads: dict[tuple[int, int], tuple]) -> int:
-    """List exactly the beads of each page once, in the order of their threads.
+    """List exactly the beads of each page once, keeping the order of the array.
 
     ISO 32000-1, 12.4.3 requires a /B array on every page on which article beads
     appear, and Table 30 notes that it can be recreated from /Threads. The validated
     bead cycles define the beads of each page, so omitted, duplicated or unrelated
-    entries are repaired. Only a thread defines an order for its own beads (Table
-    30's natural reading order), so other threads keep their positions in the array,
-    and beads that the array omitted follow the listed ones.
+    entries are repaired. The array lists the beads in drawing order (12.4.3),
+    which the threads do not record and which can differ from their reading order,
+    so the listed beads keep their relative order, and a complete array stays
+    unchanged. Beads that the array omitted follow, in /Threads and reading order.
     """
     on_page: dict[tuple[int, int], dict[tuple[int, int], Dictionary]] = {}
-    for bead_id, (_, _, page_id, bead) in beads.items():
+    for bead_id, (page_id, bead) in beads.items():
         on_page.setdefault(page_id, {})[bead_id] = bead
 
     repaired = 0
@@ -363,16 +377,6 @@ def _repair_page_beads(pdf: Pdf, beads: dict[tuple[int, int], tuple]) -> int:
         }
         kept.update({key: bead for key, bead in expected.items() if key not in kept})
         ordered = list(kept.values())
-        slots: dict[tuple[int, int], list[int]] = {}
-        for index, bead in enumerate(ordered):
-            slots.setdefault(beads[bead.objgen][0], []).append(index)
-        for indices in slots.values():
-            thread_beads = sorted(
-                (ordered[index] for index in indices),
-                key=lambda bead: beads[bead.objgen][1],
-            )
-            for index, bead in zip(indices, thread_beads, strict=True):
-                ordered[index] = bead
         if (
             original is not None
             and len(original) == len(ordered)

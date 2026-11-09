@@ -44,12 +44,12 @@
 - Place overprint repairs for path paints before the path object instead of inside it, add the repair states to the resource scope a Form inherits instead of copying it into the Form, and reuse the same repair states on repeated passes
 - Retain PDF portfolios and article threads
 - Validate collection and article structures before preserving them
-- Remove collection sorting unless every `/S` field resolves in the collection schema
+- Remove collection sorting unless every `/S` field resolves in the collection schema, and an array of sort directions (`/A`) for a single `/S` field
 - Rebuild a page's `/B` array from the article threads when it is missing, incomplete, malformed or lists beads of other pages, instead of using the original-input fallback
-- Remove duplicate beads from a page's `/B` array, and restore the reading order of a page's article beads
+- Remove duplicate beads from a page's `/B` array, keeping the drawing order of the listed beads and appending omitted beads in reading order; a complete `/B` array is left unchanged
 - Make an inline catalog `/Threads` array an indirect object
 - Remove collection item values without a matching schema field or with the wrong type, keeping them when a portfolio has no schema, and a default document that is not an embedded file specification, rechecked after all embedded-file cleanup for PDF/A-2 and PDF/A-3
-- Accept every ISO 32000-1 date form in collection items and thread information (a UT offset after `Z`, an hour offset without minutes) instead of removing the value or rejecting the article, and reject out-of-range UT offsets
+- Accept every ISO 32000-1 date form in collection items and thread information (a UT offset after `Z`, an hour offset without minutes) instead of removing the value or rejecting the article, and reject out-of-range UT offsets, a UT relationship without the complete date and time, and dates that do not exist
 - Skip malformed `/EmbeddedFiles` name-tree nodes (non-dictionary `/Kids` entries, `/Names` or `/Kids` of the wrong type, non-string keys, cycles) when checking a portfolio, instead of aborting the conversion; embedded-file sanitizers share this single tolerant name-tree traversal
 
 ### Tests

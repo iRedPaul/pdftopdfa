@@ -163,6 +163,28 @@ def test_collection_items_matching_the_schema_are_unchanged():
         (Name.D, "D:20240101000000-08", True),
         (Name.D, "D:20240101000000+", True),
         (Name.D, "D:2024", True),
+        (Name.D, "D:20240229", True),
+        (Name.D, "D:2024123123", True),
+        (Name.D, "D:20241231235959", True),
+        (Name.D, "D:20241231235959+05'30", True),
+        # ISO 32000-1, 7.9.4: a field requires every preceding one, so the
+        # relationship to UT requires the complete date and time.
+        (Name.D, "D:2024Z", False),
+        (Name.D, "D:202401+05", False),
+        (Name.D, "D:20240101Z", False),
+        (Name.D, "D:2024010112-08'00'", False),
+        (Name.D, "D:202401011200Z00'00'", False),
+        (Name.D, "D:20240101000000+0530", False),
+        (Name.D, "D:202", False),
+        (Name.D, "D:2024010", False),
+        (Name.D, "D:20240001", False),
+        (Name.D, "D:20240100", False),
+        (Name.D, "D:20230229", False),
+        (Name.D, "D:20240431", False),
+        (Name.D, "D:2024010124", False),
+        (Name.D, "D:202401012360", False),
+        (Name.D, "D:20240101235960", False),
+        (Name.D, "D:\uff12\uff10\uff12\uff14", False),
         (Name.D, "D:20240101000000+24'00'", False),
         (Name.D, "D:20240101000000+05'60'", False),
         (Name.D, "D:20240101000000+05'30'00", False),
@@ -361,6 +383,34 @@ def test_collection_sort_array_lengths_need_not_match(ascending):
             A=Dictionary(Subtype=Name.S, N="A"), B=Dictionary(Subtype=Name.N, N="B")
         ),
         Sort=Dictionary(S=Array([Name.A, Name.B]), A=Array(ascending)),
+    )
+    expected = pdf.Root.Collection.unparse()
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert pdf.Root.Collection.unparse() == expected
+
+
+@pytest.mark.parametrize("ascending", [Array([False]), Array(), Array([True, 1])])
+def test_single_sort_field_loses_an_array_of_directions(ascending):
+    """Table 158 relates /A array elements to an /S array, so a name takes a bool."""
+    pdf = new_pdf()
+    pdf.add_blank_page()
+    pdf.Root.Collection = Dictionary(
+        Schema=Dictionary(A=Dictionary(Subtype=Name.S, N="A")),
+        Sort=Dictionary(S=Name.A, A=ascending),
+    )
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert pdf.Root.Collection.Sort.S == Name.A
+    assert "/A" not in pdf.Root.Collection.Sort
+
+
+@pytest.mark.parametrize("fields", [Name.A, Array([Name.A])])
+def test_sort_direction_boolean_is_kept(fields):
+    """A single boolean direction is valid for a name or an array of names."""
+    pdf = new_pdf()
+    pdf.add_blank_page()
+    pdf.Root.Collection = Dictionary(
+        Schema=Dictionary(A=Dictionary(Subtype=Name.S, N="A")),
+        Sort=Dictionary(S=fields, A=False),
     )
     expected = pdf.Root.Collection.unparse()
     assert remove_forbidden_catalog_entries(pdf) == 0
@@ -573,26 +623,62 @@ def test_page_beads_in_reading_order_are_unchanged():
     assert [bead.objgen for bead in page.B] == [first.objgen, second.objgen]
 
 
-def test_page_beads_out_of_reading_order_are_repaired():
-    """The thread defines the order, so this does not need the original fallback."""
+def test_page_beads_in_drawing_order_are_unchanged():
+    """ISO 32000-1, 12.4.3 lists /B in drawing order, which may differ from /N."""
     pdf = new_pdf()
     first, second, page = _two_bead_article(pdf)
-    page.B = Array([second, first])
-    assert remove_forbidden_catalog_entries(pdf) == 1
-    assert [bead.objgen for bead in page.B] == [first.objgen, second.objgen]
+    page.B = pdf.make_indirect(Array([second, first]))
+    listed = page.B.objgen
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert page.B.objgen == listed
+    assert [bead.objgen for bead in page.B] == [second.objgen, first.objgen]
 
 
 def test_duplicate_page_beads_are_removed():
-    """A page lists each of its beads once, so the repair keeps all destinations."""
+    """A page lists each of its beads once, at the place of its first entry."""
     pdf = new_pdf()
     first, second, page = _two_bead_article(pdf)
-    page.B = Array([first, second, first])
+    page.B = Array([second, first, second])
     assert remove_forbidden_catalog_entries(pdf) == 1
-    assert [bead.objgen for bead in page.B] == [first.objgen, second.objgen]
+    assert [bead.objgen for bead in page.B] == [second.objgen, first.objgen]
+
+
+def _visiting_article(pdf):
+    """Create an article that visits its first page, another page, then it again.
+
+    The rectangles tell the beads apart once the file has been saved.
+    """
+    thread, first, page = _article(pdf)
+    other = pdf.add_blank_page()
+    beads = [first] + [
+        pdf.make_indirect(
+            Dictionary(T=thread, P=target, R=Array([0, 0, 10 * index, 10 * index]))
+        )
+        for index, target in enumerate((other.obj, page.obj, page.obj), 2)
+    ]
+    for index, bead in enumerate(beads):
+        bead.N = beads[(index + 1) % len(beads)]
+        bead.V = beads[index - 1]
+    other.B = Array([beads[1]])
+    return beads, page
+
+
+def test_page_bead_repair_keeps_listed_order_and_appends_omitted_beads():
+    """Listed beads keep their order; omitted ones follow in reading order."""
+    pdf = new_pdf()
+    beads, page = _visiting_article(pdf)
+    page.B = Array([beads[3], 42, Dictionary(), beads[1], beads[3]])
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert [bead.objgen for bead in page.B] == [
+        beads[3].objgen,
+        beads[0].objgen,
+        beads[2].objgen,
+    ]
+    assert remove_forbidden_catalog_entries(pdf) == 0
 
 
 def test_page_bead_repair_keeps_positions_of_other_threads():
-    """No order between separate articles is defined, so they stay in place."""
+    """Repairs leave the listed beads of separate articles in place."""
     pdf = new_pdf()
     first, second, page = _two_bead_article(pdf)
     other_thread = pdf.make_indirect(Dictionary())
@@ -602,30 +688,35 @@ def test_page_bead_repair_keeps_positions_of_other_threads():
     other.N = other.V = other
     other_thread.F = other
     pdf.Root.Threads.append(other_thread)
-    page.B = Array([second, other, first])
+    page.B = Array([second, other])
     assert remove_forbidden_catalog_entries(pdf) == 1
     assert [bead.objgen for bead in page.B] == [
-        first.objgen,
-        other.objgen,
         second.objgen,
+        other.objgen,
+        first.objgen,
     ]
 
 
-def test_conversion_repairs_page_bead_order(tmp_path):
-    """An unordered /B array cannot send a document to the original-input fallback."""
+def test_conversion_keeps_page_beads_in_drawing_order(tmp_path):
+    """A page that an article visits twice keeps /B in drawing order, not /N order."""
     from pikepdf import Pdf
 
     pdf = new_pdf()
-    first, second, page = _two_bead_article(pdf)
-    page.B = Array([second, first])
+    beads, page = _visiting_article(pdf)
+    # Drawing order: the last bead of the article, then its first and third.
+    page.B = Array([beads[3], beads[0], beads[2]])
     source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
     pdf.save(source)
     result = convert_to_pdfa(source, output)
     assert result.target_produced and not result.skipped, result
     with Pdf.open(output) as converted:
         listed = converted.pages[0].B
-        assert listed[0].N.objgen == listed[1].objgen
-        assert converted.Root.Threads[0].F.objgen == listed[0].objgen
+        assert [int(bead.R[2]) for bead in listed] == [40, 100, 30]
+        first = converted.Root.Threads[0].F
+        assert first.objgen == listed[1].objgen
+        assert first.N.N.objgen == listed[2].objgen
+        assert first.N.N.N.objgen == listed[0].objgen
+        assert [int(bead.R[2]) for bead in converted.pages[1].B] == [20]
 
 
 def test_malformed_article_conversion_preserves_original_file(tmp_path):
@@ -665,6 +756,16 @@ def test_thread_information_accepts_every_iso_date_form(value):
     thread.I.ModDate = value
     assert remove_forbidden_catalog_entries(pdf) == 0
     assert str(thread.I.ModDate) == value
+
+
+@pytest.mark.parametrize("value", ["D:2024Z", "D:202401+05", "D:20240230000000Z"])
+def test_thread_information_rejects_incomplete_or_impossible_dates(value):
+    """A UT relationship needs every preceding field, and the date must exist."""
+    pdf = new_pdf()
+    thread, _, _ = _article(pdf)
+    thread.I.CreationDate = value
+    with pytest.raises(ConversionError, match="thread information date"):
+        remove_forbidden_catalog_entries(pdf)
 
 
 def test_collection_repairs_are_idempotent():
