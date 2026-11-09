@@ -43,6 +43,7 @@ from pdftopdfa.metadata import (
     _sanitize_non_catalog_metadata,
     create_xmp_metadata,
     embed_xmp_metadata,
+    extract_custom_docinfo,
     extract_pdf_info,
     remove_pdfe_identification,
     remove_pdfua_identification,
@@ -830,6 +831,41 @@ class TestSyncMetadata:
         assert "custom DocInfo entry /InvalidCustomValue with a non-text value" in (
             caplog.text
         )
+
+    def test_custom_docinfo_snapshot_keeps_only_retainable_text(
+        self, sample_pdf_bytes: bytes
+    ) -> None:
+        """The snapshot excludes standard keys, revoked claims and non-text values."""
+        from io import BytesIO
+
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
+        pdf.docinfo["/Company"] = pikepdf.String(b"\xfe\xff\x00A\x00c\x00m\x00e")
+        pdf.docinfo["/Title"] = "Report"
+        pdf.docinfo["/GTS_PDFXVersion"] = "PDF/X-4"
+        pdf.docinfo["/Count"] = 42
+
+        assert extract_custom_docinfo(pdf) == {
+            "/Company": b"\xfe\xff\x00A\x00c\x00m\x00e"
+        }
+
+    def test_sync_restores_custom_docinfo_from_source_snapshot(
+        self, sample_pdf_bytes: bytes
+    ) -> None:
+        """Custom fields that intermediate processing dropped or changed return."""
+        from io import BytesIO
+
+        source = open_pdf(BytesIO(sample_pdf_bytes))
+        source.docinfo["/Company"] = "Acme Corp"
+        source.docinfo["/Department"] = "Legal"
+        snapshot = extract_custom_docinfo(source)
+
+        # An intermediate producer such as OCR rebuilt the Info dictionary.
+        pdf = open_pdf(BytesIO(sample_pdf_bytes))
+        pdf.docinfo["/Department"] = "Rewritten"
+        sync_metadata(pdf, "3b", source_custom_docinfo=snapshot)
+
+        assert str(pdf.docinfo["/Company"]) == "Acme Corp"
+        assert str(pdf.docinfo["/Department"]) == "Legal"
 
     @pytest.mark.parametrize(
         "data,valid",
@@ -1968,6 +2004,56 @@ class TestDublinCoreMultivaluePreservation:
             "Report" if has_default else "Bericht",
             "Bericht",
         ]
+
+    @pytest.mark.parametrize("property_name", ["title", "description"])
+    @pytest.mark.parametrize("default", ["None", "", "null"])
+    def test_placeholder_default_is_kept_without_docinfo(
+        self, property_name, default
+    ) -> None:
+        """An empty or literal default is a valid translation, not a missing one."""
+        source_tree = _build_xmp_with_extras(
+            f"<dc:{property_name}><rdf:Alt>"
+            f'<rdf:li xml:lang="x-default">{default}</rdf:li>'
+            '<rdf:li xml:lang="de-DE">Bericht</rdf:li>'
+            f"</rdf:Alt></dc:{property_name}>"
+        )
+        result = _parse_xmp_bytes(
+            create_xmp_metadata({}, 2, "B", existing_xmp_tree=source_tree)
+        )
+        items = result.xpath(
+            f"//dc:{property_name}/rdf:Alt/rdf:li", namespaces=NAMESPACES
+        )
+        assert [item.text or "" for item in items] == [default, "Bericht"]
+        assert result.xpath(
+            f"//dc:{property_name}/rdf:Alt/rdf:li/@xml:lang", namespaces=NAMESPACES
+        ) == ["x-default", "de-DE"]
+
+    @pytest.mark.parametrize("property_name", ["title", "description"])
+    def test_sole_empty_default_is_kept_without_docinfo(self, property_name) -> None:
+        """A property whose only alternative is empty is not dropped."""
+        source_tree = _build_xmp_with_extras(
+            f'<dc:{property_name}><rdf:Alt><rdf:li xml:lang="x-default"/>'
+            f"</rdf:Alt></dc:{property_name}>"
+        )
+        result = _parse_xmp_bytes(
+            create_xmp_metadata({}, 2, "B", existing_xmp_tree=source_tree)
+        )
+        assert result.xpath(
+            f"//dc:{property_name}/rdf:Alt/rdf:li/@xml:lang", namespaces=NAMESPACES
+        ) == ["x-default"]
+
+    def test_docinfo_value_still_replaces_placeholder_default(self) -> None:
+        """A synchronized DocInfo value updates only the default language."""
+        source_tree = _build_xmp_with_extras(
+            '<dc:title><rdf:Alt><rdf:li xml:lang="x-default">None</rdf:li>'
+            '<rdf:li xml:lang="de-DE">Bericht</rdf:li></rdf:Alt></dc:title>'
+        )
+        result = _parse_xmp_bytes(
+            create_xmp_metadata(
+                {"title": "Report"}, 2, "B", existing_xmp_tree=source_tree
+            )
+        )
+        assert self._values(result, "title") == ["Report", "Bericht"]
 
     def test_missing_default_adds_fallback_without_losing_translation(self) -> None:
         """Add a default language while preserving the existing translations."""
@@ -3928,6 +4014,22 @@ class TestProvenancePreservation:
             "<stEvt:when>2024-01-01</stEvt:when></rdf:li></rdf:Seq></xmpMM:History>",
             '<xmpMM:History><rdf:Seq><rdf:li stEvt:action="saved"/>'
             "</rdf:Seq></xmpMM:History>",
+            # Resource nodes cannot carry the Text and Date literals of an event.
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
+            '<stEvt:action rdf:resource="saved"/>'
+            '<stEvt:when rdf:resource="2024-01-01"/>'
+            "</rdf:li></rdf:Seq></xmpMM:History>",
+            # Character data between events would be copied into the rdf:Seq.
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
+            "<stEvt:action>saved</stEvt:action><stEvt:when>2024-01-01</stEvt:when>"
+            "</rdf:li>junk</rdf:Seq></xmpMM:History>",
+            # A typed value is copied verbatim, so it is checked unstripped.
+            "<xmpMM:History><rdf:Seq><rdf:li><rdf:Description "
+            'stEvt:action="saved" stEvt:when=" 2024-01-01 "/></rdf:li>'
+            "</rdf:Seq></xmpMM:History>",
+            '<xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">'
+            "<stEvt:action>saved</stEvt:action><stEvt:when> 2024-01-01 </stEvt:when>"
+            "</rdf:li></rdf:Seq></xmpMM:History>",
         ],
     )
     def test_malformed_provenance_is_not_retained(
@@ -3984,6 +4086,27 @@ class TestProvenancePreservation:
             pdf.add_blank_page()
             result = self._roundtrip(pdf, tree, "2b", location, tmp_path / "uri.pdf")
         assert result.xpath("//stRef:manageTo/text()", namespaces=NAMESPACES) == [uri]
+
+    @pytest.mark.parametrize("location", ["catalog", "page"])
+    def test_uri_field_may_be_a_resource_node(self, location, tmp_path) -> None:
+        """A URI field keeps its rdf:resource form, unlike the literal field types."""
+        tree = self._packet(
+            '<xmpMM:DerivedFrom rdf:parseType="Resource">'
+            "<stRef:documentID>uuid:source</stRef:documentID>"
+            '<stRef:manageTo rdf:resource="https://example.org/a"/>'
+            '<stRef:manager rdf:resource="https://example.org/manager"/>'
+            "</xmpMM:DerivedFrom>"
+        )
+        with new_pdf() as pdf:
+            pdf.add_blank_page()
+            result = self._roundtrip(pdf, tree, "2b", location, tmp_path / "res.pdf")
+        assert result.xpath(
+            "//stRef:manageTo/@rdf:resource", namespaces=NAMESPACES
+        ) == ["https://example.org/a"]
+        assert not result.xpath("//stRef:manager", namespaces=NAMESPACES)
+        assert result.xpath("//stRef:documentID/text()", namespaces=NAMESPACES) == [
+            "uuid:source"
+        ]
 
     @pytest.mark.parametrize("location", ["catalog", "page"])
     def test_invalid_history_event_is_removed_alone(self, location, tmp_path) -> None:
@@ -4123,11 +4246,18 @@ class TestXmpDateValidation:
             "2024-12-31T23:59:59.5+13:59",
             "2024-12-31T23:59:59.5+14:00",
             "2024-12-31T23:59:59.5-14:00",
+            "2024-01-01T00:00+15:00",
+            "2024-01-01T00:00-14:01",
+            "2024-01-01T00:00+23:59",
             "0000-01-01",
         ],
     )
     def test_existing_dates_are_accepted(self, value) -> None:
-        """Every precision that the XMP date format defines remains valid."""
+        """Every precision that the XMP date format defines remains valid.
+
+        The XMP time zone uses the hh:mm components of a time, not the 14-hour
+        limit of XML Schema.
+        """
         assert _is_valid_simple_value(value, "d")
 
     @pytest.mark.parametrize(
@@ -4145,9 +4275,8 @@ class TestXmpDateValidation:
             "2024-01-01T23:60",
             "2024-01-01T23:59:60",
             "2024-01-01T00:00+24:00",
-            "2024-01-01T00:00+15:00",
-            "2024-01-01T00:00-14:01",
             "2024-01-01T00:00-00:60",
+            " 2024-01-01",
             "2024-01-01\n",
             "٢٠٢٤",
             "yesterday",
@@ -4511,6 +4640,101 @@ class TestInvalidRdfSyntaxIsNotCopied:
             f"{attributes}>{text}</c:prop>"
         )
         assert _has_invalid_rdf_syntax(elem) is invalid
+
+    @pytest.mark.parametrize(
+        "node,invalid",
+        [
+            ("<rdf:Seq><rdf:li>8</rdf:li></rdf:Seq>", False),
+            ('<rdf:Seq rdf:ID="s"><rdf:li>8</rdf:li></rdf:Seq>', False),
+            ('<rdf:Seq rdf:resource="urn:bad"><rdf:li>8</rdf:li></rdf:Seq>', True),
+            ('<rdf:Bag rdf:about=""><rdf:li>8</rdf:li></rdf:Bag>', True),
+            ('<rdf:Alt c:field="1"><rdf:li xml:lang="en">8</rdf:li></rdf:Alt>', True),
+            ('<rdf:Description rdf:about="" c:field="1"/>', False),
+            ('<rdf:Description rdf:nodeID="n" c:field="1"/>', False),
+            ('<rdf:Description rdf:resource="urn:bad" c:field="1"/>', True),
+            ('<rdf:Description rdf:datatype="urn:t" c:field="1"/>', True),
+            ('<rdf:Description rdf:li="1"/>', True),
+            ('<rdf:Description rdf:about="" rdf:ID="d" c:field="1"/>', True),
+        ],
+    )
+    def test_node_elements_carry_only_node_attributes(self, node, invalid) -> None:
+        """RDF/XML node elements cannot carry property-only RDF attributes."""
+        elem = etree.fromstring(
+            f'<c:prop xmlns:c="urn:custom" xmlns:rdf="{NAMESPACES["rdf"]}">{node}'
+            "</c:prop>"
+        )
+        assert _has_invalid_rdf_syntax(elem) is invalid
+
+    def test_container_attribute_drops_typed_array(self) -> None:
+        """A predefined typed array cannot copy a resource attribute on its Seq."""
+        tiff = NAMESPACES["tiff"]
+        tree = _build_xmp_with_extras(
+            f'<tiff:BitsPerSample xmlns:tiff="{tiff}">'
+            '<rdf:Seq rdf:resource="urn:bad"><rdf:li>8</rdf:li></rdf:Seq>'
+            "</tiff:BitsPerSample>"
+        )
+        result = _parse_xmp_bytes(
+            create_xmp_metadata({}, 2, "B", existing_xmp_tree=tree)
+        )
+        assert not result.xpath(f"//*[namespace-uri()='{tiff}']")
+
+    @pytest.mark.parametrize(
+        "prop,value_path,value",
+        [
+            (
+                '<dc:title><rdf:Alt><rdf:li xml:lang="x-default">Report</rdf:li>'
+                "</rdf:Alt></dc:title>junk",
+                "//*[local-name()='title']/*/*/text()",
+                "Report",
+            ),
+            (
+                '<tiff:ImageWidth xmlns:tiff="http://ns.adobe.com/tiff/1.0/">4096'
+                "</tiff:ImageWidth>junk",
+                "//*[local-name()='ImageWidth']/text()",
+                "4096",
+            ),
+        ],
+        ids=["managed", "preserved"],
+    )
+    def test_text_after_a_property_is_not_copied(self, prop, value_path, value) -> None:
+        """The property survives, but the character data after it does not."""
+        tree = _build_xmp_with_extras(prop)
+        xmp = create_xmp_metadata({}, 2, "B", existing_xmp_tree=tree)
+        assert b"junk" not in xmp
+        assert _parse_xmp_bytes(xmp).xpath(value_path) == [value]
+
+    @pytest.mark.parametrize(
+        "prop",
+        [
+            '<tiff:ImageWidth xmlns:tiff="http://ns.adobe.com/tiff/1.0/"> 4096 '
+            "</tiff:ImageWidth>",
+            '<photoshop:DateCreated xmlns:photoshop="http://ns.adobe.com/photoshop/'
+            '1.0/"> 2024-01-01 </photoshop:DateCreated>',
+            '<tiff:BitsPerSample xmlns:tiff="http://ns.adobe.com/tiff/1.0/"><rdf:Seq>'
+            "<rdf:li> 8 </rdf:li></rdf:Seq></tiff:BitsPerSample>",
+        ],
+    )
+    def test_typed_values_with_surrounding_whitespace_are_dropped(self, prop) -> None:
+        """A value is copied verbatim, and typed grammars admit no padding."""
+        tree = _build_xmp_with_extras(prop)
+        result = _parse_xmp_bytes(
+            create_xmp_metadata({}, 2, "B", existing_xmp_tree=tree)
+        )
+        assert not result.xpath(
+            "//*[local-name()='ImageWidth' or local-name()='DateCreated'"
+            " or local-name()='BitsPerSample']"
+        )
+
+    def test_text_values_keep_surrounding_whitespace(self) -> None:
+        """Whitespace is part of a Text value, which is not trimmed or dropped."""
+        tree = _build_xmp_with_extras(
+            '<photoshop:Credit xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/">'
+            " Acme </photoshop:Credit>"
+        )
+        result = _parse_xmp_bytes(
+            create_xmp_metadata({}, 2, "B", existing_xmp_tree=tree)
+        )
+        assert result.xpath("//*[local-name()='Credit']/text()") == [" Acme "]
 
     @classmethod
     def _copied(cls, prop: str) -> etree._Element:

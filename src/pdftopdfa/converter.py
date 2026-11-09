@@ -46,6 +46,7 @@ from .metadata import (
     _clean_metadata_text,
     _extract_existing_xmp,
     _extract_lang_alt_xmp_property,
+    extract_custom_docinfo,
     extract_pdf_info,
     remove_pdfe_identification,
     remove_pdfua_identification,
@@ -2111,6 +2112,7 @@ def convert_to_pdfa(
     pdf: pikepdf.Pdf | None = None
     source_info: dict | None = None
     source_xmp_tree = None
+    source_custom_docinfo: dict[str, bytes] | None = None
 
     if ocr_force and ocr_deskew:
         raise OCRError("Deskew cannot be combined with forced OCR")
@@ -2168,6 +2170,7 @@ def convert_to_pdfa(
                 )
             source_info = extract_pdf_info(check_pdf) if pdfa else None
             source_xmp_tree = _extract_existing_xmp(check_pdf) if pdfa else None
+            source_custom_docinfo = extract_custom_docinfo(check_pdf) if pdfa else None
             if pdfa and source_info is not None:
                 source_title = _clean_metadata_text(source_info.get("title"))
                 title_source = (
@@ -2720,6 +2723,7 @@ def convert_to_pdfa(
             level,
             source_info=source_info,
             source_xmp_tree=source_xmp_tree,
+            source_custom_docinfo=source_custom_docinfo,
             pdfua=pdfua,
             fallback_title=input_path.stem,
         )
