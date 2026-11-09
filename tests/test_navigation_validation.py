@@ -1082,11 +1082,14 @@ def test_malformed_unlisted_thread_leaves_only_valid_beads(damage):
         first.T = pdf.make_indirect(Dictionary(I=Dictionary(Title=String(b"\x01"))))
     else:
         second.P = pdf.make_indirect(Dictionary(Type=Name.Page))
-    assert remove_forbidden_catalog_entries(pdf) == 2
+    # Both /B arrays and the Thread action, whose destination is not a valid
+    # article (ISO 32000-1, Table 205), are removed.
+    assert remove_forbidden_catalog_entries(pdf) == 3
     assert "/B" not in page.obj and "/B" not in other.obj
     # Information of a thread that is not valid is left as the source stored it.
     assert bytes(thread.I.Title) == b"\x01undefined"
-    assert pdf.Root.OpenAction.D.objgen == thread.objgen
+    assert "/OpenAction" not in pdf.Root
+    assert remove_forbidden_catalog_entries(pdf) == 0
 
 
 def test_conversion_keeps_beads_of_an_action_thread(tmp_path):
@@ -1296,3 +1299,357 @@ def test_conversion_of_portfolio_with_invalid_subitems(tmp_path):
         assert str(item.Sent.D) == "D:20240101000000Z00'00'"
         assert str(item.Note.P) == "Prefix only" and "/D" not in item.Note
         assert list(converted.Root.Collection.Sort.S) == [Name.Sent, Name.Size]
+
+
+def _malformed_unlisted_article(pdf):
+    """Create an unlisted two-page article whose second bead breaks the cycle."""
+    thread, first, second, page, other = _unlisted_article(pdf)
+    second.N = second
+    return thread, page, other
+
+
+def _link(pdf, page, **entries):
+    annotation = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Annot, Subtype=Name.Link, Rect=Array([0, 0, 1, 1]), **entries
+        )
+    )
+    page.Annots = Array([annotation])
+    return annotation
+
+
+@pytest.mark.parametrize(
+    "location", ["open", "annotation", "additional", "outline", "next", "chain"]
+)
+def test_actions_naming_a_malformed_unlisted_thread_are_removed(location):
+    """ISO 32000-1, Table 205: the action has no valid destination, so it goes.
+
+    Only the reference to that action is removed; the conversion, the container
+    of the action and the other actions remain.
+    """
+    pdf = new_pdf()
+    thread, page, other = _malformed_unlisted_article(pdf)
+    broken = Dictionary(S=Name.Thread, D=thread)
+    goto = pdf.make_indirect(Dictionary(S=Name.GoTo, D=Array([page.obj, Name.Fit])))
+    annotation = None
+    if location == "open":
+        pdf.Root.OpenAction = broken
+    elif location == "annotation":
+        annotation = _link(pdf, other, A=broken)
+    elif location == "additional":
+        annotation = _link(pdf, other, AA=Dictionary(E=broken, X=goto))
+    elif location == "outline":
+        _outline_action(pdf, page, broken)
+    elif location == "next":
+        pdf.Root.OpenAction = Dictionary(
+            S=Name.URI, URI="https://example.org", Next=Array([broken, goto])
+        )
+    else:
+        pdf.Root.OpenAction = Dictionary(S=Name.GoTo, D=goto.D, Next=broken)
+    # Both page /B arrays, which list no valid bead, and the action reference.
+    assert remove_forbidden_catalog_entries(pdf) == 3
+    if location == "open":
+        assert "/OpenAction" not in pdf.Root
+    elif location == "annotation":
+        assert "/A" not in annotation
+        assert other.Annots[0].objgen == annotation.objgen
+    elif location == "additional":
+        assert list(annotation.AA.keys()) == ["/X"]
+        assert annotation.AA.X.objgen == goto.objgen
+    elif location == "outline":
+        assert "/A" not in pdf.Root.Outlines.First
+        assert str(pdf.Root.Outlines.First.Title) == "Article"
+    elif location == "next":
+        assert [item.objgen for item in pdf.Root.OpenAction.Next] == [goto.objgen]
+    else:
+        assert "/Next" not in pdf.Root.OpenAction
+        assert pdf.Root.OpenAction.S == Name.GoTo
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+def test_shared_thread_action_is_removed_from_every_reference():
+    """A container left without actions is removed: /AA and /Next."""
+    pdf = new_pdf()
+    thread, page, other = _malformed_unlisted_article(pdf)
+    del page.B, other.B
+    broken = pdf.make_indirect(Dictionary(S=Name.Thread, D=thread))
+    clicked = _link(pdf, page, A=broken)
+    entered = _link(pdf, other, AA=Dictionary(E=broken))
+    pdf.Root.OpenAction = Dictionary(
+        S=Name.Named, N=Name.NextPage, Next=pdf.make_indirect(Array([broken]))
+    )
+    assert remove_forbidden_catalog_entries(pdf) == 3
+    assert "/A" not in clicked and "/AA" not in entered
+    assert sorted(pdf.Root.OpenAction.keys()) == ["/N", "/S"]
+
+
+@pytest.mark.parametrize(
+    "target,kept",
+    [
+        ("thread", True),
+        (0, True),
+        ("Article", True),
+        (1, False),
+        (-1, False),
+        ("Missing", False),
+        ("indirect", False),
+        ("direct", False),
+        (None, False),
+        (Name.Article, False),
+        (True, False),
+        (Decimal("0.5"), False),
+    ],
+)
+def test_thread_action_destination_forms(target, kept):
+    """Table 205: /D is a thread dictionary, a /Threads index or a thread title."""
+    pdf = new_pdf()
+    thread, _, _ = _article(pdf)
+    action = Dictionary(S=Name.Thread)
+    if target == "thread":
+        action.D = thread
+    elif target == "indirect":
+        action.D = pdf.make_indirect(Dictionary(I=Dictionary(Title="Article")))
+    elif target == "direct":
+        action.D = Dictionary(F=thread.F)
+    elif target is not None:
+        action.D = target
+    pdf.Root.OpenAction = action
+    assert remove_forbidden_catalog_entries(pdf) == (0 if kept else 1)
+    assert ("/OpenAction" in pdf.Root) == kept
+
+
+def test_thread_title_names_the_first_listed_thread():
+    """Table 205: of two threads with one title, the first listed one is used."""
+    pdf = new_pdf()
+    first, _, _ = _article(pdf)
+    second, bead, _ = _article(pdf)
+    pdf.Root.Threads = pdf.make_indirect(Array([first, second]))
+    pdf.Root.OpenAction = Dictionary(S=Name.Thread, D="Article", B=bead)
+    # The bead of the second thread is not a bead of the first one.
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert sorted(pdf.Root.OpenAction.keys()) == ["/D", "/S"]
+
+
+@pytest.mark.parametrize("target", [7, "Elsewhere"])
+def test_thread_action_into_another_file_is_kept(target):
+    """An index or title of a thread in another file (/F) is not checked here."""
+    pdf = new_pdf()
+    pdf.add_blank_page()
+    pdf.Root.OpenAction = Dictionary(S=Name.Thread, F="other.pdf", D=target, B=3)
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert pdf.Root.OpenAction.D == target and pdf.Root.OpenAction.B == 3
+
+
+def test_thread_dictionary_with_a_file_specification_is_checked():
+    """A thread dictionary is in the current file whatever /F says (Table 205)."""
+    pdf = new_pdf()
+    thread, _, _ = _malformed_unlisted_article(pdf)
+    pdf.Root.OpenAction = Dictionary(S=Name.Thread, F="other.pdf", D=thread)
+    assert remove_forbidden_catalog_entries(pdf) == 3
+    assert "/OpenAction" not in pdf.Root
+
+
+@pytest.mark.parametrize(
+    "bead,kept",
+    [
+        ("own", True),
+        (0, True),
+        (1, False),
+        (-1, False),
+        (True, False),
+        ("other", False),
+        (Name.Bad, False),
+    ],
+)
+def test_thread_action_bead_must_belong_to_its_thread(bead, kept):
+    """Table 205: /B is a bead of the destination thread or its index there.
+
+    An invalid bead is removed, so that the action opens the thread at its
+    first bead, rather than the whole action.
+    """
+    pdf = new_pdf()
+    thread, own, _ = _article(pdf)
+    other, foreign, _ = _article(pdf)
+    pdf.Root.Threads = pdf.make_indirect(Array([thread, other]))
+    action = pdf.make_indirect(Dictionary(S=Name.Thread, D=thread))
+    action.B = {"own": own, "other": foreign}.get(bead, bead)
+    pdf.Root.OpenAction = action
+    _link(pdf, pdf.pages[0], A=action)
+    assert remove_forbidden_catalog_entries(pdf) == (0 if kept else 1)
+    assert ("/B" in action) == kept
+    assert pdf.Root.OpenAction.objgen == action.objgen
+
+
+def test_conversion_removes_actions_naming_a_malformed_unlisted_thread(tmp_path):
+    """The output keeps the link and its other actions, without the broken ones."""
+    from pikepdf import Pdf
+
+    pdf = new_pdf()
+    thread, page, other = _malformed_unlisted_article(pdf)
+    pdf.Root.OpenAction = Dictionary(S=Name.Thread, D=thread)
+    _link(
+        pdf,
+        other,
+        A=Dictionary(
+            S=Name.GoTo,
+            D=Array([page.obj, Name.Fit]),
+            Next=Array([Dictionary(S=Name.Thread, D=thread)]),
+        ),
+    )
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    result = convert_to_pdfa(source, output)
+    assert result.target_produced and not result.skipped, result
+    with Pdf.open(output) as converted:
+        assert "/OpenAction" not in converted.Root
+        link = converted.pages[1].Annots[0]
+        assert link.A.S == Name.GoTo and "/Next" not in link.A
+        assert all("/B" not in item.obj for item in converted.pages)
+
+
+def test_repeated_threads_are_traversed_once(monkeypatch):
+    """A thread listed or named many times is not validated again each time."""
+    from pdftopdfa.sanitizers import navigation
+
+    calls = []
+    original = navigation._thread_beads
+
+    def counting(thread, pages):
+        calls.append(thread.objgen)
+        return original(thread, pages)
+
+    monkeypatch.setattr(navigation, "_thread_beads", counting)
+    pdf = new_pdf()
+    thread, _, _ = _article(pdf)
+    unlisted, _, _, _, _ = _unlisted_article(pdf)
+    pdf.Root.Threads = pdf.make_indirect(Array([thread] * 50))
+    action = pdf.make_indirect(Dictionary(S=Name.Thread, D=unlisted))
+    pdf.Root.OpenAction = Dictionary(S=Name.Thread, D=thread, Next=Array([action] * 50))
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert calls == [thread.objgen, unlisted.objgen]
+
+
+def test_action_scan_visits_shared_containers_once():
+    """Shared /Annots arrays, annotations, /AA dictionaries and /Next arrays."""
+    from pdftopdfa.sanitizers import navigation
+
+    pdf = new_pdf()
+    leaf = pdf.make_indirect(Dictionary(S=Name.Named, N=Name.NextPage))
+    following = pdf.make_indirect(Array([leaf]))
+    action = pdf.make_indirect(
+        Dictionary(S=Name.Named, N=Name.PrevPage, Next=following)
+    )
+    annotation = _link(
+        pdf, pdf.add_blank_page(), A=action, AA=pdf.make_indirect(Dictionary(E=leaf))
+    )
+    annots = pdf.make_indirect(Array([annotation] * 5))
+    for _ in range(30):
+        pdf.add_blank_page().Annots = annots
+    pdf.Root.OpenAction = Dictionary(S=Name.Named, N=Name.FirstPage, Next=following)
+    checked = []
+    actions, removed = navigation._walk_actions(
+        pdf, lambda item: checked.append(item.objgen) or False
+    )
+    # The open action, the annotation /A and /AA entries and the /Next entry.
+    assert removed == 0 and len(checked) == 4
+    assert len(actions) == 3
+
+
+def test_page_bead_array_shared_by_pages_is_split():
+    """Pages that share one /B array each regain their own beads."""
+    pdf = new_pdf()
+    _, first, second, page, other = _unlisted_article(pdf)
+    page.B = other.B = pdf.make_indirect(Array([first, second]))
+    assert remove_forbidden_catalog_entries(pdf) == 2
+    assert [item.objgen for item in page.B] == [first.objgen]
+    assert [item.objgen for item in other.B] == [second.objgen]
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+def test_shared_thread_information_is_checked_once(monkeypatch):
+    """Threads that share one information dictionary repair it once."""
+    from pdftopdfa.sanitizers import navigation
+
+    calls = []
+    original = navigation._check_date
+
+    def counting(owner, key):
+        calls.append(key)
+        return original(owner, key)
+
+    monkeypatch.setattr(navigation, "_check_date", counting)
+    pdf = new_pdf()
+    threads = [_article(pdf)[0] for _ in range(5)]
+    info = pdf.make_indirect(Dictionary(Title="Shared", ModDate="20240101"))
+    for thread in threads:
+        thread.I = info
+    pdf.Root.Threads = pdf.make_indirect(Array(threads))
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert calls == ["/ModDate"] and str(info.ModDate) == "D:20240101"
+
+
+def test_shared_collection_item_is_checked_once(monkeypatch):
+    """A file specification listed under many names has its item checked once."""
+    from pdftopdfa.sanitizers import navigation
+
+    calls = []
+    original = navigation._check_item_value
+
+    def counting(item, key, subtype):
+        calls.append(key)
+        return original(item, key, subtype)
+
+    monkeypatch.setattr(navigation, "_check_item_value", counting)
+    pdf = new_pdf()
+    spec = _portfolio(pdf, Dictionary(Good=Dictionary(Subtype=Name.S, N="Good")))
+    del spec.CI.Foo
+    names = []
+    for index in range(20):
+        names.extend([f"{index:02}.txt", spec])
+    pdf.Root.Names.EmbeddedFiles = Dictionary(Names=Array(names))
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert calls == ["/Good"]
+
+
+def _utf16(text):
+    return String(b"\xfe\xff" + text.encode("utf-16-be"))
+
+
+@pytest.mark.parametrize("text", ["D:20240101000000Z", "20240101000000Z"])
+def test_utf16_thread_information_dates_become_ascii(text):
+    """ISO 32000-1, Table 34 lists a date as an ASCII string."""
+    pdf = new_pdf()
+    thread, _, _ = _article(pdf)
+    thread.I.ModDate = _utf16(text)
+    thread.I.Title = _utf16("Article")
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert bytes(thread.I.ModDate) == b"D:20240101000000Z"
+    # A text string keeps its UTF-16BE encoding.
+    assert bytes(thread.I.Title) == bytes(_utf16("Article"))
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+@pytest.mark.parametrize("text", ["D:20240101000000Z", "20240101000000Z"])
+def test_utf16_collection_dates_become_ascii(text):
+    """Item and subitem dates are rewritten as ASCII strings of the same date."""
+    pdf = new_pdf()
+    spec = _portfolio(
+        pdf,
+        Dictionary(
+            Sent=Dictionary(Subtype=Name.D, N="Sent"),
+            Read=Dictionary(Subtype=Name.D, N="Read"),
+        ),
+    )
+    spec.CI = Dictionary(Sent=_utf16(text), Read=Dictionary(D=_utf16(text)))
+    assert remove_forbidden_catalog_entries(pdf) == 2
+    assert bytes(spec.CI.Sent) == bytes(spec.CI.Read.D) == b"D:20240101000000Z"
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+def test_utf16_text_that_is_not_a_date_is_removed():
+    """The decoded text must still be a PDF date."""
+    pdf = new_pdf()
+    thread, _, _ = _article(pdf)
+    thread.I.ModDate = _utf16("D:2024é")
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert "/ModDate" not in thread.I

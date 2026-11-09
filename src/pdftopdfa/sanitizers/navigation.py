@@ -61,19 +61,29 @@ def _check_date(owner, key: str) -> int | None:
     PDF Reference 1.7, 3.8.3 made the prefix optional ("The prefix D:, although
     also optional, is strongly recommended"), whereas ISO 32000-1, 7.9.4 states
     "The prefix D: shall be present". A date that is valid apart from the prefix
-    is therefore kept with the prefix added. Returns the number of repaired
-    entries, or None if the value is not a PDF date.
+    is therefore kept with the prefix added.
+
+    ISO 32000-1, Table 34 lists a date as "Date (ASCII string)", so a date stored
+    in another encoding, such as UTF-16BE with a byte order marker, is rewritten
+    as the ASCII string of the same date, as DocInfo dates are written.
+
+    Returns:
+        The number of repaired entries, or None if the value is not a PDF date.
     """
     value = owner[key]
     if not isinstance(value, String):
         return None
     text = str(value)
-    if text.startswith("D:"):
-        return 0 if _is_pdf_date(text) else None
-    if not _is_pdf_date(f"D:{text}"):
+    if not text.startswith("D:"):
+        text = f"D:{text}"
+    # The date syntax admits only ASCII characters.
+    if not _is_pdf_date(text):
         return None
-    owner[key] = String(f"D:{text}")
-    logger.warning("Added the D: prefix to navigation date %s", key)
+    canonical = text.encode("ascii")
+    if bytes(value) == canonical:
+        return 0
+    owner[key] = String(canonical)
+    logger.warning("Rewrote navigation date %s as an ASCII string with D:", key)
     return 1
 
 
@@ -90,6 +100,17 @@ def _optional_type(owner, expected: Name) -> int:
     return (
         _remove_entry(owner, "/Type") if value is not None and value != expected else 0
     )
+
+
+def _first_visit(item, seen: set) -> bool:
+    """Record an indirect object; a direct object has only the owner it is in."""
+    key = item.objgen
+    if key == (0, 0):
+        return True
+    if key in seen:
+        return False
+    seen.add(key)
+    return True
 
 
 def _embedded_files(pdf: Pdf) -> list[tuple]:
@@ -152,7 +173,8 @@ def _sanitize_collection_items(pdf: Pdf, schema) -> int:
     A schema left with no fields (Table 156 makes each of them optional) describes
     no values, so its items keep only their /Type. Only files of the EmbeddedFiles
     name tree belong to the collection (ISO 32000-1, 12.3.5), so the items of other
-    file specifications are not checked against its schema.
+    file specifications are not checked against its schema. A file specification
+    or item that several names share is checked once.
 
     ISO 32000-1, Table 157 lists only S, D and N as "the types of fields in the
     collection item or collection subitem dictionary". The field data of the
@@ -160,8 +182,10 @@ def _sanitize_collection_items(pdf: Pdf, schema) -> int:
     corresponding entry of the file specification or embedded file parameters,
     so an item value under such a field's key is not field data and is removed.
     """
-    removed = 0
+    removed, seen = 0, set()
     for _, filespec in _embedded_files(pdf):
+        if not _first_visit(filespec, seen):
+            continue
         item = filespec.get("/CI")
         if item is None:
             continue
@@ -172,6 +196,8 @@ def _sanitize_collection_items(pdf: Pdf, schema) -> int:
         if item.objgen == (0, 0):
             item = pdf.make_indirect(item)
             filespec["/CI"] = item
+        if not _first_visit(item, seen):
+            continue
         removed += _optional_type(item, Name.CollectionItem)
         if schema is None:
             continue
@@ -353,52 +379,121 @@ def _thread_beads(thread, pages: set) -> list[tuple]:
     return beads
 
 
-def _action_threads(pdf: Pdf):
-    """Yield the threads that Thread actions name directly by their dictionary.
+def _action_owners(pdf: Pdf) -> list:
+    """Return the catalog, then the pages, annotations and outline items, each once.
 
-    ISO 32000-1, 12.6.4.6 lets a Thread action refer to a thread of the same file
-    by its dictionary, so the thread need not appear in the optional catalog
-    /Threads array. Actions of the document, its pages, annotations and outline
-    items are searched, including the actions that follow them (/Next).
-
-    The keys of each dictionary are listed once: with pikepdf, looking up an
-    absent key costs far more, which matters for the many annotations of a large
-    document.
+    An /Annots array or annotation that several pages share is listed once.
     """
-    owners = [pdf.Root]
+    owners, seen = [pdf.Root], set()
     for page in pdf.pages:
+        if not _first_visit(page.obj, seen):
+            continue
         owners.append(page.obj)
-        if "/Annots" in page.obj.keys() and isinstance(page.obj.Annots, Array):
+        annots = page.obj["/Annots"] if "/Annots" in page.obj.keys() else None
+        if isinstance(annots, Array) and _first_visit(annots, seen):
             owners.extend(
-                item for item in page.obj.Annots if isinstance(item, Dictionary)
+                item
+                for item in annots
+                if isinstance(item, Dictionary) and _first_visit(item, seen)
             )
     outlines = pdf.Root.get("/Outlines")
     items = [outlines] if isinstance(outlines, Dictionary) else []
     visited = set()
     while items:
         item = items.pop()
-        if not isinstance(item, Dictionary) or item.objgen in visited:
+        if not isinstance(item, Dictionary) or not _first_visit(item, visited):
             continue
-        if item.objgen != (0, 0):
-            visited.add(item.objgen)
         keys = item.keys()
-        if item is not outlines:
+        if item is not outlines and _first_visit(item, seen):
             owners.append(item)
         items.extend(item[key] for key in ("/First", "/Next") if key in keys)
-    pending = [pdf.Root.get("/OpenAction")]
-    for owner in owners:
+    return owners
+
+
+def _walk_actions(pdf: Pdf, remove=None) -> tuple[list, int]:
+    """Visit each action of the document once, optionally removing references.
+
+    The catalog /OpenAction and the /A and /AA entries of the catalog, pages,
+    annotations and outline items are searched, with the actions that follow
+    them (/Next, ISO 32000-1, Table 193). Each indirect action, /AA dictionary and
+    /Next array is visited once, so the work stays linear in the size of the
+    document however often they are referenced.
+
+    The keys of each dictionary are listed once: with pikepdf, looking up an
+    absent key costs far more, which matters for the many annotations of a large
+    document.
+
+    Args:
+        pdf: The document.
+        remove: Called with each action dictionary where it is referenced. A true
+            result removes that reference together with the actions that follow
+            the removed action, which form its subtree (12.6.2, NOTE 1), as
+            remove_actions() removes a non-compliant action. A /AA dictionary
+            or /Next array that this leaves empty is removed as well.
+
+    Returns:
+        The visited actions, and the number of removed references.
+    """
+    actions, pending, seen, emptied = [], [], set(), set()
+    removed = 0
+
+    def prune(holder, keys: list) -> bool:
+        """Remove rejected actions from a container; True if that emptied it."""
+        nonlocal removed
+        kept = []
+        for key in keys:
+            value = holder[key]
+            if remove is not None and isinstance(value, Dictionary) and remove(value):
+                del holder[key]
+                removed += 1
+            else:
+                kept.append(value)
+        # Keys are given last first, so that array indices stay valid while
+        # deleting; the actions are visited in their original order.
+        pending.extend(reversed(kept))
+        return len(kept) < len(keys) and len(holder) == 0
+
+    def emptied_container(holder, keys: list) -> bool:
+        """Prune a shared /AA or /Next container once; report if it was emptied."""
+        if not _first_visit(holder, seen):
+            return holder.objgen in emptied
+        if not prune(holder, keys):
+            return False
+        emptied.add(holder.objgen)
+        return True
+
+    for index, owner in enumerate(_action_owners(pdf)):
         keys = owner.keys()
-        if "/A" in keys:
-            pending.append(owner["/A"])
-        if "/AA" in keys and isinstance(owner["/AA"], Dictionary):
-            pending.extend(owner["/AA"].values())
-    visited = set()
+        slots = ("/OpenAction", "/A") if index == 0 else ("/A",)
+        prune(owner, [key for key in reversed(slots) if key in keys])
+        additional = owner["/AA"] if "/AA" in keys else None
+        if isinstance(additional, Dictionary) and emptied_container(
+            additional, sorted(additional.keys(), reverse=True)
+        ):
+            del owner["/AA"]
     while pending:
         action = pending.pop()
-        if not isinstance(action, Dictionary) or action.objgen in visited:
+        if not isinstance(action, Dictionary) or not _first_visit(action, seen):
             continue
-        if action.objgen != (0, 0):
-            visited.add(action.objgen)
+        actions.append(action)
+        if "/Next" not in action.keys():
+            continue
+        following = action["/Next"]
+        if not isinstance(following, Array):
+            prune(action, ["/Next"])
+        elif emptied_container(following, list(reversed(range(len(following))))):
+            del action["/Next"]
+    return actions, removed
+
+
+def _action_threads(actions: list):
+    """Yield the threads that Thread actions name directly by their dictionary.
+
+    ISO 32000-1, 12.6.4.6 lets a Thread action refer to a thread of the same file
+    by its dictionary, so the thread need not appear in the optional catalog
+    /Threads array.
+    """
+    for action in actions:
         keys = action.keys()
         if (
             "/S" in keys
@@ -407,21 +502,20 @@ def _action_threads(pdf: Pdf):
             and isinstance(action["/D"], Dictionary)
         ):
             yield action["/D"]
-        if "/Next" in keys:
-            following = action["/Next"]
-            pending.extend(following if isinstance(following, Array) else [following])
 
 
 def _listed_bead_threads(pdf: Pdf):
     """Yield the thread of each bead cycle that a page /B array refers to.
 
     Only the first bead of a thread has to name it (/T), so each cycle is followed
-    until a bead does; no bead is followed twice.
+    until a bead does; no bead, and no /B array that pages share, is followed twice.
     """
     visited = set()
     for page in pdf.pages:
         listed = page.obj.get("/B")
-        for bead in listed if isinstance(listed, Array) else []:
+        if not isinstance(listed, Array) or not _first_visit(listed, visited):
+            continue
+        for bead in listed:
             while (
                 isinstance(bead, Dictionary)
                 and bead.objgen != (0, 0)
@@ -435,42 +529,50 @@ def _listed_bead_threads(pdf: Pdf):
                 bead = bead.get("/N")
 
 
-def _validate_threads(pdf: Pdf) -> tuple[list, dict[tuple[int, int], tuple]]:
+def _validate_threads(pdf: Pdf) -> tuple[dict, dict[tuple[int, int], tuple]]:
     """Validate bead cycles and page links without renumbering local Thread actions.
 
     Every thread of the catalog /Threads array must be valid. A thread that a
     Thread action or a page /B array refers to without being listed there (the
     catalog array is optional, Table 28) supplies its beads when it is valid.
+    Each thread is traversed once, however often it is listed or referred to.
 
     Returns:
-        The valid threads, and for each of their beads, in /Threads and reading
-        order: its page and bead dictionary.
+        For each valid thread, in /Threads and discovery order: its dictionary
+        and the ids of its beads. For each of their beads, in the same order and
+        then in reading order: its page and bead dictionary.
     """
     threads = pdf.Root.get("/Threads")
     if threads is not None and not isinstance(threads, Array):
         raise _thread_error("expected an array")
     pages = {page.objgen for page in pdf.pages}
     found, beads = {}, {}
-    for thread in threads if threads is not None else []:
-        for bead_id, page_id, bead in _thread_beads(thread, pages):
-            # A thread listed twice keeps the place of its first traversal;
-            # separate threads cannot share beads, because the first bead of
+
+    def add(thread, cycle: list) -> None:
+        found[thread.objgen] = (thread, {bead_id for bead_id, _, _ in cycle})
+        for bead_id, page_id, bead in cycle:
+            # Separate threads cannot share beads, because the first bead of
             # each one names its own thread.
             beads.setdefault(bead_id, (page_id, bead))
-        found.setdefault(thread.objgen, thread)
+
+    for thread in threads if threads is not None else []:
+        # A thread listed again keeps the place of its first occurrence; its
+        # cycle is not traversed again.
+        if not (isinstance(thread, Dictionary) and thread.objgen in found):
+            add(thread, _thread_beads(thread, pages))
     tried = set(found)
-    for thread in chain(_action_threads(pdf), _listed_bead_threads(pdf)):
+    actions, _ = _walk_actions(pdf)
+    for thread in chain(_action_threads(actions), _listed_bead_threads(pdf)):
         if thread.objgen in tried:
             continue
         tried.add(thread.objgen)
         try:
             cycle = _thread_beads(thread, pages)
         except ConversionError:
+            # The Thread actions that name this thread are removed later.
             continue
-        found[thread.objgen] = thread
-        for bead_id, page_id, bead in cycle:
-            beads.setdefault(bead_id, (page_id, bead))
-    return list(found.values()), beads
+        add(thread, cycle)
+    return found, beads
 
 
 def _sanitize_thread_info(threads: list) -> int:
@@ -481,15 +583,18 @@ def _sanitize_thread_info(threads: list) -> int:
     removed on its own, keeping its valid siblings and the article: a date that
     is not a PDF date, a /Trapped value other than the three names, and a text
     string, standard or custom, whose encoding is invalid. A date lacking only the
-    D: prefix gains it.
+    D: prefix gains it. An information dictionary that threads share is checked
+    once.
     """
-    removed = 0
+    removed, seen = 0, set()
     for thread in threads:
         info = thread.get("/I")
         if info is None:
             continue
         if not isinstance(info, Dictionary):
             removed += _remove_entry(thread, "/I")
+            continue
+        if not _first_visit(info, seen):
             continue
         for key in list(info.keys()):
             value = info.get(key)
@@ -534,36 +639,46 @@ def _repair_page_beads(pdf: Pdf, beads: dict[tuple[int, int], tuple]) -> int:
     which the threads do not record and which can differ from their reading order,
     so the listed beads keep their relative order, and a complete array stays
     unchanged. Beads that the array omitted follow, in /Threads and reading order.
+
+    The position of each bead in a /B array that pages share is found once, so
+    the work stays linear in the size of the arrays and the number of beads.
     """
     on_page: dict[tuple[int, int], dict[tuple[int, int], Dictionary]] = {}
     for bead_id, (page_id, bead) in beads.items():
         on_page.setdefault(page_id, {})[bead_id] = bead
 
+    shared: dict[tuple[int, int], dict[tuple[int, int], int]] = {}
     repaired = 0
     for page in pdf.pages:
         expected = on_page.get(page.objgen, {})
         listed = page.get("/B")
         if listed is None and not expected:
             continue
-        original = list(listed) if isinstance(listed, Array) else None
-        # Direct dictionaries are never beads of a cycle, which requires indirect
-        # references, and a dictionary keeps the first occurrence of each bead.
-        kept = {
-            item.objgen: expected[item.objgen]
-            for item in original or []
-            if isinstance(item, Dictionary) and item.objgen in expected
-        }
-        kept.update({key: bead for key, bead in expected.items() if key not in kept})
-        ordered = list(kept.values())
-        if (
-            original is not None
-            and len(original) == len(ordered)
-            and all(
-                isinstance(item, Dictionary) and item.objgen == bead.objgen
-                for item, bead in zip(original, ordered, strict=True)
-            )
-        ):
+        positions, length = {}, None
+        if isinstance(listed, Array):
+            length = len(listed)
+            if listed.objgen in shared:
+                positions = shared[listed.objgen]
+            else:
+                # Direct dictionaries are never beads of a cycle, which requires
+                # indirect references; the first occurrence of each bead counts.
+                for index, item in enumerate(listed):
+                    if isinstance(item, Dictionary) and item.objgen != (0, 0):
+                        positions.setdefault(item.objgen, index)
+                if listed.objgen != (0, 0):
+                    shared[listed.objgen] = positions
+        kept = sorted(
+            (bead_id for bead_id in expected if bead_id in positions),
+            key=positions.__getitem__,
+        )
+        # An array that lists every expected bead and has no other entry holds
+        # exactly those beads, once each, in drawing order.
+        if length == len(kept) == len(expected):
             continue
+        ordered = [expected[bead_id] for bead_id in kept]
+        ordered.extend(
+            bead for bead_id, bead in expected.items() if bead_id not in positions
+        )
         if ordered:
             page.B = Array(ordered)
         else:
@@ -573,23 +688,111 @@ def _repair_page_beads(pdf: Pdf, beads: dict[tuple[int, int], tuple]) -> int:
     return repaired
 
 
+def _thread_action_filter(pdf: Pdf, found: dict):
+    """Return a check that rejects Thread actions without a valid destination.
+
+    ISO 32000-1, Table 205 names the destination thread (/D) of a Thread action
+    by its dictionary in the current file, by its index in the catalog /Threads
+    array, or by the title of its thread information dictionary, the first
+    thread of the catalog array with that title being used. With a file
+    specification (/F) only the dictionary form refers to the current file; an
+    index or a title in another file is not checked. An action whose destination
+    is missing, of another type, out of range, or not a valid thread is rejected.
+    The optional bead (/B), a bead dictionary of that thread or its index in the
+    thread, is removed if it is neither, so that the action opens the thread at
+    its first bead.
+
+    Returns:
+        The check, called with each action dictionary, and a one-element list
+        that counts the removed /B entries.
+    """
+    listed = pdf.Root.get("/Threads")
+    listed = [thread.objgen for thread in listed] if listed is not None else []
+    titles: dict[str, tuple[int, int]] = {}
+    for thread_id in listed:
+        info = found[thread_id][0].get("/I")
+        title = info.get("/Title") if isinstance(info, Dictionary) else None
+        if isinstance(title, String):
+            titles.setdefault(str(title), thread_id)
+    decided: dict[tuple[int, int], bool] = {}
+    beads_removed = [0]
+
+    def invalid(action) -> bool:
+        keys = action.keys()
+        if "/S" not in keys or action["/S"] != _THREAD:
+            return False
+        target = action["/D"] if "/D" in keys else None
+        if isinstance(target, Dictionary):
+            thread_id = target.objgen if target.objgen in found else None
+        elif isinstance(target, bool) or not isinstance(target, (int, String)):
+            thread_id = None
+        elif "/F" in keys:
+            return False
+        elif isinstance(target, int):
+            thread_id = listed[target] if 0 <= target < len(listed) else None
+        else:
+            thread_id = titles.get(str(target))
+        if thread_id is None:
+            logger.warning("Removed a Thread action without a valid destination")
+            return True
+        bead = action["/B"] if "/B" in keys else None
+        members = found[thread_id][1]
+        if bead is not None and not (
+            (isinstance(bead, Dictionary) and bead.objgen in members)
+            or (
+                isinstance(bead, int)
+                and not isinstance(bead, bool)
+                and 0 <= bead < len(members)
+            )
+        ):
+            beads_removed[0] += _remove_entry(action, "/B")
+        return False
+
+    def check(action) -> bool:
+        key = action.objgen
+        if key == (0, 0):
+            return invalid(action)
+        if key not in decided:
+            decided[key] = invalid(action)
+        return decided[key]
+
+    return check, beads_removed
+
+
+def _repair_thread_actions(pdf: Pdf, found: dict) -> int:
+    """Remove the Thread actions whose destination is not a valid article.
+
+    A malformed thread of the catalog /Threads array rejects the conversion, as
+    removing it would renumber the threads that actions name by index. A thread
+    that only actions name is not part of that array, so removing a Thread
+    action that names it, or a thread that does not exist, changes no other
+    destination. The action is removed where it is referenced: from the
+    /OpenAction, /A or /AA entry, or from the /Next entry of another action.
+    """
+    check, beads_removed = _thread_action_filter(pdf, found)
+    _, removed = _walk_actions(pdf, check)
+    return removed + beads_removed[0]
+
+
 def sanitize_catalog_navigation(pdf: Pdf) -> int:
     """Preserve portfolios/articles and reject ambiguous repairs of article graphs.
 
     Returns:
-        Number of article structures repaired (an inline /Threads array or a page
-        /B array) and malformed thread information and collection entries
-        removed, all in place.
+        Number of article structures repaired (an inline /Threads array, a page
+        /B array, a Thread action without a valid destination or its invalid
+        bead) and malformed thread information and collection entries removed,
+        all in place.
 
     Raises:
         ConversionError: If an article of the catalog /Threads array is malformed.
             Article validation precedes all edits and leaves thread destinations
             unchanged.
     """
-    threads, beads = _validate_threads(pdf)
+    found, beads = _validate_threads(pdf)
     return (
         _make_threads_indirect(pdf)
         + _repair_page_beads(pdf, beads)
-        + _sanitize_thread_info(threads)
+        + _sanitize_thread_info([thread for thread, _ in found.values()])
+        + _repair_thread_actions(pdf, found)
         + _sanitize_collection(pdf)
     )

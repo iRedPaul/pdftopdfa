@@ -254,7 +254,8 @@ UTF-16BE text encoding; valid string bytes remain unchanged.
 Article threads are checked for complete bead cycles and page links;
 malformed graphs of the catalog `/Threads` array use the original-input fallback
 to preserve navigation targets. Threads that only actions or page `/B` arrays
-refer to keep their beads when their cycles are valid. Malformed thread
+refer to keep their beads when their cycles are valid; Thread actions whose
+destination is not a valid article are removed. Malformed thread
 information entries are removed individually, with the same text-string check
 as custom DocInfo strings.
 
