@@ -13,6 +13,7 @@ from tempfile import SpooledTemporaryFile
 
 import pikepdf
 import pytest
+from conftest import pdf_object
 from pikepdf import Array, Dictionary, Name, String
 
 import pdftopdfa.digital_layout as digital_layout
@@ -322,7 +323,7 @@ def test_classifies_color_key_mask_visibility(
         pdf,
         data,
         width=width,
-        color_space=color_space,
+        color_space=pdf_object(color_space),
     )
     image["/Mask"] = Array(mask)
     _page(pdf, b"/Im Do", Dictionary(XObject=Dictionary(Im=image)))
@@ -2245,7 +2246,7 @@ def test_process_cmyk_ink_proves_overprinted_text_visibility(
             + b" Tr 10 20 Td (Text) Tj ET"
         ),
         Dictionary(
-            ExtGState=Dictionary(GS=graphics_state),
+            ExtGState=Dictionary(GS=pdf_object(graphics_state)),
             Font=Dictionary(F1=_font(pdf)),
         ),
     )

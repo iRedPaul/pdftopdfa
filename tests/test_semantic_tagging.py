@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import pikepdf
 import pytest
-from conftest import register_form_widget
+from conftest import pdf_object, register_form_widget
 from pikepdf import Array, Dictionary, Name, NumberTree, String
 
 import pdftopdfa.digital_layout as digital_layout
@@ -6415,7 +6415,7 @@ def test_described_overprint_vector_fails_closed(
     page = _page(
         pdf,
         b"/GS gs /Figure <</ActualText (No ink)>> BDC " + operator + b" EMC",
-        Dictionary(ExtGState=Dictionary(GS=parameters)),
+        Dictionary(ExtGState=Dictionary(GS=pdf_object(parameters))),
         size=(100, 100),
     )
     original = bytes(page.obj["/Contents"].read_bytes())

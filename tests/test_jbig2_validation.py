@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from conftest import new_pdf
+from conftest import new_pdf, pdf_object
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from pdftopdfa.converter import convert_to_pdfa
@@ -49,7 +49,7 @@ def test_non_stream_globals_are_rejected(layout: str, value: object) -> None:
     """Reject globals dictionaries, names, and integers before publication."""
     pdf = new_pdf()
     image = _image(pdf, layout)
-    _set_globals(image, layout, value)
+    _set_globals(image, layout, pdf_object(value))
 
     with pytest.raises(ConversionError, match="/JBIG2Globals.*stream reference"):
         validate_jbig2_globals(pdf)
@@ -68,7 +68,7 @@ def test_malformed_jbig2_parameters_are_rejected(layout: str, parms: object) -> 
     """Reject parameter values that cannot describe the specified filters."""
     pdf = new_pdf()
     image = _image(pdf, layout)
-    image.DecodeParms = parms
+    image.DecodeParms = pdf_object(parms)
 
     with pytest.raises(ConversionError, match="Invalid /DecodeParms"):
         get_jbig2_globals_streams(pdf)

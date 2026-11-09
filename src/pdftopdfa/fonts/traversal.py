@@ -55,11 +55,14 @@ def _is_direct_cycle(
 
     # pikepdf does not expose qpdf's direct-object identity. A temporary key
     # provides the same test because wrappers of one direct object share writes.
-    while marker in obj:
+    # Membership is tested on keys(): since pikepdf 10.18, "in" on a direct
+    # Dictionary costs time proportional to its whole subtree, which made deep
+    # direct resource chains cubic.
+    while marker in obj.keys():
         marker += "_"
     obj[marker] = True
     try:
-        return any(marker in ancestor for ancestor in ancestors)
+        return any(marker in ancestor.keys() for ancestor in ancestors)
     finally:
         del obj[marker]
 

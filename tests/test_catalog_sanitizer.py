@@ -6,7 +6,7 @@
 
 import pikepdf
 import pytest
-from conftest import new_pdf
+from conftest import new_pdf, pdf_object
 
 from pdftopdfa.sanitizers import sanitize_for_pdfa
 from pdftopdfa.sanitizers.catalog import (
@@ -43,7 +43,7 @@ class TestRemoveForbiddenCatalogEntries:
     def test_remove_single_forbidden_entry(self, key, value):
         """Each forbidden catalog entry is individually removed."""
         pdf = new_pdf()
-        pdf.Root[key] = value
+        pdf.Root[key] = pdf_object(value)
         assert remove_forbidden_catalog_entries(pdf) == 1
         assert key not in pdf.Root
 

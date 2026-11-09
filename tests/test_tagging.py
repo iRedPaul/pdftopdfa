@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pikepdf
 import pytest
-from conftest import new_pdf, open_pdf
+from conftest import new_pdf, open_pdf, pdf_object
 from pikepdf import Array, Dictionary, Name, NameTree, NumberTree, String
 
 import pdftopdfa.tagging as tagging
@@ -816,7 +816,7 @@ def test_rebuilds_structure_with_unresolvable_roles(
     old_root, _ = _install_existing_structure(
         pdf,
         role=Name("/Custom"),
-        role_map=role_map,
+        role_map=pdf_object(role_map),
     )
 
     result = ensure_logical_structure(pdf)
@@ -843,7 +843,7 @@ def test_rebuilds_when_role_map_is_cyclic_even_if_cycle_is_unused(
     old_root, _ = _install_existing_structure(
         pdf,
         role=Name.Document,
-        role_map=role_map,
+        role_map=pdf_object(role_map),
     )
 
     ensure_logical_structure(pdf)
