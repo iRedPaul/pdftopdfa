@@ -1942,6 +1942,33 @@ class TestDublinCoreMultivaluePreservation:
         assert str(pdf.docinfo["/Title"]) == "Report"
         assert str(pdf.docinfo["/Author"]) == "Alice"
 
+    @pytest.mark.parametrize("property_name", ["title", "description"])
+    @pytest.mark.parametrize("node", ["<!-- note -->", "<?app data?>"])
+    @pytest.mark.parametrize("has_default", [False, True])
+    def test_comment_in_alternative_does_not_stop_sync(
+        self, property_name, node, has_default
+    ) -> None:
+        """Non-element nodes in a copied alternative cannot break synchronization."""
+        default = '<rdf:li xml:lang="x-default">Report</rdf:li>' if has_default else ""
+        tree = _build_xmp_with_extras(
+            f"<dc:{property_name}><rdf:Alt>{node}"
+            f'<rdf:li xml:lang="de-DE">Bericht</rdf:li>{default}'
+            f"</rdf:Alt></dc:{property_name}>"
+        )
+        pdf = new_pdf()
+        pdf.add_blank_page()
+        embed_xmp_metadata(pdf, _reserialize_xmp(tree))
+        sync_metadata(pdf, "2b")
+        result = _extract_existing_xmp(pdf)
+        assert result is not None
+        assert result.xpath(
+            f"//dc:{property_name}/rdf:Alt/rdf:li/@xml:lang", namespaces=NAMESPACES
+        ) == ["x-default", "de-DE"]
+        assert self._values(result, property_name) == [
+            "Report" if has_default else "Bericht",
+            "Bericht",
+        ]
+
     def test_missing_default_adds_fallback_without_losing_translation(self) -> None:
         """Add a default language while preserving the existing translations."""
         source_tree = _build_xmp_with_extras(
@@ -4195,6 +4222,60 @@ class TestXmpNumberValidation:
         assert _is_valid_simple_value(value, "r") is valid
 
 
+class TestXmpUriValidation:
+    """URI-typed values must follow the RFC 3986 URI-reference grammar."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "file:///source%20file.pdf",
+            "https://example.org/a?b=c#d",
+            "https://user:pw@example.org:8080/p",
+            "http://192.0.2.1/",
+            "http://[::1]/",
+            "http://[2001:db8::7]:80/a",
+            "http://[v1.fe80::a+en1]/",
+            "urn:uuid:6e8bc430-9c3a-11d9-9669-0800200c9a66",
+            "mailto:a@example.org",
+            "relative/path.pdf",
+            "../up;p=1",
+            "//example.org",
+            "?query",
+            "#fragment",
+            "a:",
+        ],
+    )
+    def test_valid_references_are_accepted(self, value) -> None:
+        """Absolute URIs, IP literals and every relative form are accepted."""
+        assert _is_valid_simple_value(value, "u")
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "http://example.com/%ZZ",
+            "http://example.com/%2",
+            "http://[::g]/",
+            "http://[::1/",
+            "http://[::1]x/",
+            "http://[fe80::1%25eth0]/",
+            "http://[v1.]/",
+            "http://example.com:80a/",
+            "http://a@b@example.com/",
+            "http://exa mple.com/",
+            "1http://example.com/",
+            "C:\\folder\\file.pdf",
+            ":no-scheme",
+            "a b",
+            "a\nb",
+            "https://example.org/ä",
+            "https://example.org/#a#b",
+        ],
+    )
+    def test_invalid_references_are_rejected(self, value) -> None:
+        """Bad percent escapes, hosts, ports and characters are not URI references."""
+        assert not _is_valid_simple_value(value, "u")
+
+
 class TestLanguageTags:
     """Copied xml:lang qualifiers must be language tags, repaired where unambiguous."""
 
@@ -4537,6 +4618,53 @@ class TestInvalidRdfSyntaxIsNotCopied:
     def test_structured_container_cannot_hide_other_elements(self, prop) -> None:
         """Predefined structured containers follow the same rule."""
         result = self._copied(prop)
+        assert not result.xpath(f"//*[namespace-uri()='{self.PAGED_TEXT}']")
+
+    @pytest.mark.parametrize(
+        "body,expected",
+        [
+            ("<rdf:Seq>\n  <rdf:li>8</rdf:li>\n</rdf:Seq>", True),
+            ("<rdf:Seq><!-- note --><rdf:li>8</rdf:li></rdf:Seq>", True),
+            ("<rdf:Seq>junk<rdf:li>8</rdf:li></rdf:Seq>", False),
+            ("<rdf:Seq><rdf:li>8</rdf:li>junk</rdf:Seq>", False),
+            ("<rdf:Seq><!-- note -->junk<rdf:li>8</rdf:li></rdf:Seq>", False),
+            ("<rdf:Seq><rdf:li>8</rdf:li></rdf:Seq>junk", False),
+            ("junk<rdf:Seq><rdf:li>8</rdf:li></rdf:Seq>", False),
+        ],
+    )
+    def test_container_cannot_hold_character_data(self, body, expected) -> None:
+        """RDF containers hold only list items, so stray text must not be copied."""
+        tiff = "http://ns.adobe.com/tiff/1.0/"
+        tree = _build_xmp_with_extras(
+            f'<tiff:BitsPerSample xmlns:tiff="{tiff}">{body}</tiff:BitsPerSample>'
+        )
+        result = _parse_xmp_bytes(
+            create_xmp_metadata({}, 2, "B", existing_xmp_tree=tree)
+        )
+        assert bool(result.xpath(f"//*[namespace-uri()='{tiff}']")) is expected
+        assert b"junk" not in etree.tostring(result)
+
+    @pytest.mark.parametrize(
+        "container",
+        [
+            "<rdf:Bag>junk<rdf:li>a</rdf:li></rdf:Bag>",
+            "<rdf:Bag><rdf:li>a</rdf:li><!-- note -->junk</rdf:Bag>",
+        ],
+    )
+    def test_extension_container_cannot_hold_character_data(self, container) -> None:
+        """Declared extension arrays reject stray text as well."""
+        elem = etree.fromstring(
+            f'<c:prop xmlns:c="urn:custom" xmlns:rdf="{NAMESPACES["rdf"]}">'
+            f"{container}</c:prop>"
+        )
+        assert not _is_valid_extension_property_value(elem, "Bag Text", {})
+
+    def test_structured_container_cannot_hold_character_data(self) -> None:
+        """Text between structured list items keeps the property from being copied."""
+        result = self._copied(
+            '<xmpTPg:Fonts><rdf:Bag>junk<rdf:li rdf:parseType="Resource">'
+            "<stFnt:fontName>A</stFnt:fontName></rdf:li></rdf:Bag></xmpTPg:Fonts>"
+        )
         assert not result.xpath(f"//*[namespace-uri()='{self.PAGED_TEXT}']")
 
     def test_valid_structured_container_is_retained(self) -> None:

@@ -6,6 +6,7 @@
 
 import calendar
 import copy
+import ipaddress
 import logging
 import re
 from collections.abc import Iterator, Mapping
@@ -49,8 +50,21 @@ _XMP_DATE_RE = re.compile(
 _XMP_INTEGER_RE = re.compile(r"[+-]?\d+", re.ASCII)
 _XMP_REAL_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", re.ASCII)
 _XMP_RATIONAL_RE = re.compile(r"[+-]?\d+/[+-]?\d+", re.ASCII)
-# Characters that RFC 3986 does not allow unencoded in a URI reference.
-_XMP_URI_RE = re.compile(r"[^\s<>\"{}|\\^`]+")
+# RFC 3986 URI-reference grammar. The Appendix B expression splits a reference,
+# then each component is checked against its own production.
+_URI_SPLIT_RE = re.compile(
+    r"(?:([^:/?#]+):)?(?://([^/?#]*))?([^?#]*)(?:\?([^#]*))?(?:#(.*))?", re.DOTALL
+)
+_URI_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*", re.ASCII)
+_URI_PCT_ENCODED = r"%[0-9A-Fa-f]{2}"
+# The unreserved and sub-delims characters, as a character class body.
+_URI_PLAIN = r"A-Za-z0-9\-._~!$&'()*+,;="
+_URI_USERINFO_RE = re.compile(rf"(?:[{_URI_PLAIN}:]|{_URI_PCT_ENCODED})*", re.ASCII)
+_URI_REG_NAME_RE = re.compile(rf"(?:[{_URI_PLAIN}]|{_URI_PCT_ENCODED})*", re.ASCII)
+_URI_IPV_FUTURE_RE = re.compile(rf"v[0-9A-Fa-f]+\.[{_URI_PLAIN}:]+", re.ASCII)
+_URI_PORT_RE = re.compile(r"[0-9]*", re.ASCII)
+_URI_PATH_RE = re.compile(rf"(?:[{_URI_PLAIN}:@/]|{_URI_PCT_ENCODED})*", re.ASCII)
+_URI_QUERY_RE = re.compile(rf"(?:[{_URI_PLAIN}:@/?]|{_URI_PCT_ENCODED})*", re.ASCII)
 
 
 def _sanitize_xml_text(text: str) -> str:
@@ -1597,6 +1611,65 @@ def _has_undeclarable_structure(elem: etree._Element) -> bool:
     return False
 
 
+def _is_valid_uri_host(host: str) -> bool:
+    """Validate an RFC 3986 host: IP-literal, IPv4 address or registered name."""
+    if not host.startswith("["):
+        # A dotted IPv4 address is also a syntactically valid reg-name.
+        return _URI_REG_NAME_RE.fullmatch(host) is not None
+    if not host.endswith("]"):
+        return False
+    literal = host[1:-1]
+    if _URI_IPV_FUTURE_RE.fullmatch(literal):
+        return True
+    # RFC 3986 has no IPv6 zone identifiers, which ipaddress would accept.
+    if "%" in literal:
+        return False
+    try:
+        ipaddress.IPv6Address(literal)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_valid_uri_authority(authority: str) -> bool:
+    """Validate an RFC 3986 authority: [ userinfo "@" ] host [ ":" port ]."""
+    userinfo, at, host_port = authority.rpartition("@")
+    if at and _URI_USERINFO_RE.fullmatch(userinfo) is None:
+        return False
+    if host_port.startswith("["):
+        end = host_port.find("]") + 1
+        if not end:
+            return False
+        host, rest = host_port[:end], host_port[end:]
+        if rest and not rest.startswith(":"):
+            return False
+        port = rest[1:]
+    else:
+        host, _, port = host_port.partition(":")
+    return _is_valid_uri_host(host) and _URI_PORT_RE.fullmatch(port) is not None
+
+
+def _is_valid_uri_reference(text: str) -> bool:
+    """Validate an absolute URI or a relative reference against RFC 3986."""
+    match = _URI_SPLIT_RE.fullmatch(text)
+    if match is None:
+        return False
+    scheme, authority, path, query, fragment = match.groups()
+    if scheme is not None and _URI_SCHEME_RE.fullmatch(scheme) is None:
+        return False
+    if authority is not None and not _is_valid_uri_authority(authority):
+        return False
+    if _URI_PATH_RE.fullmatch(path) is None:
+        return False
+    # In a relative reference, a colon in the first segment would read as a scheme.
+    if scheme is None and authority is None and ":" in path.split("/", 1)[0]:
+        return False
+    return all(
+        part is None or _URI_QUERY_RE.fullmatch(part) is not None
+        for part in (query, fragment)
+    )
+
+
 def _is_valid_xmp_date(text: str) -> bool:
     """Require XMP date syntax whose components exist on the calendar and clock."""
     match = _XMP_DATE_RE.fullmatch(text)
@@ -1631,7 +1704,7 @@ def _is_valid_simple_value(text: str, type_code: str) -> bool:
     if type_code == "r":
         return _XMP_RATIONAL_RE.fullmatch(text) is not None
     if type_code == "u":
-        return _XMP_URI_RE.fullmatch(text) is not None
+        return _is_valid_uri_reference(text)
     if type_code == "d":
         return _is_valid_xmp_date(text)
     if type_code == "B":
@@ -1652,10 +1725,22 @@ def _container_items(
     children = [child for child in elem if isinstance(child.tag, str)]
     if len(children) != 1 or children[0].tag != f"{{{ns_rdf}}}{container}":
         return None
-    items = [item for item in children[0] if isinstance(item.tag, str)]
+    array = children[0]
+    # Neither the property element nor the container may hold character data of
+    # its own, which would otherwise be copied along with the subtree.
+    if _has_stray_text(elem) or _has_stray_text(array):
+        return None
+    items = [item for item in array if isinstance(item.tag, str)]
     if any(item.tag != f"{{{ns_rdf}}}li" for item in items):
         return None
     return items
+
+
+def _has_stray_text(node: etree._Element) -> bool:
+    """Report non-whitespace text directly inside node, around any child node."""
+    return bool((node.text or "").strip()) or any(
+        (child.tail or "").strip() for child in node
+    )
 
 
 def _validate_seq_items(
@@ -1680,11 +1765,7 @@ def _text_array_items(elem, ns_rdf: str, container: str):
     if len(children) != 1 or children[0].tag != f"{{{ns_rdf}}}{container}":
         return None
     array = children[0]
-    if (
-        (elem.text or "").strip()
-        or (array.text or "").strip()
-        or (array.tail or "").strip()
-    ):
+    if _has_stray_text(elem) or _has_stray_text(array):
         return None
     if any(name.startswith(f"{{{ns_rdf}}}") for name in elem.attrib) or array.attrib:
         return None
@@ -1697,7 +1778,6 @@ def _text_array_items(elem, ns_rdf: str, container: str):
             item.tag != f"{{{ns_rdf}}}li"
             or any(isinstance(child.tag, str) for child in item)
             or set(item.attrib) - {xml_lang}
-            or (item.tail or "").strip()
         ):
             return None
         items.append(item)
@@ -3107,7 +3187,13 @@ def create_xmp_metadata(
             assert alt is not None
         xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
         default = next(
-            (li for li in alt if li.get(xml_lang, "").casefold() == "x-default"),
+            (
+                li
+                for li in alt
+                # Copied comments and processing instructions have no attributes.
+                if isinstance(li.tag, str)
+                and (li.get(xml_lang) or "").casefold() == "x-default"
+            ),
             None,
         )
         if default is None:
