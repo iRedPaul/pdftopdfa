@@ -1329,6 +1329,9 @@ class TestEmbedColorProfiles:
             ("NotARegistryEntry", None),
             ("NotARegistryEntry", " "),
             ("FOGRA39 extra", None),
+            # Profile and reference names, not registered identifiers.
+            ("GRACoL2006_Coated1v2", None),
+            ("PSO Coated v3", None),
         ],
     )
     def test_additional_intent_without_a_standard_condition_is_removed(
@@ -1374,6 +1377,12 @@ class TestEmbedColorProfiles:
             ("CGATS TR 006", None),
             ("JC200103", None),
             ("JCW2003", None),
+            ("JCS2011", None),
+            ("CGATS21-2-CRPC6", None),
+            ("EUROSB104", None),
+            ("APTEC_CTV_5", None),
+            ("APTEC Coated CardBoard", None),
+            ("APTEC CCNB", None),
             ("Regional press condition", "http://www.color.org"),
         ],
     )

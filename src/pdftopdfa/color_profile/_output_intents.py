@@ -27,9 +27,16 @@ _ICC_SIGNATURE_TO_COLORSPACE: dict[bytes, tuple[int, ColorSpaceType]] = {
 # and the pipeline does not keep those for third-party extensions.
 _DEFINED_OUTPUT_INTENT_SUBTYPES = (Name.GTS_PDFA1, Name.GTS_PDFX, Name.ISO_PDFE1)
 
-# Well-known families in the ICC characterization data registry.
+# Identifier families of the ICC characterization data registry for CMYK
+# (https://registry.color.org/cmyk-registry/). Reference and profile names such as
+# GRACoL2006_Coated1v2 or "PSO Coated v3" are not registered identifiers.
 _KNOWN_CONDITION_RE = re.compile(
-    r"(?:FOGRA|IFRA)\s*\d+|CGATS\s*TR\s*\d+|JC[A-Z]*\s*\d+",
+    r"(?:FOGRA|IFRA)\s*\d+"
+    r"|CGATS\s*TR\s*\d+"
+    r"|CGATS\s*21-2-CRPC\d+"
+    r"|JC[A-Z]*\s*\d+"
+    r"|EUROSB\s*\d+"
+    r"|APTEC(?:_CTV_\d+|\s+Coated\s+CardBoard|\s+CCNB)",
     re.ASCII | re.IGNORECASE,
 )
 
@@ -124,10 +131,10 @@ def prepare_existing_output_intents(pdf: Pdf) -> OutputIntentPreparation:
                 keep_existing=False,
                 reason="OutputIntent dictionary has missing or malformed fields",
             )
-        if subtype == Name("/GTS_PDFX"):
-            if "/DestOutputProfileRef" in intent:
-                del intent["/DestOutputProfileRef"]
-                logger.debug("Removed DestOutputProfileRef from PDF/X OutputIntent")
+        # ISO 19005-2, 6.2.3 forbids this ISO 15930-7 key in PDF/X intents only.
+        if subtype == Name.GTS_PDFX and "/DestOutputProfileRef" in intent:
+            del intent["/DestOutputProfileRef"]
+            logger.debug("Removed DestOutputProfileRef from PDF/X OutputIntent")
         # DestOutputProfile is optional for non-PDF/A intents only if they name a
         # standard production condition (ISO 32000-1, Table 365). Rule 6.2.3-2
         # constrains the entries that actually contain an embedded profile.
