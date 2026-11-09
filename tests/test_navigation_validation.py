@@ -1440,6 +1440,60 @@ def test_thread_action_into_another_file_is_kept(target):
     assert pdf.Root.OpenAction.D == target and pdf.Root.OpenAction.B == 3
 
 
+@pytest.mark.parametrize(
+    "file,kept",
+    [
+        ("other.pdf", True),
+        ("filespec", True),
+        ("unicode", True),
+        ("indirect", True),
+        ("", False),
+        (42, False),
+        (Name.Other, False),
+        (Array([String("other.pdf")]), False),
+        ("empty", False),
+        ("wrong-type", False),
+        ("name-entry", False),
+    ],
+)
+@pytest.mark.parametrize("target", [7, "Elsewhere", "thread"])
+def test_thread_action_file_must_be_a_file_specification(target, file, kept):
+    """Table 205, 7.11: /F is a file specification string or dictionary.
+
+    Its presence alone does not make the destination a thread in another file,
+    so an action whose /F is not a file specification is removed.
+    """
+    pdf = new_pdf()
+    thread, _, _ = _article(pdf)
+    specs = {
+        "filespec": Dictionary(Type=Name.Filespec, F="other.pdf"),
+        "unicode": Dictionary(UF="other.pdf"),
+        "indirect": pdf.make_indirect(Dictionary(Type=Name.Filespec, F="other.pdf")),
+        "empty": Dictionary(),
+        "wrong-type": Dictionary(Type=Name.EmbeddedFile, F="other.pdf"),
+        "name-entry": Dictionary(Type=Name.Filespec, F=Name.Other),
+    }
+    action = Dictionary(S=Name.Thread, D=thread if target == "thread" else target)
+    action.F = specs.get(file, file) if isinstance(file, str) else file
+    pdf.Root.OpenAction = action
+    assert remove_forbidden_catalog_entries(pdf) == (0 if kept else 1)
+    assert ("/OpenAction" in pdf.Root) == kept
+
+
+@pytest.mark.parametrize("target,kept", [(0, True), ("Article", True), (1, False)])
+def test_thread_action_with_a_null_file_is_in_the_current_file(target, kept):
+    """A null /F is an absent /F, so the destination is checked in this file."""
+    from pikepdf import Object
+
+    pdf = new_pdf()
+    _article(pdf)
+    action = Object.parse(b"<< /S /Thread /F null >>")
+    action.D = target
+    pdf.Root.OpenAction = action
+    assert remove_forbidden_catalog_entries(pdf) == (0 if kept else 1)
+    assert ("/OpenAction" in pdf.Root) == kept
+
+
 def test_thread_dictionary_with_a_file_specification_is_checked():
     """A thread dictionary is in the current file whatever /F says (Table 205)."""
     pdf = new_pdf()

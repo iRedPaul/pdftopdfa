@@ -20,6 +20,7 @@ from .files import _is_filespec, _iter_name_tree_pairs
 logger = logging.getLogger(__name__)
 
 _THREAD = Name.Thread
+_FILE_NAME_KEYS = ("/F", "/UF", "/DOS", "/Mac", "/Unix")
 
 
 # ISO 32000-1, 7.9.4: D:YYYYMMDDHHmmSSOHH'mm. Each field may be present only
@@ -699,6 +700,27 @@ def _repair_page_beads(pdf: Pdf, beads: dict[tuple[int, int], tuple]) -> int:
     return repaired
 
 
+def _is_file_reference(value) -> bool:
+    """Check that a value is a file specification naming a file (7.11).
+
+    A file specification is a string or a dictionary (7.11.1). The dictionary
+    names the file by /F, /UF or the deprecated /DOS, /Mac and /Unix strings, at
+    least one of which is required without embedded file streams (Table 44);
+    its optional /Type is /Filespec.
+    """
+    if isinstance(value, String):
+        return len(bytes(value)) > 0
+    if not isinstance(value, Dictionary):
+        return False
+    keys = value.keys()
+    if "/Type" in keys and value["/Type"] != Name.Filespec:
+        return False
+    return any(
+        key in keys and isinstance(value[key], String) and len(bytes(value[key])) > 0
+        for key in _FILE_NAME_KEYS
+    )
+
+
 def _thread_action_filter(pdf: Pdf, found: dict):
     """Return a check that rejects Thread actions without a valid destination.
 
@@ -707,8 +729,9 @@ def _thread_action_filter(pdf: Pdf, found: dict):
     array, or by the title of its thread information dictionary, the first
     thread of the catalog array with that title being used. With a file
     specification (/F) only the dictionary form refers to the current file; an
-    index or a title in another file is not checked. An action whose destination
-    is missing, of another type, out of range, or not a valid thread is rejected.
+    index or a title in another file is not checked. A null /F is an absent one,
+    and an action whose /F is not a file specification, or whose destination is
+    missing, of another type, out of range, or not a valid thread, is rejected.
     The optional bead (/B), a bead dictionary of that thread or its index in the
     thread, is removed if it is neither, so that the action opens the thread at
     its first bead. In another file the bead can only be an index (a bead
@@ -735,11 +758,15 @@ def _thread_action_filter(pdf: Pdf, found: dict):
         if "/S" not in keys or action["/S"] != _THREAD:
             return False
         target = action["/D"] if "/D" in keys else None
+        file = action["/F"] if "/F" in keys else None
+        if file is not None and not _is_file_reference(file):
+            logger.warning("Removed a Thread action with an invalid file specification")
+            return True
         if isinstance(target, Dictionary):
             thread_id = target.objgen if target.objgen in found else None
         elif isinstance(target, bool) or not isinstance(target, (int, String)):
             thread_id = None
-        elif "/F" in keys:
+        elif file is not None:
             # The bead of a thread in another file can only be its index; the
             # dictionary form requires the thread to be in the current file.
             bead = action["/B"] if "/B" in keys else None
