@@ -640,3 +640,137 @@ def test_article_rejects_nonreciprocal_links(key):
     with pytest.raises(ConversionError, match="inconsistent next/previous links"):
         remove_forbidden_catalog_entries(pdf)
     assert first.N.objgen == second.objgen
+
+
+def _malformed_kid(pdf, kind):
+    """Build one /Kids entry that is not a name-tree node dictionary."""
+    return {
+        "integer": lambda: 42,
+        "null": lambda: None,
+        "name": lambda: Name.Bad,
+        "string": lambda: "not a node",
+        "array": lambda: Array([1, 2]),
+        "nested array": lambda: Array([Dictionary(Names=Array(["x.txt", 1]))]),
+        "indirect integer": lambda: pdf.make_indirect(42),
+        "indirect array": lambda: pdf.make_indirect(Array([1, 2])),
+        "stream": lambda: pdf.make_stream(b"not a node"),
+    }[kind]()
+
+
+_MALFORMED_KIDS = [
+    "integer",
+    "null",
+    "name",
+    "string",
+    "array",
+    "nested array",
+    "indirect integer",
+    "indirect array",
+    "stream",
+]
+
+
+@pytest.mark.parametrize("kind", _MALFORMED_KIDS)
+def test_portfolio_tolerates_malformed_name_tree_children(kind):
+    """A /Kids entry that is no node is skipped instead of aborting the repair."""
+    pdf = new_pdf()
+    spec = _portfolio(pdf, Dictionary(Good=Dictionary(Subtype=Name.S, N="Good")))
+    pdf.Root.Names.EmbeddedFiles.Kids.append(_malformed_kid(pdf, kind))
+    pdf.Root.Collection.D = "a.txt"
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert str(pdf.Root.Collection.D) == "a.txt"
+    assert str(spec.CI.Good) == "keep" and "/Foo" not in spec.CI
+
+
+def _spec_placeholder(pdf, value, spec):
+    """Rebuild a parametrized tree, putting the file specification at "SPEC"."""
+    if isinstance(value, list | Array):
+        return Array([_spec_placeholder(pdf, item, spec) for item in value])
+    if isinstance(value, dict | Dictionary):
+        return Dictionary(
+            {key: _spec_placeholder(pdf, item, spec) for key, item in value.items()}
+        )
+    return spec if value == "SPEC" else value
+
+
+@pytest.mark.parametrize(
+    "embedded,kept",
+    [
+        # Odd length: the trailing key has no value.
+        ({"/Names": ["a.txt", "SPEC", "orphan"]}, True),
+        # Keys that are not strings are skipped with their values.
+        ({"/Names": [42, "SPEC", Name.Bad, "SPEC", "a.txt", "SPEC"]}, True),
+        ({"/Names": [Name("/a.txt"), "SPEC"]}, False),
+        # /Names and /Kids values of the wrong type.
+        ({"/Names": {"/A": 1}, "/Kids": [{"/Names": 7}]}, False),
+        ({"/Names": "a.txt", "/Kids": 42}, False),
+        ({"/Kids": [{"/Kids": Name.Bad}, {"/Names": ["a.txt", "SPEC"]}]}, True),
+        # A single node given as /Kids is accepted like the normalization does.
+        ({"/Kids": {"/Names": ["a.txt", "SPEC"]}}, True),
+    ],
+)
+def test_portfolio_tolerates_malformed_name_tree_leaves(embedded, kept):
+    """Malformed /Names and /Kids values are skipped like the later normalization.
+
+    Only a string key paired with a file specification names the initial document.
+    """
+    pdf = new_pdf()
+    pdf.add_blank_page()
+    spec = pdf.make_indirect(Dictionary(Type=Name.Filespec, F="a.txt", UF="a.txt"))
+    pdf.Root.Names = Dictionary(EmbeddedFiles=_spec_placeholder(pdf, embedded, spec))
+    pdf.Root.Collection = Dictionary(D="a.txt", View=Name.D)
+    remove_forbidden_catalog_entries(pdf)
+    assert ("/D" in pdf.Root.Collection) is kept
+    assert pdf.Root.Collection.View == Name.D
+
+
+def test_portfolio_tolerates_cyclic_name_tree():
+    """Cyclic /Kids terminate, and the files reached before the cycle still count."""
+    pdf = new_pdf()
+    _portfolio(pdf, None)
+    root = pdf.make_indirect(pdf.Root.Names.EmbeddedFiles)
+    pdf.Root.Names.EmbeddedFiles = root
+    root.Kids.append(root)
+    root.Kids[0].Kids = Array([root, root.Kids[0]])
+    pdf.Root.Collection.D = "a.txt"
+    remove_forbidden_catalog_entries(pdf)
+    assert str(pdf.Root.Collection.D) == "a.txt"
+
+
+@pytest.mark.parametrize("kind", ["integer", "null", "indirect array"])
+def test_sanitizing_portfolio_discards_malformed_name_tree_children(kind):
+    """The full pipeline keeps the portfolio and flattens away the malformed child.
+
+    PDF/A-3 keeps the attachment, which PDF/A-2 would discard with its /D entry.
+    """
+    pdf = new_pdf()
+    spec = _portfolio(pdf, Dictionary(Good=Dictionary(Subtype=Name.S, N="Good")))
+    pdf.Root.Names.EmbeddedFiles.Kids.append(_malformed_kid(pdf, kind))
+    pdf.Root.Collection.D = "a.txt"
+    sanitize_for_pdfa(pdf, level="3b")
+    embedded = pdf.Root.Names.EmbeddedFiles
+    assert "/Kids" not in embedded
+    assert [str(key) for key in embedded.Names[::2]] == ["a.txt"]
+    assert str(pdf.Root.Collection.D) == "a.txt"
+    assert str(spec.CI.Good) == "keep"
+
+
+def test_conversion_of_portfolio_with_malformed_name_tree_child(tmp_path):
+    """A malformed /EmbeddedFiles child no longer aborts the conversion."""
+    from pikepdf import Pdf
+
+    pdf = new_pdf()
+    _portfolio(pdf, Dictionary(Good=Dictionary(Subtype=Name.S, N="Good")))
+    kids = pdf.Root.Names.EmbeddedFiles.Kids
+    kids.append(42)
+    kids.append(pdf.make_indirect(Array([1, 2])))
+    pdf.Root.Collection.D = "a.txt"
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    result = convert_to_pdfa(source, output, level="3b")
+    assert result.target_produced and not result.skipped, result
+    with Pdf.open(output) as converted:
+        embedded = converted.Root.Names.EmbeddedFiles
+        assert [str(key) for key in embedded.Names[::2]] == ["a.txt"]
+        assert str(converted.Root.Collection.D) == "a.txt"
+        assert str(embedded.Names[1].CI.Good) == "keep"

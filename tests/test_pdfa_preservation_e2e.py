@@ -451,6 +451,47 @@ def test_full_conversion_keeps_collection_items_without_a_schema(tmp_path):
         assert str(filespec.CI.Note) == "kept"
 
 
+def test_full_conversion_keeps_portfolio_with_malformed_name_tree_children(
+    tmp_path,
+):
+    """Malformed /EmbeddedFiles children are discarded without losing the portfolio.
+
+    The missing /AFRelationship makes the source nonconforming, so the conversion
+    runs the sanitizers rather than keeping the source unchanged.
+    """
+    pdf = _document("3b")
+    embedded = pdf.make_stream(b"text", Type=Name.EmbeddedFile)
+    embedded[Name.Subtype] = Name("/text/plain")
+    embedded.Params = Dictionary(ModDate="D:20240101000000Z", Size=4)
+    spec = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Filespec,
+            F="a.txt",
+            UF="a.txt",
+            Desc="Attachment",
+            EF=Dictionary(F=embedded, UF=embedded),
+            CI=pdf.make_indirect(Dictionary(Type=Name.CollectionItem, Note="kept")),
+        )
+    )
+    leaf = pdf.make_indirect(Dictionary(Names=Array(["a.txt", spec])))
+    kids = Array([leaf, 42, None, pdf.make_indirect(Array([1, 2])), Name.Bad])
+    pdf.Root.Names = Dictionary(EmbeddedFiles=pdf.make_indirect(Dictionary(Kids=kids)))
+    pdf.Root.Collection = Dictionary(Type=Name.Collection, View=Name.D, D="a.txt")
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source, force_version="1.7")
+
+    result = convert_to_pdfa(source, output, level="3b", validate=True)
+    assert result.target_produced and not result.skipped, result
+    assert not result.validation_failed, result
+    with pikepdf.open(output) as restored:
+        tree = restored.Root.Names.EmbeddedFiles
+        assert "/Kids" not in tree
+        assert [str(key) for key in tree.Names[::2]] == ["a.txt"]
+        assert str(tree.Names[1].CI.Note) == "kept"
+        assert str(restored.Root.Collection.D) == "a.txt"
+        assert restored.Root.AF[0].AFRelationship == Name.Unspecified
+
+
 @pytest.mark.parametrize("source_level,target_level", [("2b", "3b"), ("3b", "2b")])
 def test_full_conversion_repairs_xmp_language_tags(
     source_level, target_level, tmp_path
