@@ -1682,8 +1682,8 @@ class TestFixAnnotationOpacity:
             (Name.bad, 1.0),
             (True, 1.0),
             (False, 1.0),
-            (Array([0.4]), 1.0),
-            (Dictionary(), 1.0),
+            ([0.4], 1.0),
+            ({}, 1.0),
         ],
     )
     def test_malformed_opacity_repaired(self, make_pdf_with_page, ca_value, expected):
@@ -1694,7 +1694,7 @@ class TestFixAnnotationOpacity:
                 Type=Name.Annot,
                 Subtype=Name.Link,
                 Rect=Array([0, 0, 100, 100]),
-                CA=ca_value,
+                CA=pdf_object(ca_value),
             )
         )
         pdf.pages[0].Annots = Array([annot])
