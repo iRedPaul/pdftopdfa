@@ -18,6 +18,7 @@ from pdftopdfa.sanitizers import sanitize_for_pdfa
 from pdftopdfa.sanitizers.structure_limits import (
     _operands_contain_parse_placeholders,
     _sanitize_operand,
+    normalize_number,
     sanitize_structure_limits,
 )
 
@@ -424,12 +425,69 @@ class TestStructureLimitsSanitizer:
         assert float(Decimal(pdf.Root["/AtLimit"])) == _max_float
 
         # Content stream operands are also detected and counted.
-        # Note: we do not re-parse the stream after sanitization because
-        # float64 values near 3.403e+38 are exact integers and pikepdf
-        # serializes them without a decimal point, causing a 64-bit
-        # integer overflow on re-parse. The counter is the reliable signal.
         # At least 4 fixes: 2 object-graph + 2 content-stream operands
         assert result["reals_normalized"] >= 4
+
+    def test_clamped_reals_are_written_as_readable_reals(self) -> None:
+        """A clamped real is written with its decimal point and reads back.
+
+        pikepdf writes a Decimal through a C double without a trailing ".0", which
+        made the limit the integer 340299999999999993642572978492905881600. QPDF
+        cannot read that token, so the page that held it was lost on reopening.
+        """
+        huge = b"1" + b"0" * 400 + b".0"
+        pdf = _make_page_pdf(huge + b" w -" + huge + b" g")
+        pdf.pages[0].obj[Name("/Huge")] = pikepdf.Object.parse(
+            b"[" + huge + b" -" + huge + b"]"
+        )
+
+        assert sanitize_structure_limits(pdf)["reals_normalized"] == 4
+
+        written = pdf.pages[0].obj.Huge.unparse()
+        assert written == (
+            b"[ 340300000000000000000000000000000000000.0"
+            b" -340300000000000000000000000000000000000.0 ]"
+        )
+        buffer = BytesIO()
+        pdf.save(buffer)
+        with Pdf.open(BytesIO(buffer.getvalue())) as reopened:
+            page = reopened.pages[0]
+            limit = Decimal("3.403e38")
+            assert list(page.obj.Huge) == [limit, -limit]
+            operands = [
+                instruction.operands[0]
+                for instruction in pikepdf.parse_content_stream(page)
+            ]
+            assert operands == [limit, -limit]
+            # Normalizing the written values again changes nothing.
+            assert sanitize_structure_limits(reopened)["reals_normalized"] == 0
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (Decimal("3.403e38"), Decimal("3.403e38")),
+            (Decimal("-3.403e38"), Decimal("-3.403e38")),
+            # Beyond the limit only in the 31st significant digit, which abs()
+            # rounds away at the 28 digits of the default context.
+            (Decimal("3.4030000000000000000000000000001e38"), Decimal("3.403e38")),
+            (Decimal("-3.4030000000000000000000000000001e38"), Decimal("-3.403e38")),
+            (Decimal("1.175e-38"), Decimal("1.175e-38")),
+            (Decimal("-1.175e-38"), Decimal("-1.175e-38")),
+            (Decimal("1.1749999999999999999999999999999e-38"), Decimal("0")),
+            (Decimal("-1.1749999999999999999999999999999e-38"), Decimal("0")),
+            # An exponent beyond the context, for which abs() raises Overflow.
+            (Decimal("1e1000000"), Decimal("3.403e38")),
+            (Decimal("1e-1000000"), Decimal("0")),
+            (Decimal("Infinity"), Decimal("3.403e38")),
+            (2**31, 2**31 - 1),
+            (-(2**31) - 1, -(2**31)),
+        ],
+    )
+    def test_normalize_number_compares_exactly(self, value, expected) -> None:
+        """Real limits are compared exactly, so values just beyond them change."""
+        result = normalize_number(value)
+        assert result == expected
+        assert type(result) is type(expected)
 
     def test_remaps_used_cmap_cid_overflow_to_notdef(self) -> None:
         pdf = new_pdf()

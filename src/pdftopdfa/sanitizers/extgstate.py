@@ -292,10 +292,18 @@ def _function_number(value) -> int | float | None:
     as for a Domain [1e-40 1] of { ln }, while the written function is undefined.
     Normalizing again is a no-op, so the result is the same if that pass already
     ran. Integers stay integers; reals are returned as floats.
+
+    The value is normalized before any conversion to float. A finite real beyond
+    the float range, such as a literal of hundreds of digits, converts to inf, but
+    it is written as +-3.403e38; so is a real that pikepdf holds as infinity (an
+    out-of-range Decimal assigned from Python is written as "inf"). Only NaN has no
+    written value. Every normalized real is finite and converts to a float within
+    the real limit, and float rounding is monotonic, so a value at a limit stays
+    at the float limit (MAX_REAL_MAGNITUDE).
     """
     if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
         return None
-    if not isinstance(value, int) and not math.isfinite(value):
+    if value.is_nan() if isinstance(value, Decimal) else value != value:
         return None
     value = normalize_number(value)
     return value if isinstance(value, int) else float(value)
@@ -487,19 +495,36 @@ def _fold_calculator_operator(operator: str, operands: list):
     return None
 
 
+def _calculator_literal(token: bytes) -> int | float | None:
+    """Read a calculator number literal as a conforming reader does, or None.
+
+    structure_limits rewrites number objects and content streams, but not the
+    literals of a calculator stream, so a literal is written as it is. Unlike a
+    dictionary parameter, a literal beyond the real limit is therefore not clamped
+    but out of range, and it is rejected. The literal is read exactly as a Decimal,
+    since float() reads hundreds of digits as inf and int() refuses thousands of
+    them, and compared with the limits by normalize_number(): a literal it clamps
+    is out of range, while one it sets to 0 is below 1.175e-38 in magnitude, which
+    a conforming reader also reads as 0 (ISO 32000-1, Table C.1).
+    """
+    number = Decimal(token.decode("ascii"))
+    if re.fullmatch(rb"[+-]?\d+", token) and (
+        _CALCULATOR_MIN_INTEGER <= number <= _CALCULATOR_MAX_INTEGER
+    ):
+        return int(number)
+    # A real, or an integer literal beyond the implementation limit, read as a real.
+    normalized = normalize_number(number)
+    if normalized != number and normalized != 0:
+        return None
+    return float(normalized)
+
+
 def _apply_calculator_operator(token: bytes, stack: list) -> bool:
     """Apply one number or non-conditional operator to an abstract operand stack."""
     operator = token.decode("latin-1")
     if operator not in _CALCULATOR_OPERATORS:
-        text = token.decode("ascii")
-        value = int(text) if re.fullmatch(r"[+-]?\d+", text) else float(text)
-        if isinstance(value, int) and not (
-            _CALCULATOR_MIN_INTEGER <= value <= _CALCULATOR_MAX_INTEGER
-        ):
-            # An integer literal beyond the implementation limit is read as a real.
-            value = float(value)
-        if not _function_real(value):
-            # float() reads a literal of hundreds of digits as inf without raising.
+        value = _calculator_literal(token)
+        if value is None:
             return False
         stack.append(value)
         return True
@@ -648,7 +673,9 @@ def _calculator_literals(block: list) -> set[float]:
         if isinstance(item, list):
             literals |= _calculator_literals(item)
         elif item.decode("latin-1") not in _CALCULATOR_OPERATORS:
-            literals.add(float(item))
+            value = _calculator_literal(item)
+            if value is not None:
+                literals.add(float(value))
     return literals
 
 
@@ -783,7 +810,9 @@ def _check_scalar_transfer_function(function, ancestors, validated: dict) -> boo
             return False
         if kind == 4:
             # structure_limits rewrites number objects and content streams, not
-            # the literals of a calculator stream, so these are read as they are.
+            # the literals of a calculator stream, so these are read as they are:
+            # a literal beyond the real limit is rejected rather than clamped
+            # (_calculator_literal()), unlike the dictionary parameters above.
             return _is_scalar_calculator(data, domain)
         size = _function_numbers(function.get("/Size"), 1)
         bits = _function_integer(function.get("/BitsPerSample"))

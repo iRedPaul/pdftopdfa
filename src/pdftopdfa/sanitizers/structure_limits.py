@@ -196,9 +196,12 @@ def _sanitize_real(value: Any) -> tuple[Any, bool]:
     Overflow  (abs > 3.403e+38): clamp to ±3.403e+38.
     """
     if isinstance(value, Decimal):
-        if value != 0 and abs(value) < _MIN_REAL_MAGNITUDE:
+        # copy_abs() is exact. abs() rounds to the 28 digits of the context, so a
+        # value just beyond a limit would pass, and it raises for a huge exponent.
+        magnitude = value.copy_abs()
+        if value != 0 and magnitude < _MIN_REAL_MAGNITUDE:
             return Decimal("0"), True
-        if abs(value) > _MAX_REAL_MAGNITUDE:
+        if magnitude > _MAX_REAL_MAGNITUDE:
             return (_MAX_REAL_MAGNITUDE if value > 0 else -_MAX_REAL_MAGNITUDE), True
         return value, False
     if isinstance(value, float):
@@ -214,6 +217,23 @@ def _sanitize_real(value: Any) -> tuple[Any, bool]:
 
 # The largest real magnitude of ISO 32000-1, Table C.1, as a float.
 MAX_REAL_MAGNITUDE = float(_MAX_REAL_MAGNITUDE)
+_MAX_REAL_TEXT = b"340300000000000000000000000000000000000.0"
+
+
+def _real_object(value: Any) -> Any:
+    """Return a real replacement of _sanitize_real() in a form written as a real.
+
+    pikepdf writes a Decimal or float through a C double and drops a trailing
+    ".0", so the clamped limit would be written as the integer token
+    340299999999999993642572978492905881600. That is beyond the integer limits,
+    and QPDF cannot read it back, so the object that holds it is lost. A real
+    parsed from its text keeps that text. The only other replacement, 0, is
+    written as it is.
+    """
+    if value == 0:
+        return value
+    with pikepdf.explicit_conversion():
+        return pikepdf.Object.parse((b"-" if value < 0 else b"") + _MAX_REAL_TEXT)
 
 
 def normalize_number(value: Any) -> Any:
@@ -276,7 +296,7 @@ def _sanitize_operand(value: Any, stats: dict[str, int]) -> tuple[Any, bool]:
         if _INT_MIN <= value <= _INT_MAX:
             return value, False
     elif value_type is Decimal:
-        if value == 0 or _MIN_REAL_MAGNITUDE <= abs(value) <= _MAX_REAL_MAGNITUDE:
+        if value == 0 or _MIN_REAL_MAGNITUDE <= value.copy_abs() <= _MAX_REAL_MAGNITUDE:
             return value, False
     result = _resolve(value)
     changed = False
@@ -313,6 +333,7 @@ def _sanitize_operand(value: Any, stats: dict[str, int]) -> tuple[Any, bool]:
                     replacement, item_changed = _sanitize_real(current)
                     if item_changed:
                         stats["reals_normalized"] += 1
+                        replacement = _real_object(replacement)
 
         if item_changed:
             if parent is None:
@@ -912,6 +933,7 @@ def _sanitize_object_graph(
                     replacement, real_changed = _sanitize_real(replacement)
                     if real_changed:
                         stats["reals_normalized"] += 1
+                        replacement = _real_object(replacement)
 
         if parent is None:
             result = replacement

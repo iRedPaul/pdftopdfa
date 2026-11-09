@@ -4,6 +4,8 @@
 
 """Tests for Extended Graphics State sanitization for PDF/A compliance."""
 
+import math
+from decimal import Decimal
 from io import BytesIO
 from unittest.mock import patch
 
@@ -1261,6 +1263,22 @@ class TestSoftMaskValidation:
     # assigned from Python is rounded to 0 before it reaches the file.
     _TINY = b"0." + b"0" * 39 + b"1"
     _IDENTITY = b"<< /FunctionType 2 /Domain [0 1] /N 1 >>"
+    # Placeholders of the case texts, replaced in this order. HUGE and VAST are
+    # finite reals beyond the float range, which float() reads as inf; LIMIT is
+    # the largest real and BEYOND exceeds it in the 31st significant digit.
+    _LIMIT = b"340300000000000000000000000000000000000.0"
+    _PLACEHOLDERS = (
+        (b"ID", _IDENTITY),
+        (b"TINY", _TINY),
+        (b"HUGE", b"1" + b"0" * 400 + b".0"),
+        (b"VAST", b"2" + b"0" * 400 + b".0"),
+        (b"BEYOND", _LIMIT + b"0" * 30 + b"1"),
+        (b"LIMIT", _LIMIT),
+        # The largest integer that QPDF reads; it rejects longer ones.
+        (b"INT64", b"9223372036854775807"),
+        # More digits than int() converts from text.
+        (b"DIGITS", b"9" * 5000),
+    )
     _NORMALIZED_DICTIONARIES = {
         # Bounds [0] once written, violating Domain0 < Bounds0 (7.10.4).
         "first_bound": b"<< /FunctionType 3 /Domain [0 1] /Functions [ID ID]"
@@ -1278,6 +1296,41 @@ class TestSoftMaskValidation:
         b" /C0 [TINY] /C1 [-TINY] >>",
         "subnormal_encode": b"<< /FunctionType 3 /Domain [0 1] /Functions [ID ID]"
         b" /Bounds [0.5] /Encode [TINY 1 0 -TINY] >>",
+        # Domain [0 3.403e38] once written, which halves inputs in [0, 1].
+        "huge_domain": b"<< /FunctionType 2 /Domain [0 HUGE] /N 1 /C1 [0.5] >>",
+        "huge_negative_domain": b"<< /FunctionType 2 /Domain [-HUGE 0] /N 1 >>",
+        # (3.403e38)^2 exceeds the real limit at the written upper end.
+        "huge_squared_domain": b"<< /FunctionType 2 /Domain [0 HUGE] /N 2 >>",
+        "huge_coefficients": b"<< /FunctionType 2 /Domain [0 1] /N 1"
+        b" /C0 [-HUGE] /C1 [0] >>",
+        "huge_range": b"<< /FunctionType 2 /Domain [0 1] /Range [-HUGE HUGE] /N 1 >>",
+        "huge_stitching": b"<< /FunctionType 3 /Domain [0 HUGE] /Functions [ID ID]"
+        b" /Bounds [1] /Encode [0 HUGE -HUGE 1] >>",
+        # Bounds [3.403e38] once written, beyond Domain1.
+        "huge_bound": b"<< /FunctionType 3 /Domain [0 1] /Functions [ID ID]"
+        b" /Bounds [HUGE] /Encode [0 1 0 1] >>",
+        # Bounds0 exceeds Domain1, but both become 3.403e38, a permitted
+        # final interval of zero width.
+        "clamped_final_bound": b"<< /FunctionType 3 /Domain [-HUGE HUGE]"
+        b" /Functions [ID ID] /Bounds [VAST] /Encode [0 1 0 1] >>",
+        "limit_domain": b"<< /FunctionType 2 /Domain [-LIMIT LIMIT] /N 1 >>",
+        "beyond_limit_domain": b"<< /FunctionType 2 /Domain [0 BEYOND] /N 1 >>",
+        # Domain [-2147483648 2147483647] once written.
+        "huge_integer_domain": b"<< /FunctionType 2 /Domain [-INT64 INT64] /N 1 >>",
+        # N 2147483647 once written, which keeps 1^N within the limit.
+        "huge_integer_exponent": b"<< /FunctionType 2 /Domain [0 1] /N INT64 >>",
+        "huge_integer_exponent_overflow": b"<< /FunctionType 2 /Domain [0 2]"
+        b" /N INT64 >>",
+        # -0 is 0, which a non-integer N permits and a negative N does not.
+        "negative_zero_domain": b"<< /FunctionType 2 /Domain [-0.0 1] /N 0.5 >>",
+        "negative_zero_exponent": b"<< /FunctionType 2 /Domain [-0.0 1] /N -1 >>",
+    }
+    _NORMALIZED_SAMPLED = {
+        "huge_sampled": b"<< /FunctionType 0 /Domain [-HUGE HUGE] /Range [0 HUGE]"
+        b" /Size [2] /BitsPerSample 8 /Encode [0 HUGE] /Decode [-HUGE HUGE] >>",
+        # Size [2147483647] once written, for which two bytes are too few.
+        "huge_sampled_size": b"<< /FunctionType 0 /Domain [0 1] /Range [0 1]"
+        b" /Size [INT64] /BitsPerSample 8 >>",
     }
     _NORMALIZED_CALCULATORS = {
         # Domain [0 1] once written, where { ln } is undefined at 0.
@@ -1285,26 +1338,50 @@ class TestSoftMaskValidation:
         # Domain [2147483647 2147483647] once written, where the program is
         # undefined, although it is defined at every original input.
         "clamped_domain": (b"[4294967296 4294967297]", b"{ 2147483648 sub ln }"),
+        # The Domain is a dictionary parameter, written as [0 3.403e38].
+        "huge_calculator_domain": (b"[0 HUGE]", b"{ 2 div }"),
+        "huge_calculator_overflow": (b"[0 HUGE]", b"{ dup mul }"),
+        # structure_limits does not rewrite calculator literals, so these stay
+        # beyond the real limit in the output.
+        "huge_calculator_literal": (b"[0 1]", b"{ HUGE pop }"),
+        "long_integer_literal": (b"[0 1]", b"{ DIGITS pop }"),
+        "beyond_limit_literal": (b"[0 1]", b"{ BEYOND pop }"),
+        "limit_literal": (b"[0 1]", b"{ LIMIT mul }"),
+        # A reader takes the literal as 0, so { ln } is undefined at 0.
+        "tiny_literal": (b"[0 1]", b"{ TINY add ln }"),
+        "tiny_literal_offset": (b"[1 2]", b"{ TINY add ln }"),
     }
 
     @classmethod
     def _normalized_transfer(cls, pdf: Pdf, case: str):
         """Create a transfer function whose verdict depends on number normalization.
 
-        sanitize_structure_limits() sets a real below 1.175e-38 in magnitude to 0
-        and clamps integers to the 32-bit limits, so the validator must decide on
-        the values that pass writes, not on the original ones.
+        sanitize_structure_limits() sets a real below 1.175e-38 in magnitude to 0,
+        clamps reals to +-3.403e38 and clamps integers to the 32-bit limits, so the
+        validator must decide on the values that pass writes, not on the original
+        ones. The numbers are parsed from text: pikepdf rounds a Decimal assigned
+        from Python through a C double.
         """
+
+        def substitute(text: bytes) -> bytes:
+            for placeholder, value in cls._PLACEHOLDERS:
+                text = text.replace(placeholder, value)
+            return text
+
         if case in cls._NORMALIZED_CALCULATORS:
             domain, program = cls._NORMALIZED_CALCULATORS[case]
-            transfer = pdf.make_stream(program)
+            transfer = pdf.make_stream(substitute(program))
             transfer.FunctionType = 4
-            transfer.Domain = pikepdf.Object.parse(domain.replace(b"TINY", cls._TINY))
+            transfer.Domain = pikepdf.Object.parse(substitute(domain))
             transfer.Range = Array([-100, 100])
             return transfer
-        text = cls._NORMALIZED_DICTIONARIES[case]
-        text = text.replace(b"ID", cls._IDENTITY).replace(b"TINY", cls._TINY)
-        return pikepdf.Object.parse(text)
+        if case in cls._NORMALIZED_SAMPLED:
+            transfer = pdf.make_stream(b"\x00\xff")
+            text = substitute(cls._NORMALIZED_SAMPLED[case])
+            for key, value in pikepdf.Object.parse(text).items():
+                transfer[key] = value
+            return transfer
+        return pikepdf.Object.parse(substitute(cls._NORMALIZED_DICTIONARIES[case]))
 
     _NORMALIZATION_CASES = [
         ("calculator_domain", False),
@@ -1316,6 +1393,31 @@ class TestSoftMaskValidation:
         ("fractional_exponent_domain", True),
         ("subnormal_coefficients", True),
         ("subnormal_encode", True),
+        ("huge_domain", True),
+        ("huge_negative_domain", True),
+        ("huge_squared_domain", False),
+        ("huge_coefficients", True),
+        ("huge_range", True),
+        ("huge_stitching", True),
+        ("huge_bound", False),
+        ("clamped_final_bound", True),
+        ("limit_domain", True),
+        ("beyond_limit_domain", True),
+        ("huge_integer_domain", True),
+        ("huge_integer_exponent", True),
+        ("huge_integer_exponent_overflow", False),
+        ("negative_zero_domain", True),
+        ("negative_zero_exponent", False),
+        ("huge_sampled", True),
+        ("huge_sampled_size", False),
+        ("huge_calculator_domain", True),
+        ("huge_calculator_overflow", False),
+        ("huge_calculator_literal", False),
+        ("long_integer_literal", False),
+        ("beyond_limit_literal", False),
+        ("limit_literal", True),
+        ("tiny_literal", False),
+        ("tiny_literal_offset", True),
     ]
 
     @pytest.mark.parametrize("case,kept", _NORMALIZATION_CASES)
@@ -1366,6 +1468,92 @@ class TestSoftMaskValidation:
             assert ("/TR" in smask) is kept
             if kept:
                 assert extgstate._is_scalar_transfer_function(smask.TR)
+
+    _MAX_REAL = float(Decimal("3.403e38"))
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            # A finite real beyond the float range, which float() reads as inf.
+            (Decimal("1" + "0" * 400 + ".0"), _MAX_REAL),
+            (Decimal("-1" + "0" * 400 + ".0"), -_MAX_REAL),
+            (Decimal("3.403e38"), _MAX_REAL),
+            (Decimal("3.4030000000000000000000000000001e38"), _MAX_REAL),
+            # Infinity is clamped like structure_limits clamps it.
+            (Decimal("Infinity"), _MAX_REAL),
+            (Decimal("-Infinity"), -_MAX_REAL),
+            (float("inf"), _MAX_REAL),
+            (Decimal("1.1749999999999999999999999999999e-38"), 0.0),
+            (Decimal("1.175e-38"), 1.175e-38),
+            (2**80, 2**31 - 1),
+            (-(2**80), -(2**31)),
+            (Decimal("NaN"), None),
+            (Decimal("sNaN"), None),
+            (float("nan"), None),
+            (True, None),
+            (False, None),
+        ],
+    )
+    def test_function_number_normalizes_before_converting(
+        self, value, expected
+    ) -> None:
+        """Numbers are normalized first, so no finite real is read as inf."""
+        result = extgstate._function_number(value)
+        assert result == expected
+        assert type(result) is type(expected)
+
+    def test_function_number_keeps_negative_zero(self) -> None:
+        """-0 is 0 for every ordering and exponent check."""
+        result = extgstate._function_number(Decimal("-0.0"))
+        assert result == 0.0 and math.copysign(1, result) == -1
+
+    @pytest.mark.parametrize("limits_first", [False, True])
+    def test_assigned_infinite_domain_is_clamped(self, limits_first) -> None:
+        """pikepdf writes an out-of-range Decimal assigned from Python as inf.
+
+        structure_limits clamps that infinity to 3.403e38, so the validator
+        keeps a function that is valid with the clamped Domain.
+        """
+        pdf = new_pdf()
+        transfer = Dictionary(
+            FunctionType=2, Domain=Array([0, Decimal("1e400")]), N=1, C1=Array([0.5])
+        )
+        assert transfer.Domain[1] == Decimal("Infinity")
+        mask = Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=transfer)
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        if limits_first:
+            sanitize_structure_limits(pdf)
+        sanitize_extgstate(pdf)
+        sanitize_structure_limits(pdf)
+        smask = pdf.pages[0].Resources.ExtGState.GS0.SMask
+        assert smask.TR.Domain[1] == Decimal("3.403e38")
+        assert extgstate._is_scalar_transfer_function(smask.TR)
+
+    @pytest.mark.parametrize(
+        "token,expected",
+        [
+            (b"2147483647", 2147483647),
+            (b"-2147483648", -2147483648),
+            # Integer literals beyond the 32-bit limits are read as reals.
+            (b"2147483648", 2147483648.0),
+            (b"340300000000000000000000000000000000000", float(Decimal("3.403e38"))),
+            (b"340300000000000000000000000000000000001", None),
+            (b"340300000000000000000000000000000000000.0000000000000001", None),
+            (b"1" + b"0" * 400 + b".0", None),
+            (b"9" * 5000, None),
+            (b"-" + b"9" * 5000, None),
+            # Below 1.175e-38 in magnitude, a reader takes a real as 0.
+            (b"0." + b"0" * 39 + b"1", 0.0),
+            (b"-0.00000000000000000000000000000000000001175", -1.175e-38),
+            (b".5", 0.5),
+            (b"-0.0", -0.0),
+        ],
+    )
+    def test_calculator_literals_are_read_exactly(self, token, expected) -> None:
+        """Calculator literals are compared with the limits before any float()."""
+        result = extgstate._calculator_literal(token)
+        assert result == expected
+        assert type(result) is type(expected)
 
     @staticmethod
     def _calculator_mask(pdf: Pdf, program: bytes) -> Dictionary:
