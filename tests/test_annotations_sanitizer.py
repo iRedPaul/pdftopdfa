@@ -33,6 +33,20 @@ from pdftopdfa.sanitizers.base import (
 )
 
 
+def _pdf_value(value):
+    """Build a fresh PDF object from a plain Python parameter value.
+
+    Parametrized values are shared by every case, and since pikepdf 10.18 a
+    direct container assigned into one Pdf cannot be assigned into another, so
+    containers are given as lists and dicts and built per test.
+    """
+    if isinstance(value, list):
+        return Array([_pdf_value(item) for item in value])
+    if isinstance(value, dict):
+        return Dictionary({key: _pdf_value(item) for key, item in value.items()})
+    return value
+
+
 class TestRemoveForbiddenAnnotations:
     """Tests for remove_forbidden_annotations()."""
 
@@ -806,14 +820,13 @@ class TestEnsureAppearanceStreams:
         assert b"0.5 0.5 99 99 re S" in annot.AP.N.read_bytes()
 
     @pytest.mark.parametrize("legacy", [False, True])
-    @pytest.mark.parametrize(
-        "dash", [42, Name.bad, Array([Name.bad]), Array([-1, 2]), Array([0, 0])]
-    )
+    @pytest.mark.parametrize("dash", [42, Name.bad, [Name.bad], [-1, 2], [0, 0]])
     def test_square_malformed_dash_raises(self, make_pdf_with_page, legacy, dash):
         pdf = make_pdf_with_page()
         annot = pdf.make_indirect(
             Dictionary(Subtype=Name.Square, Rect=Array([0, 0, 100, 100]))
         )
+        dash = _pdf_value(dash)
         if legacy:
             annot.Border = Array([0, 0, 1, dash])
         else:
@@ -829,13 +842,13 @@ class TestEnsureAppearanceStreams:
             42,
             Name.bad,
             "bad",
-            Array([]),
-            Array([0, 0]),
-            Array([0, 0, 1, Array([]), 0]),
-            Array([Name.bad, 0, 1]),
-            Array([0, 0, "1"]),
-            Array([0, 0, -1]),
-            Array([True, 0, 1]),
+            [],
+            [0, 0],
+            [0, 0, 1, [], 0],
+            [Name.bad, 0, 1],
+            [0, 0, "1"],
+            [0, 0, -1],
+            [True, 0, 1],
         ],
     )
     def test_square_malformed_legacy_border_raises(self, make_pdf_with_page, border):
@@ -844,7 +857,7 @@ class TestEnsureAppearanceStreams:
             Dictionary(
                 Subtype=Name.Square,
                 Rect=Array([0, 0, 100, 100]),
-                Border=border,
+                Border=_pdf_value(border),
             )
         )
         pdf.pages[0].Annots = Array([annot])
@@ -908,8 +921,7 @@ class TestEnsureAppearanceStreams:
                 Rect=Array([0, 0, 100, 100]),
             )
         )
-        # Build arrays per test: a shared Array would belong to the first Pdf.
-        annot[key] = Array(color) if isinstance(color, list) else color
+        annot[key] = _pdf_value(color)
         pdf.pages[0].Annots = Array([annot])
 
         with pytest.raises(ConversionError, match="invalid .* color array"):
@@ -951,18 +963,22 @@ class TestEnsureAppearanceStreams:
         assert paint_ops == ([] if color == [] else ["B", "S"])
 
     @pytest.mark.parametrize("subtype", [Name.Square, Name.Text, Name.FileAttachment])
-    @pytest.mark.parametrize("opacity", [Name.bad, Array([1]), "bad", -0.1, 1.1])
+    @pytest.mark.parametrize("opacity", [Name.bad, [1], "bad", -0.1, 1.1])
     def test_malformed_opacity_raises(self, make_pdf_with_page, subtype, opacity):
         pdf = make_pdf_with_page()
         annot = pdf.make_indirect(
-            Dictionary(Subtype=subtype, Rect=Array([0, 0, 100, 100]), CA=opacity)
+            Dictionary(
+                Subtype=subtype,
+                Rect=Array([0, 0, 100, 100]),
+                CA=_pdf_value(opacity),
+            )
         )
         pdf.pages[0].Annots = Array([annot])
 
         with pytest.raises(ConversionError, match="invalid opacity"):
             ensure_appearance_streams(pdf)
 
-    @pytest.mark.parametrize("width", [Name.bad, "2", Array([2]), True, -1])
+    @pytest.mark.parametrize("width", [Name.bad, "2", [2], True, -1])
     @pytest.mark.parametrize("legacy", [False, True])
     def test_square_malformed_bs_width_raises(self, make_pdf_with_page, width, legacy):
         pdf = make_pdf_with_page()
@@ -970,7 +986,7 @@ class TestEnsureAppearanceStreams:
             Dictionary(
                 Subtype=Name.Square,
                 Rect=Array([0, 0, 100, 100]),
-                BS=Dictionary(W=width),
+                BS=Dictionary(W=_pdf_value(width)),
             )
         )
         if legacy:
@@ -981,14 +997,14 @@ class TestEnsureAppearanceStreams:
             ensure_appearance_streams(pdf)
         assert "/AP" not in annot
 
-    @pytest.mark.parametrize("border", [42, Array([1]), Name.S, "invalid"])
+    @pytest.mark.parametrize("border", [42, [1], Name.S, "invalid"])
     def test_square_malformed_border_raises(self, make_pdf_with_page, border):
         pdf = make_pdf_with_page()
         annot = pdf.make_indirect(
             Dictionary(
                 Subtype=Name.Square,
                 Rect=Array([0, 0, 100, 100]),
-                BS=border,
+                BS=_pdf_value(border),
             )
         )
         pdf.pages[0].Annots = Array([annot])
@@ -1348,7 +1364,7 @@ class TestEnsureAppearanceStreams:
         n = resolve(ap.get("/N"))
         assert isinstance(n, pikepdf.Stream)
 
-    @pytest.mark.parametrize("normal", [Dictionary(), Dictionary(On=42), 42])
+    @pytest.mark.parametrize("normal", [{}, {"/On": 42}, 42])
     def test_generates_widget_appearance_without_usable_stream(
         self, make_pdf_with_page, normal
     ):
@@ -1360,7 +1376,7 @@ class TestEnsureAppearanceStreams:
                 FT=Name.Tx,
                 V="Visible field value",
                 Rect=Array([0, 0, 200, 30]),
-                AP=Dictionary(N=normal),
+                AP=Dictionary(N=_pdf_value(normal)),
             )
         )
         pdf.pages[0].Annots = Array([annot])
