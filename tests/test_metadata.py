@@ -27,6 +27,7 @@ from pdftopdfa.metadata import (
     XMP_TRAILER,
     _collect_non_catalog_extension_needs,
     _collect_preserved_elements,
+    _extract_array_xmp_property,
     _extract_existing_xmp,
     _extract_extension_schema_blocks,
     _format_pdf_date,
@@ -1867,6 +1868,75 @@ class TestDublinCoreMultivaluePreservation:
             create_xmp_metadata({"author": "Carol"}, 2, "B", existing_xmp_tree=source)
         )
         assert self._values(result, "creator") == ["Carol", "Alice", "Bob"]
+
+    @staticmethod
+    def _item_texts(tree: etree._Element, property_name: str) -> list[str]:
+        """Read the full character data of each item, across any child nodes."""
+        return [
+            "".join(item.itertext())
+            for item in tree.xpath(
+                f"//dc:{property_name}/*/rdf:li", namespaces=NAMESPACES
+            )
+        ]
+
+    @pytest.mark.parametrize("markup", ["<!-- note -->", "<?note x?>"])
+    @pytest.mark.parametrize(
+        "author,expected",
+        [
+            (None, ["Alice", "Bob"]),
+            ("Alice, Bob", ["Alice", "Bob"]),
+            ("Bob", ["Bob", "Alice"]),
+            ("Carol", ["Carol", "Bob"]),
+        ],
+    )
+    def test_markup_inside_creator_is_read_and_replaced_whole(
+        self, markup, author, expected
+    ) -> None:
+        """A comment or PI splitting a creator must not keep part of the old name."""
+        source = _build_xmp_with_extras(
+            f"<dc:creator><rdf:Seq><rdf:li>A{markup}lice</rdf:li>"
+            "<rdf:li>Bob</rdf:li></rdf:Seq></dc:creator>"
+        )
+        original = etree.tostring(source)
+        result = _parse_xmp_bytes(
+            create_xmp_metadata({"author": author}, 2, "B", existing_xmp_tree=source)
+        )
+        assert self._item_texts(result, "creator") == expected
+        # The caller's tree keeps its comment or processing instruction.
+        assert etree.tostring(source) == original
+
+    @pytest.mark.parametrize("markup", ["<!-- note -->", "<?note x?>"])
+    @pytest.mark.parametrize("property_name", ["title", "description"])
+    def test_markup_inside_language_alternative_is_replaced_whole(
+        self, markup, property_name
+    ) -> None:
+        """Updating the default replaces all of its text; other languages stay whole."""
+        source = _build_xmp_with_extras(
+            f"<dc:{property_name}><rdf:Alt>"
+            f'<rdf:li xml:lang="x-default">Old{markup} text</rdf:li>'
+            f'<rdf:li xml:lang="de-DE">Al{markup}ter Text</rdf:li>'
+            f"</rdf:Alt></dc:{property_name}>"
+        )
+        key = "title" if property_name == "title" else "subject"
+        for info, default in (({}, "Old text"), ({key: "New"}, "New")):
+            result = _parse_xmp_bytes(
+                create_xmp_metadata(info, 2, "B", existing_xmp_tree=source)
+            )
+            assert self._item_texts(result, property_name) == [default, "Alter Text"]
+
+    @pytest.mark.parametrize("markup", ["<!-- note -->", "<?note x?>"])
+    def test_parsed_xmp_joins_text_around_markup(self, markup) -> None:
+        """Parsed packets expose an item's whole value through its text."""
+        source = _build_xmp_with_extras(
+            f"<dc:creator><rdf:Seq><rdf:li>A{markup}lice</rdf:li>"
+            "</rdf:Seq></dc:creator>"
+        )
+        tree = _parse_xmp_bytes(etree.tostring(source))
+        assert tree is not None
+        assert self._values(tree, "creator") == ["Alice"]
+        assert _extract_array_xmp_property(tree, NAMESPACES["dc"], "creator") == [
+            "Alice"
+        ]
 
     @pytest.mark.parametrize("property_name", ["title", "description", "creator"])
     @pytest.mark.parametrize("malformation", ["sibling", "extra_container", "nested"])
@@ -4301,10 +4371,10 @@ class TestXmpNumberValidation:
     """XMP numbers use plain decimal notation, unlike what Python can parse."""
 
     @pytest.mark.parametrize(
-        "value", ["0", "1.5", "-1.5", "+1.5", ".5", "5.", "-.5", "007"]
+        "value", ["0", "-0", "+7", "1.5", "-1.5", "+1.5", ".5", "-.5", "+.5", "007"]
     )
     def test_decimal_reals_are_accepted(self, value) -> None:
-        """Every decimal spelling with an optional sign and point stays valid."""
+        """An optional sign, then an integer part, a fraction or both."""
         assert _is_valid_simple_value(value, "f")
 
     @pytest.mark.parametrize(
@@ -4321,11 +4391,25 @@ class TestXmpNumberValidation:
             "1 ",
             ".",
             "1_000",
+            # A decimal point must be followed by at least one digit.
+            "5.",
+            "-5.",
+            "+5.",
+            "+.",
+            "1.5.",
         ],
     )
     def test_other_float_spellings_are_rejected(self, value) -> None:
         """Python's float() accepts these, but XMP does not."""
         assert not _is_valid_simple_value(value, "f")
+
+    @pytest.mark.parametrize(
+        "value,valid", [("5", True), ("5.0", True), (".5", True), ("5.", False)]
+    )
+    def test_declared_real_extension_value(self, value, valid) -> None:
+        """A declared Real property is retained only in valid decimal notation."""
+        elem = etree.fromstring(f'<c:prop xmlns:c="urn:custom">{value}</c:prop>')
+        assert _is_valid_extension_property_value(elem, "Real", {}) is valid
 
     @pytest.mark.parametrize(
         "value,valid",

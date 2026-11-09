@@ -26,6 +26,15 @@ from .utils import log_suppressed_error, resolve_indirect, validate_pdfa_level
 logger = logging.getLogger(__name__)
 
 _SECURE_XML_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
+# Comments and processing instructions carry no XMP data. Dropping them while
+# parsing joins the text around them, so a value such as "A<!-- x -->lice" is
+# read, validated and rewritten as the one text "Alice" rather than as "A".
+_XMP_XML_PARSER = etree.XMLParser(
+    resolve_entities=False,
+    no_network=True,
+    remove_comments=True,
+    remove_pis=True,
+)
 
 # Regex matching control characters forbidden in XML 1.0
 # (U+0000-U+0008, U+000B-U+000C, U+000E-U+001F)
@@ -48,7 +57,9 @@ _XMP_DATE_RE = re.compile(
 
 # XMP numbers use plain decimal notation, without exponents, NaN or infinities.
 _XMP_INTEGER_RE = re.compile(r"[+-]?\d+", re.ASCII)
-_XMP_REAL_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", re.ASCII)
+# XMP Real: an optional sign, then an integer part and a fraction, either of
+# which (but not both) may be omitted. A fraction is "." plus one or more digits.
+_XMP_REAL_RE = re.compile(r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)", re.ASCII)
 _XMP_RATIONAL_RE = re.compile(r"[+-]?\d+/[+-]?\d+", re.ASCII)
 # RFC 3986 URI-reference grammar. The Appendix B expression splits a reference,
 # then each component is checked against its own production.
@@ -2512,7 +2523,7 @@ def _extract_existing_xmp(pdf: pikepdf.Pdf) -> etree._Element | None:
         if not content:
             return None
 
-        return etree.fromstring(content, _SECURE_XML_PARSER)
+        return etree.fromstring(content, _XMP_XML_PARSER)
     except etree.XMLSyntaxError as e:
         logger.debug("Existing XMP XML parsing error: %s", e)
         return None
@@ -3117,6 +3128,22 @@ def _copy_valid_xmp_property(
     return None
 
 
+def _without_comments(tree: etree._Element | None) -> etree._Element | None:
+    """Return the XMP tree without comments and processing instructions.
+
+    Matches what _XMP_XML_PARSER produces for trees parsed elsewhere. The text
+    around each removed node is joined, so reading a value through .text and
+    replacing it through .text agree. The caller's tree is never modified.
+    """
+    if tree is None or all(isinstance(node.tag, str) for node in tree.iter()):
+        return tree
+    tree = copy.deepcopy(tree)
+    etree.strip_elements(
+        tree, etree.Comment, etree.ProcessingInstruction, with_tail=False
+    )
+    return tree
+
+
 def create_xmp_metadata(
     info: dict[str, Any],
     pdfa_part: int,
@@ -3161,6 +3188,7 @@ def create_xmp_metadata(
     """
     if now is None:
         now = datetime.now(UTC)
+    existing_xmp_tree = _without_comments(existing_xmp_tree)
     # Create namespace-aware element makers
     ns_rdf = NAMESPACES["rdf"]
     ns_dc = NAMESPACES["dc"]
@@ -3264,10 +3292,8 @@ def create_xmp_metadata(
         default = next(
             (
                 li
-                for li in alt
-                # Copied comments and processing instructions have no attributes.
-                if isinstance(li.tag, str)
-                and (li.get(xml_lang) or "").casefold() == "x-default"
+                for li in alt.findall(f"{{{ns_rdf}}}li")
+                if (li.get(xml_lang) or "").casefold() == "x-default"
             ),
             None,
         )
@@ -3535,7 +3561,7 @@ def _parse_xmp_bytes(data: bytes) -> etree._Element | None:
         content = _strip_xpacket_wrapper(data)
         if not content:
             return None
-        return etree.fromstring(content, _SECURE_XML_PARSER)
+        return etree.fromstring(content, _XMP_XML_PARSER)
     except (etree.XMLSyntaxError, ValueError):
         return None
 
