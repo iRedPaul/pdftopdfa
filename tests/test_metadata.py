@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pikepdf
 import pytest
-from conftest import new_pdf, open_pdf
+from conftest import new_pdf, open_pdf, pdf_object
 from lxml import etree
 from pikepdf import Array, Dictionary, Name, Pdf
 
@@ -818,7 +818,7 @@ class TestSyncMetadata:
 
         pdf = open_pdf(BytesIO(sample_pdf_bytes))
         pdf.docinfo["/Company"] = "Acme Corp"
-        pdf.docinfo["/InvalidCustomValue"] = invalid_value
+        pdf.docinfo["/InvalidCustomValue"] = pdf_object(invalid_value)
         pdf.docinfo["/Trapped"] = Name("/False")
 
         with caplog.at_level(logging.WARNING, logger="pdftopdfa.metadata"):
