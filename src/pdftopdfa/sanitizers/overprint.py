@@ -10,7 +10,7 @@ pages and forms, so its OPM cannot be changed globally. Repairs temporarily
 select OPM 0 around the affected instruction and restore OPM 1 afterwards.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
@@ -21,6 +21,10 @@ from ..fonts.traversal import get_page_resources
 _STROKE = frozenset({"S", "s", "B", "B*", "b", "b*"})
 _FILL = frozenset({"f", "F", "f*", "B", "B*", "b", "b*"})
 _TEXT = frozenset({"Tj", "TJ", "'", '"'})
+_PATH_PAINT = _STROKE | _FILL
+# ISO 32000-1, 8.5.1, Figure 9: only these may precede a path-painting operator
+# inside a path object, so an OPM guard must be placed before all of them.
+_PATH_BUILD = frozenset({"m", "l", "c", "v", "y", "h", "re", "W", "W*"})
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,9 @@ class _Plan:
     instructions: list
     repairs: frozenset[int]
     resource_signature: bytes
+    # Every resource dictionary this stream is painted with, keyed by id().
+    # Equal direct dictionaries of different pages are still distinct scopes.
+    scopes: dict[int, Dictionary] = field(default_factory=dict)
 
 
 @dataclass
@@ -260,6 +267,10 @@ class _Analyzer:
                 or previous.resource_signature != plan.resource_signature
             ):
                 raise _error("shared form has incompatible painting/resource contexts")
+        scopes = dict(previous.scopes) if previous is not None else {}
+        scopes.update(plan.scopes)
+        scopes[id(plan.resources)] = plan.resources
+        plan.scopes = scopes
         self.plans[key] = plan
 
     def prove_programs(
@@ -563,19 +574,70 @@ class _Analyzer:
         self.walk(stream, resources, state, ancestors, resource_initial)
 
 
+def _accepts_guard(value, mode: int) -> bool:
+    """Accept a free name or a guard state that selects only the given OPM."""
+    if value is None:
+        return True
+    if not isinstance(value, Dictionary):
+        return False
+    if not set(value.keys()) <= {"/OPM", "/Type"}:
+        return False
+    if value.get("/Type", Name.ExtGState) != Name.ExtGState:
+        return False
+    opm = value.get("/OPM")
+    return isinstance(opm, int) and not isinstance(opm, bool) and opm == mode
+
+
+def _guard_names(scopes) -> tuple[Name, Name]:
+    """Choose one guard-name pair that is free or already a guard in every scope.
+
+    Reusing an existing pair keeps repeated passes and several streams drawing
+    from one scope from accumulating PdfaOverprint0_, PdfaOverprint0__, ...
+    """
+    tables = [scope.get("/ExtGState", Dictionary()) for scope in scopes]
+    suffix = ""
+    while True:
+        names = (Name(f"/PdfaOverprint0{suffix}"), Name(f"/PdfaOverprint1{suffix}"))
+        if all(
+            _accepts_guard(table.get(name), mode)
+            for table in tables
+            for mode, name in enumerate(names)
+        ):
+            return names
+        suffix += "_"
+
+
+def _path_start(instructions, index: int) -> int:
+    """Return the first instruction of the path object a path paint ends."""
+    start = index
+    if str(instructions[index].operator) in _PATH_PAINT:
+        while start > 0 and str(instructions[start - 1].operator) in _PATH_BUILD:
+            start -= 1
+    return start
+
+
 def sanitize_overprint(pdf: Pdf) -> int:
     """Plan all context-sensitive repairs before changing any content streams.
 
     Ambiguous shared forms and patterns/Type3 glyphs needing invocation-specific
     repair fail explicitly instead of applying a global change. The converter's
     original-input fallback then preserves the input. Provably harmless programs,
-    unmodified streams and shared ExtGStates stay intact.
+    unmodified streams and existing ExtGState entries stay intact.
+
+    The two guard states are added under fresh or reused names to the resource
+    dictionary each repaired stream is actually painted with. A Form without its
+    own /Resources keeps inheriting: giving it a copy would move inherited
+    patterns into the Form's scope and change their pattern space and initial
+    graphics state (ISO 32000-1, 8.7.3.1 and 11.6.7). New names cannot change
+    the meaning of any existing name, even in a shared dictionary.
     """
     analyzer = _Analyzer()
+    detached = {}
     for page in pdf.pages:
         resources = get_page_resources(page)
         if resources is None:
             resources = Dictionary()
+            detached[id(resources)] = (page, resources)
         if "/Contents" in page.obj:
             analyzer.walk(page, resources, _State())
         for annotation in page.get("/Annots", []):
@@ -592,23 +654,31 @@ def sanitize_overprint(pdf: Pdf) -> int:
                     if isinstance(stream, Stream):
                         analyzer.form(stream, resources, _State(), frozenset())
 
+    plans = [plan for plan in analyzer.plans.values() if plan.repairs]
+    for plan in plans:
+        for scope in plan.scopes.values():
+            if "/ExtGState" in scope and not isinstance(scope.ExtGState, Dictionary):
+                raise _error("invalid ExtGState resource table")
+
     fixed = 0
-    for plan in analyzer.plans.values():
-        if not plan.repairs:
-            continue
-        resources = Dictionary(plan.resources)
-        graphics = Dictionary(resources.get("/ExtGState", Dictionary()))
-        names = []
-        for mode in (0, 1):
-            name = f"/PdfaOverprint{mode}"
-            while name in graphics:
-                name += "_"
-            graphics[name] = Dictionary(OPM=mode)
-            names.append(Name(name))
-        resources.ExtGState = graphics
+    for plan in plans:
+        scopes = list(plan.scopes.values())
+        names = _guard_names(scopes)
+        for scope in scopes:
+            if id(scope) in detached:
+                # A page without any resources receives the dictionary itself.
+                page, _ = detached.pop(id(scope))
+                page.obj.Resources = scope
+            if "/ExtGState" not in scope:
+                scope.ExtGState = Dictionary()
+            table = scope.ExtGState
+            for mode, name in enumerate(names):
+                if table.get(name) is None:
+                    table[name] = Dictionary(OPM=mode)
+        starts = {_path_start(plan.instructions, index) for index in plan.repairs}
         rewritten = []
         for index, instruction in enumerate(plan.instructions):
-            if index in plan.repairs:
+            if index in starts:
                 rewritten.append(
                     pikepdf.ContentStreamInstruction([names[0]], pikepdf.Operator("gs"))
                 )
@@ -619,10 +689,8 @@ def sanitize_overprint(pdf: Pdf) -> int:
                 )
         data = pikepdf.unparse_content_stream(rewritten)
         if isinstance(plan.owner, pikepdf.Page):
-            plan.owner.obj.Resources = resources
             plan.owner.obj.Contents = pdf.make_stream(data)
         else:
-            plan.owner.Resources = resources
             plan.owner.write(data)
         fixed += len(plan.repairs)
     return fixed

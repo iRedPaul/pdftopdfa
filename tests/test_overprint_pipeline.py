@@ -58,7 +58,9 @@ def test_default_cmyk_overprint_is_repaired_after_profile_embedding(
         for index, instruction in enumerate(instructions):
             if str(instruction.operator) != "f":
                 continue
-            before, after = instructions[index - 1], instructions[index + 1]
+            # ISO 32000-1, 8.5.1: the guard precedes the whole path object.
+            assert str(instructions[index - 1].operator) == "re"
+            before, after = instructions[index - 2], instructions[index + 1]
             assert str(before.operator) == str(after.operator) == "gs"
             assert page.Resources.ExtGState[str(before.operands[0])].OPM == 0
             assert page.Resources.ExtGState[str(after.operands[0])].OPM == 1

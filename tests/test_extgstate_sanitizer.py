@@ -1855,6 +1855,25 @@ class TestTransparencyCombined:
         assert float(gs_out.CA) == pytest.approx(1.0)
 
 
+_PATH_PAINT = frozenset({"S", "s", "f", "F", "f*", "B", "B*", "b", "b*"})
+_PATH_BUILD = frozenset({"m", "l", "c", "v", "y", "h", "re", "W", "W*"})
+
+
+def _assert_no_gs_inside_paths(owner) -> None:
+    """Reject a gs operator between a path's construction and its paint/n."""
+    in_path = False
+    for instruction in pikepdf.parse_content_stream(owner):
+        op = str(instruction.operator)
+        if op in _PATH_BUILD:
+            in_path = True
+        elif op in _PATH_PAINT or op == "n":
+            in_path = False
+        elif op == "gs":
+            assert not in_path, pikepdf.unparse_content_stream(
+                pikepdf.parse_content_stream(owner)
+            )
+
+
 class TestOverprintIccBasedCmyk:
     """Overprint repairs depend on actual paints, never resource presence."""
 
@@ -1868,25 +1887,37 @@ class TestOverprintIccBasedCmyk:
         page.Contents = pdf.make_stream(content)
         return page
 
-    def _assert_guard(self, owner, operator: str, count: int = 1) -> None:
-        """Require local overprint guards around the expected painting operations."""
+    def _assert_guard(
+        self, owner, operator: str, count: int = 1, resources=None
+    ) -> None:
+        """Require local overprint guards around the expected painting operations.
+
+        A path paint is guarded outside its path object: OPM 0 is selected
+        before the first path-construction operator, never between it and the
+        paint (ISO 32000-1, 8.5.1). Other paints are guarded directly.
+        """
         instructions = list(pikepdf.parse_content_stream(owner))
+        states = (resources if resources is not None else owner.Resources).ExtGState
         guarded = 0
         for i, instruction in enumerate(instructions):
-            if (
-                str(instruction.operator) != operator
-                or i == 0
-                or i + 1 == len(instructions)
-            ):
+            if str(instruction.operator) != operator or i + 1 == len(instructions):
                 continue
-            before, after = instructions[i - 1], instructions[i + 1]
+            start = i
+            if operator in _PATH_PAINT:
+                while (
+                    start > 0 and str(instructions[start - 1].operator) in _PATH_BUILD
+                ):
+                    start -= 1
+            if start == 0:
+                continue
+            before, after = instructions[start - 1], instructions[i + 1]
             if str(before.operator) != "gs" or str(after.operator) != "gs":
                 continue
-            states = owner.Resources.ExtGState
             assert states[str(before.operands[0])].OPM == 0
             assert states[str(after.operands[0])].OPM == 1
             guarded += 1
         assert guarded == count
+        _assert_no_gs_inside_paths(owner)
 
     @pytest.mark.parametrize(
         "paint,colour,flags",
@@ -2202,7 +2233,9 @@ class TestOverprintIccBasedCmyk:
         page.Resources.XObject = Dictionary(Fm=form)
         original_page = page.Contents.read_bytes()
         assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
-        self._assert_guard(form, "f")
+        # The guards are added to the inherited scope; the Form keeps inheriting.
+        assert "/Resources" not in form
+        self._assert_guard(form, "f", resources=page.Resources)
         assert page.Contents.read_bytes() == original_page
         assert page.Resources.ExtGState.GS0.OPM == 1
 
@@ -2231,7 +2264,9 @@ class TestOverprintIccBasedCmyk:
         pdf.Root.Pages.Resources = page.Resources
         del page.obj["/Resources"]
         assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
-        self._assert_guard(page, "f")
+        # The guards join the inherited scope; the page keeps inheriting it.
+        assert "/Resources" not in page.obj
+        self._assert_guard(page, "f", resources=pdf.Root.Pages.Resources)
         assert pdf.Root.Pages.Resources.ExtGState.GS0.OPM == 1
 
     def test_mixed_fill_stroke_modes_fail_without_corrupting_device_paint(self) -> None:
@@ -2597,6 +2632,216 @@ class TestOverprintIccBasedCmyk:
         del page.Resources["/ColorSpace"]
         assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
         self._assert_guard(page, "sh")
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            (b"0 0 20 20 re f", ["gs", "re", "f", "gs"]),
+            (b"0 0 m 20 0 l 20 20 l h f", ["gs", "m", "l", "l", "h", "f", "gs"]),
+            (
+                b"0 0 m 10 20 20 20 0 c 20 10 20 0 v 10 10 0 0 y h f*",
+                ["gs", "m", "c", "v", "y", "h", "f*", "gs"],
+            ),
+            (b"0 0 m 20 20 l S", ["gs", "m", "l", "S", "gs"]),
+            (
+                b"0 0 20 20 re W n 5 5 10 10 re f",
+                ["re", "W", "n", "gs", "re", "f", "gs"],
+            ),
+            (b"0 0 20 20 re W* f", ["gs", "re", "W*", "f", "gs"]),
+            (
+                b"0 0 20 20 re f 30 30 m 40 40 l h F",
+                ["gs", "re", "f", "gs", "gs", "m", "l", "h", "F", "gs"],
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("owner", ["page", "form"])
+    def test_path_guard_stays_outside_the_path_object(
+        self, path, expected, owner
+    ) -> None:
+        """ISO 32000-1, 8.5.1 allows no gs between path construction and paint."""
+        pdf = new_pdf()
+        stroke = path.endswith(b"S")
+        selection = b"/CS0 CS " if stroke else b"/CS0 cs "
+        if owner == "page":
+            page = self._page(pdf, b"/GS0 gs " + selection + path, OPM=1, OP=True)
+            target, prefix = page, ["gs", "CS" if stroke else "cs"]
+        else:
+            # The Form's path construction starts at the first instruction.
+            page = self._page(pdf, b"/GS0 gs " + selection + b"/Fm Do", OPM=1, OP=True)
+            target = pdf.make_stream(path)
+            target.Subtype = Name.Form
+            target.BBox = Array([0, 0, 50, 50])
+            page.Resources.XObject = Dictionary(Fm=target)
+            prefix = []
+        repairs = expected.count("gs") // 2
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == repairs
+        operators = [str(i.operator) for i in pikepdf.parse_content_stream(target)]
+        assert operators == prefix + expected
+        _assert_no_gs_inside_paths(target)
+        for paint in {op for op in expected if op in _PATH_PAINT}:
+            count = expected.count(paint)
+            self._assert_guard(target, paint, count, resources=page.Resources)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+
+    def test_text_and_xobject_guards_stay_at_the_paint(self) -> None:
+        """Only path paints move their guard; gs is legal inside a text object."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs BT /F 12 Tf (A) Tj ET", OPM=1, op=True)
+        page.Resources.Font = Dictionary(
+            F=Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica)
+        )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        operators = [str(i.operator) for i in pikepdf.parse_content_stream(page)]
+        assert operators == ["gs", "cs", "BT", "Tf", "gs", "Tj", "gs", "ET"]
+
+    def _inheriting_form_with_page_pattern(self, pdf, page_paint: bytes = b""):
+        """Paint an inheriting Form that repairs and uses a page-defined pattern."""
+        page = self._page(pdf, b"/GS0 gs " + page_paint + b"/Fm Do", OPM=1, OP=True)
+        pattern = pdf.make_stream(b"/CS0 cs 0 0 20 20 re f")
+        pattern.PatternType = 1
+        pattern.PaintType = 1
+        pattern.TilingType = 1
+        pattern.BBox = Array([0, 0, 20, 20])
+        pattern.XStep = pattern.YStep = 20
+        pattern.Resources = Dictionary(ColorSpace=page.Resources.ColorSpace)
+        page.Resources.Pattern = Dictionary(P=pattern)
+        form = pdf.make_stream(
+            b"/CS0 cs 0 0 20 20 re f /Pattern cs /P scn 0 0 20 20 re f"
+        )
+        form.Subtype = Name.Form
+        form.BBox = Array([0, 0, 20, 20])
+        page.Resources.XObject = Dictionary(Fm=form)
+        return page, form, pattern
+
+    @pytest.mark.parametrize("sanitize", [sanitize_overprint_usage, "extgstate"])
+    def test_inheriting_form_keeps_its_resource_scope(self, sanitize) -> None:
+        """A page-defined pattern keeps its page scope across repeated passes."""
+        pdf = new_pdf()
+        page, form, pattern = self._inheriting_form_with_page_pattern(pdf)
+
+        def run() -> int:
+            if sanitize == "extgstate":
+                return sanitize_extgstate(pdf)["extgstate_fixed"]
+            return sanitize(pdf)
+
+        assert run() == 1
+        assert "/Resources" not in form
+        assert pattern.read_bytes() == b"/CS0 cs 0 0 20 20 re f"
+        names = set(page.Resources.ExtGState.keys())
+        assert names == {"/GS0", "/PdfaOverprint0", "/PdfaOverprint1"}
+        self._assert_guard(form, "f", resources=page.Resources)
+        form_data = form.read_bytes()
+        # The converter runs the analysis again after profile embedding.
+        assert run() == 0
+        assert "/Resources" not in form
+        assert form.read_bytes() == form_data
+        assert set(page.Resources.ExtGState.keys()) == names
+
+    def test_page_and_inheriting_form_share_one_guard_pair(self) -> None:
+        """Repairs drawn from the same scope reuse one pair of guard names."""
+        pdf = new_pdf()
+        page, form, _ = self._inheriting_form_with_page_pattern(
+            pdf, b"/CS0 cs 0 0 5 5 re f "
+        )
+        assert sanitize_overprint_usage(pdf) == 2
+        assert set(page.Resources.ExtGState.keys()) == {
+            "/GS0",
+            "/PdfaOverprint0",
+            "/PdfaOverprint1",
+        }
+        self._assert_guard(page, "f")
+        self._assert_guard(form, "f", resources=page.Resources)
+        assert sanitize_overprint_usage(pdf) == 0
+
+    def test_conflicting_guard_name_in_receiving_scope_is_avoided(self) -> None:
+        """An unrelated state under a guard name is neither reused nor replaced."""
+        pdf = new_pdf()
+        page, form, _ = self._inheriting_form_with_page_pattern(pdf)
+        other = Dictionary(OPM=1, OP=False)
+        page.Resources.ExtGState.PdfaOverprint0 = other
+        page.Resources.ExtGState.PdfaOverprint1 = Dictionary(OPM=1)
+        assert sanitize_overprint_usage(pdf) == 1
+        assert page.Resources.ExtGState.PdfaOverprint0 == other
+        names = {
+            str(i.operands[0])
+            for i in pikepdf.parse_content_stream(form)
+            if str(i.operator) == "gs"
+        }
+        assert names == {"/PdfaOverprint0_", "/PdfaOverprint1_"}
+        self._assert_guard(form, "f", resources=page.Resources)
+        assert sanitize_overprint_usage(pdf) == 0
+
+    def test_inheriting_form_shared_by_equivalent_page_scopes(self) -> None:
+        """Every scope a shared inheriting Form is painted with gets the guards."""
+        pdf = new_pdf()
+        first = self._page(pdf, b"/GS0 gs /Fm Do", OPM=1, OP=True)
+        form = pdf.make_stream(b"/CS0 cs 0 0 20 20 re f")
+        form.Subtype = Name.Form
+        form.BBox = Array([0, 0, 20, 20])
+        first.Resources.XObject = Dictionary(Fm=form)
+        pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
+        second = pdf.pages[-1]
+        second.obj.MediaBox = first.obj.MediaBox
+        second.obj.Contents = pdf.make_stream(b"/GS0 gs /Fm Do")
+
+        def copy(value):
+            """Copy direct dictionaries, keeping references to shared objects."""
+            if isinstance(value, Dictionary) and value.objgen == (0, 0):
+                return Dictionary({key: copy(item) for key, item in value.items()})
+            return value
+
+        # A separate direct dictionary with identical content.
+        second.obj.Resources = copy(first.Resources)
+        assert second.Resources.unparse() == first.Resources.unparse()
+        assert sanitize_overprint_usage(pdf) == 1
+        assert "/Resources" not in form
+        for page in (first, second):
+            self._assert_guard(form, "f", resources=page.Resources)
+        assert sanitize_overprint_usage(pdf) == 0
+
+    @pytest.mark.parametrize("level", ["2b", "3b"])
+    def test_inheriting_form_repair_survives_conversion(self, tmp_path, level) -> None:
+        """The late post-embedding pass accepts the earlier inherited-scope repair."""
+        from pdftopdfa.verapdf import is_verapdf_available, validate_with_verapdf
+
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /Fm Do", OPM=1, OP=True)
+        form = pdf.make_stream(b"/CS0 cs 0 0 20 20 re f")
+        form.Subtype = Name.Form
+        form.BBox = Array([0, 0, 20, 20])
+        page.Resources.XObject = Dictionary(Fm=form)
+        source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+        pdf.save(source)
+        result = convert_to_pdfa(source, output, level=level)
+        assert result.success and result.target_produced, result
+        assert not result.skipped, result.warnings
+        assert not any("Conversion skipped" in w for w in result.warnings)
+        with pikepdf.open(output) as converted:
+            form = converted.pages[0].Resources.XObject.Fm
+            # Rule 6.2.2 materializes the used names, guards included.
+            self._assert_guard(form, "f")
+        if is_verapdf_available():
+            validation = validate_with_verapdf(output, flavour=level)
+            assert validation.compliant, validation.failed_rules
+
+    def test_page_pattern_in_inheriting_form_fails_closed_in_conversion(
+        self, tmp_path
+    ) -> None:
+        """Rule 6.2.2 moves the pattern into the Form scope, where it overprints.
+
+        PDF/A needs explicit Form resources, so the converted Form defines the
+        pattern itself and the cell starts with the Form's overprint state
+        (ISO 32000-1, 8.7.3.1). That paint would need an invocation-specific
+        repair, so the original input is kept instead of a non-conforming file.
+        """
+        pdf = new_pdf()
+        self._inheriting_form_with_page_pattern(pdf)
+        source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+        pdf.save(source)
+        result = convert_to_pdfa(source, output, level="2b")
+        assert result.skipped and not result.target_produced, result
+        assert any("tiling pattern" in w for w in result.warnings), result.warnings
+        assert output.read_bytes() == source.read_bytes()
 
 
 class TestShadingTransferFunctions:

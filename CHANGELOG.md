@@ -41,6 +41,7 @@
 - Reject non-integer text rendering modes during overprint analysis, and evaluate a soft mask at the invocation of a transparency group instead of at its inner paints
 - Check uncolored tiling patterns under the overprint state at their painting operation
 - Sanitize an `/ExtGState` stored directly on a shading pattern like other graphics states
+- Place overprint repairs for path paints before the path object instead of inside it, add the repair states to the resource scope a Form inherits instead of copying it into the Form, and reuse the same repair states on repeated passes
 
 ### Tests
 
