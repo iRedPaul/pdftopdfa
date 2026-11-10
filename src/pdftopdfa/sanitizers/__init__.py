@@ -83,6 +83,7 @@ from .glyph_coverage import sanitize_glyph_coverage
 from .javascript import remove_javascript
 from .jbig2 import convert_jbig2_external_globals, validate_jbig2_globals
 from .jpx import sanitize_jpx_color_boxes
+from .navigation import remove_dangling_collection_default
 from .notdef_usage import sanitize_notdef_usage
 from .optional_content import sanitize_optional_content
 from .page_boxes import sanitize_page_boxes
@@ -265,6 +266,13 @@ def sanitize_for_pdfa(
     result["invalid_bpc_fixed"] = bpc_result["invalid_bpc_fixed"]
     result["mask_bpc_fixed"] = bpc_result["mask_bpc_fixed"]
 
+    # Preserve valid annotation opacity; repair only malformed /CA values.
+    # Appearance generation rejects malformed values, so repair them first.
+    result["annotation_opacity_fixed"] = fix_annotation_opacity(pdf, level)
+
+    # Preserve valid annotation colors; remove only malformed /C and /IC entries.
+    result["annotation_colors_removed"] = remove_annotation_colors(pdf, level)
+
     # Ensure annotation appearance streams (all levels)
     result["appearance_streams_added"] = ensure_appearance_streams(pdf, level)
 
@@ -279,12 +287,6 @@ def sanitize_for_pdfa(
 
     # Fix annotation flags (all levels)
     result["annotation_flags_fixed"] = fix_annotation_flags(pdf, level)
-
-    # Fix annotation-level /CA opacity (ISO 19005-2, 6.5.3)
-    result["annotation_opacity_fixed"] = fix_annotation_opacity(pdf, level)
-
-    # Remove Device color arrays /C and /IC from annotations (ISO 19005-2)
-    result["annotation_colors_removed"] = remove_annotation_colors(pdf, level)
 
     # Validate color spaces (Separation/DeviceN preserved; ICC profiles validated)
     sanitize_colorspaces(pdf, level)
@@ -470,6 +472,11 @@ def sanitize_for_pdfa(
     # - /UF on FileSpec dicts
     # These are no-ops when no embedded files exist.
     result["af_relationships_fixed"] = ensure_af_relationships(pdf)
+    # PDF/A-2 file removal and the name-tree normalization of the call above may
+    # both have discarded the portfolio's initial document (ISO 32000-1, Table 155).
+    result["forbidden_catalog_entries_removed"] += remove_dangling_collection_default(
+        pdf
+    )
     result["embedded_file_subtypes_fixed"] = ensure_embedded_file_subtypes(pdf)
     result["embedded_file_params_fixed"] = ensure_embedded_file_params(pdf)
     result["filespec_uf_fixed"] = ensure_filespec_uf_entries(pdf)

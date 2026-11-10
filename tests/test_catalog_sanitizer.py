@@ -4,6 +4,8 @@
 
 """Tests for Document Catalog sanitization."""
 
+from io import BytesIO
+
 import pikepdf
 import pytest
 from conftest import new_pdf, pdf_object
@@ -34,9 +36,7 @@ class TestRemoveForbiddenCatalogEntries:
                     [pikepdf.Dictionary({"/Type": pikepdf.Name("/Requirement")})]
                 ),
             ),
-            ("/Collection", pikepdf.Dictionary()),
             ("/NeedsRendering", True),
-            ("/Threads", pikepdf.Array([pikepdf.Dictionary()])),
             ("/SpiderInfo", pikepdf.Dictionary()),
         ],
     )
@@ -47,18 +47,19 @@ class TestRemoveForbiddenCatalogEntries:
         assert remove_forbidden_catalog_entries(pdf) == 1
         assert key not in pdf.Root
 
-    def test_remove_all_five(self):
+    def test_remove_only_forbidden_entries(self):
+        """Retain navigation while removing catalog entries prohibited by PDF/A."""
         pdf = new_pdf()
         pdf.Root["/Requirements"] = pikepdf.Array()
         pdf.Root["/Collection"] = pikepdf.Dictionary()
         pdf.Root["/NeedsRendering"] = True
-        pdf.Root["/Threads"] = pikepdf.Array()
+        pdf.Root["/Threads"] = pdf.make_indirect(pikepdf.Array())
         pdf.Root["/SpiderInfo"] = pikepdf.Dictionary()
-        assert remove_forbidden_catalog_entries(pdf) == 5
+        assert remove_forbidden_catalog_entries(pdf) == 3
         assert "/Requirements" not in pdf.Root
-        assert "/Collection" not in pdf.Root
+        assert "/Collection" in pdf.Root
         assert "/NeedsRendering" not in pdf.Root
-        assert "/Threads" not in pdf.Root
+        assert "/Threads" in pdf.Root
         assert "/SpiderInfo" not in pdf.Root
 
     def test_no_forbidden_keys_present(self):
@@ -340,13 +341,90 @@ class TestSanitizeForPdfaIntegration:
         assert "forbidden_catalog_entries_removed" in result
 
     def test_forbidden_entries_removed_via_sanitize(self):
+        """Apply catalog restrictions through the complete sanitizer pipeline."""
         pdf = new_pdf()
         pdf.Root["/Perms"] = pikepdf.Dictionary()
-        pdf.Root["/Collection"] = pikepdf.Dictionary()
+        pdf.Root["/Requirements"] = pikepdf.Array()
         result = sanitize_for_pdfa(pdf, level="3b")
         assert result["forbidden_catalog_entries_removed"] == 2
         assert "/Perms" not in pdf.Root
-        assert "/Collection" not in pdf.Root
+        assert "/Requirements" not in pdf.Root
+
+    @pytest.mark.parametrize("level", ["2a", "2b", "2u", "3a", "3b", "3u"])
+    def test_preserves_portfolio_and_article_navigation(self, level):
+        """Collection settings and the circular bead graph survive saving."""
+        pdf = new_pdf()
+        pages = [pdf.add_blank_page(), pdf.add_blank_page()]
+        collection = pikepdf.Dictionary(
+            Type=pikepdf.Name.Collection,
+            View=pikepdf.Name.D,
+            Schema=pikepdf.Dictionary(
+                Type=pikepdf.Name.CollectionSchema,
+                Title=pikepdf.Dictionary(
+                    Type=pikepdf.Name.CollectionField,
+                    Subtype=pikepdf.Name.S,
+                    N="Document title",
+                    O=0,
+                    V=True,
+                    E=False,
+                ),
+            ),
+            Sort=pikepdf.Dictionary(
+                Type=pikepdf.Name.CollectionSort, S=pikepdf.Name.Title, A=True
+            ),
+        )
+        pdf.Root.Collection = collection
+        original_collection = collection.unparse()
+        thread = pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name.Thread,
+                I=pikepdf.Dictionary(Title="Article A", Author="Alice"),
+            )
+        )
+        beads = [
+            pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name.Bead,
+                    T=thread,
+                    P=page.obj,
+                    R=pikepdf.Array([20, 30, 200, 300]),
+                )
+            )
+            for page in pages
+        ]
+        for index, bead in enumerate(beads):
+            bead.N = beads[1 - index]
+            bead.V = beads[1 - index]
+            pages[index].B = pikepdf.Array([bead])
+        thread.F = beads[0]
+        pdf.Root.Threads = pdf.make_indirect(pikepdf.Array([thread]))
+        pdf.Root.OpenAction = pikepdf.Dictionary(S=pikepdf.Name.Thread, D=thread)
+        pdf.Root.Requirements = pikepdf.Array()
+
+        result = sanitize_for_pdfa(pdf, level=level)
+
+        assert result["forbidden_catalog_entries_removed"] == 1
+        assert "/Requirements" not in pdf.Root
+        saved = BytesIO()
+        pdf.save(saved, force_version="1.7")
+        with pikepdf.open(saved) as restored:
+            assert restored.Root.Collection.unparse() == original_collection
+            restored_thread = restored.Root.Threads[0]
+            assert str(restored_thread.I.Title) == "Article A"
+            assert str(restored_thread.I.Author) == "Alice"
+            assert restored.Root.OpenAction.S == pikepdf.Name.Thread
+            assert restored.Root.OpenAction.D.objgen == restored_thread.objgen
+            first = restored_thread.F
+            second = first.N
+            assert first.T.objgen == restored_thread.objgen
+            assert second.T.objgen == restored_thread.objgen
+            assert first.V.objgen == second.objgen
+            assert second.N.objgen == first.objgen
+            assert second.V.objgen == first.objgen
+            for page, bead in zip(restored.pages, [first, second], strict=True):
+                assert bead.P.objgen == page.objgen
+                assert page.B[0].objgen == bead.objgen
+                assert list(bead.R) == [20, 30, 200, 300]
 
     def test_forbidden_names_entries_removed_via_sanitize(self):
         pdf = new_pdf()

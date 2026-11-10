@@ -196,9 +196,12 @@ def _sanitize_real(value: Any) -> tuple[Any, bool]:
     Overflow  (abs > 3.403e+38): clamp to ±3.403e+38.
     """
     if isinstance(value, Decimal):
-        if value != 0 and abs(value) < _MIN_REAL_MAGNITUDE:
+        # copy_abs() is exact. abs() rounds to the 28 digits of the context, so a
+        # value just beyond a limit would pass, and it raises for a huge exponent.
+        magnitude = value.copy_abs()
+        if value != 0 and magnitude < _MIN_REAL_MAGNITUDE:
             return Decimal("0"), True
-        if abs(value) > _MAX_REAL_MAGNITUDE:
+        if magnitude > _MAX_REAL_MAGNITUDE:
             return (_MAX_REAL_MAGNITUDE if value > 0 else -_MAX_REAL_MAGNITUDE), True
         return value, False
     if isinstance(value, float):
@@ -212,6 +215,41 @@ def _sanitize_real(value: Any) -> tuple[Any, bool]:
     return value, False
 
 
+# The largest real magnitude of ISO 32000-1, Table C.1, as a float.
+MAX_REAL_MAGNITUDE = float(_MAX_REAL_MAGNITUDE)
+_MAX_REAL_TEXT = b"340300000000000000000000000000000000000.0"
+
+
+def _real_object(value: Any) -> Any:
+    """Return a real replacement of _sanitize_real() in a form written as a real.
+
+    pikepdf writes a Decimal or float through a C double and drops a trailing
+    ".0", so the clamped limit would be written as the integer token
+    340299999999999993642572978492905881600. That is beyond the integer limits,
+    and QPDF cannot read it back, so the object that holds it is lost. A real
+    parsed from its text keeps that text. The only other replacement, 0, is
+    written as it is.
+    """
+    if value == 0:
+        return value
+    with pikepdf.explicit_conversion():
+        return pikepdf.Object.parse((b"-" if value < 0 else b"") + _MAX_REAL_TEXT)
+
+
+def normalize_number(value: Any) -> Any:
+    """Return a number object as sanitize_structure_limits() leaves it in the file.
+
+    This applies the same integer clamping and real normalization as the object
+    pass, so that an earlier pass can validate a value as it will be written,
+    such as a real below 1.175e-38 that becomes 0. Other values are returned
+    unchanged.
+    """
+    value, clamped = _sanitize_integer(value)
+    if clamped:
+        return value
+    return _sanitize_real(value)[0]
+
+
 def _sanitize_string(value: Any) -> tuple[Any, bool]:
     """Truncate string objects to the PDF/A implementation limit."""
     if not isinstance(value, pikepdf.String):
@@ -222,7 +260,26 @@ def _sanitize_string(value: Any) -> tuple[Any, bool]:
         return value, False
     if len(raw) <= _MAX_STRING_BYTES:
         return value, False
-    return pikepdf.String(raw[:_MAX_STRING_BYTES]), True
+    return pikepdf.String(_truncate_string_bytes(raw)), True
+
+
+def _truncate_string_bytes(raw: bytes) -> bytes:
+    """Cut string bytes to the limit without splitting a UTF-16BE character.
+
+    ISO 32000-1, 7.9.2.2: a text string that begins with the byte order marker
+    FE FF is encoded in UTF-16BE, so it keeps an even length and no high
+    surrogate without its low surrogate. Other strings, PDFDocEncoding text and
+    byte strings, are cut at the limit; ISO 32000-1 defines no UTF-8 text
+    strings. A byte string that begins with FE FF by chance loses at most three
+    further bytes.
+    """
+    if not raw.startswith(b"\xfe\xff"):
+        return raw[:_MAX_STRING_BYTES]
+    end = _MAX_STRING_BYTES - _MAX_STRING_BYTES % 2
+    # The first byte of the last code unit; D8-DB start a high surrogate.
+    if 0xD8 <= raw[end - 2] <= 0xDB:
+        end -= 2
+    return raw[:end]
 
 
 def _fix_odd_hex_string(value: pikepdf.String) -> pikepdf.String:
@@ -258,7 +315,7 @@ def _sanitize_operand(value: Any, stats: dict[str, int]) -> tuple[Any, bool]:
         if _INT_MIN <= value <= _INT_MAX:
             return value, False
     elif value_type is Decimal:
-        if value == 0 or _MIN_REAL_MAGNITUDE <= abs(value) <= _MAX_REAL_MAGNITUDE:
+        if value == 0 or _MIN_REAL_MAGNITUDE <= value.copy_abs() <= _MAX_REAL_MAGNITUDE:
             return value, False
     result = _resolve(value)
     changed = False
@@ -295,6 +352,7 @@ def _sanitize_operand(value: Any, stats: dict[str, int]) -> tuple[Any, bool]:
                     replacement, item_changed = _sanitize_real(current)
                     if item_changed:
                         stats["reals_normalized"] += 1
+                        replacement = _real_object(replacement)
 
         if item_changed:
             if parent is None:
@@ -894,6 +952,7 @@ def _sanitize_object_graph(
                     replacement, real_changed = _sanitize_real(replacement)
                     if real_changed:
                         stats["reals_normalized"] += 1
+                        replacement = _real_object(replacement)
 
         if parent is None:
             result = replacement

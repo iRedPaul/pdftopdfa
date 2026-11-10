@@ -4,16 +4,26 @@
 
 """Tests for Extended Graphics State sanitization for PDF/A compliance."""
 
+import math
+from decimal import Decimal
+from io import BytesIO
+from unittest.mock import patch
+
 import pikepdf
 import pytest
-from conftest import new_pdf
+from conftest import new_pdf, pdf_object
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from pdftopdfa.color_profile import get_cmyk_profile
+from pdftopdfa.converter import convert_to_pdfa
+from pdftopdfa.exceptions import ConversionError
+from pdftopdfa.sanitizers import extgstate
 from pdftopdfa.sanitizers.extgstate import (
     _sanitize_shadings_in_resources,
     sanitize_extgstate,
+    sanitize_overprint_usage,
 )
+from pdftopdfa.sanitizers.structure_limits import sanitize_structure_limits
 
 
 def _make_form_stream(pdf: Pdf):
@@ -992,20 +1002,754 @@ class TestSoftMaskValidation:
         assert result["extgstate_fixed"] == 1
         assert str(pdf.pages[0].Resources.ExtGState.GS0.SMask) == "/None"
 
-    def test_smask_dict_tr_removed(self) -> None:
-        """Removes /TR entry from SMask dict while keeping the SMask."""
+    @pytest.mark.parametrize(
+        "transfer_type",
+        ["identity", "exponential", "calculator", "sampled", "stitching"],
+    )
+    @pytest.mark.parametrize("with_extgstate_tr", [False, True])
+    def test_smask_transfer_function_preserved(
+        self, transfer_type: str, with_extgstate_tr: bool
+    ) -> None:
+        """Mask opacity mappings survive even when an ExtGState /TR is removed."""
         pdf = new_pdf()
-        tr_stream = pdf.make_stream(b"{ }")
-        smask_dict = Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=tr_stream)
+        if transfer_type == "identity":
+            transfer = Name.Identity
+        elif transfer_type == "exponential":
+            transfer = pdf.make_indirect(
+                Dictionary(
+                    FunctionType=2,
+                    Domain=Array([0, 1]),
+                    C0=Array([1]),
+                    C1=Array([0]),
+                    N=1,
+                )
+            )
+        elif transfer_type == "calculator":
+            transfer = pdf.make_stream(b"{ 1 exch sub }")
+            transfer.FunctionType = 4
+            transfer.Domain = Array([0, 1])
+            transfer.Range = Array([0, 1])
+        elif transfer_type == "sampled":
+            transfer = pdf.make_stream(b"\xff\x00")
+            transfer.FunctionType = 0
+            transfer.Domain = Array([0, 1])
+            transfer.Range = Array([0, 1])
+            transfer.Size = Array([2])
+            transfer.BitsPerSample = 8
+        else:
+            transfer = Dictionary(
+                FunctionType=3,
+                Domain=Array([0, 1]),
+                Functions=Array(
+                    [Dictionary(FunctionType=2, Domain=Array([0, 1]), N=1)]
+                ),
+                Bounds=Array(),
+                Encode=Array([1, 0]),
+            )
+        smask_dict = Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=transfer)
         gs = Dictionary(Type=Name.ExtGState, SMask=smask_dict)
+        if with_extgstate_tr:
+            gs.TR = transfer
         _make_pdf_with_extgstate(pdf, gs)
 
         result = sanitize_extgstate(pdf)
-        assert result["extgstate_fixed"] == 1
+        assert result["extgstate_fixed"] == int(with_extgstate_tr)
         gs_out = pdf.pages[0].Resources.ExtGState.GS0
-        # SMask should still be a dict (not replaced with /None)
-        assert isinstance(gs_out.SMask, Dictionary)
-        assert "/TR" not in gs_out.SMask
+        assert "/TR" not in gs_out
+        assert gs_out.SMask.TR == transfer
+
+        saved = BytesIO()
+        pdf.save(saved)
+        with pikepdf.open(saved) as reopened:
+            restored = reopened.pages[0].Resources.ExtGState.GS0.SMask.TR
+            if transfer_type == "identity":
+                assert restored == Name.Identity
+            elif transfer_type == "exponential":
+                assert restored.FunctionType == 2
+                assert list(restored.Domain) == [0, 1]
+                assert list(restored.C0) == [1]
+                assert list(restored.C1) == [0]
+                assert restored.N == 1
+            elif transfer_type == "calculator":
+                assert restored.FunctionType == 4
+                assert list(restored.Domain) == [0, 1]
+                assert list(restored.Range) == [0, 1]
+                assert restored.read_bytes() == b"{ 1 exch sub }"
+            elif transfer_type == "sampled":
+                assert restored.FunctionType == 0
+                assert restored.read_bytes() == b"\xff\x00"
+            else:
+                assert restored.FunctionType == 3
+                assert list(restored.Encode) == [1, 0]
+
+    @pytest.mark.parametrize(
+        "transfer",
+        [
+            42,
+            Name.Default,
+            Dictionary(FunctionType=2, N=1),
+            Dictionary(FunctionType=2, Domain=Array([0, 1]), N=Name.Bad),
+            Dictionary(FunctionType=2, Domain=Array([0, 1]), N=1, C0=Array([0, 1])),
+            Dictionary(
+                FunctionType=2, Domain=Array([0, 1]), N=1, Range=Array([0, 1, 0, 1])
+            ),
+            Dictionary(FunctionType=2, Domain=Array([0, 1]), N=-1),
+            Dictionary(FunctionType=7, Domain=Array([0, 1])),
+            # Results beyond the real limit of ISO 32000-1, Table C.1.
+            Dictionary(FunctionType=2, Domain=Array([0, 2]), N=2000),
+            Dictionary(FunctionType=2, Domain=Array([0, 10]), N=39),
+            Dictionary(FunctionType=2, Domain=Array([0.001, 1]), N=-20),
+            Dictionary(
+                FunctionType=2,
+                Domain=Array([0, 2]),
+                N=1,
+                C0=Array([0]),
+                C1=Array([3e38]),
+            ),
+        ],
+    )
+    def test_invalid_soft_mask_transfer_uses_identity_default(self, transfer) -> None:
+        """Malformed transfers are removed without discarding the valid mask group."""
+        pdf = new_pdf()
+        mask = Dictionary(
+            S=Name.Alpha, G=_make_form_stream(pdf), TR=pdf_object(transfer)
+        )
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        assert "/TR" not in pdf.pages[0].Resources.ExtGState.GS0.SMask
+        assert pdf.pages[0].Resources.ExtGState.GS0.SMask.G == mask.G
+
+    @pytest.mark.parametrize(
+        "kind",
+        ["short_samples", "surplus_samples", "bad_calculator", "cycle", "first_bound"],
+    )
+    def test_invalid_transfer_programs_do_not_survive(self, kind) -> None:
+        """Check sampled payloads, calculator syntax, and recursive stitching graphs.
+
+        ISO 32000-1, 7.3.8.2 makes both too little and too much sample data an error,
+        and 7.10.4 requires Domain0 < Bounds0 (only the last bound may equal Domain1).
+        """
+        pdf = new_pdf()
+        if kind == "cycle":
+            transfer = pdf.make_indirect(
+                Dictionary(
+                    FunctionType=3,
+                    Domain=Array([0, 1]),
+                    Bounds=Array(),
+                    Encode=Array([0, 1]),
+                )
+            )
+            transfer.Functions = Array([transfer])
+        elif kind == "first_bound":
+            identity = Dictionary(FunctionType=2, Domain=Array([0, 1]), N=1)
+            transfer = Dictionary(
+                FunctionType=3,
+                Domain=Array([0, 1]),
+                Functions=Array([identity, identity]),
+                Bounds=Array([0]),
+                Encode=Array([0, 1, 0, 1]),
+            )
+        else:
+            samples = {"short_samples": b"\x00", "surplus_samples": b"\x00\x80\xff"}
+            transfer = pdf.make_stream(samples.get(kind, b"{ bogus }"))
+            transfer.FunctionType = 0 if kind in samples else 4
+            transfer.Domain = transfer.Range = Array([0, 1])
+            if kind in samples:
+                transfer.Size = Array([2])
+                transfer.BitsPerSample = 8
+        _make_pdf_with_extgstate(
+            pdf,
+            Dictionary(
+                SMask=Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=transfer)
+            ),
+        )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        assert "/TR" not in pdf.pages[0].Resources.ExtGState.GS0.SMask
+
+    @pytest.mark.parametrize(
+        "domain,exponent,c1",
+        [
+            ([0, 1], 2000, 1),
+            ([0, 10], 38, 1),
+            ([0.01, 1], -19, 1),
+            ([-2, 2], 3, -1),
+            ([0, 1], 1, 3e38),
+        ],
+    )
+    def test_exponential_with_large_finite_results_is_preserved(
+        self, domain, exponent, c1
+    ) -> None:
+        """Results that stay within the real limit keep an exponential transfer."""
+        pdf = new_pdf()
+        transfer = Dictionary(
+            FunctionType=2, Domain=Array(domain), N=exponent, C1=Array([c1])
+        )
+        mask = Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=transfer)
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert "/TR" in pdf.pages[0].Resources.ExtGState.GS0.SMask
+
+    @pytest.mark.parametrize(
+        "domain,program,kept",
+        [
+            ([1, 2], b"{ ln }", True),
+            ([0, 1], b"{ ln }", False),
+            ([-1, 1], b"{ sqrt }", False),
+            ([0, 1], b"{ sqrt }", True),
+            ([1, 2], b"{ 1 exch div }", True),
+        ],
+    )
+    def test_calculator_is_checked_over_its_declared_domain(
+        self, domain, program, kept
+    ) -> None:
+        """Whether an operation has a defined result depends on the actual input."""
+        pdf = new_pdf()
+        mask = self._calculator_mask(pdf, program)
+        mask.TR.Domain = Array(domain)
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        sanitize_extgstate(pdf)
+        assert ("/TR" in pdf.pages[0].Resources.ExtGState.GS0.SMask) is kept
+
+    def test_calculator_sampling_is_bounded_by_program_size(self) -> None:
+        """Thousands of literals cannot make validation quadratic in the stream."""
+        literals = b" ".join(b"0.%05d pop" % step for step in range(1, 5001))
+        program = extgstate._parse_calculator(b"{ " + literals + b" }")
+        samples = extgstate._calculator_samples(program, 0.0, 1.0)
+        size = extgstate._calculator_size(program)
+        assert size == 10000
+        assert len(samples) * size <= extgstate._CALCULATOR_SAMPLE_BUDGET
+        assert samples[:3] == [0.0, 1.0, 0.5]
+
+        pdf = new_pdf()
+        mask = self._calculator_mask(pdf, b"{ " + literals + b" }")
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+
+    def test_small_calculator_keeps_every_sample(self) -> None:
+        """A short program runs on the whole grid and on all its literals."""
+        program = extgstate._parse_calculator(b"{ 0.3 sub 0.7 mul }")
+        samples = extgstate._calculator_samples(program, 0.0, 1.0)
+        assert len(samples) == len(set(samples))
+        assert {0.0, 1.0, 0.5, 0.3, 0.7, 1 / 255} <= set(samples)
+
+    def test_shared_stitching_children_are_validated_once(self) -> None:
+        """A deep graph that reuses each child twice is not walked exponentially."""
+        pdf = new_pdf()
+        child = pdf.make_indirect(Dictionary(FunctionType=2, Domain=Array([0, 1]), N=1))
+        for _ in range(40):
+            child = pdf.make_indirect(
+                Dictionary(
+                    FunctionType=3,
+                    Domain=Array([0, 1]),
+                    Functions=Array([child, child]),
+                    Bounds=Array([0.5]),
+                    Encode=Array([0, 1, 0, 1]),
+                )
+            )
+        _make_pdf_with_extgstate(
+            pdf,
+            Dictionary(
+                SMask=Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=child)
+            ),
+        )
+        with patch.object(
+            extgstate,
+            "_check_scalar_transfer_function",
+            wraps=extgstate._check_scalar_transfer_function,
+        ) as checked:
+            assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert checked.call_count == 41
+        assert pdf.pages[0].Resources.ExtGState.GS0.SMask.TR.objgen == child.objgen
+
+    # A real of magnitude 1e-40, which pikepdf keeps only when parsed: a Decimal
+    # assigned from Python is rounded to 0 before it reaches the file.
+    _TINY = b"0." + b"0" * 39 + b"1"
+    _IDENTITY = b"<< /FunctionType 2 /Domain [0 1] /N 1 >>"
+    # Placeholders of the case texts, replaced in this order. HUGE and VAST are
+    # finite reals beyond the float range, which float() reads as inf; LIMIT is
+    # the largest real and BEYOND exceeds it in the 31st significant digit.
+    _LIMIT = b"340300000000000000000000000000000000000.0"
+    _PLACEHOLDERS = (
+        (b"ID", _IDENTITY),
+        (b"TINY", _TINY),
+        (b"HUGE", b"1" + b"0" * 400 + b".0"),
+        (b"VAST", b"2" + b"0" * 400 + b".0"),
+        (b"BEYOND", _LIMIT + b"0" * 30 + b"1"),
+        (b"LIMIT", _LIMIT),
+        # The largest integer that QPDF reads; it rejects longer ones.
+        (b"INT64", b"9223372036854775807"),
+        # More digits than int() converts from text.
+        (b"DIGITS", b"9" * 5000),
+    )
+    _NORMALIZED_DICTIONARIES = {
+        # Bounds [0] once written, violating Domain0 < Bounds0 (7.10.4).
+        "first_bound": b"<< /FunctionType 3 /Domain [0 1] /Functions [ID ID]"
+        b" /Bounds [TINY] /Encode [0 1 0 1] >>",
+        # Domain [0 1] and Bounds [0] once written.
+        "stitching_domain": b"<< /FunctionType 3 /Domain [-TINY 1]"
+        b" /Functions [ID ID] /Bounds [0] /Encode [0 1 0 1] >>",
+        # Domain [0 1] once written, which a negative N must exclude.
+        "negative_exponent_domain": b"<< /FunctionType 2 /Domain [TINY 1] /N -1 >>",
+        # N becomes 0, which the Domain [0 1] permits, unlike a negative N.
+        "subnormal_exponent": b"<< /FunctionType 2 /Domain [0 1] /N -TINY >>",
+        # Domain [0 1] once written, which a non-integer N permits.
+        "fractional_exponent_domain": b"<< /FunctionType 2 /Domain [-TINY 1] /N 0.5 >>",
+        "subnormal_coefficients": b"<< /FunctionType 2 /Domain [0 1] /N 1"
+        b" /C0 [TINY] /C1 [-TINY] >>",
+        "subnormal_encode": b"<< /FunctionType 3 /Domain [0 1] /Functions [ID ID]"
+        b" /Bounds [0.5] /Encode [TINY 1 0 -TINY] >>",
+        # Domain [0 3.403e38] once written, which halves inputs in [0, 1].
+        "huge_domain": b"<< /FunctionType 2 /Domain [0 HUGE] /N 1 /C1 [0.5] >>",
+        "huge_negative_domain": b"<< /FunctionType 2 /Domain [-HUGE 0] /N 1 >>",
+        # (3.403e38)^2 exceeds the real limit at the written upper end.
+        "huge_squared_domain": b"<< /FunctionType 2 /Domain [0 HUGE] /N 2 >>",
+        "huge_coefficients": b"<< /FunctionType 2 /Domain [0 1] /N 1"
+        b" /C0 [-HUGE] /C1 [0] >>",
+        "huge_range": b"<< /FunctionType 2 /Domain [0 1] /Range [-HUGE HUGE] /N 1 >>",
+        "huge_stitching": b"<< /FunctionType 3 /Domain [0 HUGE] /Functions [ID ID]"
+        b" /Bounds [1] /Encode [0 HUGE -HUGE 1] >>",
+        # Bounds [3.403e38] once written, beyond Domain1.
+        "huge_bound": b"<< /FunctionType 3 /Domain [0 1] /Functions [ID ID]"
+        b" /Bounds [HUGE] /Encode [0 1 0 1] >>",
+        # Bounds0 exceeds Domain1, but both become 3.403e38, a permitted
+        # final interval of zero width.
+        "clamped_final_bound": b"<< /FunctionType 3 /Domain [-HUGE HUGE]"
+        b" /Functions [ID ID] /Bounds [VAST] /Encode [0 1 0 1] >>",
+        "limit_domain": b"<< /FunctionType 2 /Domain [-LIMIT LIMIT] /N 1 >>",
+        "beyond_limit_domain": b"<< /FunctionType 2 /Domain [0 BEYOND] /N 1 >>",
+        # Domain [-2147483648 2147483647] once written.
+        "huge_integer_domain": b"<< /FunctionType 2 /Domain [-INT64 INT64] /N 1 >>",
+        # N 2147483647 once written, which keeps 1^N within the limit.
+        "huge_integer_exponent": b"<< /FunctionType 2 /Domain [0 1] /N INT64 >>",
+        "huge_integer_exponent_overflow": b"<< /FunctionType 2 /Domain [0 2]"
+        b" /N INT64 >>",
+        # -0 is 0, which a non-integer N permits and a negative N does not.
+        "negative_zero_domain": b"<< /FunctionType 2 /Domain [-0.0 1] /N 0.5 >>",
+        "negative_zero_exponent": b"<< /FunctionType 2 /Domain [-0.0 1] /N -1 >>",
+    }
+    _NORMALIZED_SAMPLED = {
+        "huge_sampled": b"<< /FunctionType 0 /Domain [-HUGE HUGE] /Range [0 HUGE]"
+        b" /Size [2] /BitsPerSample 8 /Encode [0 HUGE] /Decode [-HUGE HUGE] >>",
+        # Size [2147483647] once written, for which two bytes are too few.
+        "huge_sampled_size": b"<< /FunctionType 0 /Domain [0 1] /Range [0 1]"
+        b" /Size [INT64] /BitsPerSample 8 >>",
+    }
+    _NORMALIZED_CALCULATORS = {
+        # Domain [0 1] once written, where { ln } is undefined at 0.
+        "calculator_domain": (b"[TINY 1]", b"{ ln }"),
+        # Domain [2147483647 2147483647] once written, where the program is
+        # undefined, although it is defined at every original input.
+        "clamped_domain": (b"[4294967296 4294967297]", b"{ 2147483648 sub ln }"),
+        # The Domain is a dictionary parameter, written as [0 3.403e38].
+        "huge_calculator_domain": (b"[0 HUGE]", b"{ 2 div }"),
+        "huge_calculator_overflow": (b"[0 HUGE]", b"{ dup mul }"),
+        # structure_limits does not rewrite calculator literals, so these stay
+        # beyond the real limit in the output.
+        "huge_calculator_literal": (b"[0 1]", b"{ HUGE pop }"),
+        "long_integer_literal": (b"[0 1]", b"{ DIGITS pop }"),
+        "beyond_limit_literal": (b"[0 1]", b"{ BEYOND pop }"),
+        "limit_literal": (b"[0 1]", b"{ LIMIT mul }"),
+        # A reader takes the literal as 0, so { ln } is undefined at 0.
+        "tiny_literal": (b"[0 1]", b"{ TINY add ln }"),
+        "tiny_literal_offset": (b"[1 2]", b"{ TINY add ln }"),
+    }
+
+    @classmethod
+    def _normalized_transfer(cls, pdf: Pdf, case: str):
+        """Create a transfer function whose verdict depends on number normalization.
+
+        sanitize_structure_limits() sets a real below 1.175e-38 in magnitude to 0,
+        clamps reals to +-3.403e38 and clamps integers to the 32-bit limits, so the
+        validator must decide on the values that pass writes, not on the original
+        ones. The numbers are parsed from text: pikepdf rounds a Decimal assigned
+        from Python through a C double.
+        """
+
+        def substitute(text: bytes) -> bytes:
+            for placeholder, value in cls._PLACEHOLDERS:
+                text = text.replace(placeholder, value)
+            return text
+
+        if case in cls._NORMALIZED_CALCULATORS:
+            domain, program = cls._NORMALIZED_CALCULATORS[case]
+            transfer = pdf.make_stream(substitute(program))
+            transfer.FunctionType = 4
+            transfer.Domain = pikepdf.Object.parse(substitute(domain))
+            transfer.Range = Array([-100, 100])
+            return transfer
+        if case in cls._NORMALIZED_SAMPLED:
+            transfer = pdf.make_stream(b"\x00\xff")
+            text = substitute(cls._NORMALIZED_SAMPLED[case])
+            for key, value in pikepdf.Object.parse(text).items():
+                transfer[key] = value
+            return transfer
+        return pikepdf.Object.parse(substitute(cls._NORMALIZED_DICTIONARIES[case]))
+
+    _NORMALIZATION_CASES = [
+        ("calculator_domain", False),
+        ("first_bound", False),
+        ("stitching_domain", False),
+        ("negative_exponent_domain", False),
+        ("clamped_domain", False),
+        ("subnormal_exponent", True),
+        ("fractional_exponent_domain", True),
+        ("subnormal_coefficients", True),
+        ("subnormal_encode", True),
+        ("huge_domain", True),
+        ("huge_negative_domain", True),
+        ("huge_squared_domain", False),
+        ("huge_coefficients", True),
+        ("huge_range", True),
+        ("huge_stitching", True),
+        ("huge_bound", False),
+        ("clamped_final_bound", True),
+        ("limit_domain", True),
+        ("beyond_limit_domain", True),
+        ("huge_integer_domain", True),
+        ("huge_integer_exponent", True),
+        ("huge_integer_exponent_overflow", False),
+        ("negative_zero_domain", True),
+        ("negative_zero_exponent", False),
+        ("huge_sampled", True),
+        ("huge_sampled_size", False),
+        ("huge_calculator_domain", True),
+        ("huge_calculator_overflow", False),
+        ("huge_calculator_literal", False),
+        ("long_integer_literal", False),
+        ("beyond_limit_literal", False),
+        ("limit_literal", True),
+        ("tiny_literal", False),
+        ("tiny_literal_offset", True),
+    ]
+
+    @pytest.mark.parametrize("case,kept", _NORMALIZATION_CASES)
+    @pytest.mark.parametrize("limits_first", [False, True])
+    def test_transfer_is_validated_as_structure_limits_writes_it(
+        self, case, kept, limits_first
+    ) -> None:
+        """The /TR verdict holds for the written numbers, in either pass order."""
+        pdf = new_pdf()
+        mask = Dictionary(
+            S=Name.Alpha,
+            G=_make_form_stream(pdf),
+            TR=self._normalized_transfer(pdf, case),
+        )
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        if limits_first:
+            sanitize_structure_limits(pdf)
+        sanitize_extgstate(pdf)
+        sanitize_structure_limits(pdf)
+        smask = pdf.pages[0].Resources.ExtGState.GS0.SMask
+        assert ("/TR" in smask) is kept
+        if kept:
+            # The written function passes on its own, without normalization.
+            assert extgstate._is_scalar_transfer_function(smask.TR)
+
+    @pytest.mark.parametrize("case,kept", _NORMALIZATION_CASES)
+    def test_full_conversion_keeps_only_valid_written_transfers(
+        self, case, kept, tmp_path
+    ) -> None:
+        """After the whole pipeline, a soft-mask /TR is present only if valid."""
+        pdf = new_pdf()
+        mask = Dictionary(
+            S=Name.Alpha,
+            G=_make_form_stream(pdf),
+            TR=self._normalized_transfer(pdf, case),
+        )
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        pdf.pages[0].Contents = pdf.make_stream(b"/GS0 gs 0 0 10 10 re f")
+        source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+        pdf.save(source)
+
+        result = convert_to_pdfa(source, output, level="2b", validate=False)
+
+        assert result.success
+        with Pdf.open(output) as converted:
+            smask = converted.pages[0].Resources.ExtGState.GS0.SMask
+            assert isinstance(smask, Dictionary)
+            assert ("/TR" in smask) is kept
+            if kept:
+                assert extgstate._is_scalar_transfer_function(smask.TR)
+
+    _MAX_REAL = float(Decimal("3.403e38"))
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            # A finite real beyond the float range, which float() reads as inf.
+            (Decimal("1" + "0" * 400 + ".0"), _MAX_REAL),
+            (Decimal("-1" + "0" * 400 + ".0"), -_MAX_REAL),
+            (Decimal("3.403e38"), _MAX_REAL),
+            (Decimal("3.4030000000000000000000000000001e38"), _MAX_REAL),
+            # Infinity is clamped like structure_limits clamps it.
+            (Decimal("Infinity"), _MAX_REAL),
+            (Decimal("-Infinity"), -_MAX_REAL),
+            (float("inf"), _MAX_REAL),
+            (Decimal("1.1749999999999999999999999999999e-38"), 0.0),
+            (Decimal("1.175e-38"), 1.175e-38),
+            (2**80, 2**31 - 1),
+            (-(2**80), -(2**31)),
+            (Decimal("NaN"), None),
+            (Decimal("sNaN"), None),
+            (float("nan"), None),
+            (True, None),
+            (False, None),
+        ],
+    )
+    def test_function_number_normalizes_before_converting(
+        self, value, expected
+    ) -> None:
+        """Numbers are normalized first, so no finite real is read as inf."""
+        result = extgstate._function_number(value)
+        assert result == expected
+        assert type(result) is type(expected)
+
+    def test_function_number_keeps_negative_zero(self) -> None:
+        """-0 is 0 for every ordering and exponent check."""
+        result = extgstate._function_number(Decimal("-0.0"))
+        assert result == 0.0 and math.copysign(1, result) == -1
+
+    @pytest.mark.parametrize("limits_first", [False, True])
+    def test_assigned_infinite_domain_is_clamped(self, limits_first) -> None:
+        """pikepdf writes an out-of-range Decimal assigned from Python as inf.
+
+        structure_limits clamps that infinity to 3.403e38, so the validator
+        keeps a function that is valid with the clamped Domain.
+        """
+        pdf = new_pdf()
+        transfer = Dictionary(
+            FunctionType=2, Domain=Array([0, Decimal("1e400")]), N=1, C1=Array([0.5])
+        )
+        assert transfer.Domain[1] == Decimal("Infinity")
+        mask = Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=transfer)
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        if limits_first:
+            sanitize_structure_limits(pdf)
+        sanitize_extgstate(pdf)
+        sanitize_structure_limits(pdf)
+        smask = pdf.pages[0].Resources.ExtGState.GS0.SMask
+        assert smask.TR.Domain[1] == Decimal("3.403e38")
+        assert extgstate._is_scalar_transfer_function(smask.TR)
+
+    @pytest.mark.parametrize(
+        "token,expected",
+        [
+            (b"2147483647", 2147483647),
+            (b"-2147483648", -2147483648),
+            # Integer literals beyond the 32-bit limits are read as reals.
+            (b"2147483648", 2147483648.0),
+            (b"340300000000000000000000000000000000000", float(Decimal("3.403e38"))),
+            (b"340300000000000000000000000000000000001", None),
+            (b"340300000000000000000000000000000000000.0000000000000001", None),
+            (b"1" + b"0" * 400 + b".0", None),
+            (b"9" * 5000, None),
+            (b"-" + b"9" * 5000, None),
+            # Below 1.175e-38 in magnitude, a reader takes a real as 0.
+            (b"0." + b"0" * 39 + b"1", 0.0),
+            (b"-0.00000000000000000000000000000000000001175", -1.175e-38),
+            (b".5", 0.5),
+            (b"-0.0", -0.0),
+        ],
+    )
+    def test_calculator_literals_are_read_exactly(self, token, expected) -> None:
+        """Calculator literals are compared with the limits before any float()."""
+        result = extgstate._calculator_literal(token)
+        assert result == expected
+        assert type(result) is type(expected)
+
+    @staticmethod
+    def _calculator_mask(pdf: Pdf, program: bytes) -> Dictionary:
+        """Create a soft mask whose transfer function runs the given program."""
+        transfer = pdf.make_stream(program)
+        transfer.FunctionType = 4
+        transfer.Domain = transfer.Range = Array([0, 1])
+        return Dictionary(S=Name.Alpha, G=_make_form_stream(pdf), TR=transfer)
+
+    @pytest.mark.parametrize(
+        "program",
+        [
+            b"{ 1 exch sub }",
+            b"{ % comment\n 0.5 mul }",
+            b"{ dup 0.5 lt { 2 mul } if }",
+            b"{ dup 0.5 gt { pop 1 } { pop 0 } ifelse }",
+            b"{ 0 eq { 1 } { 0 } ifelse }",
+            b"{ dup 0 gt true and { 1 exch sub } if }",
+            b"{ 1 1 index add exch pop }",
+            b"{ 1 2 1 roll pop }",
+            b"{ 2 mul 0 0 roll }",
+            b"{ dup 1 copy pop pop }",
+            b"{ 0 copy }",
+            b"{ cvi 1 and cvr }",
+            b"{ dup 0 gt { dup 1 gt { pop 1 } if } { pop 0 } ifelse }",
+            b"{ 1 cvi copy pop }",
+            b"{ 1.9 cvi copy pop }",
+            b"{ -1.9 abs cvi copy pop }",
+            b"{ 2 1 sub copy pop }",
+            b"{ 0 0 add index exch pop }",
+            b"{ 3 2 idiv copy pop }",
+            b"{ 5 2 mod copy pop }",
+            b"{ 3 1 and copy pop }",
+            b"{ 1.5 floor cvi copy pop }",
+            b"{ 0.5 round cvi copy pop }",
+            b"{ -1.4 round cvi abs copy pop }",
+            b"{ -1.5 round add }",
+            b"{ 2 2 mul 3 sub copy pop }",
+            b"{ 3 2 div floor cvi copy pop }",
+            b"{ dup 0 gt { 1 } { 1 } ifelse copy pop }",
+            b"{ cvi 2 idiv cvr }",
+            b"{ cvi 2 mod cvr }",
+            b"{ cvi 1 bitshift cvr }",
+            b"{ cvi not cvr }",
+            b"{ cvi 1 add 1 and cvr }",
+            b"{ cvi dup 0 gt { pop 1 } if 1 and cvr }",
+            b"{ pop 3 2 xor }",
+            b"{ pop 4 sqrt }",
+            b"{ pop 1 ln }",
+            b"{ pop 100 log }",
+            b"{ pop 2 3 exp }",
+            b"{ pop 1 1 atan }",
+            b"{ pop 90 sin }",
+            b"{ 16 sqrt cvi 3 sub copy pop }",
+            b"{ sqrt }",
+            b"{ 1 add ln }",
+            b"{ dup 0 gt { ln } { pop 0 } ifelse }",
+            b"{ dup 0 eq { pop 0 } { 1 exch div } ifelse }",
+            b"{ false { pop } if }",
+            b"{ true { 1 exch sub } if }",
+            b"{ true not { pop } if }",
+            b"{ 1 2 lt { 1 exch sub } { pop } ifelse }",
+            # A guard at the singular input, which is sampled as a literal.
+            b"{ dup 0.25 eq { pop 0 } { 0.25 sub 1 exch div } ifelse }",
+            b"{ pop -2147483648.0 cvi }",
+            # Literal bit shifts are folded, so they can drive stack operators.
+            b"{ 1 1 bitshift 1 sub copy pop }",
+            b"{ 0 1 bitshift copy }",
+            b"{ 8 -3 bitshift copy pop }",
+            b"{ pop 2147483647 1 and cvr }",
+            # Form feed, tab, CR and LF are PDF white-space characters.
+            b"{\x0cpop\t1\r\n}",
+            # Large reals within the limit of ISO 32000-1, Table C.1.
+            b"{ pop 1" + b"0" * 38 + b".0 }",
+            b"{ 1" + b"0" * 18 + b".0 mul 1" + b"0" * 18 + b".0 mul }",
+            b"{ pop 10 38 exp }",
+        ],
+    )
+    def test_calculator_with_one_numeric_result_is_preserved(self, program) -> None:
+        """Conditionals and literal stack operands can be proven correct."""
+        pdf = new_pdf()
+        mask = self._calculator_mask(pdf, program)
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert pdf.pages[0].Resources.ExtGState.GS0.SMask.TR.read_bytes() == program
+
+    @pytest.mark.parametrize(
+        "program",
+        [
+            b"{ pop }",
+            b"{ dup }",
+            b"{ add }",
+            b"{ 1 }",
+            b"{ pop true }",
+            b"{ 0 gt }",
+            b"{ true add }",
+            b"{ true 1 eq pop }",
+            b"{ { 2 mul } if }",
+            b"{ 1 { 2 mul } if }",
+            b"{ { 2 mul } }",
+            b"{ dup 0 gt { pop } if }",
+            b"{ dup 0 gt { pop } { pop 1 } ifelse }",
+            b"{ dup 0 gt { 2 mul } { 3 mul } { 4 mul } ifelse }",
+            b"{ dup 0 gt { pop 1 } { pop true } ifelse }",
+            b"{ dup copy }",
+            b"{ 5 copy }",
+            b"{ 5 index }",
+            b"{ 3 1 roll }",
+            b"{ dup roll }",
+            b"{ 1.0 copy pop }",
+            b"{ 1 cvr copy pop }",
+            b"{ -1.5 round cvi abs copy pop }",
+            b"{ -0.5 round cvi 1 add copy pop }",
+            b"{ pop 1.5 2 and }",
+            b"{ pop 1.5 2 or }",
+            b"{ pop 1.5 2 xor }",
+            b"{ pop 1.5 not }",
+            b"{ pop 1.5 2 idiv }",
+            b"{ 1 and }",
+            b"{ not }",
+            b"{ 2 idiv }",
+            b"{ 2 mod }",
+            b"{ 1 bitshift }",
+            b"{ cvi 1.5 or }",
+            b"{ cvr 1 and }",
+            b"{ pop true 1 and }",
+            b"{ pop -1 sqrt }",
+            b"{ pop 0 ln }",
+            b"{ pop -1 ln }",
+            b"{ pop 0 log }",
+            b"{ pop 0 -1 exp }",
+            b"{ pop -1 0.5 exp }",
+            b"{ pop 0 0 atan }",
+            b"{ ln }",
+            b"{ log }",
+            b"{ 1 exch div }",
+            b"{ 0.5 sub ln }",
+            b"{ 0.5 sub 1 exch div }",
+            b"{ -1 exp }",
+            b"{ true { pop } if }",
+            b"{ false { 1 exch sub } { pop } ifelse }",
+            b"{ dup 1 gt { pop } if pop }",
+            b"{ true copy }",
+            b"{ true true roll }",
+            b"{ cvi copy }",
+            b"{ 1 0 idiv pop }",
+            b"{ 1 0 div pop }",
+            b"{ 1 0 mod pop }",
+            b"{ 2147483647 1 add index }",
+            b"{ dup 0 gt { 1 } { 0 } ifelse copy pop }",
+            b"{ dup 0 gt { 1 } { 1.0 } ifelse copy pop }",
+            b"{" + b" dup" * 150 + b" }",
+            b"{ " * 40 + b"}" * 40,
+            b"{ 1 exch sub } }",
+            b"{ 1 exch sub } { 1 exch sub }",
+            b"1 exch sub",
+            # Undefined between the ends and the middle of the domain.
+            b"{ 0.25 sub 1 exch div }",
+            b"{ -0.25 add 1 exch div }",
+            b"{ 3 mul 1 sub 1 exch div }",
+            b"{ 0.3 sub ln }",
+            # cvi and integer-only operators cannot leave the integer range.
+            b"{ pop 2147483648.0 cvi }",
+            b"{ pop -2147483649.0 cvi }",
+            b"{ pop -2147483648 -1 idiv }",
+            # Renderers disagree on these shifts, so their result is not known.
+            b"{ -1 1 bitshift copy pop }",
+            b"{ 1 31 bitshift copy pop }",
+            # An integer literal beyond the 32-bit limit is a real.
+            b"{ pop 2147483648 1 and cvr }",
+            # A vertical tab is not PDF white space, so this is one bad token.
+            b"{ pop\x0b1 }",
+            # Non-finite values, and reals beyond the limit of ISO 32000-1, Table C.1.
+            b"{ pop " + b"1" * 400 + b".0 }",
+            b"{ pop " + b"1" * 400 + b" }",
+            b"{ pop 4" + b"0" * 38 + b".0 }",
+            b"{ pop 1" + b"0" * 200 + b".0 1" + b"0" * 200 + b".0 mul 0 mul }",
+            b"{ pop 1" + b"0" * 30 + b".0 dup mul }",
+            b"{ pop 1" + b"0" * 30 + b".0 0." + b"0" * 29 + b"1 div }",
+            b"{ pop 10 39 exp }",
+            b"{ pop 1" + b"0" * 38 + b".0 10 mul }",
+            b"{ pop -3" + b"0" * 38 + b".0 dup add }",
+            b"{ 1" + b"0" * 30 + b".0 mul 1" + b"0" * 30 + b".0 mul }",
+        ],
+    )
+    def test_calculator_without_provable_result_is_removed(self, program) -> None:
+        """Malformed stack effects cannot produce a defined mask mapping."""
+        pdf = new_pdf()
+        mask = self._calculator_mask(pdf, program)
+        _make_pdf_with_extgstate(pdf, Dictionary(SMask=mask))
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        state = pdf.pages[0].Resources.ExtGState.GS0
+        assert "/TR" not in state.SMask
+        assert state.SMask.G == mask.G
 
     def test_smask_dict_invalid_bc_removed(self) -> None:
         """Removes malformed /BC (non-Array) from SMask dict."""
@@ -1111,104 +1855,993 @@ class TestTransparencyCombined:
         assert float(gs_out.CA) == pytest.approx(1.0)
 
 
+_PATH_PAINT = frozenset({"S", "s", "f", "F", "f*", "B", "B*", "b", "b*"})
+_PATH_BUILD = frozenset({"m", "l", "c", "v", "y", "h", "re", "W", "W*"})
+
+
+def _assert_no_gs_inside_paths(owner) -> None:
+    """Reject a gs operator between a path's construction and its paint/n."""
+    in_path = False
+    for instruction in pikepdf.parse_content_stream(owner):
+        op = str(instruction.operator)
+        if op in _PATH_BUILD:
+            in_path = True
+        elif op in _PATH_PAINT or op == "n":
+            in_path = False
+        elif op == "gs":
+            assert not in_path, pikepdf.unparse_content_stream(
+                pikepdf.parse_content_stream(owner)
+            )
+
+
 class TestOverprintIccBasedCmyk:
-    """Tests for PDF/A 6.2.4.2 overprint handling with ICCBased CMYK."""
+    """Overprint repairs depend on actual paints, never resource presence."""
 
-    def _add_icc_cmyk_colorspace(self, pdf: Pdf) -> None:
-        """Attach an ICCBased CMYK color space to page resources."""
-        icc_stream = pikepdf.Stream(pdf, get_cmyk_profile())
-        icc_stream.N = 4
-        icc_cs = Array([Name.ICCBased, pdf.make_indirect(icc_stream)])
-        pdf.pages[0].Resources[Name.ColorSpace] = Dictionary(CS0=icc_cs)
+    def _page(self, pdf: Pdf, content: bytes, **gs_values):
+        """Create a page with a CMYK ICC space and configurable graphics state."""
+        _make_pdf_with_extgstate(pdf, Dictionary(Type=Name.ExtGState, **gs_values))
+        page = pdf.pages[-1]
+        profile = pdf.make_stream(get_cmyk_profile())
+        profile.N = 4
+        page.Resources.ColorSpace = Dictionary(CS0=Array([Name.ICCBased, profile]))
+        page.Contents = pdf.make_stream(content)
+        return page
 
-    def test_opm_reset_when_stroke_overprint_enabled(self) -> None:
-        """Sets /OPM 1 -> 0 when /OP true and ICCBased CMYK is present."""
-        pdf = new_pdf()
-        gs = Dictionary(Type=Name.ExtGState, OPM=1, OP=True)
-        _make_pdf_with_extgstate(pdf, gs)
-        self._add_icc_cmyk_colorspace(pdf)
+    def _assert_guard(
+        self, owner, operator: str, count: int = 1, resources=None
+    ) -> None:
+        """Require local overprint guards around the expected painting operations.
 
-        result = sanitize_extgstate(pdf)
-        assert result["extgstate_fixed"] == 1
-        assert int(pdf.pages[0].Resources.ExtGState.GS0.OPM) == 0
-
-    def test_opm_reset_when_fill_overprint_enabled(self) -> None:
-        """Sets /OPM 1 -> 0 when /op true and ICCBased CMYK is present."""
-        pdf = new_pdf()
-        gs = Dictionary(Type=Name.ExtGState, OPM=1, op=True)
-        _make_pdf_with_extgstate(pdf, gs)
-        self._add_icc_cmyk_colorspace(pdf)
-
-        result = sanitize_extgstate(pdf)
-        assert result["extgstate_fixed"] == 1
-        assert int(pdf.pages[0].Resources.ExtGState.GS0.OPM) == 0
-
-    def test_opm_reset_when_overprint_is_in_another_graphics_state(self) -> None:
-        """Combines independently persistent OPM and overprint parameters."""
-        pdf = new_pdf()
-        _make_pdf_with_extgstate(
-            pdf,
-            Dictionary(Type=Name.ExtGState, OPM=1),
-        )
-        pdf.pages[0].Resources.ExtGState.GS1 = Dictionary(
-            Type=Name.ExtGState,
-            OP=True,
-        )
-        self._add_icc_cmyk_colorspace(pdf)
-
-        result = sanitize_extgstate(pdf)
-        assert result["extgstate_fixed"] == 1
-        assert int(pdf.pages[0].Resources.ExtGState.GS0.OPM) == 0
-
-    def test_opm_unchanged_without_iccbased_cmyk(self) -> None:
-        """Leaves OPM untouched when ICCBased CMYK is not used."""
-        pdf = new_pdf()
-        gs = Dictionary(Type=Name.ExtGState, OPM=1, OP=True)
-        _make_pdf_with_extgstate(pdf, gs)
-
-        result = sanitize_extgstate(pdf)
-        assert result["extgstate_fixed"] == 0
-        assert int(pdf.pages[0].Resources.ExtGState.GS0.OPM) == 1
-
-    def test_opm_unchanged_when_overprint_not_enabled(self) -> None:
-        """Leaves OPM untouched when /OP and /op are false."""
-        pdf = new_pdf()
-        gs = Dictionary(Type=Name.ExtGState, OPM=1, OP=False, op=False)
-        _make_pdf_with_extgstate(pdf, gs)
-        self._add_icc_cmyk_colorspace(pdf)
-
-        result = sanitize_extgstate(pdf)
-        assert result["extgstate_fixed"] == 0
-        assert int(pdf.pages[0].Resources.ExtGState.GS0.OPM) == 1
-
-    def test_opm_conservative_cross_page(self) -> None:
-        """OPM is reset even when ICCBased CMYK is on a different page.
-
-        The document-wide flag is intentionally conservative: shared
-        ExtGState objects could be referenced from any page.
+        A path paint is guarded outside its path object: OPM 0 is selected
+        before the first path-construction operator, never between it and the
+        paint (ISO 32000-1, 8.5.1). Other paints are guarded directly.
         """
-        pdf = new_pdf()
-        # Page 1: ExtGState with OPM=1 and overprint, no ICC CMYK
-        gs = Dictionary(Type=Name.ExtGState, OPM=1, OP=True)
-        _make_pdf_with_extgstate(pdf, gs)
+        instructions = list(pikepdf.parse_content_stream(owner))
+        states = (resources if resources is not None else owner.Resources).ExtGState
+        guarded = 0
+        for i, instruction in enumerate(instructions):
+            if str(instruction.operator) != operator or i + 1 == len(instructions):
+                continue
+            start = i
+            if operator in _PATH_PAINT:
+                while (
+                    start > 0 and str(instructions[start - 1].operator) in _PATH_BUILD
+                ):
+                    start -= 1
+            if start == 0:
+                continue
+            before, after = instructions[start - 1], instructions[i + 1]
+            if str(before.operator) != "gs" or str(after.operator) != "gs":
+                continue
+            assert states[str(before.operands[0])].OPM == 0
+            assert states[str(after.operands[0])].OPM == 1
+            guarded += 1
+        assert guarded == count
+        _assert_no_gs_inside_paths(owner)
 
-        # Page 2: has ICC CMYK but no problematic ExtGState
-        page2 = pikepdf.Page(
-            Dictionary(
-                Type=Name.Page,
-                MediaBox=Array([0, 0, 612, 792]),
-                Resources=Dictionary(),
+    @pytest.mark.parametrize(
+        "paint,colour,flags",
+        [
+            (b"S", b"CS", {"OP": True, "op": False}),
+            (b"f", b"cs", {"OP": False, "op": True}),
+        ],
+    )
+    def test_only_prohibited_paint_is_repaired(self, paint, colour, flags) -> None:
+        """Repair the painted side whose effective overprint state is prohibited."""
+        pdf = new_pdf()
+        page = self._page(
+            pdf, b"/GS0 gs /CS0 " + colour + b" 0 0 20 20 re " + paint, OPM=1, **flags
+        )
+        original_state = page.Resources.ExtGState.GS0
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        assert original_state.OPM == 1
+        assert page.Resources.ExtGState.GS0 == original_state
+        self._assert_guard(page, paint.decode())
+        # The restoration must also make a second sanitizer pass a no-op.
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+
+    @pytest.mark.parametrize(
+        "value,mode,fixes",
+        [(Decimal("1.0"), 1, 2), (Decimal("1"), 1, 2), (Decimal("0.0"), 0, 1)],
+    )
+    def test_equivalent_real_mode_becomes_an_integer(self, value, mode, fixes) -> None:
+        """Keep the selected mode while storing the required integer type."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs 0 0 20 20 re f", op=True)
+        page.Resources.ExtGState.GS0.OPM = value
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == fixes
+        state = page.Resources.ExtGState.GS0
+        assert isinstance(state.OPM, int) and state.OPM == mode
+        assert b"/OPM 1.0" not in state.unparse()
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+
+    def test_real_mode_without_iccbased_cmyk_is_normalized(self) -> None:
+        """The stored type does not depend on whether overprint analysis runs."""
+        pdf = new_pdf()
+        gs = Dictionary(Type=Name.ExtGState, OP=True)
+        gs.OPM = Decimal("1.0")
+        _make_pdf_with_extgstate(pdf, gs)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        assert isinstance(pdf.pages[0].Resources.ExtGState.GS0.OPM, int)
+
+    @pytest.mark.parametrize(
+        "value", [Decimal("0.5"), Decimal("2.0"), 2, -1, True, Name.One]
+    )
+    def test_undefined_mode_is_removed(self, value) -> None:
+        """An optional entry without a defined mode cannot remain in the output."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs 0 0 20 20 re f", op=True)
+        page.Resources.ExtGState.GS0.OPM = value
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        assert "/OPM" not in page.Resources.ExtGState.GS0
+        assert page.Resources.ExtGState.GS0.op is True
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+
+    @pytest.mark.parametrize("value", [1, 0])
+    def test_valid_integer_mode_is_unchanged(self, value) -> None:
+        """Repairing malformed modes must not touch the two defined values."""
+        pdf = new_pdf()
+        gs = Dictionary(Type=Name.ExtGState, OP=False)
+        gs.OPM = value
+        _make_pdf_with_extgstate(pdf, gs)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert pdf.pages[0].Resources.ExtGState.GS0.OPM == value
+
+    @pytest.mark.parametrize(
+        "value,flag,fixes",
+        [
+            (1, True, 2),
+            (Decimal("1.0"), True, 2),
+            (0, False, 1),
+            (Decimal("0.0"), False, 1),
+        ],
+    )
+    def test_numeric_overprint_flag_becomes_a_boolean(self, value, flag, fixes) -> None:
+        """Unambiguous flags keep their meaning, and enabled ones are still repaired."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs 0 0 20 20 re f", OPM=1)
+        page.Resources.ExtGState.GS0.op = value
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == fixes
+        assert page.Resources.ExtGState.GS0.op is flag
+        if flag:
+            self._assert_guard(page, "f")
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+
+    @pytest.mark.parametrize("key", ["/OP", "/op"])
+    @pytest.mark.parametrize("value", [2, -1, Decimal("0.5"), Name.Yes])
+    def test_undefined_overprint_flag_is_removed(self, key, value) -> None:
+        """A flag without a defined meaning cannot force the original-input fallback."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs 0 0 20 20 re f", OPM=1)
+        page.Resources.ExtGState.GS0[key] = value
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        assert key not in page.Resources.ExtGState.GS0
+        assert page.Resources.ExtGState.GS0.OPM == 1
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_boolean_overprint_flag_is_unchanged(self, value) -> None:
+        """The repair leaves correctly typed flags alone."""
+        pdf = new_pdf()
+        _make_pdf_with_extgstate(pdf, Dictionary(Type=Name.ExtGState, OP=value))
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert pdf.pages[0].Resources.ExtGState.GS0.OP is value
+
+    @pytest.mark.parametrize("key,value", [("/OP", 1), ("/op", 1), ("/OP", 2)])
+    def test_conversion_does_not_fall_back_for_numeric_flags(
+        self, key, value, tmp_path
+    ) -> None:
+        """These documents converted before point-of-use overprint analysis."""
+        from pdftopdfa.converter import convert_to_pdfa
+
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs 0 0 20 20 re f", OPM=1)
+        page.Resources.ExtGState.GS0[key] = value
+        source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+        pdf.save(source)
+        result = convert_to_pdfa(source, output, level="3b")
+        assert result.target_produced and not result.skipped, result
+
+    def test_overprint_analysis_rejects_unrepaired_flag(self) -> None:
+        """A dictionary that sanitization did not reach still fails closed."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs 0 0 20 20 re f", OPM=1)
+        page.Resources.ExtGState.GS0.OP = 1
+        with pytest.raises(ConversionError, match="non-boolean /OP"):
+            sanitize_overprint_usage(pdf)
+
+    def test_overprint_analysis_rejects_unrepaired_real_mode(self) -> None:
+        """A dictionary that sanitization did not reach still fails closed."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs 0 0 20 20 re f", op=True)
+        page.Resources.ExtGState.GS0.OPM = Decimal("1.0")
+        with pytest.raises(ConversionError, match="invalid /OPM"):
+            sanitize_overprint_usage(pdf)
+
+    def test_independently_persistent_graphics_states(self) -> None:
+        """Combine overprint parameters selected by separate ExtGState operations."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /GS1 gs /CS0 cs 0 0 20 20 re f", OPM=1)
+        page.Resources.ExtGState.GS1 = Dictionary(OP=True)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        assert page.Resources.ExtGState.GS0.OPM == 1
+        self._assert_guard(page, "f")
+
+    @pytest.mark.parametrize(
+        "colorspace,data,cmyk",
+        [
+            (b"/CMYK", b"000000ff>", True),
+            (b"/RGB", b"ff0000>", False),
+            (b"/G", b"80>", False),
+            (b"[/I /G 1 <00ff>]", b"00>", False),
+            (b"[/I /CMYK 1 <00000000000000ff>]", b"00>", True),
+        ],
+    )
+    def test_inline_abbreviations_use_effective_color_space(
+        self, colorspace, data, cmyk
+    ) -> None:
+        """Recognize inline abbreviations and guard only prohibited paints."""
+        pdf = new_pdf()
+        content = (
+            b"/GS0 gs BI /W 1 /H 1 /BPC 8 /F /AHx /CS "
+            + colorspace
+            + b" ID "
+            + data
+            + b" EI"
+        )
+        page = self._page(pdf, content, OPM=1, op=True)
+        page.Resources.ColorSpace.DefaultCMYK = page.Resources.ColorSpace.CS0
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == int(cmyk)
+        if cmyk:
+            self._assert_guard(page, "INLINE IMAGE")
+        else:
+            assert page.Contents.read_bytes() == content
+
+    @pytest.mark.parametrize("mode", range(8))
+    @pytest.mark.parametrize("show", [b"(A) Tj", b"[(A)] TJ", b"(A) '", b'0 0 (A) "'])
+    def test_type3_overprint_ignores_only_invisible_text(self, mode, show) -> None:
+        """Only mode 3 suppresses Type3 glyph paints, for every text-show operator."""
+        pdf = new_pdf()
+        content = b"/GS0 gs BT /F 12 Tf " + str(mode).encode() + b" Tr " + show + b" ET"
+        page = self._page(pdf, content, OPM=1, OP=True)
+        glyph_data = b"600 0 d0 /CS0 cs 0 0 0 1 scn 0 0 20 20 re f"
+        glyph = pdf.make_stream(glyph_data)
+        page.Resources.Font = Dictionary(
+            F=Dictionary(
+                Subtype=Name.Type3,
+                CharProcs=Dictionary(A=glyph),
+                Resources=Dictionary(ColorSpace=page.Resources.ColorSpace),
             )
         )
-        pdf.pages.append(page2)
-        icc_stream = pikepdf.Stream(pdf, get_cmyk_profile())
-        icc_stream.N = 4
-        icc_cs = Array([Name.ICCBased, pdf.make_indirect(icc_stream)])
-        pdf.pages[1].Resources[Name.ColorSpace] = Dictionary(CS0=icc_cs)
+        if mode == 3:
+            assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        else:
+            with pytest.raises(ConversionError, match="Type3 glyph"):
+                sanitize_extgstate(pdf)
+        assert page.Contents.read_bytes() == content
+        assert glyph.read_bytes() == glyph_data
+        assert page.Resources.ExtGState.GS0.OPM == 1
 
-        result = sanitize_extgstate(pdf)
-        assert result["extgstate_fixed"] == 1
-        assert int(pdf.pages[0].Resources.ExtGState.GS0.OPM) == 0
+    def test_repeated_type3_proofs_do_not_exhaust_context_budget(self) -> None:
+        """A large harmless Type3 text page needs one proof per glyph context."""
+        from pdftopdfa.sanitizers.overprint import _Analyzer, _State
+
+        pdf = new_pdf()
+        content = b"/GS0 gs BT /F 12 Tf " + b"(A) Tj " * 3000 + b"ET"
+        page = self._page(pdf, content, OPM=1, OP=True)
+        charprocs = Dictionary()
+        for index in range(50):
+            charprocs[f"/Glyph{index}"] = pdf.make_stream(b"0 g 0 0 1 1 re f")
+        page.Resources.Font = Dictionary(
+            F=Dictionary(
+                Subtype=Name.Type3, CharProcs=charprocs, Resources=Dictionary()
+            )
+        )
+        analyzer = _Analyzer()
+        analyzer.walk(page, page.Resources, _State())
+        assert analyzer.calls == 51
+        assert not any(plan.repairs for plan in analyzer.plans.values())
+        assert page.Contents.read_bytes() == content
+
+    def test_repeated_soft_mask_uses_share_equivalent_analysis(self) -> None:
+        """Repeated mask use is cached without masking a later conflicting context."""
+        from pdftopdfa.sanitizers.overprint import _Analyzer, _State
+
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs " + b"0 0 20 20 re f " * 2000, OPM=1, OP=False)
+        mask = pdf.make_stream(b"/CS0 cs 0 0 20 20 re f")
+        mask.Subtype = Name.Form
+        mask.Resources = Dictionary(ColorSpace=page.Resources.ColorSpace)
+        page.Resources.ExtGState.GS0.SMask = Dictionary(S=Name.Alpha, G=mask)
+        analyzer = _Analyzer()
+        analyzer.walk(page, page.Resources, _State())
+        assert analyzer.calls == 2
+        page.Resources.ExtGState.On = Dictionary(OP=True)
+        page.Contents = pdf.make_stream(
+            page.Contents.read_bytes() + b"/On gs 0 0 20 20 re f"
+        )
+        with pytest.raises(ConversionError, match="shared form"):
+            sanitize_extgstate(pdf)
+
+    @pytest.mark.parametrize(
+        "content,flags",
+        [
+            (b"/GS0 gs 0 0 0 1 k 0 0 20 20 re f", {"OP": True}),
+            (b"/GS0 gs /CS0 cs 0 0 20 20 re f", {"OP": False, "op": False}),
+            (b"/GS0 gs /CS0 cs 0 0 20 20 re f", {"OP": True, "op": False}),
+            (b"/GS0 gs /CS0 CS 0 0 20 20 re S", {"OP": False, "op": True}),
+            (b"", {"OP": True}),
+        ],
+    )
+    def test_allowed_or_unused_combinations_unchanged(self, content, flags) -> None:
+        """Preserve allowed and unused color-space and overprint combinations."""
+        pdf = new_pdf()
+        page = self._page(pdf, content, OPM=1, **flags)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert page.Resources.ExtGState.GS0.OPM == 1
+        assert page.Contents.read_bytes() == content
+
+    def test_icc_on_different_page_does_not_reset_overprint(self) -> None:
+        """An unrelated page cannot change valid DeviceCMYK overprint."""
+        pdf = new_pdf()
+        first = self._page(pdf, b"/GS0 gs 0 0 0 1 k 0 0 20 20 re f", OPM=1, OP=True)
+        del first.Resources["/ColorSpace"]
+        second = self._page(pdf, b"/CS0 cs 0 0 20 20 re f", OPM=0)
+        first_data, second_data = (
+            first.Contents.read_bytes(),
+            second.Contents.read_bytes(),
+        )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert first.Resources.ExtGState.GS0.OPM == 1
+        assert first.Contents.read_bytes() == first_data
+        assert second.Contents.read_bytes() == second_data
+
+    def test_q_q_restore_and_content_array_share_graphics_state(self) -> None:
+        """Honor saved state across the combined page content-stream array."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"", OPM=1, OP=True)
+        page.Resources.ExtGState.Off = Dictionary(OP=False)
+        page.Contents = Array(
+            [
+                pdf.make_stream(b"/GS0 gs /CS0 cs q /Off gs 0 0 20 20 re f"),
+                pdf.make_stream(b"Q 30 30 20 20 re f"),
+            ]
+        )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        self._assert_guard(page, "f")
+
+    def test_shared_gs_preserves_device_cmyk_paint_on_same_page(self) -> None:
+        """Leave shared settings intact when only one paint needs a repair."""
+        pdf = new_pdf()
+        page = self._page(
+            pdf,
+            b"/GS0 gs 0 0 0 1 k 0 0 20 20 re f "
+            b"/CS0 cs 30 30 20 20 re f 0 0 0 1 k 60 60 20 20 re f",
+            OPM=1,
+            OP=True,
+        )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        assert page.Resources.ExtGState.GS0.OPM == 1
+        self._assert_guard(page, "f")
+
+    def test_nested_form_uses_callers_state_and_inherited_resources(self) -> None:
+        """Resolve inherited resources and graphics state inside a nested Form."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /Fm Do", OPM=1, OP=True)
+        form = pdf.make_stream(b"/CS0 cs 0 0 20 20 re f")
+        form.Subtype = Name.Form
+        form.BBox = Array([0, 0, 20, 20])
+        page.Resources.XObject = Dictionary(Fm=form)
+        original_page = page.Contents.read_bytes()
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        # The guards are added to the inherited scope; the Form keeps inheriting.
+        assert "/Resources" not in form
+        self._assert_guard(form, "f", resources=page.Resources)
+        assert page.Contents.read_bytes() == original_page
+        assert page.Resources.ExtGState.GS0.OPM == 1
+
+    def test_shared_form_with_conflicting_states_fails_without_mutation(self) -> None:
+        """Reject incompatible shared-Form repairs before modifying any stream."""
+        from pdftopdfa.exceptions import ConversionError
+
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /Fm Do /Off gs /Fm Do", OPM=1, OP=True)
+        page.Resources.ExtGState.Off = Dictionary(OP=False)
+        content = b"/CS0 cs 0 0 20 20 re f"
+        form = pdf.make_stream(content)
+        form.Subtype = Name.Form
+        form.BBox = Array([0, 0, 20, 20])
+        page.Resources.XObject = Dictionary(Fm=form)
+        with pytest.raises(ConversionError, match="shared form"):
+            sanitize_extgstate(pdf)
+        assert form.read_bytes() == content
+        assert page.Resources.ExtGState.GS0.OPM == 1
+
+    def test_default_cmyk_mapping_and_inherited_page_resources(self) -> None:
+        """Resolve effective CMYK through inherited DefaultCMYK resources."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs 0 0 0 1 k 0 0 20 20 re f", OPM=1, OP=True)
+        page.Resources.ColorSpace.DefaultCMYK = page.Resources.ColorSpace.CS0
+        pdf.Root.Pages.Resources = page.Resources
+        del page.obj["/Resources"]
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        # The guards join the inherited scope; the page keeps inheriting it.
+        assert "/Resources" not in page.obj
+        self._assert_guard(page, "f", resources=pdf.Root.Pages.Resources)
+        assert pdf.Root.Pages.Resources.ExtGState.GS0.OPM == 1
+
+    def test_mixed_fill_stroke_modes_fail_without_corrupting_device_paint(self) -> None:
+        """Reject combined paints that would require two overprint modes."""
+        from pdftopdfa.exceptions import ConversionError
+
+        pdf = new_pdf()
+        content = b"/GS0 gs /CS0 cs 0 0 0 1 K 0 0 20 20 re B"
+        page = self._page(pdf, content, OPM=1, OP=True)
+        with pytest.raises(ConversionError, match="different overprint modes"):
+            sanitize_extgstate(pdf)
+        assert page.Contents.read_bytes() == content
+        assert page.Resources.ExtGState.GS0.OPM == 1
+
+    @pytest.mark.parametrize("kind", ["image", "shading"])
+    def test_image_and_shading_use_their_own_colourspace(self, kind) -> None:
+        """Classify image and shading paints by their own source color spaces."""
+        pdf = new_pdf()
+        page = self._page(
+            pdf,
+            b"/GS0 gs /Paint " + (b"Do" if kind == "image" else b"sh"),
+            OPM=1,
+            op=True,
+        )
+        if kind == "image":
+            obj = pdf.make_stream(bytes([0, 0, 0, 255]))
+            obj.Subtype = Name.Image
+            obj.Width = obj.Height = 1
+            obj.BitsPerComponent = 8
+            obj.ColorSpace = page.Resources.ColorSpace.CS0
+            page.Resources.XObject = Dictionary(Paint=obj)
+        else:
+            obj = Dictionary(ShadingType=2, ColorSpace=page.Resources.ColorSpace.CS0)
+            page.Resources.Shading = Dictionary(Paint=obj)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        self._assert_guard(page, "Do" if kind == "image" else "sh")
+
+    def test_op_without_op_key_replaces_both_overprint_flags(self) -> None:
+        """Apply OP to both sides when the dictionary omits a separate op entry."""
+        pdf = new_pdf()
+        page = self._page(
+            pdf, b"/GS0 gs /Enable gs /CS0 cs 0 0 20 20 re f", OPM=1, OP=False, op=False
+        )
+        page.Resources.ExtGState.Enable = Dictionary(OP=True)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        self._assert_guard(page, "f")
+
+    def test_nonstroking_update_does_not_override_stroking_flag(self) -> None:
+        """Updating nonstroking overprint must retain the stroking parameter."""
+        pdf = new_pdf()
+        page = self._page(
+            pdf, b"/GS0 gs /DisableFill gs /CS0 CS 0 0 20 20 re S", OPM=1, OP=True
+        )
+        page.Resources.ExtGState.DisableFill = Dictionary(op=False)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        self._assert_guard(page, "S")
+
+    @pytest.mark.parametrize("kind", ["pattern", "type3"])
+    @pytest.mark.parametrize("colour", [b"1 0 0 rg", b"0 0 0 1 k"])
+    def test_unrelated_pattern_and_type3_programs_are_preserved(
+        self, kind, colour
+    ) -> None:
+        """Preserve harmless pattern and glyph programs with unrelated ICC resources."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"", OPM=1, OP=True)
+        program_data = colour + b" 0 0 20 20 re f"
+        program = pdf.make_stream(program_data)
+        program.Resources = Dictionary()
+        if kind == "pattern":
+            program.PatternType = 1
+            program.PaintType = 1
+            program.TilingType = 1
+            program.BBox = Array([0, 0, 20, 20])
+            program.XStep = program.YStep = 20
+            page.Resources.Pattern = Dictionary(P=program)
+            content = b"/GS0 gs /Pattern cs /P scn 0 0 20 20 re f"
+        else:
+            page.Resources.Font = Dictionary(
+                F=Dictionary(
+                    Type=Name.Font,
+                    Subtype=Name.Type3,
+                    CharProcs=Dictionary(A=program),
+                    Resources=Dictionary(),
+                )
+            )
+            content = b"/GS0 gs BT /F 12 Tf (A) Tj ET"
+        page.Contents = pdf.make_stream(content)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert page.Contents.read_bytes() == content
+        assert program.read_bytes() == program_data
+        assert page.Resources.ExtGState.GS0.OPM == 1
+
+    @pytest.mark.parametrize("paint", [b"", b"/Off gs 0 0 20 20 re f"])
+    def test_soft_mask_is_analyzed_at_actual_paint_not_selection(self, paint) -> None:
+        """Do not repair unused masks or masks painted after overprint is disabled."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs " + paint, OPM=1, OP=True)
+        mask_data = b"/CS0 cs 0 0 20 20 re f"
+        mask = pdf.make_stream(mask_data)
+        mask.Subtype = Name.Form
+        mask.Resources = Dictionary(ColorSpace=page.Resources.ColorSpace)
+        page.Resources.ExtGState.GS0.SMask = Dictionary(S=Name.Alpha, G=mask)
+        page.Resources.ExtGState.Off = Dictionary(OP=False)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert mask.read_bytes() == mask_data
+
+    @pytest.mark.parametrize(
+        "location", ["page", "inherited_form", "selected_in_parent", "own_form"]
+    )
+    def test_pattern_uses_its_resource_definition_state(self, location) -> None:
+        """Use the initial state of the scope defining the selected pattern."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"", OPM=1, OP=True)
+        pattern_data = b"/CS0 cs 0 1 0 0 scn 0 0 20 20 re f"
+        pattern = pdf.make_stream(pattern_data)
+        pattern.PatternType = 1
+        pattern.PaintType = 1
+        pattern.TilingType = 1
+        pattern.BBox = Array([0, 0, 20, 20])
+        pattern.XStep = pattern.YStep = 20
+        pattern.Resources = Dictionary(ColorSpace=page.Resources.ColorSpace)
+        page.Resources.Pattern = Dictionary(P=pattern)
+        selection = b"/Pattern cs /P scn "
+        paint = b"0 0 20 20 re f"
+        if location == "page":
+            content = b"/GS0 gs " + selection + paint
+        else:
+            form_data = (
+                selection + paint
+                if location in {"inherited_form", "own_form"}
+                else paint
+            )
+            form = pdf.make_stream(form_data)
+            form.Subtype = Name.Form
+            form.BBox = Array([0, 0, 20, 20])
+            if location == "selected_in_parent":
+                form.Resources = Dictionary()
+            elif location == "own_form":
+                form.Resources = Dictionary(Pattern=page.Resources.Pattern)
+            page.Resources.XObject = Dictionary(Form=form)
+            content = b"/GS0 gs "
+            if location == "selected_in_parent":
+                content += selection
+            content += b"/Form Do"
+        page.Contents = pdf.make_stream(content)
+
+        if location == "own_form":
+            # Its resource is defined in a Form entered with overprint enabled.
+            # Unlike the page-defined pattern, this really needs a repair.
+            with pytest.raises(ConversionError, match="tiling pattern"):
+                sanitize_extgstate(pdf)
+            assert pattern.read_bytes() == pattern_data
+            return
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert page.Contents.read_bytes() == content
+        assert pattern.read_bytes() == pattern_data
+
+    def test_shading_pattern_uses_nonstroking_overprint_only(self) -> None:
+        """Ignore the stroking flag when evaluating a shading pattern."""
+        pdf = new_pdf()
+        content = b"/Pattern cs /P scn 0 0 20 20 re f"
+        page = self._page(pdf, content)
+        page.Resources.Pattern = Dictionary(
+            P=Dictionary(
+                PatternType=2,
+                ExtGState=Dictionary(OP=True, op=False, OPM=1),
+                Shading=Dictionary(
+                    ShadingType=2, ColorSpace=page.Resources.ColorSpace.CS0
+                ),
+            )
+        )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert page.Contents.read_bytes() == content
+
+    @pytest.mark.parametrize(
+        "base,paint_type,fixes",
+        [
+            ("icc", 2, 1),
+            ("device", 2, 0),
+            ("icc", 1, 0),
+        ],
+    )
+    def test_uncolored_pattern_is_checked_under_the_painting_state(
+        self, base, paint_type, fixes
+    ) -> None:
+        """Its separately supplied color is what the overprint state applies to."""
+        pdf = new_pdf()
+        content = b"/GS0 gs /PCS cs 0 0 0 1 /P scn 0 0 20 20 re f"
+        page = self._page(pdf, content, OPM=1, op=True)
+        page.Resources.ColorSpace.PCS = Array(
+            [
+                Name.Pattern,
+                page.Resources.ColorSpace.CS0 if base == "icc" else Name.DeviceCMYK,
+            ]
+        )
+        pattern = pdf.make_stream(b"0 0 20 20 re f")
+        pattern.PatternType = 1
+        pattern.PaintType = paint_type
+        pattern.TilingType = 1
+        pattern.BBox = Array([0, 0, 20, 20])
+        pattern.XStep = pattern.YStep = 20
+        pattern.Resources = Dictionary()
+        page.Resources.Pattern = Dictionary(P=pattern)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == fixes
+        if fixes:
+            self._assert_guard(page, "f")
+        else:
+            assert page.Contents.read_bytes() == content
+
+    def _masked_form(self, pdf, page, form_data, mask_data, *, group):
+        """Paint a Form under a soft mask, optionally as a transparency group."""
+        mask = pdf.make_stream(mask_data)
+        mask.Subtype = Name.Form
+        mask.BBox = Array([0, 0, 20, 20])
+        mask.Resources = Dictionary(ColorSpace=page.Resources.ColorSpace)
+        form = pdf.make_stream(form_data)
+        form.Subtype = Name.Form
+        form.BBox = Array([0, 0, 20, 20])
+        form.Resources = Dictionary(
+            ColorSpace=page.Resources.ColorSpace,
+            ExtGState=Dictionary(Off=Dictionary(OP=False, op=False)),
+        )
+        if group:
+            form.Group = Dictionary(S=Name.Transparency)
+        page.Resources.ExtGState.GS0.SMask = Dictionary(S=Name.Alpha, G=mask)
+        page.Resources.XObject = Dictionary(Fm=form)
+        return form, mask
+
+    def test_transparency_group_mask_is_analyzed_at_the_invocation(self) -> None:
+        """Inner state changes cannot hide the mask that composites the whole group."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /Fm Do", OPM=1, op=True)
+        form_data = b"/Off gs 0 g 0 0 20 20 re f"
+        form, mask = self._masked_form(
+            pdf, page, form_data, b"/CS0 cs 0 0 20 20 re f", group=True
+        )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        self._assert_guard(mask, "f")
+        assert form.read_bytes() == form_data
+
+    def test_transparency_group_mask_ignores_inner_paint_state(self) -> None:
+        """A group starts without the mask, so inner paints do not re-evaluate it."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /Fm Do", OPM=1, op=False)
+        form_data = b"/Enable gs 0 g 0 0 20 20 re f"
+        mask_data = b"/CS0 cs 0 0 20 20 re f"
+        form, mask = self._masked_form(pdf, page, form_data, mask_data, group=True)
+        form.Resources.ExtGState.Enable = Dictionary(op=True)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert mask.read_bytes() == mask_data
+        assert form.read_bytes() == form_data
+
+    def test_plain_form_keeps_the_mask_for_each_inner_paint(self) -> None:
+        """Without a group, the inherited mask still applies to every paint inside."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /Fm Do", OPM=1, op=False)
+        form_data = b"/Enable gs 0 g 0 0 20 20 re f"
+        form, mask = self._masked_form(
+            pdf, page, form_data, b"/CS0 cs 0 0 20 20 re f", group=False
+        )
+        form.Resources.ExtGState.Enable = Dictionary(op=True)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        self._assert_guard(mask, "f")
+
+    @pytest.mark.parametrize("mode", [b"3.5", b"3.0", b"8", b"-1"])
+    def test_invalid_text_rendering_mode_fails_closed(self, mode) -> None:
+        """A truncated mode could hide Type3 paint from the overprint analysis."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs " + mode + b" Tr", OPM=1, OP=True)
+        with pytest.raises(ConversionError, match="invalid text rendering mode"):
+            sanitize_extgstate(pdf)
+        assert page.Resources.ExtGState.GS0.OPM == 1
+
+    @pytest.mark.parametrize("mode", [b"0", b"3", b"7"])
+    def test_valid_text_rendering_mode_is_accepted(self, mode) -> None:
+        """Every defined mode remains analyzable."""
+        pdf = new_pdf()
+        content = b"/GS0 gs " + mode + b" Tr"
+        page = self._page(pdf, content, OPM=1, OP=True)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert page.Contents.read_bytes() == content
+
+    def test_shading_pattern_extgstate_is_sanitized(self) -> None:
+        """A pattern's own graphics state follows the same rules as a resource."""
+        pdf = new_pdf()
+        content = b"/Pattern cs /P scn 0 0 20 20 re f"
+        page = self._page(pdf, content)
+        state = Dictionary(
+            TR=Name.Identity, HTP=Array([0, 0]), OP=1, OPM=Decimal("1.0")
+        )
+        page.Resources.Pattern = Dictionary(
+            P=Dictionary(
+                PatternType=2,
+                ExtGState=state,
+                Shading=Dictionary(ShadingType=2, ColorSpace=Name.DeviceGray),
+            )
+        )
+        sanitize_extgstate(pdf)
+        cleaned = page.Resources.Pattern.P.ExtGState
+        assert "/TR" not in cleaned and "/HTP" not in cleaned
+        assert cleaned.OP is True
+        assert isinstance(cleaned.OPM, int) and cleaned.OPM == 1
+
+    @pytest.mark.parametrize(
+        "mask_paint,fixes",
+        [(b"/CS0 cs 0 0 20 20 re f", 1), (b"0 g 0 0 20 20 re f", 0)],
+    )
+    def test_shading_pattern_soft_mask_is_analyzed(self, mask_paint, fixes) -> None:
+        """A mask selected by a shading pattern's ExtGState belongs to that paint."""
+        pdf = new_pdf()
+        content = b"/Pattern cs /P scn 0 0 20 20 re f"
+        page = self._page(pdf, content)
+        mask = pdf.make_stream(mask_paint)
+        mask.Subtype = Name.Form
+        mask.BBox = Array([0, 0, 20, 20])
+        mask.Resources = Dictionary(ColorSpace=page.Resources.ColorSpace)
+        page.Resources.Pattern = Dictionary(
+            P=Dictionary(
+                PatternType=2,
+                ExtGState=Dictionary(
+                    OP=True, op=True, OPM=1, SMask=Dictionary(S=Name.Alpha, G=mask)
+                ),
+                Shading=Dictionary(ShadingType=2, ColorSpace=Name.DeviceGray),
+            )
+        )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == fixes
+        assert page.Contents.read_bytes() == content
+        if fixes:
+            self._assert_guard(mask, "f")
+        else:
+            assert mask.read_bytes() == mask_paint
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+
+    def test_unused_shading_pattern_soft_mask_is_not_repaired(self) -> None:
+        """A selected but unpainted pattern does not count as an actual paint."""
+        pdf = new_pdf()
+        content = b"/Pattern cs /P scn"
+        page = self._page(pdf, content)
+        mask_data = b"/CS0 cs 0 0 20 20 re f"
+        mask = pdf.make_stream(mask_data)
+        mask.Subtype = Name.Form
+        mask.BBox = Array([0, 0, 20, 20])
+        mask.Resources = Dictionary(ColorSpace=page.Resources.ColorSpace)
+        page.Resources.Pattern = Dictionary(
+            P=Dictionary(
+                PatternType=2,
+                ExtGState=Dictionary(
+                    OP=True, op=True, OPM=1, SMask=Dictionary(S=Name.Alpha, G=mask)
+                ),
+                Shading=Dictionary(ShadingType=2, ColorSpace=Name.DeviceGray),
+            )
+        )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+        assert mask.read_bytes() == mask_data
+
+    def test_shading_direct_icc_without_colorspace_table_is_detected(self) -> None:
+        """Find a shading ICC profile even without a named ColorSpace table."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /Sh sh", OPM=1, OP=True)
+        page.Resources.Shading = Dictionary(
+            Sh=Dictionary(ShadingType=2, ColorSpace=page.Resources.ColorSpace.CS0)
+        )
+        del page.Resources["/ColorSpace"]
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        self._assert_guard(page, "sh")
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            (b"0 0 20 20 re f", ["gs", "re", "f", "gs"]),
+            (b"0 0 m 20 0 l 20 20 l h f", ["gs", "m", "l", "l", "h", "f", "gs"]),
+            (
+                b"0 0 m 10 20 20 20 0 c 20 10 20 0 v 10 10 0 0 y h f*",
+                ["gs", "m", "c", "v", "y", "h", "f*", "gs"],
+            ),
+            (b"0 0 m 20 20 l S", ["gs", "m", "l", "S", "gs"]),
+            (
+                b"0 0 20 20 re W n 5 5 10 10 re f",
+                ["re", "W", "n", "gs", "re", "f", "gs"],
+            ),
+            (b"0 0 20 20 re W* f", ["gs", "re", "W*", "f", "gs"]),
+            (
+                b"0 0 20 20 re f 30 30 m 40 40 l h F",
+                ["gs", "re", "f", "gs", "gs", "m", "l", "h", "F", "gs"],
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("owner", ["page", "form"])
+    def test_path_guard_stays_outside_the_path_object(
+        self, path, expected, owner
+    ) -> None:
+        """ISO 32000-1, 8.5.1 allows no gs between path construction and paint."""
+        pdf = new_pdf()
+        stroke = path.endswith(b"S")
+        selection = b"/CS0 CS " if stroke else b"/CS0 cs "
+        if owner == "page":
+            page = self._page(pdf, b"/GS0 gs " + selection + path, OPM=1, OP=True)
+            target, prefix = page, ["gs", "CS" if stroke else "cs"]
+        else:
+            # The Form's path construction starts at the first instruction.
+            page = self._page(pdf, b"/GS0 gs " + selection + b"/Fm Do", OPM=1, OP=True)
+            target = pdf.make_stream(path)
+            target.Subtype = Name.Form
+            target.BBox = Array([0, 0, 50, 50])
+            page.Resources.XObject = Dictionary(Fm=target)
+            prefix = []
+        repairs = expected.count("gs") // 2
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == repairs
+        operators = [str(i.operator) for i in pikepdf.parse_content_stream(target)]
+        assert operators == prefix + expected
+        _assert_no_gs_inside_paths(target)
+        for paint in {op for op in expected if op in _PATH_PAINT}:
+            count = expected.count(paint)
+            self._assert_guard(target, paint, count, resources=page.Resources)
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 0
+
+    def test_text_and_xobject_guards_stay_at_the_paint(self) -> None:
+        """Only path paints move their guard; gs is legal inside a text object."""
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /CS0 cs BT /F 12 Tf (A) Tj ET", OPM=1, op=True)
+        page.Resources.Font = Dictionary(
+            F=Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica)
+        )
+        assert sanitize_extgstate(pdf)["extgstate_fixed"] == 1
+        operators = [str(i.operator) for i in pikepdf.parse_content_stream(page)]
+        assert operators == ["gs", "cs", "BT", "Tf", "gs", "Tj", "gs", "ET"]
+
+    def _inheriting_form_with_page_pattern(self, pdf, page_paint: bytes = b""):
+        """Paint an inheriting Form that repairs and uses a page-defined pattern."""
+        page = self._page(pdf, b"/GS0 gs " + page_paint + b"/Fm Do", OPM=1, OP=True)
+        pattern = pdf.make_stream(b"/CS0 cs 0 0 20 20 re f")
+        pattern.PatternType = 1
+        pattern.PaintType = 1
+        pattern.TilingType = 1
+        pattern.BBox = Array([0, 0, 20, 20])
+        pattern.XStep = pattern.YStep = 20
+        pattern.Resources = Dictionary(ColorSpace=page.Resources.ColorSpace)
+        page.Resources.Pattern = Dictionary(P=pattern)
+        form = pdf.make_stream(
+            b"/CS0 cs 0 0 20 20 re f /Pattern cs /P scn 0 0 20 20 re f"
+        )
+        form.Subtype = Name.Form
+        form.BBox = Array([0, 0, 20, 20])
+        page.Resources.XObject = Dictionary(Fm=form)
+        return page, form, pattern
+
+    @pytest.mark.parametrize("sanitize", [sanitize_overprint_usage, "extgstate"])
+    def test_inheriting_form_keeps_its_resource_scope(self, sanitize) -> None:
+        """A page-defined pattern keeps its page scope across repeated passes."""
+        pdf = new_pdf()
+        page, form, pattern = self._inheriting_form_with_page_pattern(pdf)
+
+        def run() -> int:
+            if sanitize == "extgstate":
+                return sanitize_extgstate(pdf)["extgstate_fixed"]
+            return sanitize(pdf)
+
+        assert run() == 1
+        assert "/Resources" not in form
+        assert pattern.read_bytes() == b"/CS0 cs 0 0 20 20 re f"
+        names = set(page.Resources.ExtGState.keys())
+        assert names == {"/GS0", "/PdfaOverprint0", "/PdfaOverprint1"}
+        self._assert_guard(form, "f", resources=page.Resources)
+        form_data = form.read_bytes()
+        # The converter runs the analysis again after profile embedding.
+        assert run() == 0
+        assert "/Resources" not in form
+        assert form.read_bytes() == form_data
+        assert set(page.Resources.ExtGState.keys()) == names
+
+    def test_page_and_inheriting_form_share_one_guard_pair(self) -> None:
+        """Repairs drawn from the same scope reuse one pair of guard names."""
+        pdf = new_pdf()
+        page, form, _ = self._inheriting_form_with_page_pattern(
+            pdf, b"/CS0 cs 0 0 5 5 re f "
+        )
+        assert sanitize_overprint_usage(pdf) == 2
+        assert set(page.Resources.ExtGState.keys()) == {
+            "/GS0",
+            "/PdfaOverprint0",
+            "/PdfaOverprint1",
+        }
+        self._assert_guard(page, "f")
+        self._assert_guard(form, "f", resources=page.Resources)
+        assert sanitize_overprint_usage(pdf) == 0
+
+    def test_conflicting_guard_name_in_receiving_scope_is_avoided(self) -> None:
+        """An unrelated state under a guard name is neither reused nor replaced."""
+        pdf = new_pdf()
+        page, form, _ = self._inheriting_form_with_page_pattern(pdf)
+        other = Dictionary(OPM=1, OP=False)
+        page.Resources.ExtGState.PdfaOverprint0 = other
+        page.Resources.ExtGState.PdfaOverprint1 = Dictionary(OPM=1)
+        assert sanitize_overprint_usage(pdf) == 1
+        assert page.Resources.ExtGState.PdfaOverprint0 == other
+        names = {
+            str(i.operands[0])
+            for i in pikepdf.parse_content_stream(form)
+            if str(i.operator) == "gs"
+        }
+        assert names == {"/PdfaOverprint0_", "/PdfaOverprint1_"}
+        self._assert_guard(form, "f", resources=page.Resources)
+        assert sanitize_overprint_usage(pdf) == 0
+
+    def test_inheriting_form_shared_by_equivalent_page_scopes(self) -> None:
+        """Every scope a shared inheriting Form is painted with gets the guards."""
+        pdf = new_pdf()
+        first = self._page(pdf, b"/GS0 gs /Fm Do", OPM=1, OP=True)
+        form = pdf.make_stream(b"/CS0 cs 0 0 20 20 re f")
+        form.Subtype = Name.Form
+        form.BBox = Array([0, 0, 20, 20])
+        first.Resources.XObject = Dictionary(Fm=form)
+        pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page)))
+        second = pdf.pages[-1]
+        second.obj.MediaBox = first.obj.MediaBox
+        second.obj.Contents = pdf.make_stream(b"/GS0 gs /Fm Do")
+
+        def copy(value):
+            """Copy direct dictionaries, keeping references to shared objects."""
+            if isinstance(value, Dictionary) and value.objgen == (0, 0):
+                return Dictionary({key: copy(item) for key, item in value.items()})
+            return value
+
+        # A separate direct dictionary with identical content.
+        second.obj.Resources = copy(first.Resources)
+        assert second.Resources.unparse() == first.Resources.unparse()
+        assert sanitize_overprint_usage(pdf) == 1
+        assert "/Resources" not in form
+        for page in (first, second):
+            self._assert_guard(form, "f", resources=page.Resources)
+        assert sanitize_overprint_usage(pdf) == 0
+
+    @pytest.mark.parametrize("level", ["2b", "3b"])
+    def test_inheriting_form_repair_survives_conversion(self, tmp_path, level) -> None:
+        """The late post-embedding pass accepts the earlier inherited-scope repair."""
+        from pdftopdfa.verapdf import is_verapdf_available, validate_with_verapdf
+
+        pdf = new_pdf()
+        page = self._page(pdf, b"/GS0 gs /Fm Do", OPM=1, OP=True)
+        form = pdf.make_stream(b"/CS0 cs 0 0 20 20 re f")
+        form.Subtype = Name.Form
+        form.BBox = Array([0, 0, 20, 20])
+        page.Resources.XObject = Dictionary(Fm=form)
+        source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+        pdf.save(source)
+        result = convert_to_pdfa(source, output, level=level)
+        assert result.success and result.target_produced, result
+        assert not result.skipped, result.warnings
+        assert not any("Conversion skipped" in w for w in result.warnings)
+        with pikepdf.open(output) as converted:
+            form = converted.pages[0].Resources.XObject.Fm
+            # Rule 6.2.2 materializes the used names, guards included.
+            self._assert_guard(form, "f")
+        if is_verapdf_available():
+            validation = validate_with_verapdf(output, flavour=level)
+            assert validation.compliant, validation.failed_rules
+
+    def test_page_pattern_in_inheriting_form_fails_closed_in_conversion(
+        self, tmp_path
+    ) -> None:
+        """Rule 6.2.2 moves the pattern into the Form scope, where it overprints.
+
+        PDF/A needs explicit Form resources, so the converted Form defines the
+        pattern itself and the cell starts with the Form's overprint state
+        (ISO 32000-1, 8.7.3.1). That paint would need an invocation-specific
+        repair, so the original input is kept instead of a non-conforming file.
+        """
+        pdf = new_pdf()
+        self._inheriting_form_with_page_pattern(pdf)
+        source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+        pdf.save(source)
+        result = convert_to_pdfa(source, output, level="2b")
+        assert result.skipped and not result.target_produced, result
+        assert any("tiling pattern" in w for w in result.warnings), result.warnings
+        assert output.read_bytes() == source.read_bytes()
 
 
 class TestShadingTransferFunctions:

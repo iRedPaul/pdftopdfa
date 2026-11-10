@@ -266,59 +266,94 @@ def _iter_name_tree_values(node: object) -> Iterator[object]:
         yield value
 
 
-def _iter_name_tree_pairs(node: object) -> Iterator[tuple[object, object]]:
-    """Yield (name, value) pairs from a PDF Name Tree node.
+# Direct objects have no object number to detect cycles with. A parsed file
+# nests them acyclically inside indirect objects, but objects built in memory
+# can refer to themselves, so the number of direct nodes visited is bounded.
+_MAX_DIRECT_NAME_TREE_NODES = 10_000
 
-    Same traversal as _iter_name_tree_values but yields both the key and value.
-    Used by remove_non_compliant_embedded_files which needs to rebuild the array.
+
+def _iter_name_tree_pairs(node: object) -> Iterator[tuple[object, object]]:
+    """Yield the (key, value) pairs of a PDF Name Tree, skipping malformed parts.
+
+    This is the single name-tree traversal shared by the embedded-file and
+    navigation sanitizers, so it must not raise on any malformed node shape: a
+    node or /Kids entry that is not a dictionary, /Names or /Kids values of the
+    wrong type, a key that is not a string or a key without a value are skipped.
+    A single dictionary given as /Kids is treated as a one-element array. Values
+    are yielded unresolved and unvalidated.
+
+    Traversal uses an explicit stack, so tree depth is not limited by Python's
+    recursion limit. Indirect nodes are visited once, which breaks cycles, and
+    at most ``_MAX_DIRECT_NAME_TREE_NODES`` direct nodes are visited.
 
     Args:
-        node: A pikepdf Dictionary representing a Name Tree node.
+        node: The root node of the name tree, usually a pikepdf Dictionary.
     """
     pending = [node]
     visited: set[tuple[int, int]] = set()
+    direct_nodes = 0
     while pending:
         try:
             resolved = _resolve_indirect(pending.pop())
-        except Exception:
+            if not isinstance(resolved, Dictionary):
+                continue
+            objgen = resolved.objgen
+            if objgen == (0, 0):
+                direct_nodes += 1
+                if direct_nodes > _MAX_DIRECT_NAME_TREE_NODES:
+                    logger.warning(
+                        "Stopped traversing a name tree after %d direct nodes",
+                        _MAX_DIRECT_NAME_TREE_NODES,
+                    )
+                    return
+            elif objgen in visited:
+                continue
+            else:
+                visited.add(objgen)
+
+            pairs: list[tuple[object, object]] = []
+            names_array = _resolve_indirect(resolved.get("/Names"))
+            if isinstance(names_array, Array):
+                items = list(names_array)
+                pairs = [
+                    (items[index], items[index + 1])
+                    for index in range(0, len(items) - 1, 2)
+                    if isinstance(items[index], pikepdf.String)
+                ]
+
+            kids = _resolve_indirect(resolved.get("/Kids"))
+            if isinstance(kids, Array):
+                children = list(kids)
+            elif isinstance(kids, Dictionary):
+                children = [kids]
+            else:
+                children = []
+        except Exception as e:
+            log_suppressed_error(logger, e, "Skipped a malformed name-tree node: %s", e)
             continue
 
-        try:
-            objgen = resolved.objgen
-        except Exception:
-            objgen = (0, 0)
-        if objgen != (0, 0):
-            if objgen in visited:
-                continue
-            visited.add(objgen)
+        yield from pairs
+        pending.extend(reversed(children))
 
-        names_array = resolved.get("/Names")
-        if names_array is not None:
-            try:
-                for i in range(0, len(names_array), 2):
-                    if i + 1 < len(names_array):
-                        yield (names_array[i], names_array[i + 1])
-            except Exception:
-                pass
 
-        kids = resolved.get("/Kids")
-        if kids is not None:
-            try:
-                pending.extend(reversed(kids))
-            except Exception:
-                pass
+def _is_filespec(obj: object) -> bool:
+    """Check whether a resolved object is a file specification dictionary.
+
+    This is the criterion that name-tree and /AF normalization keep entries by.
+    """
+    if not isinstance(obj, Dictionary):
+        return False
+    type_value = obj.get("/Type")
+    if type_value is not None and str(type_value) != "/Filespec":
+        return False
+    return any(obj.get(key) is not None for key in ("/F", "/UF", "/EF"))
 
 
 def _as_indirect_filespec(pdf: Pdf, obj: object) -> object | None:
     """Return a valid FileSpec as an indirect object."""
     try:
         resolved = _resolve_indirect(obj)
-        if not isinstance(resolved, Dictionary):
-            return None
-        type_value = resolved.get("/Type")
-        if type_value is not None and str(type_value) != "/Filespec":
-            return None
-        if not any(key in resolved for key in ("/F", "/UF", "/EF")):
+        if not _is_filespec(resolved):
             return None
         try:
             objgen = resolved.objgen
@@ -356,40 +391,10 @@ def _normalize_embedded_files_name_tree(pdf: Pdf) -> None:
         return
 
     pairs: list[tuple[bytes, object, object]] = []
-    pending = [embedded]
-    visited: set[tuple[int, int]] = set()
-    while pending:
-        try:
-            node = _resolve_indirect(pending.pop())
-            if not isinstance(node, Dictionary):
-                continue
-            try:
-                if node.objgen == (0, 0):
-                    node = pdf.make_indirect(node)
-                objgen = node.objgen
-            except (AttributeError, ValueError, TypeError):
-                continue
-            if objgen in visited:
-                continue
-            visited.add(objgen)
-
-            names_array = _resolve_indirect(node.get("/Names"))
-            if isinstance(names_array, Array):
-                for index in range(0, len(names_array) - 1, 2):
-                    key = names_array[index]
-                    if not isinstance(key, pikepdf.String):
-                        continue
-                    filespec = _as_indirect_filespec(pdf, names_array[index + 1])
-                    if filespec is not None:
-                        pairs.append((bytes(key), key, filespec))
-
-            kids = _resolve_indirect(node.get("/Kids"))
-            if isinstance(kids, Array):
-                pending.extend(reversed(kids))
-            elif isinstance(kids, Dictionary):
-                pending.append(kids)
-        except Exception:
-            continue
+    for key, value in _iter_name_tree_pairs(embedded):
+        filespec = _as_indirect_filespec(pdf, value)
+        if filespec is not None:
+            pairs.append((bytes(key), key, filespec))
 
     flattened: list[object] = []
     seen_keys: set[bytes] = set()

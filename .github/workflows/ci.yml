@@ -35,7 +35,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-15]
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,ocr]"
+
+      - name: Tests with coverage
+        run: python -m pytest --cov=pdftopdfa --cov-report=term-missing
+
+  test-macos:
+    name: test (macos-15, ${{ matrix.python-version }})
+    runs-on: macos-15
+    strategy:
+      # Request one ARM64 runner at a time to reduce hosted-capacity failures.
+      max-parallel: 1
+      fail-fast: false
+      matrix:
         python-version: ["3.12", "3.13", "3.14"]
 
     steps:
@@ -48,7 +75,6 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Verify macOS runner architecture
-        if: runner.os == 'macOS'
         run: test "$(uname -m)" = "arm64"
 
       - name: Install dependencies
@@ -119,3 +145,10 @@ jobs:
           python -m pytest tests/test_converter.py
           -k "convert_pdfua_passes_both_verapdf_profiles"
           --no-cov
+
+      - name: PDF/A feature preservation gate
+        env:
+          VERAPDF_PATH: ${{ runner.temp }}/verapdf/verapdf
+        run: >-
+          python -m pytest tests/test_pdfa_preservation_e2e.py
+          tests/test_overprint_pipeline.py --no-cov

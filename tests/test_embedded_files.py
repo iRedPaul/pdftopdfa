@@ -10,12 +10,13 @@ from unittest.mock import patch
 
 import pikepdf
 import pytest
-from conftest import new_pdf
+from conftest import new_pdf, pdf_object
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from pdftopdfa.converter import ConversionResult, convert_to_pdfa
 from pdftopdfa.sanitizers import sanitize_for_pdfa
 from pdftopdfa.sanitizers.files import (
+    _MAX_DIRECT_NAME_TREE_NODES,
     _is_pdfa_compliant_embedded,
     _iter_all_filespecs,
     _iter_all_filespecs_by_scan,
@@ -1638,6 +1639,47 @@ class TestNameTreeTraversal:
         assert "/Limits" not in normalized
         assert [str(item) for item in normalized.Names[::2]] == ["a.txt", "z.txt"]
         assert len(pdf.Root.AF) == 2
+
+    def test_malformed_nodes_are_skipped(self) -> None:
+        """Children and values of the wrong type never abort the traversal."""
+        pdf = new_pdf()
+        spec = pdf.make_indirect(Dictionary(Type=Name.Filespec, F="a.txt"))
+        root = pdf.make_indirect(
+            Dictionary(
+                Names=Dictionary(A=1),
+                Kids=Array(
+                    [
+                        42,
+                        None,
+                        Name.Bad,
+                        Array([Dictionary(Names=Array(["hidden", spec]))]),
+                        pdf.make_indirect(42),
+                        pdf.make_stream(b"no node"),
+                        Dictionary(Names=7, Kids=Name.Bad),
+                        Dictionary(Names=Array([1, spec, Name.Key, spec, "a.txt"])),
+                        Dictionary(Kids=Dictionary(Names=Array(["a.txt", spec]))),
+                    ]
+                ),
+            )
+        )
+
+        pairs = list(_iter_name_tree_pairs(root))
+        assert [(str(key), value.objgen) for key, value in pairs] == [
+            ("a.txt", spec.objgen)
+        ]
+
+    @pytest.mark.parametrize("root", [42, None, Name.Bad, Array([1, 2])])
+    def test_non_dictionary_root_yields_nothing(self, root) -> None:
+        """A malformed root node is an empty tree."""
+        assert list(_iter_name_tree_pairs(pdf_object(root))) == []
+
+    def test_direct_cycle_terminates(self) -> None:
+        """Direct nodes built in memory can refer to themselves without hanging."""
+        node = Dictionary(Names=Array(["a.txt", Dictionary(F="a.txt")]))
+        node["/Kids"] = Array([node, node])
+
+        pairs = list(_iter_name_tree_pairs(node))
+        assert 1 <= len(pairs) <= _MAX_DIRECT_NAME_TREE_NODES
 
     def test_odd_length_names_no_crash(self) -> None:
         """Malformed /Names array with odd length doesn't crash."""

@@ -10,7 +10,10 @@ from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..exceptions import ConversionError
 from ..utils import validate_pdfa_level
-from ._calibrated import _convert_calibrated_colorspaces
+from ._calibrated import (
+    _convert_calibrated_colorspaces,
+    validate_calibrated_colorspaces,
+)
 from ._defaults import _apply_default_colorspaces, _apply_defaults_to_ap_entry
 from ._detection import (
     _analyze_colorspace,
@@ -144,47 +147,60 @@ def embed_color_profiles(
     level: str = "3b",
     *,
     replace_existing: bool = True,
-    convert_calibrated: bool = True,
+    convert_calibrated: bool = False,
 ) -> list[ColorSpaceType]:
     """
     Detect color spaces and embed appropriate ICC profiles.
 
-    This function analyzes the PDF for used color spaces and embeds
-    the corresponding ICC profiles as OutputIntents.
+    Analyze used color spaces, retain compatible OutputIntents, and add a
+    PDF/A OutputIntent when needed. Install contextual default color spaces
+    and repair transparency groups in place.
 
     Args:
         pdf: pikepdf Pdf object to modify.
         level: PDF/A conformance level.
-        replace_existing: If True, replace existing OutputIntents.
+        replace_existing: If True, repair or replace incompatible OutputIntents
+            while retaining compatible output conditions.
             If False and OutputIntents exist, do nothing.
-        convert_calibrated: If True, convert CalGray/CalRGB color spaces
-            to ICCBased equivalents.
+        convert_calibrated: Deprecated compatibility option. If True, warn and
+            preserve CalGray/CalRGB calibration unchanged.
 
     Returns:
-        List of color space types that were embedded.
+        Detected color space types sorted by their string values, defaulting
+        to DeviceRGB when none are detected. Return an empty list when existing
+        OutputIntents are kept with replace_existing=False.
 
     Raises:
-        ConversionError: If level is invalid or profiles cannot be embedded.
+        ConversionError: If level is invalid, declared CalGray/CalRGB calibration
+            is malformed, or profiles cannot be embedded. Calibration validation
+            is skipped when existing OutputIntents are kept without replacement.
     """
     level = validate_pdfa_level(level)
 
+    has_existing_intents = has_output_intent(pdf)
+    if has_existing_intents and not replace_existing:
+        logger.debug("OutputIntents already present, skipping")
+        return []
+
+    # Validate before repairing OutputIntents so that a rejected document has
+    # not been partially modified.
+    validate_calibrated_colorspaces(pdf)
+
     existing_output_intent_colorspace: ColorSpaceType | None = None
-    if has_output_intent(pdf):
-        if replace_existing:
-            output_intent_preparation = prepare_existing_output_intents(pdf)
-            if output_intent_preparation.keep_existing:
-                existing_output_intent_colorspace = (
-                    output_intent_preparation.document_colorspace
-                )
-                logger.info("Keeping existing PDF/A OutputIntent")
-            else:
-                logger.info(
-                    "Replacing existing OutputIntents: %s",
-                    output_intent_preparation.reason,
-                )
+    retained_output_intents = Array()
+    if has_existing_intents:
+        output_intent_preparation = prepare_existing_output_intents(pdf)
+        if output_intent_preparation.keep_existing:
+            retained_output_intents = pdf.Root.OutputIntents
+            existing_output_intent_colorspace = (
+                output_intent_preparation.document_colorspace
+            )
+            logger.info("Keeping compatible existing OutputIntents")
         else:
-            logger.debug("OutputIntents already present, skipping")
-            return []
+            logger.info(
+                "Replacing existing OutputIntents: %s",
+                output_intent_preparation.reason,
+            )
 
     # Detect color spaces
     analysis = detect_color_spaces(pdf)
@@ -195,8 +211,10 @@ def embed_color_profiles(
         detected = {ColorSpaceType.DEVICE_RGB}
         logger.debug("No color spaces detected, using default sRGB")
 
-    # PDF/A allows only a single OutputIntent with S=GTS_PDFA1
-    # Select dominant color space by priority: CMYK > RGB > Gray
+    # Add a PDF/A intent when none carries a usable profile. Compatible existing
+    # intents remain intact; all embedded profiles share one indirect object
+    # (ISO 19005-2/3, 6.2.3-2).
+    # Select a new dominant color space by priority: CMYK > RGB > Gray.
     if ColorSpaceType.DEVICE_CMYK in detected:
         dominant = ColorSpaceType.DEVICE_CMYK
     elif ColorSpaceType.DEVICE_RGB in detected:
@@ -220,7 +238,8 @@ def embed_color_profiles(
         output_intent = create_output_intent_for_colorspace(
             pdf, dominant, profile_data, level
         )
-        pdf.Root.OutputIntents = Array([pdf.make_indirect(output_intent)])
+        retained_output_intents.append(pdf.make_indirect(output_intent))
+        pdf.Root.OutputIntents = retained_output_intents
 
     # Cover non-dominant Device color spaces with contextual Default entries.
     # Note: Separation/DeviceN spaces are not converted - they are PDF/A-2/3
@@ -247,7 +266,7 @@ def embed_color_profiles(
     if tg_fixed > 0:
         logger.info("Transparency group /CS fixed: %d", tg_fixed)
 
-    # Optionally convert CalGray/CalRGB -> ICCBased
+    # Honor the legacy option without discarding valid color calibration.
     if convert_calibrated:
         _convert_calibrated_colorspaces(pdf, icc_stream_cache)
 

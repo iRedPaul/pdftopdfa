@@ -236,6 +236,27 @@ class TestCliConsoleOutput:
 class TestCliConvert:
     """Tests for file conversion."""
 
+    @pytest.mark.parametrize(
+        ("options", "expected"),
+        [
+            ([], False),
+            (["--no-convert-calibrated"], False),
+            (["--convert-calibrated"], True),
+        ],
+    )
+    def test_calibrated_compatibility_option(
+        self, runner, sample_pdf, tmp_dir, options, expected
+    ):
+        """Default preservation and both historical spellings remain available."""
+        with patch(
+            "pdftopdfa.cli._convert_single_file", return_value=EXIT_SUCCESS
+        ) as run:
+            result = runner.invoke(
+                main, [str(sample_pdf), str(tmp_dir / "output.pdf"), *options]
+            )
+        assert result.exit_code == EXIT_SUCCESS
+        assert run.call_args.kwargs["convert_calibrated"] is expected
+
     @patch("pdftopdfa.cli._convert_single_file")
     def test_cli_convert_passes_no_pdfa(
         self,

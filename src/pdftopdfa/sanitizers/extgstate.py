@@ -4,7 +4,7 @@
 
 """Extended Graphics State sanitization for PDF/A compliance.
 
-ISO 19005-2, Section 6.2.8 forbids certain ExtGState entries:
+ISO 19005-2, Section 6.2.5 forbids certain ExtGState entries:
 - /TR (transfer function) — always forbidden
 - /TR2 — forbidden unless value is /Default
 - /HTP (halftone phase) — always forbidden
@@ -16,15 +16,24 @@ ISO 19005-2, Section 6.4 constrains transparency-related entries:
 - /BM (blend mode) — must be a valid PDF blend mode name
 - /CA and /ca (opacity) — must be numeric in [0.0, 1.0]
 - /SMask (soft mask) — must be /None or a valid soft mask dictionary
+
+ISO 32000-1, Table 58 defines /OPM (overprint mode) as the integer 0 or 1, and
+/OP and /op (overprint) as booleans.
 """
 
+import itertools
 import logging
+import math
+import re
+from decimal import Decimal
 
-from pikepdf import Array, Dictionary, Name, Pdf, Stream
+from pikepdf import Array, Dictionary, Name, Pdf, PdfError, Stream
 
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
+from .overprint import sanitize_overprint
 from .rendering_intent import VALID_RENDERING_INTENTS
+from .structure_limits import MAX_REAL_MAGNITUDE, normalize_number
 
 # Valid blend modes per PDF Reference 1.7, Table 136
 VALID_BLEND_MODES = frozenset(
@@ -149,6 +158,25 @@ def _resources_use_iccbased_cmyk(
                 if cs and _colorspace_uses_iccbased_cmyk(cs, visited):
                     return True
 
+    shadings = resources.get("/Shading")
+    if isinstance(shadings, Dictionary):
+        for shading in shadings.values():
+            if isinstance(
+                shading, (Dictionary, Stream)
+            ) and _colorspace_uses_iccbased_cmyk(shading.get("/ColorSpace"), visited):
+                return True
+
+    patterns = resources.get("/Pattern")
+    if isinstance(patterns, Dictionary):
+        for pattern in patterns.values():
+            if not isinstance(pattern, Dictionary):
+                continue
+            shading = pattern.get("/Shading")
+            if isinstance(
+                shading, (Dictionary, Stream)
+            ) and _colorspace_uses_iccbased_cmyk(shading.get("/ColorSpace"), visited):
+                return True
+
     return False
 
 
@@ -209,9 +237,11 @@ def _overprint_enabled(gs_dict: Dictionary, key: str) -> bool:
 
 
 def _pdf_enables_overprint(pdf: Pdf) -> bool:
-    """Return True when any reachable graphics state enables overprint."""
+    """Return whether reachable state entries can enable overprint with OPM 1."""
     stack = [pdf.Root]
     visited: set[tuple[int, int]] = set()
+    overprint = False
+    mode_one = False
 
     while stack:
         try:
@@ -224,6 +254,10 @@ def _pdf_enables_overprint(pdf: Pdf) -> bool:
 
             if isinstance(obj, (Dictionary, Stream)):
                 if _overprint_enabled(obj, "/OP") or _overprint_enabled(obj, "/op"):
+                    overprint = True
+                if obj.get("/OPM") == 1:
+                    mode_one = True
+                if overprint and mode_one:
                     return True
                 stack.extend(obj.values())
             elif isinstance(obj, Array):
@@ -266,17 +300,620 @@ def _clamp_opacity(gs_dict: Dictionary, key: str) -> int:
     return 0
 
 
+# The largest real magnitude of ISO 32000-1, Table C.1, to which structure_limits
+# later clamps the real objects of the file. A calculator value beyond it is an
+# undefinedresult or limitcheck error, and infinity on single-precision renderers.
+_FUNCTION_MAX_REAL = MAX_REAL_MAGNITUDE
+
+
+def _function_real(value) -> bool:
+    """Return whether a computed number is finite and within the real limit."""
+    return math.isfinite(value) and abs(value) <= _FUNCTION_MAX_REAL
+
+
+def _function_number(value) -> int | float | None:
+    """Read a numeric function parameter as it will be written, or None.
+
+    sanitize_structure_limits() runs after this sanitizer and rewrites every number
+    object of the file: it clamps integers to the 32-bit limits, clamps reals to
+    +-3.403e38 and sets a real below 1.175e-38 in magnitude to 0. A function is
+    validated with those values, since a check of the original ones can pass,
+    as for a Domain [1e-40 1] of { ln }, while the written function is undefined.
+    Normalizing again is a no-op, so the result is the same if that pass already
+    ran. Integers stay integers; reals are returned as floats.
+
+    The value is normalized before any conversion to float. A finite real beyond
+    the float range, such as a literal of hundreds of digits, converts to inf, but
+    it is written as +-3.403e38; so is a real that pikepdf holds as infinity (an
+    out-of-range Decimal assigned from Python is written as "inf"). Only NaN has no
+    written value. Every normalized real is finite and converts to a float within
+    the real limit, and float rounding is monotonic, so a value at a limit stays
+    at the float limit (MAX_REAL_MAGNITUDE).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        return None
+    if value.is_nan() if isinstance(value, Decimal) else value != value:
+        return None
+    value = normalize_number(value)
+    return value if isinstance(value, int) else float(value)
+
+
+def _function_numbers(value, count: int) -> list | None:
+    """Read an array parameter of ``count`` numbers via _function_number()."""
+    if not isinstance(value, Array) or len(value) != count:
+        return None
+    numbers = [_function_number(number) for number in value]
+    return None if None in numbers else numbers
+
+
+def _function_integer(value) -> int | None:
+    """Read an integer function parameter via _function_number(), or None."""
+    number = _function_number(value)
+    return number if isinstance(number, int) else None
+
+
+_CALCULATOR_UNARY = frozenset(
+    "abs ceiling cos cvi cvr floor ln log neg round sin sqrt truncate".split()
+)
+_CALCULATOR_BINARY = frozenset("add atan bitshift div exp idiv mod mul sub".split())
+_CALCULATOR_COMPARISONS = {
+    "eq": lambda a, b: a == b,
+    "ge": lambda a, b: a >= b,
+    "gt": lambda a, b: a > b,
+    "le": lambda a, b: a <= b,
+    "lt": lambda a, b: a < b,
+    "ne": lambda a, b: a != b,
+}
+_CALCULATOR_LOGICAL = frozenset("and not or xor".split())
+_CALCULATOR_OPERATORS = (
+    _CALCULATOR_UNARY
+    | _CALCULATOR_BINARY
+    | frozenset(_CALCULATOR_COMPARISONS)
+    | _CALCULATOR_LOGICAL
+    | frozenset("copy dup exch false if ifelse index pop roll true".split())
+)
+_CALCULATOR_BOOLEAN = object()
+# A number known to be an integer, although its value is not known.
+_CALCULATOR_INTEGER = object()
+_CALCULATOR_INTEGER_ONLY = frozenset("and bitshift idiv mod not or xor".split())
+_CALCULATOR_PRESERVES_INTEGER = frozenset(
+    "abs add ceiling floor mul neg round sub truncate".split()
+)
+_CALCULATOR_MAX_NESTING = 32
+_CALCULATOR_MAX_STACK = 100
+_CALCULATOR_MAX_INTEGER = 2**31 - 1
+_CALCULATOR_MIN_INTEGER = -(2**31)
+
+
+def _calculator_atan(numerator, denominator) -> float:
+    """Compute PostScript atan in degrees, in which 0 0 atan has no defined result."""
+    if numerator == 0 and denominator == 0:
+        raise ValueError("undefined angle")
+    return math.degrees(math.atan2(numerator, denominator)) % 360
+
+
+# Deterministic results of operators whose literal operands are known, which keep
+# later copy, index and roll operands provable. Other operators yield unknown numbers.
+_CALCULATOR_FOLDS = {
+    "abs": abs,
+    "neg": lambda a: -a,
+    "cvi": int,
+    "cvr": float,
+    "ceiling": lambda a: type(a)(math.ceil(a)),
+    "floor": lambda a: type(a)(math.floor(a)),
+    # PostScript rounds a tie to the greater value, so -1.5 becomes -1, but renderers
+    # may differ. Such a value is not treated as known in order to prove a stack effect.
+    "round": lambda a: None if a < 0 and a % 1 == 0.5 else type(a)(math.floor(a + 0.5)),
+    "truncate": lambda a: type(a)(math.trunc(a)),
+    "add": lambda a, b: a + b,
+    "sub": lambda a, b: a - b,
+    "mul": lambda a, b: a * b,
+    "div": lambda a, b: float(a) / b,
+    # These raise ValueError for an operand without a defined result, such as -1 sqrt.
+    "sqrt": math.sqrt,
+    "ln": math.log,
+    "log": math.log10,
+    "exp": math.pow,
+    "sin": lambda a: math.sin(math.radians(a)),
+    "cos": lambda a: math.cos(math.radians(a)),
+    "atan": _calculator_atan,
+}
+
+
+def _calculator_bitshift(value: int, shift: int):
+    """Fold bitshift where renderers agree on its 32-bit result.
+
+    A non-negative value shifted right, or left without losing bits or reaching the
+    sign bit, has one result. Renderers differ for negative values and long shifts
+    (arithmetic or logical shifts, and counts taken modulo 32), so those results
+    remain an integer of unknown value.
+    """
+    if value < 0 or not -31 <= shift <= 31:
+        return _CALCULATOR_INTEGER
+    if shift < 0:
+        return value >> -shift
+    result = value << shift
+    return result if result <= _CALCULATOR_MAX_INTEGER else _CALCULATOR_INTEGER
+
+
+_CALCULATOR_INTEGER_FOLDS = {
+    # idiv truncates toward zero, and mod takes the sign of the dividend.
+    "idiv": lambda a, b: (1 if (a < 0) == (b < 0) else -1) * (abs(a) // abs(b)),
+    "mod": lambda a, b: (1 if a >= 0 else -1) * (abs(a) % abs(b)),
+    "and": lambda a, b: a & b,
+    "or": lambda a, b: a | b,
+    "xor": lambda a, b: a ^ b,
+    "not": lambda a: ~a,
+    "bitshift": _calculator_bitshift,
+}
+
+
+def _parse_calculator(data: bytes) -> list | None:
+    """Parse one braced calculator program into nested blocks, rejecting bad syntax."""
+    data = re.sub(rb"%[^\r\n]*", b"", data.replace(b"\x00", b" "))
+    outer: list = []
+    blocks = [outer]
+    # Only the PDF white-space characters (ISO 32000-1, Table 1) separate tokens;
+    # Python's \s would also accept a vertical tab, which is a regular character.
+    for token in re.findall(rb"[{}]|[^\x00\t\n\x0c\r {}]+", data):
+        if token == b"{":
+            block: list = []
+            blocks[-1].append(block)
+            blocks.append(block)
+            if len(blocks) > _CALCULATOR_MAX_NESTING:
+                return None
+        elif token == b"}":
+            blocks.pop()
+            if not blocks:
+                return None
+        elif len(blocks) > 1 and (
+            token.decode("latin-1") in _CALCULATOR_OPERATORS
+            or re.fullmatch(rb"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", token)
+        ):
+            blocks[-1].append(token)
+        else:
+            return None
+    return outer[0] if len(blocks) == 1 and len(outer) == 1 else None
+
+
+def _calculator_boolean(value) -> bool:
+    """Return whether a stack entry is a boolean, with a known value or not."""
+    return value is _CALCULATOR_BOOLEAN or isinstance(value, bool)
+
+
+def _calculator_known_integer(value) -> bool:
+    """Return whether a stack entry is an integer of known value."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _calculator_integer(value) -> bool:
+    """Return whether a stack entry is certainly an integer."""
+    return _calculator_known_integer(value) or value is _CALCULATOR_INTEGER
+
+
+def _fold_calculator_operator(operator: str, operands: list):
+    """Return the most specific abstract result that an operator's operands allow."""
+    function = _CALCULATOR_FOLDS.get(operator) or _CALCULATOR_INTEGER_FOLDS.get(
+        operator
+    )
+    if function is not None and all(isinstance(a, (int, float)) for a in operands):
+        result = function(*operands)
+        if isinstance(result, float) and not _function_real(result):
+            # Python float arithmetic yields inf or NaN, or a value no renderer
+            # represents, without raising, as in 1e30 dup mul or inf 0 mul.
+            raise ValueError("real result out of range")
+        if isinstance(result, int) and not (
+            _CALCULATOR_MIN_INTEGER <= result <= _CALCULATOR_MAX_INTEGER
+        ):
+            if operator == "cvi" or operator in _CALCULATOR_INTEGER_ONLY:
+                # These operators can only return an integer, so a value outside
+                # its range is a rangecheck error rather than an unknown number.
+                raise ValueError("integer result out of range")
+            # Integer overflow produces an implementation-dependent real result.
+            return None
+        return result
+    if (
+        operator == "cvi"
+        or operator in _CALCULATOR_INTEGER_ONLY
+        or (
+            operator in _CALCULATOR_PRESERVES_INTEGER
+            and all(_calculator_integer(a) for a in operands)
+        )
+    ):
+        return _CALCULATOR_INTEGER
+    return None
+
+
+def _calculator_literal(token: bytes) -> int | float | None:
+    """Read a calculator number literal as a conforming reader does, or None.
+
+    structure_limits rewrites number objects and content streams, but not the
+    literals of a calculator stream, so a literal is written as it is. Unlike a
+    dictionary parameter, a literal beyond the real limit is therefore not clamped
+    but out of range, and it is rejected. The literal is read exactly as a Decimal,
+    since float() reads hundreds of digits as inf and int() refuses thousands of
+    them, and compared with the limits by normalize_number(): a literal it clamps
+    is out of range, while one it sets to 0 is below 1.175e-38 in magnitude, which
+    a conforming reader also reads as 0 (ISO 32000-1, Table C.1).
+    """
+    number = Decimal(token.decode("ascii"))
+    if re.fullmatch(rb"[+-]?\d+", token) and (
+        _CALCULATOR_MIN_INTEGER <= number <= _CALCULATOR_MAX_INTEGER
+    ):
+        return int(number)
+    # A real, or an integer literal beyond the implementation limit, read as a real.
+    normalized = normalize_number(number)
+    if normalized != number and normalized != 0:
+        return None
+    return float(normalized)
+
+
+def _apply_calculator_operator(token: bytes, stack: list) -> bool:
+    """Apply one number or non-conditional operator to an abstract operand stack."""
+    operator = token.decode("latin-1")
+    if operator not in _CALCULATOR_OPERATORS:
+        value = _calculator_literal(token)
+        if value is None:
+            return False
+        stack.append(value)
+        return True
+    if operator in ("true", "false"):
+        stack.append(operator == "true")
+        return True
+    single = operator in _CALCULATOR_UNARY or operator in (
+        "copy",
+        "dup",
+        "index",
+        "not",
+        "pop",
+    )
+    pops = 1 if single else 2
+    if len(stack) < pops:
+        return False
+    if operator == "dup":
+        stack.append(stack[-1])
+        return True
+    if operator == "exch":
+        stack[-1], stack[-2] = stack[-2], stack[-1]
+        return True
+    operands = stack[-pops:]
+    del stack[-pops:]
+    booleans = [_calculator_boolean(operand) for operand in operands]
+    known = all(isinstance(operand, (int, float)) for operand in operands)
+    if operator == "pop":
+        return True
+    if operator == "copy":
+        count = operands[0]
+        if not _calculator_known_integer(count) or not 0 <= count <= len(stack):
+            return False
+        stack.extend(stack[len(stack) - count :])
+    elif operator == "index":
+        offset = operands[0]
+        if not _calculator_known_integer(offset) or not 0 <= offset < len(stack):
+            return False
+        stack.append(stack[-1 - offset])
+    elif operator == "roll":
+        count, shift = operands
+        if (
+            not _calculator_known_integer(count)
+            or not _calculator_known_integer(shift)
+            or not 0 <= count <= len(stack)
+        ):
+            return False
+        if count:
+            shift %= count
+            rolled = stack[-count:]
+            stack[-count:] = rolled[-shift:] + rolled[:-shift]
+    elif operator in _CALCULATOR_COMPARISONS:
+        if booleans[0] != booleans[1] or (booleans[0] and operator not in ("eq", "ne")):
+            return False
+        stack.append(
+            _CALCULATOR_COMPARISONS[operator](*operands)
+            if known
+            else _CALCULATOR_BOOLEAN
+        )
+    elif all(booleans) and operator in _CALCULATOR_LOGICAL:
+        if not known:
+            stack.append(_CALCULATOR_BOOLEAN)
+        elif operator == "not":
+            stack.append(not operands[0])
+        else:
+            stack.append(_CALCULATOR_INTEGER_FOLDS[operator](*operands))
+    else:
+        # The function input is a real number, so integer operators need a proof
+        # such as cvi. Applying them to anything else is a run-time type error.
+        if any(booleans) or (
+            operator in _CALCULATOR_INTEGER_ONLY
+            and not all(_calculator_integer(a) for a in operands)
+        ):
+            return False
+        stack.append(_fold_calculator_operator(operator, operands))
+    return True
+
+
+def _apply_calculator_block(block: list, stack: list) -> bool:
+    """Prove a block's effect on an abstract operand stack along each possible path.
+
+    Entries are a known integer, real or boolean, None for an unknown number, or a
+    marker for a boolean or an integer of unknown value. Known integers let copy,
+    index and roll be proven; other operands cannot. A known condition takes only
+    its own path, and an unknown one has to be valid along both.
+    """
+    conditional: list[list] = []
+    for item in block:
+        if isinstance(item, list):
+            conditional.append(item)
+        elif item in (b"if", b"ifelse"):
+            if len(conditional) != (1 if item == b"if" else 2):
+                return False
+            if not stack or not _calculator_boolean(stack[-1]):
+                return False
+            condition = stack.pop()
+            if condition is not _CALCULATOR_BOOLEAN:
+                if condition or item == b"ifelse":
+                    taken = conditional[0] if condition else conditional[1]
+                    if not _apply_calculator_block(taken, stack):
+                        return False
+                conditional = []
+                continue
+            outcomes = [list(stack) for _ in conditional]
+            for branch, outcome in zip(conditional, outcomes, strict=True):
+                if not _apply_calculator_block(branch, outcome):
+                    return False
+            first, second = outcomes if len(outcomes) == 2 else (outcomes[0], stack)
+            if len(first) != len(second) or any(
+                _calculator_boolean(a) != _calculator_boolean(b)
+                for a, b in zip(first, second, strict=True)
+            ):
+                return False
+            stack[:] = [
+                a
+                if type(a) is type(b) and a == b
+                else _CALCULATOR_BOOLEAN
+                if _calculator_boolean(a)
+                else _CALCULATOR_INTEGER
+                if _calculator_integer(a) and _calculator_integer(b)
+                else None
+                for a, b in zip(first, second, strict=True)
+            ]
+            conditional = []
+        elif conditional or not _apply_calculator_operator(item, stack):
+            return False
+        if len(stack) > _CALCULATOR_MAX_STACK:
+            return False
+    return not conditional
+
+
+_CALCULATOR_SAMPLE_STEPS = 255
+# Tokens executed across all sampled runs of one program, which bounds the cost of
+# a long program with many distinct literals.
+_CALCULATOR_SAMPLE_BUDGET = 200_000
+# Grid steps from coarse to fine (8-bit reversal), so that a program which can only
+# afford a few samples still spreads them over the whole domain.
+_CALCULATOR_GRID_ORDER = sorted(
+    range(_CALCULATOR_SAMPLE_STEPS + 1), key=lambda step: int(f"{step:08b}"[::-1], 2)
+)
+
+
+def _calculator_literals(block: list) -> set[float]:
+    """Collect the numeric literals of a parsed calculator program."""
+    literals: set[float] = set()
+    for item in block:
+        if isinstance(item, list):
+            literals |= _calculator_literals(item)
+        elif item.decode("latin-1") not in _CALCULATOR_OPERATORS:
+            value = _calculator_literal(item)
+            if value is not None:
+                literals.add(float(value))
+    return literals
+
+
+def _calculator_size(block: list) -> int:
+    """Count the tokens of a parsed calculator program, including nested blocks."""
+    return sum(
+        _calculator_size(item) if isinstance(item, list) else 1 for item in block
+    )
+
+
+def _calculator_samples(program: list, low: float, high: float) -> list[float]:
+    """Return the inputs at which a calculator program is run with actual values.
+
+    The domain is sampled at 256 evenly spaced points, which include the entries of
+    an 8-bit transfer lookup table. A result is commonly undefined where an input
+    equals a constant of the program, as in { 0.25 sub 1 exch div }, so each literal
+    and its negation inside the domain are sampled as well. The ends and the middle
+    of the domain come first; grid points and literals then alternate up to the
+    number of runs that _CALCULATOR_SAMPLE_BUDGET allows for the program's size.
+    """
+    grid = [
+        low + (high - low) * step / _CALCULATOR_SAMPLE_STEPS
+        for step in _CALCULATOR_GRID_ORDER
+    ]
+    literals = sorted(
+        {
+            value
+            for literal in _calculator_literals(program)
+            for value in (literal, -literal)
+            if low <= value <= high
+        }
+    )
+    ordered = [low, high, (low + high) / 2]
+    for pair in itertools.zip_longest(grid, literals):
+        ordered.extend(value for value in pair if value is not None)
+    limit = max(3, _CALCULATOR_SAMPLE_BUDGET // max(1, _calculator_size(program)))
+    return list(dict.fromkeys(ordered))[:limit]
+
+
+def _is_scalar_calculator(data: bytes, domain) -> bool:
+    """Require a calculator program that provably maps one number to one number.
+
+    The program must hold for any input. It also runs for actual inputs, where
+    conditions select the path, so a guarded { ln } passes but an unguarded one fails
+    at zero. These inputs are a sample of the domain (_calculator_samples()), so an
+    undefined result elsewhere is not excluded: sound interval reasoning would also
+    reject such guarded programs and replace their valid transfer functions.
+    """
+    program = _parse_calculator(data)
+    if program is None:
+        return False
+    # The Domain is normalized by _function_numbers() as structure_limits writes
+    # it, so its real limit also keeps the sampling grid from overflowing.
+    low, high = float(domain[0]), float(domain[1])
+    try:
+        for value in (None, *_calculator_samples(program, low, high)):
+            stack: list = [value]
+            if (
+                not _apply_calculator_block(program, stack)
+                or len(stack) != 1
+                or _calculator_boolean(stack[0])
+            ):
+                return False
+    except (ZeroDivisionError, OverflowError, ValueError):
+        # An operation without a defined result, such as a division by zero.
+        return False
+    return True
+
+
+def _is_scalar_transfer_function(
+    function, ancestors=frozenset(), validated: dict | None = None
+) -> bool:
+    """Validate that a PDF function maps one input to one output, in each type.
+
+    A function's validity does not depend on the path that reaches it, so results
+    are memoized in ``validated``. Otherwise a stitching graph that reuses a child
+    in every level would be checked an exponential number of times.
+    """
+    if function == Name.Identity:
+        return True
+    if not isinstance(function, (Dictionary, Stream)) or len(ancestors) >= 64:
+        return False
+    key = function.objgen if function.objgen != (0, 0) else function.unparse()
+    if key in ancestors:
+        return False
+    if validated is None:
+        validated = {}
+    if key not in validated:
+        validated[key] = _check_scalar_transfer_function(
+            function, ancestors | {key}, validated
+        )
+    return validated[key]
+
+
+def _is_bounded_exponential(domain, exponent, c0: float, c1: float) -> bool:
+    """Require C0 + x^N * (C1 - C0) to stay within the real limit over the Domain.
+
+    The Domain excludes 0 for a negative N, so |x|^N takes its largest value at an
+    end of the Domain in each case. All values are normalized (_function_number()).
+    """
+    for bound in domain:
+        try:
+            power = math.pow(float(bound), float(exponent))
+        except (OverflowError, ValueError):
+            return False
+        if not _function_real(power) or not _function_real(c0 + power * (c1 - c0)):
+            return False
+    return True
+
+
+def _check_scalar_transfer_function(function, ancestors, validated: dict) -> bool:
+    """Validate one function object; see _is_scalar_transfer_function().
+
+    Every numeric parameter is read through _function_number(), so the checks
+    apply to the values that sanitize_structure_limits() writes to the output.
+    """
+    kind = _function_integer(function.get("/FunctionType"))
+    domain = _function_numbers(function.get("/Domain"), 2)
+    if kind is None or domain is None or domain[0] > domain[1]:
+        return False
+    limits = None
+    if "/Range" in function:
+        limits = _function_numbers(function.get("/Range"), 2)
+        if limits is None or limits[0] > limits[1]:
+            return False
+    if kind in (0, 4):
+        if not isinstance(function, Stream) or limits is None:
+            return False
+        try:
+            data = function.read_bytes()
+        except (PdfError, RuntimeError):
+            return False
+        if kind == 4:
+            # structure_limits rewrites number objects and content streams, not
+            # the literals of a calculator stream, so these are read as they are:
+            # a literal beyond the real limit is rejected rather than clamped
+            # (_calculator_literal()), unlike the dictionary parameters above.
+            return _is_scalar_calculator(data, domain)
+        size = _function_numbers(function.get("/Size"), 1)
+        bits = _function_integer(function.get("/BitsPerSample"))
+        order = _function_integer(function.get("/Order", 1))
+        return (
+            size is not None
+            and isinstance(size[0], int)
+            and size[0] > 0
+            and bits in (1, 2, 4, 8, 12, 16, 24, 32)
+            and order in (1, 3)
+            # ISO 32000-1, 7.3.8.2: too little or too much data is an error.
+            and len(data) == (size[0] * bits + 7) // 8
+            and all(
+                key not in function or _function_numbers(function[key], 2) is not None
+                for key in ("/Encode", "/Decode")
+            )
+        )
+    if not isinstance(function, Dictionary):
+        return False
+    if kind == 2:
+        exponent = _function_number(function.get("/N"))
+        coefficients = [
+            _function_numbers(function[key], 1) if key in function else [default]
+            for key, default in (("/C0", 0.0), ("/C1", 1.0))
+        ]
+        return (
+            exponent is not None
+            and None not in coefficients
+            and (int(exponent) == exponent or domain[0] >= 0)
+            and (exponent >= 0 or not domain[0] <= 0 <= domain[1])
+            and _is_bounded_exponential(
+                domain, exponent, coefficients[0][0], coefficients[1][0]
+            )
+        )
+    if kind == 3:
+        functions = function.get("/Functions")
+        if not isinstance(functions, Array) or not functions:
+            return False
+        count = len(functions)
+        bounds = _function_numbers(function.get("/Bounds"), count - 1)
+        if (
+            bounds is None
+            or _function_numbers(function.get("/Encode"), 2 * count) is None
+        ):
+            return False
+        if any(a >= b for a, b in zip([domain[0], *bounds], [*bounds, domain[1]])):
+            # The final interval may have zero width (ISO 32000-1, 7.10.4).
+            if count != 1 and not (
+                bounds[-1] == domain[1]
+                and all(a < b for a, b in zip([domain[0], *bounds[:-1]], bounds))
+            ):
+                return False
+        return all(
+            isinstance(child, (Dictionary, Stream))
+            and _is_scalar_transfer_function(child, ancestors, validated)
+            for child in functions
+        )
+    return False
+
+
 def _sanitize_smask_dict(gs_dict: Dictionary, smask_dict: Dictionary) -> int:
     """Validate internal entries of a soft mask dictionary.
 
     Per PDF Reference 1.7 Table 144:
     - /S (required): must be /Alpha or /Luminosity
     - /G (required): must be a Stream (Form XObject)
-    - /TR: forbidden in PDF/A (ISO 19005-2, 6.2.8)
+    - /TR (optional): preserve the soft-mask transfer function
     - /BC (optional): if present, must be an Array
 
     If a required entry is invalid or missing, the SMask is replaced
-    with /None on gs_dict.
+    with /None on gs_dict. Otherwise, malformed /TR and non-array /BC entries
+    are removed from smask_dict; removing /TR restores the identity mapping.
 
     Args:
         gs_dict: The parent ExtGState dictionary (modified in place).
@@ -318,11 +955,13 @@ def _sanitize_smask_dict(gs_dict: Dictionary, smask_dict: Dictionary) -> int:
         )
         return 1
 
-    # /TR is forbidden in PDF/A (ISO 19005-2, 6.2.8)
-    if "/TR" in smask_dict:
+    # ISO 19005-2/3, 6.2.5 prohibits /TR in an ExtGState dictionary only.
+    # A soft mask's /TR is a separate, permitted opacity mapping. Removing
+    # it would change the mask and therefore the rendered page appearance.
+    if "/TR" in smask_dict and not _is_scalar_transfer_function(smask_dict.TR):
         del smask_dict["/TR"]
         fixes += 1
-        logger.debug("Removed forbidden /TR from SMask dictionary")
+        logger.warning("Removed malformed soft-mask /TR; using the identity mapping")
 
     # /BC must be an Array if present
     if "/BC" in smask_dict:
@@ -450,7 +1089,7 @@ def _sanitize_halftone_dict(
     return fixes, True
 
 
-def _sanitize_gs_dict(gs_dict: Dictionary, reset_opm: bool) -> int:
+def _sanitize_gs_dict(gs_dict: Dictionary) -> int:
     """Check and remove forbidden entries from a single ExtGState dictionary.
 
     Args:
@@ -461,27 +1100,41 @@ def _sanitize_gs_dict(gs_dict: Dictionary, reset_opm: bool) -> int:
     """
     removed = 0
 
+    # ISO 32000-1, Table 58 defines /OPM as the integer 0 or 1. A real with the
+    # same value selects the same mode, so this repair is also safe for shared
+    # dictionaries. Any other value selects no defined mode.
+    if "/OPM" in gs_dict:
+        opm = _resolve_indirect(gs_dict["/OPM"])
+        if isinstance(opm, Decimal) and opm in (0, 1):
+            gs_dict["/OPM"] = int(opm)
+            removed += 1
+            logger.debug("Normalized real /OPM to an integer in ExtGState")
+        elif isinstance(opm, bool) or not isinstance(opm, int) or opm not in (0, 1):
+            del gs_dict["/OPM"]
+            removed += 1
+            logger.debug("Removed undefined /OPM from ExtGState")
+
+    # The same table defines /OP and /op as booleans. Numeric 0 and 1 are
+    # unambiguous, and overprint analysis needs the type it can rely on.
+    for key in ("/OP", "/op"):
+        if key not in gs_dict:
+            continue
+        flag = _resolve_indirect(gs_dict[key])
+        if isinstance(flag, bool):
+            continue
+        if isinstance(flag, (int, Decimal)) and flag in (0, 1):
+            gs_dict[key] = bool(flag)
+            logger.debug("Normalized numeric %s to a boolean in ExtGState", key)
+        else:
+            del gs_dict[key]
+            logger.debug("Removed undefined %s from ExtGState", key)
+        removed += 1
+
     # /TR is always forbidden
     if "/TR" in gs_dict:
         del gs_dict["/TR"]
         removed += 1
         logger.debug("Removed forbidden /TR from ExtGState")
-
-    # PDF/A 6.2.4.2:
-    # OPM=1 is forbidden with ICCBased CMYK when overprint is enabled.
-    # Both the colour space and overprint flags are intentionally checked
-    # document-wide. Graphics-state parameters persist independently, so an
-    # /OPM value and /OP or /op may be supplied by different ExtGState
-    # dictionaries or inherited across a nested content stream.
-    if reset_opm and "/OPM" in gs_dict:
-        try:
-            opm = int(_resolve_indirect(gs_dict["/OPM"]))
-        except Exception:
-            opm = 0
-        if opm == 1:
-            gs_dict["/OPM"] = 0
-            removed += 1
-            logger.debug("Set /OPM to 0 due to ICCBased CMYK with overprint enabled")
 
     # /TR2 is forbidden unless value is /Default
     if "/TR2" in gs_dict:
@@ -590,7 +1243,7 @@ def _sanitize_gs_dict(gs_dict: Dictionary, reset_opm: bool) -> int:
     return removed
 
 
-def _process_extgstate_dict(extgstate_dict, reset_opm: bool) -> int:
+def _process_extgstate_dict(extgstate_dict) -> int:
     """Iterate all entries in an /ExtGState resource dictionary.
 
     Args:
@@ -608,7 +1261,7 @@ def _process_extgstate_dict(extgstate_dict, reset_opm: bool) -> int:
     for gs_name in list(extgstate_dict.keys()):
         gs = _resolve_indirect(extgstate_dict[gs_name])
         if isinstance(gs, Dictionary):
-            removed += _sanitize_gs_dict(gs, reset_opm)
+            removed += _sanitize_gs_dict(gs)
 
     return removed
 
@@ -681,7 +1334,7 @@ def _sanitize_shadings_in_resources(resources) -> int:
     return removed
 
 
-def _process_resources(resources, reset_opm: bool) -> int:
+def _process_resources(resources) -> int:
     """Extract /ExtGState from a Resources dictionary and process it.
 
     Args:
@@ -698,7 +1351,17 @@ def _process_resources(resources, reset_opm: bool) -> int:
 
     extgstate = resources.get("/ExtGState")
     if extgstate:
-        removed += _process_extgstate_dict(extgstate, reset_opm)
+        removed += _process_extgstate_dict(extgstate)
+
+    # A shading pattern holds its ExtGState directly, not in a resource table.
+    patterns = _resolve_indirect(resources.get("/Pattern"))
+    if isinstance(patterns, Dictionary):
+        for pattern in patterns.values():
+            pattern = _resolve_indirect(pattern)
+            if isinstance(pattern, (Dictionary, Stream)):
+                state = _resolve_indirect(pattern.get("/ExtGState"))
+                if isinstance(state, Dictionary):
+                    removed += _sanitize_gs_dict(state)
 
     # Remove /TR and /TR2 from Shading dictionaries (ISO 19005-2, §6.2.5)
     removed += _sanitize_shadings_in_resources(resources)
@@ -706,10 +1369,27 @@ def _process_resources(resources, reset_opm: bool) -> int:
     return removed
 
 
+def sanitize_overprint_usage(pdf: Pdf) -> int:
+    """Repair actual ICCBased CMYK overprint, including newly installed defaults.
+
+    Modify affected painting streams and their resources in place.
+
+    Returns:
+        Number of painting operations repaired, or zero when no repair is needed.
+
+    Raises:
+        ConversionError: If content cannot be safely analyzed or shared graphics
+            contexts require incompatible repairs.
+    """
+    if _pdf_uses_iccbased_cmyk(pdf) and _pdf_enables_overprint(pdf):
+        return sanitize_overprint(pdf)
+    return 0
+
+
 def sanitize_extgstate(pdf: Pdf) -> dict[str, int]:
     """Sanitize Extended Graphics State dictionaries for PDF/A compliance.
 
-    Removes forbidden entries per ISO 19005-2, Section 6.2.8:
+    Removes forbidden entries per ISO 19005-2, Section 6.2.5:
     - /TR (transfer function)
     - /TR2 (unless /Default)
     - /HTP (halftone phase)
@@ -727,15 +1407,24 @@ def sanitize_extgstate(pdf: Pdf) -> dict[str, int]:
         pdf: Opened pikepdf PDF object (modified in place).
 
     Returns:
-        Dictionary with key 'extgstate_fixed': number of entries removed.
+        Dictionary with key 'extgstate_fixed': total dictionary fixes and
+        repaired painting operations.
+
+    Raises:
+        ConversionError: If overprint analysis cannot determine a safe repair.
+            Resource dictionary cleanup errors are caught and skipped instead.
     """
-    reset_opm = _pdf_uses_iccbased_cmyk(pdf) and _pdf_enables_overprint(pdf)
     total_removed = 0
     for resources in _iter_resource_dictionaries(pdf):
         try:
-            total_removed += _process_resources(resources, reset_opm)
+            total_removed += _process_resources(resources)
         except Exception as e:
             log_suppressed_error(logger, e, "Error sanitizing ExtGState: %s", e)
+
+    # Resource presence is only a cheap preflight. The overprint pass resolves
+    # actual graphics state at each paint and never edits shared /OPM entries.
+    # Keep ConversionError outside the best-effort dictionary cleanup above.
+    total_removed += sanitize_overprint_usage(pdf)
 
     if total_removed > 0:
         logger.info("ExtGState sanitized: %d forbidden entries removed", total_removed)

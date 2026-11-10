@@ -4344,6 +4344,47 @@ class TestConvertToPdfa:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
+    def test_convert_restores_custom_docinfo_dropped_by_ocr(
+        self,
+        mock_is_ocr_available: MagicMock,
+        mock_apply_ocr: MagicMock,
+        pdf_with_metadata: Path,
+        tmp_dir: Path,
+    ) -> None:
+        """Custom DocInfo text survives an OCR step that rebuilds the Info dict."""
+        mock_is_ocr_available.return_value = True
+        input_path = tmp_dir / "custom.pdf"
+        with pikepdf.open(pdf_with_metadata) as pdf:
+            pdf.docinfo["/Company"] = "Acme Corp"
+            pdf.save(input_path)
+
+        def create_ocr_output(
+            input_path: Path, output_path: Path, langs: list[str], **kwargs: object
+        ) -> Path:
+            with pikepdf.open(input_path) as pdf:
+                del pdf.docinfo["/Company"]
+                pdf.save(output_path)
+            return output_path
+
+        mock_apply_ocr.side_effect = create_ocr_output
+        output_path = tmp_dir / "output.pdf"
+
+        result = convert_to_pdfa(
+            input_path,
+            output_path,
+            level="2b",
+            ocr_languages=["en"],
+            ocr_detection_model_dir=_DETECTION_MODEL_DIR,
+            ocr_recognition_model_dir=_RECOGNITION_MODEL_DIR,
+        )
+
+        assert result.success is True
+        mock_apply_ocr.assert_called_once()
+        with pikepdf.open(output_path) as pdf:
+            assert str(pdf.docinfo["/Company"]) == "Acme Corp"
+
+    @patch("pdftopdfa.ocr.apply_ocr")
+    @patch("pdftopdfa.ocr.is_ocr_available")
     def test_convert_delegates_text_page_skipping_to_apply_ocr(
         self,
         mock_is_ocr_available: MagicMock,
