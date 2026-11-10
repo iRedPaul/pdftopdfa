@@ -1,66 +1,61 @@
 # Changelog
 
-## [Unreleased]
+## [0.10.0] - 2026-11-10
+
+### Features
+
+- Preserve PDF portfolios (collections) and article threads, validating their structures and repairing them where possible
+- Preserve custom DocInfo text fields, valid XMP provenance, translated titles and descriptions, and ordered author lists
+- Preserve permitted soft-mask transfer functions
+- Preserve annotation colors and valid opacity values
+- Retain compatible additional OutputIntents of other subtypes, such as PDF/X
 
 ### Changes
 
-- Preserve CalGray/CalRGB calibration by default; retain `convert_calibrated=True` and `--convert-calibrated` as deprecated compatibility options that warn and preserve the original colors
+- Preserve CalGray/CalRGB calibration by default; `convert_calibrated=True` and `--convert-calibrated` are deprecated, warn, and also preserve the original colors
+- Repair ICCBased CMYK overprint at the affected painting operations instead of changing shared graphics states, and use the original-input fallback when shared Forms, patterns or Type3 glyphs need incompatible repairs
+- Rebuild a page's missing, incomplete or malformed `/B` array from its article threads instead of using the original-input fallback
+- Remove malformed thread information entries individually instead of rejecting the article
+- Sanitize navigation metadata, collection settings and Thread actions by copy-on-write, so objects shared with other roles, such as page resources or the catalog `/Names`, stay unchanged
+- Avoid slow dictionary membership tests in font traversal under pikepdf 10.18
 
 ### Bug Fixes
 
-- Retain compatible additional OutputIntents of other subtypes such as PDF/X
-- Validate calibrated color spaces and additional OutputIntent dictionaries before preserving them, restricted to actual color contexts
-- Validate calibrated color spaces that inline images declare directly, those in interactive form default resources, and those in a shading pattern's soft mask
-- Detect annotation color arrays when choosing profiles
+- Validate calibrated color spaces before preserving them, including those in inline images, interactive form default resources and shading-pattern soft masks
+- Validate additional OutputIntents: require a usable profile tag table, store real `/N` entries as integers, and remove entries with an undefined subtype or a non-standard condition without a profile
 - Leave calibrated color spaces unvalidated when `embed_color_profiles(replace_existing=False)` skips a document with existing OutputIntents
-- Rewrite real `/N` entries of retained OutputIntent profiles as integers
-- Require a usable tag table with permitted element types before retaining an existing OutputIntent profile
-- Remove OutputIntents with an undefined subtype or a non-standard condition without a profile while retaining the others
-- Preserve annotation colors and valid opacity values
-- Preserve custom DocInfo text fields, valid XMP provenance, translated titles/descriptions, and ordered author lists
-- Validate preserved XMP arrays and provenance fields
-- Match XMP default-language tags case-insensitively
-- Synchronize DocInfo Author with the first XMP creator, and move a DocInfo Author that matches a later XMP creator to the front instead of overwriting the first creator
+- Detect annotation color arrays when choosing color profiles
+- Synchronize DocInfo Author with the first XMP creator, moving a matching later creator to the front instead of overwriting the first one
 - Reject invalid text encodings in custom DocInfo strings
-- Reject impossible XMP dates and RDF/XML attribute forms that XMP parsers refuse, instead of copying them into the output metadata
-- Repair `_` separators in XMP language tags such as `en_US`, reject other malformed tags, and stop copying `xml:lang` from the top-level `rdf:Description`, which validators report as an undeclared property
-- Remove empty `xml:lang` qualifiers while retaining their values
-- Remove URI-typed provenance fields with invalid values individually, and validate the range of XMP time zone offsets
-- Require custom XMP structure fields to use the namespace of their declared value type, and validate XMP numbers against their lexical forms
-- Remove XMP history events without `stEvt:action` and `stEvt:when` individually, keeping the rest of the history, and move `x-default` to the front of language alternatives
-- Remove fields from preserved XMP provenance that PDF/A does not accept, such as `stEvt:changed`, `stRef:filePath`, and `stRef:originalDocumentID`, instead of producing a non-conforming packet or dropping the whole structure
+- Validate preserved XMP arrays, containers and provenance fields, removing invalid history events and fields that PDF/A does not accept individually
+- Reject impossible XMP dates, `Real` values without fraction digits, custom structure fields outside their declared namespace, and RDF/XML forms that XMP parsers refuse
+- Repair `_` separators in XMP language tags, remove empty `xml:lang` qualifiers, match default-language tags case-insensitively, move `x-default` to the front, and stop copying `xml:lang` from the top-level `rdf:Description`
+- Drop XML comments, processing instructions and stray text between RDF elements when rewriting XMP
 - Remove the PDF/X and PDF/E markers from DocInfo along with their XMP identification
-- Reject XMP containers with extra containers or elements other than `rdf:li`
-- Preserve permitted soft-mask transfer functions and remove malformed ones
-- Remove soft-mask calculator functions unless their stack effects provably yield one number, and reject constant operations without a defined result
-- Avoid changing valid overprint behavior in unrelated graphics contexts
-- Normalize inline-image color abbreviations and reuse equivalent overprint proofs for large documents
-- Skip invisible Type3 glyphs during overprint analysis
-- Store real `/OPM` values such as `1.0` as the required integers, store numeric `/OP` and `/op` values 0 and 1 as booleans, and remove other values without a defined meaning
-- Analyze soft masks selected by a shading pattern's `/ExtGState` during overprint repair
-- Reject non-integer text rendering modes during overprint analysis, and evaluate a soft mask at the invocation of a transparency group instead of at its inner paints
-- Check uncolored tiling patterns under the overprint state at their painting operation
-- Sanitize an `/ExtGState` stored directly on a shading pattern like other graphics states
-- Place overprint repairs for path paints before the path object instead of inside it, add the repair states to the resource scope a Form inherits instead of copying it into the Form, and reuse the same repair states on repeated passes
-- Retain PDF portfolios and article threads
-- Validate collection and article structures before preserving them
-- Remove collection sorting unless every `/S` field resolves in the collection schema, and an array of sort directions (`/A`) for a single `/S` field
-- Rebuild a page's `/B` array from the article threads when it is missing, incomplete, malformed or lists beads of other pages, instead of using the original-input fallback
-- Remove duplicate beads from a page's `/B` array, keeping the drawing order of the listed beads and appending omitted beads in reading order; a complete `/B` array is left unchanged
+- Remove malformed soft-mask transfer functions, including calculator programs without a provable single result and functions with non-finite or out-of-range values after PDF/A number normalization
+- Store real `/OPM` values as integers and numeric `/OP` and `/op` values 0 and 1 as booleans, and remove other values without a defined meaning
+- Analyze overprint through soft masks, transparency groups, shading-pattern graphics states, uncolored tiling patterns and Type3 glyphs, and reject non-integer text rendering modes
+- Place overprint repairs for path paints before the path object instead of inside it, and keep the resource scope a Form inherits
+- Validate collection schemas, items, subitems, sorting, dates and text encodings, removing invalid values individually
+- Validate article threads, beads and Thread actions, removing Thread actions with an invalid destination or file specification where they are referenced
 - Make an inline catalog `/Threads` array an indirect object
-- Remove collection item values without a matching schema field, with the wrong type, or under a file-related field (`/F`, `/Desc`, `/ModDate`, `/CreationDate`, `/Size`), whose data ISO 32000-1 Table 157 takes from the file specification, keeping them when a portfolio has no schema, and a default document that is not an embedded file specification, rechecked after all embedded-file cleanup for PDF/A-2 and PDF/A-3
-- Accept every ISO 32000-1 date form in collection items and thread information (a zero UT offset after `Z`, an hour offset without minutes) instead of removing the value, add the `D:` prefix that ISO 32000-1 requires to a PDF 1.7 date written without it, rewrite a date stored in another encoding (such as BOM-prefixed UTF-16BE) as the ASCII string ISO 32000-1 Table 34 specifies, and reject a nonzero offset after `Z`, out-of-range UT offsets, a UT relationship without the complete date and time, and dates that do not exist
-- Keep the page beads of valid threads that the catalog `/Threads` array does not list but a Thread action or a page `/B` array refers to, and rebuild the `/B` arrays of their pages, instead of removing them as unrelated beads
-- Remove a Thread action whose destination is not a valid article (a malformed thread outside the catalog `/Threads` array, a `/Threads` index out of range, a negative thread index, also for a thread in another file, an unknown thread title, a missing or mistyped `/D`, a title `/D` that is not a valid PDFDocEncoding or UTF-16BE text string, also for a thread in another file, a `/F` that is not a file specification string or dictionary) where it is referenced, instead of keeping a dangling destination, and an action bead `/B` that does not belong to its thread, or, for a thread in another file (`/F`), is not a non-negative index; the other actions and their containers are kept
-- Validate each thread, thread information dictionary, collection item, shared `/B` array and action container once, so repeated references no longer multiply the work; an object used in two roles is still checked in each, and no object reached through a reference is edited in place: a thread information dictionary (`/I`), the collection dictionary, its schema, schema fields and sorting, a collection item (`/CI`) or subitem, an action, an `/AA` dictionary or a `/Next` array that needs a repair is replaced at its references by a sanitized copy (shared by all references of the same role; actions that follow each other in a cycle are copied as a cycle), so an object it may also be, such as the page `/Resources`, a font, an annotation `/MK` or `/AP` dictionary, a page and its `/B` array, a page `/Annots` array, a bead, the catalog `/Names` dictionary, the DocInfo dictionary or a dictionary of another collection or metadata role, stays unchanged, and a valid one is kept as it is; only the reference entries of their owners (the catalog, pages, annotations, outline items, threads and file specifications) are set or removed; a `/CI` that is a file specification is not a collection item and is removed
-- Truncate an over-long BOM-prefixed UTF-16BE string to an even length without splitting a surrogate pair, so the 32,767-byte string limit no longer leaves malformed text strings
-- Remove malformed thread information entries (text strings with an invalid PDFDocEncoding or UTF-16BE encoding, invalid dates or `/Trapped` values) individually, and a `/I` entry that is not a dictionary, like custom DocInfo values, instead of rejecting the article
-- Require valid PDFDocEncoding or UTF-16BE text encoding for collection item text values, subitem prefixes and schema field names
-- Skip malformed `/EmbeddedFiles` name-tree nodes (non-dictionary `/Kids` entries, `/Names` or `/Kids` of the wrong type, non-string keys, cycles) when checking a portfolio, instead of aborting the conversion; embedded-file sanitizers share this single tolerant name-tree traversal
+- Skip malformed `/EmbeddedFiles` name-tree nodes instead of aborting the conversion
+- Validate shared threads, collection items and action containers once, so repeated references no longer multiply the work
+- Write reals clamped to the PDF/A limit as readable real numbers, which previously could leave the converted file without pages
+- Truncate over-long UTF-16BE strings to an even length without splitting a surrogate pair
+
+### Documentation
+
+- Document calibrated color handling, retained OutputIntents, overprint repair, TrapNet flattening, custom DocInfo encoding checks and article-thread handling
 
 ### Tests
 
 - Validate feature preservation through complete PDF/A-2b/PDF/A-3b conversions using the pinned veraPDF CI installation
+- Build shared parametrized PDF objects per test to restore test speed and correctness under pikepdf 10.18
+
+### CI / Build
+
+- Request macOS runners one at a time to reduce hosted-capacity failures
 
 ## [0.9.25] - 2026-11-06
 
