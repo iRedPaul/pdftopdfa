@@ -1561,7 +1561,8 @@ def test_thread_action_bead_must_belong_to_its_thread(bead, kept):
     """Table 205: /B is a bead of the destination thread or its index there.
 
     An invalid bead is removed, so that the action opens the thread at its
-    first bead, rather than the whole action.
+    first bead, rather than the whole action. Both references then share one
+    copy without it, and the action itself is unchanged.
     """
     pdf = new_pdf()
     thread, own, _ = _article(pdf)
@@ -1570,10 +1571,15 @@ def test_thread_action_bead_must_belong_to_its_thread(bead, kept):
     action = pdf.make_indirect(Dictionary(S=Name.Thread, D=thread))
     action.B = {"own": own, "other": foreign}.get(bead, bead)
     pdf.Root.OpenAction = action
-    _link(pdf, pdf.pages[0], A=action)
+    link = _link(pdf, pdf.pages[0], A=action)
     assert remove_forbidden_catalog_entries(pdf) == (0 if kept else 1)
-    assert ("/B" in action) == kept
-    assert pdf.Root.OpenAction.objgen == action.objgen
+    assert "/B" in action
+    written = pdf.Root.OpenAction
+    assert ("/B" in written) == kept
+    assert (written.objgen == action.objgen) == kept
+    assert link.A.objgen == written.objgen != (0, 0)
+    assert written.D.objgen == thread.objgen
+    assert remove_forbidden_catalog_entries(pdf) == 0
 
 
 def test_conversion_removes_actions_naming_a_malformed_unlisted_thread(tmp_path):
@@ -1644,7 +1650,7 @@ def test_action_scan_visits_shared_containers_once():
     pdf.Root.OpenAction = Dictionary(S=Name.Named, N=Name.FirstPage, Next=following)
     checked = []
     actions, removed = navigation._walk_actions(
-        pdf, lambda item: checked.append(item.objgen) or False
+        pdf, lambda item: checked.append(item.objgen) or (False, ())
     )
     # The open action, the annotation /A and /AA entries and the /Next entry.
     assert removed == 0 and len(checked) == 4
@@ -1837,7 +1843,11 @@ def test_collection_item_typed_as_a_file_specification_is_detached():
 
 
 def test_action_that_is_also_an_additional_actions_dictionary_is_checked():
-    """An object scanned as an /AA dictionary is still followed as an action."""
+    """An object scanned as an /AA dictionary is still followed as an action.
+
+    Its /Next entry names an invalid Thread action, so the action is replaced
+    by a copy without it; as an /AA dictionary it holds no action and stays.
+    """
     pdf = new_pdf()
     shared = pdf.make_indirect(
         Dictionary(
@@ -1849,8 +1859,12 @@ def test_action_that_is_also_an_additional_actions_dictionary_is_checked():
     pdf.Root.OpenAction = shared
     _link(pdf, pdf.add_blank_page(), AA=shared)
     assert remove_forbidden_catalog_entries(pdf) == 1
-    assert "/Next" not in shared
-    assert pdf.Root.OpenAction.objgen == shared.objgen
+    assert "/Next" in shared
+    written = pdf.Root.OpenAction
+    assert written.objgen not in ((0, 0), shared.objgen)
+    assert sorted(written.keys()) == ["/N", "/S"]
+    assert pdf.pages[0].Annots[0].AA.objgen == shared.objgen
+    assert remove_forbidden_catalog_entries(pdf) == 0
 
 
 @pytest.mark.parametrize("target", [-1, -7])
@@ -2260,6 +2274,376 @@ def test_conversion_keeps_page_resources_aliased_by_a_collection_item(tmp_path):
         item = converted.Root.Names.EmbeddedFiles.Names[1].CI
         assert item.objgen != page.Resources.objgen
         assert "/Font" not in item and "/XObject" not in item
+    if is_verapdf_available():
+        validation = validate_with_verapdf(output, flavour="3b")
+        assert validation.compliant, validation.failed_rules
+
+
+# The entries that hold a reference on the owner whose role it is. Only they
+# may be set or removed; an object reached through a reference never changes.
+_OWNER_ENTRIES = {
+    "catalog": {"/Collection", "/OpenAction", "/A", "/AA", "/Threads"},
+    "page": {"/B", "/A", "/AA"},
+    "annotation": {"/A", "/AA"},
+    "thread": {"/I"},
+    "filespec": {"/CI"},
+}
+
+
+def _owner_entries(pdf):
+    """Return, by object id, the reference entries that its roles may change."""
+    from pdftopdfa.sanitizers import navigation
+
+    owners = {}
+
+    def add(item, role):
+        if isinstance(item, Dictionary) and item.objgen != (0, 0):
+            owners.setdefault(item.objgen, set()).update(_OWNER_ENTRIES[role])
+
+    add(pdf.Root, "catalog")
+    for page in pdf.pages:
+        add(page.obj, "page")
+        for annotation in page.obj.get("/Annots", Array()):
+            add(annotation, "annotation")
+    outlines = pdf.Root.get("/Outlines")
+    item = outlines.get("/First") if isinstance(outlines, Dictionary) else None
+    while isinstance(item, Dictionary) and item.objgen not in owners:
+        add(item, "annotation")
+        item = item.get("/Next")
+    for thread in pdf.Root.get("/Threads", Array()):
+        add(thread, "thread")
+    for item in pdf.objects:
+        # The thread of each bead, which need not be listed in /Threads.
+        if isinstance(item, Dictionary) and "/R" in item and "/P" in item:
+            add(item.get("/T"), "thread")
+    for _, filespec in navigation._embedded_files(pdf):
+        add(filespec, "filespec")
+    return owners
+
+
+def _structure_snapshot(pdf):
+    """Serialize every object, without the reference entries of its owner roles."""
+    owners = _owner_entries(pdf)
+    snapshot = {}
+    for item in pdf.objects:
+        if item is None:
+            continue
+        objgen = item.objgen
+        if isinstance(item, Dictionary) and objgen in owners:
+            item = Dictionary(
+                {key: item[key] for key in item.keys() if key not in owners[objgen]}
+            )
+        snapshot[objgen] = bytes(item.unparse(resolved=True))
+    return snapshot
+
+
+def _only_references_changed(pdf, before):
+    """Check that existing objects changed only in their owners' reference entries."""
+    after = _structure_snapshot(pdf)
+    changed = [objgen for objgen, data in before.items() if after.get(objgen) != data]
+    assert changed == [], changed
+    return True
+
+
+def _schema_is_name_dictionary(pdf, parts):
+    pdf.Root.Names = pdf.make_indirect(pdf.Root.Names)
+    pdf.Root.Collection.Schema = pdf.Root.Names
+
+
+def _field_is_page_resources(pdf, parts):
+    parts["schema"].Good = _nested_structures(pdf)["resources"]
+
+
+def _field_is_sort(pdf, parts):
+    # As a field its /Type is wrong; as the sorting it is valid.
+    sort = parts["sort"]
+    sort.Subtype, sort.N = Name.S, "Good"
+    parts["schema"].Good = sort
+
+
+def _sort_is_field(pdf, parts):
+    # As the sorting its /Type and /A are wrong; as a field it is valid.
+    field = parts["field"]
+    field.Type, field.S, field.A = Name.CollectionField, Name.Good, Name.Bad
+    pdf.Root.Collection.Sort = field
+
+
+def _page_is_thread_action(pdf, parts):
+    page = parts["page"]
+    page.S, page.D = Name.Thread, parts["thread"]
+    pdf.Root.OpenAction = page
+
+
+def _additional_actions_are_thread_info(pdf, parts):
+    info = parts["info"]
+    info.O = Dictionary(S=Name.Thread, D=99)
+    parts["annotation"].AA = info
+    pdf.pages[0].obj.AA = info
+
+
+def _next_is_page_annotations(pdf, parts):
+    page = pdf.pages[1].obj
+    broken = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Annot,
+            Subtype=Name.Link,
+            Rect=Array([0, 0, 1, 1]),
+            S=Name.Thread,
+            D=99,
+        )
+    )
+    page.Annots = pdf.make_indirect(Array([parts["annotation"], broken]))
+    pdf.Root.OpenAction = Dictionary(S=Name.Named, N=Name.NextPage, Next=page.Annots)
+
+
+def _next_is_threads(pdf, parts):
+    pdf.Root.OpenAction = Dictionary(
+        S=Name.Thread, D=parts["thread"], B=Name.Bad, Next=pdf.Root.Threads
+    )
+
+
+def _action_cycle(pdf, parts):
+    first = pdf.make_indirect(Dictionary(S=Name.Named, N=Name.NextPage))
+    second = pdf.make_indirect(Dictionary(S=Name.Thread, D=parts["thread"], B=7))
+    first.Next, second.Next = second, Array([first])
+    pdf.Root.OpenAction = first
+    parts["annotation"].A = second
+
+
+def _direct_action_cycle(pdf, parts):
+    following = pdf.make_indirect(Array())
+    following.append(
+        Dictionary(S=Name.Thread, D=parts["thread"], B=Name.Bad, Next=following)
+    )
+    pdf.Root.OpenAction = Dictionary(S=Name.Named, N=Name.NextPage, Next=following)
+
+
+def _info_is_bead(pdf, parts):
+    parts["thread"].I = parts["bead"]
+
+
+def _item_is_collection(pdf, parts):
+    parts["filespec"].CI = parts["collection"]
+
+
+def _malformed_actions_everywhere(pdf, parts):
+    # A thread without beads, which /Threads does not list.
+    malformed = pdf.make_indirect(Dictionary(Type=Name.Thread))
+    broken = pdf.make_indirect(Dictionary(S=Name.Thread, D=malformed))
+    shared = pdf.make_indirect(Array([broken, parts["action"]]))
+    parts["annotation"].AA = pdf.make_indirect(Dictionary(E=broken, X=parts["action"]))
+    parts["action"].Next = shared
+    pdf.Root.OpenAction = Dictionary(S=Name.Named, N=Name.NextPage, Next=shared)
+    _outline_action(pdf, pdf.pages[0], broken)
+
+
+_ALIASES = {
+    "schema is /Names": _schema_is_name_dictionary,
+    "field is page /Resources": _field_is_page_resources,
+    "field is /Sort": _field_is_sort,
+    "/Sort is a field": _sort_is_field,
+    "page is a Thread action": _page_is_thread_action,
+    "/AA is thread /I": _additional_actions_are_thread_info,
+    "/Next is page /Annots": _next_is_page_annotations,
+    "/Next is /Threads": _next_is_threads,
+    "action cycle": _action_cycle,
+    "direct action cycle": _direct_action_cycle,
+    "/I is a bead": _info_is_bead,
+    "/CI is the collection": _item_is_collection,
+    "malformed actions everywhere": _malformed_actions_everywhere,
+}
+
+
+@pytest.mark.parametrize("alias", list(_ALIASES))
+def test_only_owner_reference_entries_change(alias):
+    """No object reached through a reference is edited, whatever else it is.
+
+    Every existing object is compared before and after the repairs, apart from
+    the entries that hold the references on their owners (the catalog, pages,
+    annotations and outline items, threads and file specifications); the
+    repairs themselves go to copies. A second run finds nothing to repair.
+    """
+    pdf = new_pdf()
+    _, _, parts = _structures(pdf)
+    _ALIASES[alias](pdf, parts)
+    before = _structure_snapshot(pdf)
+    assert remove_forbidden_catalog_entries(pdf) >= 1
+    assert _only_references_changed(pdf, before)
+    assert [item.objgen for item in pdf.pages[0].B] == [parts["bead"].objgen]
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+def test_schema_aliasing_the_name_dictionary_is_copied():
+    """The /EmbeddedFiles name tree is no schema field, but stays in /Names."""
+    pdf = new_pdf()
+    _, _, parts = _structures(pdf)
+    _schema_is_name_dictionary(pdf, parts)
+    names = pdf.Root.Names
+    assert remove_forbidden_catalog_entries(pdf) >= 1
+    assert sorted(names.keys()) == ["/EmbeddedFiles"]
+    assert pdf.Root.Names.objgen == names.objgen
+    collection = pdf.Root.Collection
+    assert collection.objgen not in ((0, 0), parts["collection"].objgen)
+    assert collection.Schema.objgen not in ((0, 0), names.objgen)
+    assert len(collection.Schema.keys()) == 0
+    # Without schema fields the sorting and item values describe nothing.
+    assert "/Sort" not in collection and "/Sort" in parts["collection"]
+    assert parts["collection"].Schema.objgen == names.objgen
+    assert sorted(parts["filespec"].CI.keys()) == ["/Type"]
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+def test_schema_field_aliasing_page_resources_is_removed_from_a_copy():
+    """A field that is the page /Resources leaves the resources intact."""
+    pdf = new_pdf()
+    _, _, parts = _structures(pdf)
+    _field_is_page_resources(pdf, parts)
+    resources = pdf.pages[0].Resources
+    assert remove_forbidden_catalog_entries(pdf) >= 1
+    assert sorted(resources.keys()) == ["/Font", "/XObject"]
+    schema = pdf.Root.Collection.Schema
+    assert schema.objgen not in ((0, 0), parts["schema"].objgen)
+    assert sorted(schema.keys()) == ["/Type"]
+    assert parts["schema"].Good.objgen == resources.objgen
+
+
+def test_dictionary_that_is_field_and_sorting_gets_a_copy_per_role():
+    """A field and the sorting are checked by different rules, each in a copy."""
+    pdf = new_pdf()
+    _, _, parts = _structures(pdf)
+    _sort_is_field(pdf, parts)
+    field = parts["field"]
+    before = bytes(field.unparse(resolved=True))
+    assert remove_forbidden_catalog_entries(pdf) == 2
+    assert bytes(field.unparse(resolved=True)) == before
+    collection = pdf.Root.Collection
+    assert collection.Schema.objgen == parts["schema"].objgen
+    assert collection.Schema.Good.objgen == field.objgen
+    sort = collection.Sort
+    assert sort.objgen not in ((0, 0), field.objgen)
+    assert sorted(sort.keys()) == ["/N", "/S", "/Subtype"]
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+def test_shared_field_copy_is_shared():
+    """Schema keys that share one field dictionary share its sanitized copy."""
+    pdf = new_pdf()
+    _, _, parts = _structures(pdf)
+    field = parts["field"]
+    field.O = Name.Bad
+    parts["schema"].Other = field
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    schema = pdf.Root.Collection.Schema
+    assert schema.Good.objgen == schema.Other.objgen != field.objgen
+    assert "/O" in field and "/O" not in schema.Good
+
+
+def test_page_used_as_a_thread_action_keeps_its_beads():
+    """The page /B array is no bead of the action, but the beads of the page.
+
+    The action gets a copy without /B; the page keeps its bead array.
+    """
+    pdf = new_pdf()
+    _, _, parts = _structures(pdf)
+    _page_is_thread_action(pdf, parts)
+    page = parts["page"]
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert [item.objgen for item in page.B] == [parts["bead"].objgen]
+    action = pdf.Root.OpenAction
+    assert action.objgen not in ((0, 0), page.objgen)
+    assert "/B" not in action and action.D.objgen == parts["thread"].objgen
+    assert pdf.pages[0].obj.objgen == page.objgen
+
+
+def test_shared_additional_actions_copy_is_shared():
+    """/AA dictionaries that also are another object are replaced by one copy."""
+    pdf = new_pdf()
+    _, _, parts = _structures(pdf)
+    _additional_actions_are_thread_info(pdf, parts)
+    info = parts["info"]
+    assert remove_forbidden_catalog_entries(pdf) >= 2
+    assert "/O" in info
+    copy = parts["annotation"].AA
+    assert copy.objgen not in ((0, 0), info.objgen)
+    assert pdf.pages[0].obj.AA.objgen == copy.objgen
+    assert sorted(copy.keys()) == ["/Title"]
+    assert parts["thread"].I.objgen not in (info.objgen, copy.objgen)
+
+
+def test_next_array_that_is_page_annotations_is_copied():
+    """A rejected action in the /Next array leaves the /Annots array intact."""
+    pdf = new_pdf()
+    _, _, parts = _structures(pdf)
+    _next_is_page_annotations(pdf, parts)
+    annots = pdf.pages[1].obj.Annots
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert len(annots) == 2 and pdf.pages[1].obj.Annots.objgen == annots.objgen
+    following = pdf.Root.OpenAction.Next
+    assert following.objgen not in ((0, 0), annots.objgen)
+    assert [item.objgen for item in following] == [parts["annotation"].objgen]
+
+
+def test_next_array_that_is_the_threads_array_stays():
+    """The threads are no actions to remove, so the /Next array is kept."""
+    pdf = new_pdf()
+    _, _, parts = _structures(pdf)
+    _next_is_threads(pdf, parts)
+    threads = pdf.Root.Threads
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert pdf.Root.Threads.objgen == threads.objgen
+    assert pdf.Root.OpenAction.Next.objgen == threads.objgen
+    assert "/B" not in pdf.Root.OpenAction
+
+
+@pytest.mark.parametrize("alias", ["action cycle", "direct action cycle"])
+def test_copies_of_cyclic_actions_refer_to_each_other(alias):
+    """Actions that follow each other in a cycle are copied as a cycle."""
+    pdf = new_pdf()
+    _, _, parts = _structures(pdf)
+    _ALIASES[alias](pdf, parts)
+    original = pdf.Root.OpenAction
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    first = pdf.Root.OpenAction
+    if alias == "action cycle":
+        second = first.Next
+        assert first.objgen != original.objgen
+        assert second.objgen not in ((0, 0), original.Next.objgen)
+        assert "/B" in original.Next and "/B" not in second
+        assert second.Next[0].objgen == first.objgen
+        assert parts["annotation"].A.objgen == second.objgen
+    else:
+        following = first.Next
+        assert following.objgen not in ((0, 0), original.Next.objgen)
+        assert "/B" in original.Next[0] and "/B" not in following[0]
+        assert following[0].Next.objgen == following.objgen
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+def test_conversion_keeps_structures_that_aliased_actions_and_schemas_are(tmp_path):
+    """/Names and the page /B survive their aliases and pass veraPDF."""
+    from pikepdf import Pdf
+
+    from pdftopdfa.verapdf import is_verapdf_available, validate_with_verapdf
+
+    pdf = new_pdf()
+    _, _, parts = _structures(pdf)
+    _schema_is_name_dictionary(pdf, parts)
+    _page_is_thread_action(pdf, parts)
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    result = convert_to_pdfa(source, output, level="3b")
+    assert result.target_produced and not result.skipped, result
+    with Pdf.open(output) as converted:
+        names = converted.Root.Names
+        assert len(names.EmbeddedFiles.Names) == 4
+        assert names.objgen != converted.Root.Collection.Schema.objgen
+        bead = converted.Root.Threads[0].F
+        page = converted.pages[0].obj
+        assert bead.P.objgen == page.objgen
+        assert [item.objgen for item in page.B] == [bead.objgen]
+        action = converted.Root.OpenAction
+        assert action.objgen != page.objgen
+        assert "/B" not in action and action.D.objgen == bead.T.objgen
     if is_verapdf_available():
         validation = validate_with_verapdf(output, flavour="3b")
         assert validation.compliant, validation.failed_rules

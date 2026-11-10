@@ -4,6 +4,7 @@
 
 """Validate preserved collection settings and circular article navigation."""
 
+import copy
 import logging
 import math
 import re
@@ -89,18 +90,15 @@ def _pdf_date(value):
 
 
 def _remove_entry(owner, key: str) -> int:
-    """Remove one malformed optional entry without discarding its valid siblings."""
+    """Remove a malformed reference from the owner whose entry it is.
+
+    Only an owner's own reference entry is removed this way (the catalog
+    /Collection, a thread /I, a file specification /CI); an object reached
+    through a reference is never edited, but replaced by a sanitized copy.
+    """
     del owner[key]
     logger.warning("Removed malformed navigation entry %s", key)
     return 1
-
-
-def _optional_type(owner, expected: Name) -> int:
-    """Omit an invalid optional type marker; its container defines the object type."""
-    value = owner.get("/Type")
-    return (
-        _remove_entry(owner, "/Type") if value is not None and value != expected else 0
-    )
 
 
 def _first_visit(item, seen: set) -> bool:
@@ -118,20 +116,42 @@ def _first_visit(item, seen: set) -> bool:
 _UNCHANGED = object()
 
 
-def _copy_on_write(pdf: Pdf, original, memo: dict, context, sanitize):
-    """Sanitize a metadata dictionary without ever editing it.
+def _detached(value):
+    """Return a value for a copy that shares no direct object with the original.
 
-    Thread information (/I), collection items (/CI) and subitems are referred to
-    by reference, and a malformed file may make that reference any other object,
-    such as a page, its resources, a font, an annotation's appearance or a bead.
+    pikepdf inserts a direct dictionary or array into another container by
+    reference, so a copy that took it as it is would edit the original along
+    with it. Its copy (copy.copy) duplicates the direct objects it contains and
+    keeps the references to indirect ones.
+    """
+    if isinstance(value, (Dictionary, Array)) and value.objgen == (0, 0):
+        return copy.copy(value)
+    return value
+
+
+def _new_dictionary(pdf: Pdf, entries: dict, indirect: bool) -> Dictionary:
+    """Create the copy of a dictionary from its retained entries."""
+    result = Dictionary({key: _detached(value) for key, value in entries.items()})
+    return pdf.make_indirect(result) if indirect else result
+
+
+def _copy_on_write(pdf: Pdf, original, memo: dict, context, sanitize):
+    """Sanitize a referenced dictionary without ever editing it.
+
+    Thread information (/I), the collection, its schema, fields and sorting,
+    collection items (/CI) and subitems are referred to by reference, and a
+    malformed file may make that reference any other object, such as a page,
+    its resources, a font, an annotation's appearance, a bead or the catalog
+    /Names dictionary.
     So the original is never changed: a dictionary that needs no change is kept
     as it is, and otherwise a new dictionary of the retained entries, indirect if
     the original is, replaces it at the reference. The original stays unchanged
     in all of its other roles and is not written if nothing refers to it anymore.
 
-    Each indirect dictionary is sanitized once per context (role and field
-    type), and its references share the result, so the work stays linear in the
-    size of the document and shared metadata stays shared.
+    Each indirect dictionary is sanitized once per role (each role has its own
+    memo) and context (a field type), and its references share the result, so
+    the work stays linear in the size of the document and shared metadata stays
+    shared.
 
     Args:
         pdf: The document.
@@ -155,9 +175,7 @@ def _copy_on_write(pdf: Pdf, original, memo: dict, context, sanitize):
         elif not checked[1]:
             result = _UNCHANGED
         else:
-            result = Dictionary(checked[0])
-            if indirect:
-                result = pdf.make_indirect(result)
+            result = _new_dictionary(pdf, checked[0], indirect)
         if indirect:
             memo[key] = result
     return original if result is _UNCHANGED else result
@@ -316,79 +334,149 @@ def _sanitize_collection_items(pdf: Pdf, schema) -> int:
     return removed
 
 
+def _dangling_default(pdf: Pdf, collection) -> bool:
+    """Check whether the initial document (/D) names no embedded file."""
+    default = collection.get("/D")
+    if default is None:
+        return False
+    return not (
+        isinstance(default, String)
+        and any(
+            isinstance(name, String) and bytes(name) == bytes(default)
+            for name, _ in _embedded_files(pdf)
+        )
+    )
+
+
+def _replace_collection(pdf: Pdf, collection, entries: dict) -> None:
+    """Point the catalog to a copy of the collection with the given entries.
+
+    The collection dictionary is reached through the catalog reference and may
+    also be another object of a malformed file, so it is never edited itself.
+    """
+    pdf.Root.Collection = _new_dictionary(pdf, entries, collection.objgen != (0, 0))
+
+
 def remove_dangling_collection_default(pdf: Pdf) -> int:
     """Remove the initial document of a portfolio unless it names an embedded file.
 
     The sanitizer pipeline repeats this check after every embedded-file cleanup,
-    which can remove the file that /D names.
+    which can remove the file that /D names. The catalog then refers to a copy
+    of the collection without /D, leaving the original dictionary unchanged.
     """
     collection = pdf.Root.get("/Collection")
-    if not isinstance(collection, Dictionary) or collection.get("/D") is None:
+    if not isinstance(collection, Dictionary) or not _dangling_default(pdf, collection):
         return 0
-    default = collection.D
-    if isinstance(default, String) and any(
-        isinstance(name, String) and bytes(name) == bytes(default)
-        for name, _ in _embedded_files(pdf)
-    ):
-        return 0
-    return _remove_entry(collection, "/D")
+    entries = {key: collection[key] for key in collection.keys() if key != "/D"}
+    _replace_collection(pdf, collection, entries)
+    return _dropped("/D")
 
 
-def _sanitize_collection(pdf: Pdf) -> int:
-    """Repair optional portfolio settings while preserving valid fields and sorting."""
-    collection = pdf.Root.get("/Collection")
-    if collection is None:
-        return 0
-    if not isinstance(collection, Dictionary):
-        return _remove_entry(pdf.Root, "/Collection")
-    removed = _optional_type(collection, Name.Collection)
-    view = collection.get("/View")
-    if view is not None and view not in (Name.D, Name.T, Name.H):
-        removed += _remove_entry(collection, "/View")
-    removed += remove_dangling_collection_default(pdf)
-    schema = collection.get("/Schema")
-    if schema is not None and not isinstance(schema, Dictionary):
-        removed += _remove_entry(collection, "/Schema")
-        schema = None
-    if isinstance(schema, Dictionary):
-        removed += _optional_type(schema, Name.CollectionSchema)
-        for key in list(schema.keys()):
-            if key == "/Type":
-                continue
-            field = schema[key]
-            if (
-                not isinstance(field, Dictionary)
-                or field.get("/Subtype")
-                not in (
-                    Name.S,
-                    Name.D,
-                    Name.N,
-                    Name.F,
-                    Name.Desc,
-                    Name.ModDate,
-                    Name.CreationDate,
-                    Name.Size,
-                )
-                or not _is_pdf_text_string(field.get("/N"))
-            ):
-                removed += _remove_entry(schema, key)
-                continue
-            removed += _optional_type(field, Name.CollectionField)
-            for flag in ("/V", "/E"):
-                if field.get(flag) is not None and not isinstance(field[flag], bool):
-                    removed += _remove_entry(field, flag)
-            order = field.get("/O")
-            if order is not None and (
-                isinstance(order, bool) or not isinstance(order, int)
-            ):
-                removed += _remove_entry(field, "/O")
-    removed += _sanitize_collection_items(pdf, schema)
-    sorting = collection.get("/Sort")
-    if sorting is None:
-        return removed
-    if not isinstance(sorting, Dictionary):
-        return removed + _remove_entry(collection, "/Sort")
-    removed += _optional_type(sorting, Name.CollectionSort)
+_FIELD_SUBTYPES = (
+    Name.S,
+    Name.D,
+    Name.N,
+    Name.F,
+    Name.Desc,
+    Name.ModDate,
+    Name.CreationDate,
+    Name.Size,
+)
+
+
+def _sanitized_entries(original, check) -> tuple[dict, bool, int]:
+    """Collect the entries of a dictionary that a check retains or replaces.
+
+    Args:
+        original: The dictionary, which is not changed.
+        check: Called with each key and value; returns the value to retain,
+            which may be a repaired one, or None to omit the entry.
+
+    Returns:
+        The retained entries, whether they differ from the original ones, and
+        the number of omitted entries.
+    """
+    entries, changed, removed = {}, False, 0
+    for key in original.keys():
+        value = original.get(key)
+        # A null value is an absent entry (7.3.7), which a copy omits.
+        if value is None:
+            continue
+        kept = check(key, value)
+        if kept is None:
+            removed += _dropped(key)
+            changed = True
+        else:
+            entries[key] = kept
+            changed = changed or kept is not value
+    return entries, changed, removed
+
+
+def _sanitize_schema(pdf: Pdf, schema) -> tuple:
+    """Sanitize a collection schema and its fields by copy on write.
+
+    A field is removed unless it has a known subtype (Table 157) and a valid
+    text string name; its optional entries are repaired. The schema and each
+    field dictionary may also be another object of a malformed file, such as
+    the catalog /Names dictionary or the page resources, so they are never
+    edited: a sanitized copy replaces them where they need a repair
+    (_copy_on_write), shared by every reference to the same field.
+
+    Returns:
+        The schema itself or its sanitized copy, and the number of repairs.
+    """
+    removed, fields = 0, {}
+
+    def field_value(key, value):
+        if key == "/Type":
+            return value if value == Name.CollectionField else None
+        if key in ("/V", "/E"):
+            return value if isinstance(value, bool) else None
+        if key == "/O":
+            return (
+                value
+                if isinstance(value, int) and not isinstance(value, bool)
+                else None
+            )
+        return value
+
+    def field_entries(field):
+        nonlocal removed
+        entries, changed, count = _sanitized_entries(field, field_value)
+        removed += count
+        return entries, changed
+
+    def schema_value(key, value):
+        if key == "/Type":
+            return value if value == Name.CollectionSchema else None
+        if (
+            not isinstance(value, Dictionary)
+            or value.get("/Subtype") not in _FIELD_SUBTYPES
+            or not _is_pdf_text_string(value.get("/N"))
+        ):
+            return None
+        return _copy_on_write(pdf, value, fields, None, field_entries)
+
+    def schema_entries(original):
+        nonlocal removed
+        entries, changed, count = _sanitized_entries(original, schema_value)
+        removed += count
+        return entries, changed
+
+    return _copy_on_write(pdf, schema, {}, None, schema_entries), removed
+
+
+def _sanitize_sort(pdf: Pdf, sorting, schema) -> tuple:
+    """Sanitize collection sorting by copy on write.
+
+    Like the schema, the sort dictionary may be another object as well, such as
+    a schema field, so it is never edited (_copy_on_write).
+
+    Returns:
+        The sort dictionary itself, its sanitized copy, or None if the sorting
+        names no field of the schema, and the number of repairs.
+    """
+    removed = 0
     fields = sorting.get("/S")
     scalar = isinstance(fields, Name)
     fields = [fields] if scalar else fields
@@ -403,20 +491,88 @@ def _sanitize_collection(pdf: Pdf) -> int:
             for field in fields
         )
     )
-    ascending = sorting.get("/A")
-    # ISO 32000-1 Table 158 explicitly permits unequal /S and /A lengths. Each
-    # element of an /A array refers to the entry at the same index of an /S
-    # array, so a single /S name takes a single boolean; without /A it is sorted
-    # in ascending order.
-    if ascending is not None and not (
-        isinstance(ascending, bool)
-        or not scalar
-        and isinstance(ascending, Array)
-        and all(isinstance(item, bool) for item in ascending)
-    ):
-        removed += _remove_entry(sorting, "/A")
-    if not valid:
-        removed += _remove_entry(collection, "/Sort")
+
+    def sort_value(key, value):
+        if key == "/Type":
+            return value if value == Name.CollectionSort else None
+        # ISO 32000-1 Table 158 explicitly permits unequal /S and /A lengths.
+        # Each element of an /A array refers to the entry at the same index of
+        # an /S array, so a single /S name takes a single boolean; without /A
+        # it is sorted in ascending order.
+        if key == "/A" and not (
+            isinstance(value, bool)
+            or not scalar
+            and isinstance(value, Array)
+            and all(isinstance(item, bool) for item in value)
+        ):
+            return None
+        return value
+
+    def sort_entries(original):
+        nonlocal removed
+        entries, changed, count = _sanitized_entries(original, sort_value)
+        removed += count
+        # Invalid sorting is removed together with its own malformed entries.
+        return (entries, changed) if valid else None
+
+    return _copy_on_write(pdf, sorting, {}, None, sort_entries), removed
+
+
+def _sanitize_collection(pdf: Pdf) -> int:
+    """Repair optional portfolio settings while preserving valid fields and sorting.
+
+    The collection dictionary, its schema, fields and sorting are sanitized by
+    copy on write: the catalog refers to a sanitized copy of the collection
+    where it needs a repair, which refers to sanitized copies of its schema,
+    fields and sorting, so none of them is edited where it is also another
+    object of the document.
+    """
+    collection = pdf.Root.get("/Collection")
+    if collection is None:
+        return 0
+    if not isinstance(collection, Dictionary):
+        return _remove_entry(pdf.Root, "/Collection")
+    removed, changed = 0, False
+    entries = {key: collection[key] for key in collection.keys()}
+
+    def drop(key: str) -> None:
+        nonlocal removed, changed
+        del entries[key]
+        removed += _dropped(key)
+        changed = True
+
+    if entries.get("/Type") not in (None, Name.Collection):
+        drop("/Type")
+    if entries.get("/View") not in (None, Name.D, Name.T, Name.H):
+        drop("/View")
+    if _dangling_default(pdf, collection):
+        drop("/D")
+    schema = entries.get("/Schema")
+    if schema is not None and not isinstance(schema, Dictionary):
+        drop("/Schema")
+        schema = None
+    if schema is not None:
+        checked, count = _sanitize_schema(pdf, schema)
+        removed += count
+        if checked is not schema:
+            entries["/Schema"] = schema = checked
+            changed = True
+    removed += _sanitize_collection_items(pdf, schema)
+    sorting = entries.get("/Sort")
+    if sorting is not None:
+        checked, count = (
+            _sanitize_sort(pdf, sorting, schema)
+            if isinstance(sorting, Dictionary)
+            else (None, 0)
+        )
+        removed += count
+        if checked is None:
+            drop("/Sort")
+        elif checked is not sorting:
+            entries["/Sort"] = checked
+            changed = True
+    if changed:
+        _replace_collection(pdf, collection, entries)
     return removed
 
 
@@ -511,7 +667,26 @@ def _action_owners(pdf: Pdf) -> list:
     return owners
 
 
-def _walk_actions(pdf: Pdf, remove=None) -> tuple[list, int]:
+class _Holder:
+    """A scanned dictionary or array whose entries may refer to actions.
+
+    Attributes:
+        obj: The original object, which is never edited unless it is an owner.
+        node: The id of the action this is (its own /Next entry), or None.
+        entries: Each key or index, its value, the id of the action it refers
+            to (None for another value), and whether that reference is removed.
+        omitted: Keys that a copy of this action leaves out (an invalid /B).
+        next_id: The id of the /Next array of this action, if it has one.
+    """
+
+    __slots__ = ("obj", "node", "entries", "omitted", "next_id")
+
+    def __init__(self, obj, node=None, omitted=()):
+        self.obj, self.node, self.omitted = obj, node, omitted
+        self.entries, self.next_id = [], None
+
+
+def _walk_actions(pdf: Pdf, decide=None) -> tuple[list, int]:
     """Visit each action of the document once, optionally removing references.
 
     The catalog /OpenAction and the /A and /AA entries of the catalog, pages,
@@ -524,68 +699,210 @@ def _walk_actions(pdf: Pdf, remove=None) -> tuple[list, int]:
     absent key costs far more, which matters for the many annotations of a large
     document.
 
+    Repairs are made by copy on write. An action, /AA dictionary or /Next array
+    is reached through a reference, and a malformed file may make it any other
+    object as well, such as a page, an annotation's /Kids or the catalog
+    /Threads array, so it is never edited: where it, or an action that follows
+    it, needs a repair, a copy (indirect if the original is) takes its place at
+    each reference, shared by all of them, and the original stays unchanged in
+    its other roles. Only the reference itself is edited in place: the
+    /OpenAction, /A and /AA entries of their owners (the catalog, pages,
+    annotations and outline items), whose role these entries are.
+
     Args:
         pdf: The document.
-        remove: Called with each action dictionary where it is referenced. A true
-            result removes that reference together with the actions that follow
-            the removed action, which form its subtree (12.6.2, NOTE 1), as
-            remove_actions() removes a non-compliant action. A /AA dictionary
-            or /Next array that this leaves empty is removed as well.
+        decide: Called with each action dictionary where it is referenced;
+            returns whether to remove that reference, and the keys that the
+            kept action has to leave out. A removed reference takes the actions
+            that follow the removed action, which form its subtree (12.6.2,
+            NOTE 1), as remove_actions() removes a non-compliant action. A /AA
+            dictionary or /Next array that this leaves empty is removed as well.
 
     Returns:
         The visited actions, and the number of removed references.
     """
     # A dictionary scanned as an /AA dictionary is still followed as an action.
-    actions, pending, seen_holders, seen_actions = [], [], set(), set()
-    emptied, removed = set(), 0
+    actions, pending, holders, owners = [], [], {}, []
+    seen_actions, removed, direct = {}, 0, 0
 
-    def prune(holder, keys: list) -> bool:
-        """Remove rejected actions from a container; True if that emptied it."""
+    def holder_id(obj, kind: str):
+        """Identify an indirect object by itself, and a direct one by its visit.
+
+        A direct object has only the one container it is in, so it is visited
+        once for each visit of that container.
+        """
+        nonlocal direct
+        if obj.objgen != (0, 0):
+            return (kind, obj.objgen)
+        direct += 1
+        return (kind, direct)
+
+    def scan(holder: _Holder, keys) -> None:
+        """Record the references of a container; kept actions are followed."""
         nonlocal removed
-        kept = []
         for key in keys:
-            value = holder[key]
-            if remove is not None and isinstance(value, Dictionary) and remove(value):
-                del holder[key]
-                removed += 1
+            value = holder.obj[key]
+            if not isinstance(value, Dictionary):
+                holder.entries.append((key, value, None, False))
+                continue
+            if decide is None:
+                drop, omitted = False, ()
             else:
-                kept.append(value)
-        # Keys are given last first, so that array indices stay valid while
-        # deleting; the actions are visited in their original order.
-        pending.extend(reversed(kept))
-        return len(kept) < len(keys) and len(holder) == 0
+                drop, omitted = decide(value)
+            if drop:
+                removed += 1
+                holder.entries.append((key, value, None, True))
+                continue
+            if value.objgen in seen_actions:
+                node = seen_actions[value.objgen]
+            else:
+                node = holder_id(value, "action")
+                if value.objgen != (0, 0):
+                    seen_actions[value.objgen] = node
+                pending.append((node, value, omitted))
+            holder.entries.append((key, value, node, False))
 
-    def emptied_container(holder, keys: list) -> bool:
-        """Prune a shared /AA or /Next container once; report if it was emptied."""
-        if not _first_visit(holder, seen_holders):
-            return holder.objgen in emptied
-        if not prune(holder, keys):
-            return False
-        emptied.add(holder.objgen)
-        return True
+    def container(obj, keys) -> tuple:
+        """Scan a shared /AA dictionary or /Next array once."""
+        kind = "array" if isinstance(obj, Array) else "aa"
+        key = holder_id(obj, kind)
+        if key not in holders:
+            holders[key] = holder = _Holder(obj)
+            scan(holder, keys)
+        return key
 
     for index, owner in enumerate(_action_owners(pdf)):
         keys = owner.keys()
         slots = ("/OpenAction", "/A") if index == 0 else ("/A",)
-        prune(owner, [key for key in reversed(slots) if key in keys])
+        holder = _Holder(owner)
+        scan(holder, [key for key in slots if key in keys])
         additional = owner["/AA"] if "/AA" in keys else None
-        if isinstance(additional, Dictionary) and emptied_container(
-            additional, sorted(additional.keys(), reverse=True)
-        ):
-            del owner["/AA"]
+        aa_id = (
+            container(additional, sorted(additional.keys()))
+            if isinstance(additional, Dictionary)
+            else None
+        )
+        owners.append((holder, aa_id))
+    # The actions are visited in their order: the stack is used last first.
+    pending.reverse()
     while pending:
-        action = pending.pop()
-        if not isinstance(action, Dictionary) or not _first_visit(action, seen_actions):
-            continue
+        node, action, omitted = pending.pop()
         actions.append(action)
-        if "/Next" not in action.keys():
+        holder = holders[node] = _Holder(action, node, omitted)
+        keys = action.keys()
+        if "/Next" not in keys:
             continue
         following = action["/Next"]
-        if not isinstance(following, Array):
-            prune(action, ["/Next"])
-        elif emptied_container(following, list(reversed(range(len(following))))):
-            del action["/Next"]
+        mark = len(pending)
+        if isinstance(following, Array):
+            holder.next_id = container(following, range(len(following)))
+        else:
+            scan(holder, ["/Next"])
+        pending[mark:] = reversed(pending[mark:])
+    if decide is not None:
+        _rewrite_actions(pdf, holders, owners)
     return actions, removed
+
+
+def _rewrite_actions(pdf: Pdf, holders: dict, owners: list) -> None:
+    """Replace the actions and containers that need a repair by copies.
+
+    An action needs a copy if it leaves out an entry, or if its /Next entry
+    refers to a removed action or to an action or array that needs a copy; a
+    /AA dictionary or /Next array needs one if one of its entries does. This is
+    propagated backwards from the repairs, so actions that follow each other in
+    a cycle are handled as well. A copy of an indirect object is created first,
+    and filled in afterwards, so that copies can refer to each other.
+    """
+    parents: dict = {}
+    dirty, queue = set(), []
+    for key, holder in holders.items():
+        children = [node for _, _, node, _ in holder.entries if node is not None]
+        if holder.next_id is not None:
+            children.append(holder.next_id)
+        for child in children:
+            parents.setdefault(child, []).append(key)
+        if holder.omitted or any(drop for *_, drop in holder.entries):
+            dirty.add(key)
+            queue.append(key)
+    while queue:
+        for parent in parents.get(queue.pop(), ()):
+            if parent not in dirty:
+                dirty.add(parent)
+                queue.append(parent)
+
+    def emptied(holder: _Holder) -> bool:
+        """A container whose every entry is removed is removed with them."""
+        return (
+            holder.node is None
+            and bool(holder.entries)
+            and all(drop for *_, drop in holder.entries)
+        )
+
+    results = {}
+    for key in dirty:
+        holder = holders[key]
+        if emptied(holder):
+            results[key] = None
+        elif holder.obj.objgen != (0, 0):
+            empty = Array() if isinstance(holder.obj, Array) else Dictionary()
+            results[key] = pdf.make_indirect(empty)
+
+    def value_of(entry):
+        _, value, node, _ = entry
+        return results[node] if node in dirty else value
+
+    # A direct object is visited after its container and before the objects it
+    # contains, so in reverse order each one is built after its contents.
+    order = {key: index for index, key in enumerate(holders)}
+    for key in sorted(dirty, key=order.__getitem__, reverse=True):
+        holder = holders[key]
+        if results.get(key, False) is None:
+            continue
+        kept = [entry for entry in holder.entries if not entry[3]]
+        if isinstance(holder.obj, Array):
+            items = [_detached(value_of(entry)) for entry in kept]
+            result = results.get(key)
+            if result is None:
+                results[key] = Array(items)
+            else:
+                result.extend(items)
+            continue
+        # An /AA dictionary consists of its scanned entries; an action keeps
+        # every entry but the omitted ones, and its /Next entry is rebuilt.
+        entries = {}
+        if holder.node is not None:
+            for name in holder.obj.keys():
+                value = holder.obj.get(name)
+                if value is not None and name not in holder.omitted:
+                    entries[name] = value
+            entries.pop("/Next", None)
+        entries.update((entry[0], value_of(entry)) for entry in kept)
+        if holder.next_id is not None:
+            if holder.next_id not in dirty:
+                entries["/Next"] = holder.obj["/Next"]
+            elif results[holder.next_id] is not None:
+                entries["/Next"] = results[holder.next_id]
+        result = results.get(key)
+        if result is None:
+            results[key] = _new_dictionary(pdf, entries, False)
+        else:
+            for name, value in entries.items():
+                result[name] = _detached(value)
+
+    # The owners hold the references; their /A, /OpenAction and /AA entries
+    # are their own and are replaced in place.
+    for holder, aa_id in owners:
+        for name, _, node, drop in holder.entries:
+            if drop:
+                del holder.obj[name]
+            elif node in dirty:
+                holder.obj[name] = results[node]
+        if aa_id in dirty:
+            if results[aa_id] is None:
+                del holder.obj["/AA"]
+            else:
+                holder.obj["/AA"] = results[aa_id]
 
 
 def _action_threads(actions: list):
@@ -842,11 +1159,14 @@ def _thread_action_filter(pdf: Pdf, found: dict):
     thread, is removed if it is neither, so that the action opens the thread at
     its first bead. In another file the bead can only be an index (a bead
     dictionary requires the thread to be in the current file), which must not be
-    negative; its upper bound is not checked.
+    negative; its upper bound is not checked. The bead is left out of a copy of
+    the action (_walk_actions), never removed from the action itself, which may
+    also be another object, such as a page and its own /B array.
 
     Returns:
-        The check, called with each action dictionary, and a one-element list
-        that counts the removed /B entries.
+        The check, called with each action dictionary, which returns whether to
+        remove the action and the keys its copy leaves out, and a one-element
+        list that counts the invalid /B entries.
     """
     listed = pdf.Root.get("/Threads")
     listed = [thread.objgen for thread in listed] if listed is not None else []
@@ -856,18 +1176,23 @@ def _thread_action_filter(pdf: Pdf, found: dict):
         title = info.get("/Title") if isinstance(info, Dictionary) else None
         if isinstance(title, String):
             titles.setdefault(str(title), thread_id)
-    decided: dict[tuple[int, int], bool] = {}
+    decided: dict[tuple[int, int], tuple[bool, tuple]] = {}
     beads_removed = [0]
+    keep, without_bead = (False, ()), (False, ("/B",))
 
-    def invalid(action) -> bool:
+    def omit_bead() -> tuple[bool, tuple]:
+        beads_removed[0] += _dropped("/B")
+        return without_bead
+
+    def invalid(action) -> tuple[bool, tuple]:
         keys = action.keys()
         if "/S" not in keys or action["/S"] != _THREAD:
-            return False
+            return keep
         target = action["/D"] if "/D" in keys else None
         file = action["/F"] if "/F" in keys else None
         if file is not None and not _is_file_reference(file):
             logger.warning("Removed a Thread action with an invalid file specification")
-            return True
+            return True, ()
         if isinstance(target, Dictionary):
             thread_id = target.objgen if target.objgen in found else None
         elif (
@@ -886,15 +1211,15 @@ def _thread_action_filter(pdf: Pdf, found: dict):
             if bead is not None and (
                 isinstance(bead, bool) or not isinstance(bead, int) or bead < 0
             ):
-                beads_removed[0] += _remove_entry(action, "/B")
-            return False
+                return omit_bead()
+            return keep
         elif isinstance(target, int):
             thread_id = listed[target] if 0 <= target < len(listed) else None
         else:
             thread_id = titles.get(str(target))
         if thread_id is None:
             logger.warning("Removed a Thread action without a valid destination")
-            return True
+            return True, ()
         bead = action["/B"] if "/B" in keys else None
         members = found[thread_id][1]
         if bead is not None and not (
@@ -905,10 +1230,10 @@ def _thread_action_filter(pdf: Pdf, found: dict):
                 and 0 <= bead < len(members)
             )
         ):
-            beads_removed[0] += _remove_entry(action, "/B")
-        return False
+            return omit_bead()
+        return keep
 
-    def check(action) -> bool:
+    def check(action) -> tuple[bool, tuple]:
         key = action.objgen
         if key == (0, 0):
             return invalid(action)
@@ -927,7 +1252,8 @@ def _repair_thread_actions(pdf: Pdf, found: dict) -> int:
     that only actions name is not part of that array, so removing a Thread
     action that names it, or a thread that does not exist, changes no other
     destination. The action is removed where it is referenced: from the
-    /OpenAction, /A or /AA entry, or from the /Next entry of another action.
+    /OpenAction, /A or /AA entry, or from the /Next entry of another action,
+    which is replaced by a copy without it (_walk_actions).
     """
     check, beads_removed = _thread_action_filter(pdf, found)
     _, removed = _walk_actions(pdf, check)
@@ -940,10 +1266,16 @@ def sanitize_catalog_navigation(pdf: Pdf) -> int:
     Returns:
         Number of article structures repaired (an inline /Threads array, a page
         /B array, a Thread action without a valid destination or its invalid
-        bead) and malformed thread information and collection entries removed,
-        all in place apart from thread information, collection items and
-        subitems, which are replaced by sanitized copies, so that no other
-        object they may also be is changed.
+        bead) and malformed thread information and collection entries removed.
+        No object reached through a reference is edited: thread information,
+        collection items and subitems, the collection, its schema, fields and
+        sorting, actions, /AA dictionaries and /Next arrays are replaced by
+        sanitized copies where they need a repair, and a page /B array by a new
+        one, so that no other object they may also be is changed. Only the
+        entries that hold these references are set or removed, on their owners:
+        the catalog (/Collection, /OpenAction, /A, /AA, /Threads), pages (/B,
+        /A, /AA), annotations and outline items (/A, /AA), threads (/I) and
+        embedded file specifications (/CI).
 
     Raises:
         ConversionError: If an article of the catalog /Threads array is malformed.
