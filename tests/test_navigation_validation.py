@@ -1663,17 +1663,17 @@ def test_page_bead_array_shared_by_pages_is_split():
 
 
 def test_shared_thread_information_is_checked_once(monkeypatch):
-    """Threads that share one information dictionary repair it once."""
+    """Threads that share one information dictionary share its repaired copy."""
     from pdftopdfa.sanitizers import navigation
 
     calls = []
-    original = navigation._check_date
+    original = navigation._pdf_date
 
-    def counting(owner, key):
-        calls.append(key)
-        return original(owner, key)
+    def counting(value):
+        calls.append(str(value))
+        return original(value)
 
-    monkeypatch.setattr(navigation, "_check_date", counting)
+    monkeypatch.setattr(navigation, "_pdf_date", counting)
     pdf = new_pdf()
     threads = [_article(pdf)[0] for _ in range(5)]
     info = pdf.make_indirect(Dictionary(Title="Shared", ModDate="20240101"))
@@ -1681,7 +1681,10 @@ def test_shared_thread_information_is_checked_once(monkeypatch):
         thread.I = info
     pdf.Root.Threads = pdf.make_indirect(Array(threads))
     assert remove_forbidden_catalog_entries(pdf) == 1
-    assert calls == ["/ModDate"] and str(info.ModDate) == "D:20240101"
+    assert calls == ["20240101"] and str(info.ModDate) == "20240101"
+    copies = {thread.I.objgen for thread in threads}
+    assert len(copies) == 1 and info.objgen not in copies
+    assert str(threads[0].I.ModDate) == "D:20240101"
 
 
 def test_shared_collection_item_is_checked_once(monkeypatch):
@@ -1689,13 +1692,13 @@ def test_shared_collection_item_is_checked_once(monkeypatch):
     from pdftopdfa.sanitizers import navigation
 
     calls = []
-    original = navigation._check_item_value
+    original = navigation._field_data
 
-    def counting(item, key, subtype):
-        calls.append(key)
-        return original(item, key, subtype)
+    def counting(value, subtype):
+        calls.append(str(value))
+        return original(value, subtype)
 
-    monkeypatch.setattr(navigation, "_check_item_value", counting)
+    monkeypatch.setattr(navigation, "_field_data", counting)
     pdf = new_pdf()
     spec = _portfolio(pdf, Dictionary(Good=Dictionary(Subtype=Name.S, N="Good")))
     del spec.CI.Foo
@@ -1704,7 +1707,7 @@ def test_shared_collection_item_is_checked_once(monkeypatch):
         names.extend([f"{index:02}.txt", spec])
     pdf.Root.Names.EmbeddedFiles = Dictionary(Names=Array(names))
     assert remove_forbidden_catalog_entries(pdf) == 0
-    assert calls == ["/Good"]
+    assert calls == ["keep"]
 
 
 def _utf16(text):
@@ -1900,20 +1903,37 @@ def _structures(pdf):
     return thread, specs[0], targets
 
 
-def _snapshot(pdf, owner):
-    """Serialize every object but the owner, so that any other edit is detected."""
-    return [
-        bytes(item.unparse(resolved=True))
+def _snapshot(pdf):
+    """Serialize every object, so that any edit of an existing one is detected."""
+    return {
+        item.objgen: bytes(item.unparse(resolved=True))
         for item in pdf.objects
-        if item is not None and item.objgen != owner.objgen
-    ]
+        if item is not None
+    }
+
+
+def _unchanged(pdf, before, owner):
+    """Check that no object existing before was edited, except the owner.
+
+    Objects added since, such as sanitized copies, are not compared.
+    """
+    after = _snapshot(pdf)
+    return all(
+        after.get(objgen) == data
+        for objgen, data in before.items()
+        if objgen != owner.objgen
+    )
 
 
 def test_alias_fixture_is_valid():
-    """Without an alias, nothing in the fixture needs a repair."""
+    """Without an alias, nothing in the fixture needs a repair or a copy."""
     pdf = new_pdf()
-    _structures(pdf)
+    thread, _, targets = _structures(pdf)
+    before = _snapshot(pdf)
     assert remove_forbidden_catalog_entries(pdf) == 0
+    assert _snapshot(pdf) == before
+    assert thread.I.objgen == targets["info"].objgen
+    assert targets["filespec"].CI.objgen == targets["item"].objgen
 
 
 @pytest.mark.parametrize(
@@ -1932,31 +1952,46 @@ def test_alias_fixture_is_valid():
         "annotation",
     ],
 )
-def test_thread_information_aliasing_another_role_is_detached(target):
-    """A dictionary with another role is never sanitized as thread information.
+def test_thread_information_aliasing_another_role_is_copied(target):
+    """A dictionary with another role is never edited as thread information.
 
-    Checking it as one would remove the entries of that role, such as the /T,
-    /N, /V, /P and /R links of a bead, so the /I reference is removed instead.
+    Checking it in place would remove the entries of that role, such as the /T,
+    /N, /V, /P and /R links of a bead, so /I refers to a sanitized copy instead,
+    which retains only the entries that the DocInfo syntax allows.
     """
     pdf = new_pdf()
     thread, _, targets = _structures(pdf)
     thread.I = targets[target]
-    before = _snapshot(pdf, thread)
-    assert remove_forbidden_catalog_entries(pdf) == 1
-    assert "/I" not in thread
-    assert _snapshot(pdf, thread) == before
+    before = _snapshot(pdf)
+    assert remove_forbidden_catalog_entries(pdf) >= 1
+    assert _unchanged(pdf, before, thread)
+    copy = thread.I
+    assert copy.objgen not in ((0, 0), targets[target].objgen)
+    assert all(_is_pdf_text_string(copy[key]) for key in copy.keys())
     assert remove_forbidden_catalog_entries(pdf) == 0
+    assert thread.I.objgen == copy.objgen
 
 
 def test_thread_information_may_be_the_document_information():
-    """/I has the syntax of DocInfo (Table 160), so the two may be one object."""
+    """/I has the syntax of DocInfo (Table 160), so the two may be one object.
+
+    A valid one stays shared; a repair goes to a copy, leaving DocInfo itself
+    to the conversion of the document information.
+    """
     pdf = new_pdf()
     thread, _, targets = _structures(pdf)
-    thread.I = targets["docinfo"]
-    targets["docinfo"].ModDate = "20240101"
+    docinfo = targets["docinfo"]
+    thread.I = docinfo
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert thread.I.objgen == docinfo.objgen
+
+    docinfo.ModDate = "20240101"
     assert remove_forbidden_catalog_entries(pdf) == 1
-    assert thread.I.objgen == targets["docinfo"].objgen
+    assert thread.I.objgen not in ((0, 0), docinfo.objgen)
     assert str(thread.I.ModDate) == "D:20240101"
+    assert str(thread.I.Title) == "Document"
+    assert str(docinfo.ModDate) == "20240101"
+    assert pdf.trailer.Info.objgen == docinfo.objgen
 
 
 @pytest.mark.parametrize(
@@ -1971,50 +2006,85 @@ def test_thread_information_may_be_the_document_information():
         "page",
         "catalog",
         "docinfo",
-        "filespec",
         "action",
         "annotation",
     ],
 )
-def test_collection_item_aliasing_another_role_is_detached(target):
-    """A dictionary with another role is never sanitized as a collection item.
+def test_collection_item_aliasing_another_role_is_copied(target):
+    """A dictionary with another role is never edited as a collection item.
 
-    Checking it as one would remove its /Type and every entry that the schema
-    does not describe, so the /CI reference is removed instead.
+    Checking it in place would remove its /Type and every entry that the schema
+    does not describe, so /CI refers to a sanitized copy instead.
     """
     pdf = new_pdf()
     _, spec, targets = _structures(pdf)
     spec.CI = targets[target]
-    before = _snapshot(pdf, spec)
+    before = _snapshot(pdf)
+    assert remove_forbidden_catalog_entries(pdf) >= 1
+    assert _unchanged(pdf, before, spec)
+    copy = spec.CI
+    assert copy.objgen not in ((0, 0), targets[target].objgen)
+    # Only schema fields remain; the schema of the fixture has one, /Good.
+    assert set(copy.keys()) <= {"/Good"}
+    assert remove_forbidden_catalog_entries(pdf) == 0
+    assert spec.CI.objgen == copy.objgen
+
+
+def test_collection_item_that_is_a_file_specification_is_still_removed():
+    """A file specification is not a collection item, so no copy is made."""
+    pdf = new_pdf()
+    _, spec, targets = _structures(pdf)
+    spec.CI = targets["filespec"]
+    before = _snapshot(pdf)
     assert remove_forbidden_catalog_entries(pdf) == 1
     assert "/CI" not in spec
-    assert _snapshot(pdf, spec) == before
+    assert _unchanged(pdf, before, spec)
     assert remove_forbidden_catalog_entries(pdf) == 0
 
 
-@pytest.mark.parametrize("target", ["docinfo", "bead", "page", "thread", "schema"])
-def test_collection_subitem_aliasing_another_role_is_removed(target):
-    """A subitem date is not rewritten in a dictionary that has another role."""
+@pytest.mark.parametrize(
+    "target,kept",
+    [
+        ("docinfo", True),
+        ("bead", False),
+        ("page", False),
+        ("thread", True),
+        ("schema", False),
+    ],
+)
+def test_collection_subitem_aliasing_another_role_is_copied(target, kept):
+    """A subitem date is rewritten in a copy, never in a shared dictionary.
+
+    A dictionary typed as another object, or whose /P is no text string (such
+    as the page of a bead), is no subitem (Table 49) and is removed from the
+    item; any other one is kept, repaired in a copy if needed.
+    """
     pdf = new_pdf()
     _, spec, targets = _structures(pdf)
     pdf.Root.Collection.Schema.Sent = Dictionary(Subtype=Name.D, N="Sent")
     targets["info"].D = targets["docinfo"].D = "20240101"
     spec.CI = pdf.make_indirect(Dictionary(Good="keep", Sent=targets[target]))
-    before = _snapshot(pdf, spec.CI)
-    assert remove_forbidden_catalog_entries(pdf) == 1
-    assert sorted(spec.CI.keys()) == ["/Good"]
-    assert _snapshot(pdf, spec.CI) == before
+    before = _snapshot(pdf)
+    remove_forbidden_catalog_entries(pdf)
+    assert _unchanged(pdf, before, spec)
+    assert str(spec.CI.Good) == "keep"
+    assert ("/Sent" in spec.CI) is kept
+    if kept and target == "docinfo":
+        assert spec.CI.Sent.objgen not in ((0, 0), targets[target].objgen)
+        assert str(spec.CI.Sent.D) == "D:20240101"
+    elif kept:
+        assert spec.CI.Sent.objgen == targets[target].objgen
     assert remove_forbidden_catalog_entries(pdf) == 0
 
 
 @pytest.mark.parametrize(
     "alias", ["/I to item", "/CI to /I", "subitem to /I", "subitem to item"]
 )
-def test_dictionary_of_two_metadata_roles_is_detached_from_both(alias):
+def test_dictionary_of_two_metadata_roles_gets_a_copy_per_role(alias):
     """Thread information, items and subitems are checked by different rules.
 
-    Neither role may edit the dictionary that both refer to, so each reference
-    to it is removed, and the dictionary itself is left unchanged.
+    Each role sanitizes its own copy where its rules require a change, so the
+    dictionary that both refer to is left unchanged and valid in the other one.
     """
     pdf = new_pdf()
     thread, spec, targets = _structures(pdf)
@@ -2029,16 +2099,27 @@ def test_dictionary_of_two_metadata_roles_is_detached_from_both(alias):
         shared = info if alias == "subitem to /I" else item
         spec.CI = pdf.make_indirect(Dictionary(Good="keep", Sent=shared))
     before = bytes(shared.unparse(resolved=True))
-    assert remove_forbidden_catalog_entries(pdf) == 2
+    assert remove_forbidden_catalog_entries(pdf) >= 1
     assert bytes(shared.unparse(resolved=True)) == before
-    references = [thread.get("/I"), spec.get("/CI"), targets["filespec"].get("/CI")]
-    if isinstance(spec.get("/CI"), Dictionary):
-        references.append(spec.CI.get("/Sent"))
-    assert all(ref is None or ref.objgen != shared.objgen for ref in references)
+    if alias == "/I to item":
+        # The /Type name is no DocInfo entry; the item itself stays valid.
+        assert sorted(thread.I.keys()) == ["/Good"]
+        assert targets["filespec"].CI.objgen == item.objgen
+    elif alias == "/CI to /I":
+        # Neither /Title nor /D is a field of the schema.
+        assert sorted(spec.CI.keys()) == []
+        assert thread.I.objgen == info.objgen
+    elif alias == "subitem to /I":
+        assert str(spec.CI.Sent.D) == "D:20240101" and str(info.D) == "20240101"
+        assert thread.I.objgen == info.objgen
+    else:
+        # A dictionary typed /CollectionItem is no subitem.
+        assert sorted(spec.CI.keys()) == ["/Good"]
+        assert targets["filespec"].CI.objgen == item.objgen
     assert remove_forbidden_catalog_entries(pdf) == 0
 
 
-def test_conversion_detaches_aliased_thread_information_and_items(tmp_path):
+def test_conversion_copies_aliased_thread_information_and_items(tmp_path):
     """The converted article and portfolio stay valid and pass veraPDF."""
     from pikepdf import Pdf
 
@@ -2055,16 +2136,130 @@ def test_conversion_detaches_aliased_thread_information_and_items(tmp_path):
     with Pdf.open(output) as converted:
         written = converted.Root.Threads[0]
         bead = written.F
-        assert "/I" not in written
+        assert written.I.objgen != bead.objgen and len(written.I.keys()) == 0
         assert sorted(bead.keys()) == ["/N", "/P", "/R", "/T", "/V"]
         assert bead.T.objgen == written.objgen and bead.N.objgen == bead.objgen
         assert [item.objgen for item in bead.P.B] == [bead.objgen]
-        first = converted.Root.Names.EmbeddedFiles.Names[1]
-        assert "/CI" not in first
         schema = converted.Root.Collection.Schema
+        first = converted.Root.Names.EmbeddedFiles.Names[1]
+        assert first.CI.objgen != schema.objgen
+        assert sorted(first.CI.keys()) == ["/Good"]
         assert schema.Type == Name.CollectionSchema
         assert str(schema.Good.N) == "Good"
         assert sorted(converted.Root.Collection.Sort.keys()) == ["/S", "/Type"]
+    if is_verapdf_available():
+        validation = validate_with_verapdf(output, flavour="3b")
+        assert validation.compliant, validation.failed_rules
+
+
+def _nested_structures(pdf):
+    """Create indirect dictionaries nested below the first page and a widget."""
+    page = pdf.pages[0]
+    font = pdf.make_indirect(
+        Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica)
+    )
+    image = pdf.make_stream(b"\xff", Type=Name.XObject, Subtype=Name.Image)
+    image.Width = image.Height = image.BitsPerComponent = 1
+    image.ColorSpace = Name.DeviceGray
+    resources = pdf.make_indirect(
+        Dictionary(Font=Dictionary(F1=font), XObject=Dictionary(Im1=image))
+    )
+    page.obj.Resources = resources
+    appearance = pdf.make_stream(b"", Type=Name.XObject, Subtype=Name.Form)
+    appearance.BBox = Array([0, 0, 1, 1])
+    characteristics = pdf.make_indirect(Dictionary(BG=Array([1]), CA="x"))
+    appearances = pdf.make_indirect(Dictionary(N=appearance))
+    widget = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Annot,
+            Subtype=Name.Widget,
+            Rect=Array([0, 0, 1, 1]),
+            MK=characteristics,
+            AP=appearances,
+        )
+    )
+    page.obj.Annots = Array([widget])
+    return {
+        "resources": resources,
+        "font": font,
+        "mk": characteristics,
+        "ap": appearances,
+    }
+
+
+@pytest.mark.parametrize(
+    "role,target",
+    [
+        ("/CI", "resources"),
+        ("/I", "resources"),
+        ("/CI", "mk"),
+        ("/I", "mk"),
+        ("/CI", "ap"),
+        ("/I", "ap"),
+        ("/CI", "font"),
+        ("/I", "font"),
+    ],
+)
+def test_metadata_aliasing_a_nested_structural_dictionary_is_copied(role, target):
+    """Page resources, fonts and annotation dictionaries are never edited.
+
+    A /CI or /I reference to them is replaced by a sanitized copy, so the page
+    keeps its /Font and /XObject resources and the widget its /MK and /AP.
+    """
+    pdf = new_pdf()
+    thread, spec, _ = _structures(pdf)
+    nested = _nested_structures(pdf)
+    owner = spec if role == "/CI" else thread
+    owner[role] = nested[target]
+    before = _snapshot(pdf)
+    assert remove_forbidden_catalog_entries(pdf) >= 1
+    assert _unchanged(pdf, before, owner)
+    assert owner[role].objgen not in ((0, 0), nested[target].objgen)
+    resources = pdf.pages[0].Resources
+    assert resources.objgen == nested["resources"].objgen
+    assert sorted(resources.keys()) == ["/Font", "/XObject"]
+    assert resources.Font.F1.objgen == nested["font"].objgen
+    assert sorted(nested["font"].keys()) == ["/BaseFont", "/Subtype", "/Type"]
+    assert sorted(nested["mk"].keys()) == ["/BG", "/CA"]
+    assert sorted(nested["ap"].keys()) == ["/N"]
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+def test_shared_collection_item_copy_is_shared():
+    """File specifications that share an item share its one sanitized copy."""
+    pdf = new_pdf()
+    _, spec, targets = _structures(pdf)
+    resources = _nested_structures(pdf)["resources"]
+    spec.CI = targets["filespec"].CI = resources
+    assert remove_forbidden_catalog_entries(pdf) == 2
+    assert spec.CI.objgen == targets["filespec"].CI.objgen != resources.objgen
+    assert sorted(resources.keys()) == ["/Font", "/XObject"]
+
+
+def test_conversion_keeps_page_resources_aliased_by_a_collection_item(tmp_path):
+    """A /CI that is the page /Resources leaves the resources intact."""
+    from pikepdf import Pdf
+
+    from pdftopdfa.verapdf import is_verapdf_available, validate_with_verapdf
+
+    pdf = new_pdf()
+    _, spec, _ = _structures(pdf)
+    resources = _nested_structures(pdf)["resources"]
+    del pdf.pages[0].obj["/Annots"]
+    pdf.pages[0].Contents = pdf.make_stream(
+        b"BT /F1 12 Tf 10 10 Td (Hi) Tj ET q 10 0 0 10 50 50 cm /Im1 Do Q"
+    )
+    spec.CI = resources
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    result = convert_to_pdfa(source, output, level="3b")
+    assert result.target_produced and not result.skipped, result
+    with Pdf.open(output) as converted:
+        page = converted.pages[0]
+        assert "/F1" in page.Resources.Font and "/Im1" in page.Resources.XObject
+        item = converted.Root.Names.EmbeddedFiles.Names[1].CI
+        assert item.objgen != page.Resources.objgen
+        assert "/Font" not in item and "/XObject" not in item
     if is_verapdf_available():
         validation = validate_with_verapdf(output, flavour="3b")
         assert validation.compliant, validation.failed_rules

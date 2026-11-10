@@ -20,6 +20,7 @@ from .files import _is_filespec, _iter_name_tree_pairs
 logger = logging.getLogger(__name__)
 
 _THREAD = Name.Thread
+_TRAPPED = (Name("/True"), Name("/False"), Name.Unknown)
 _FILE_NAME_KEYS = ("/F", "/UF", "/DOS", "/Mac", "/Unix")
 
 
@@ -56,8 +57,8 @@ def _is_pdf_date(text: str) -> bool:
     return True
 
 
-def _check_date(owner, key: str) -> int | None:
-    """Validate a date entry, adding the D: prefix that ISO 32000-1 requires.
+def _pdf_date(value):
+    """Validate a date, adding the D: prefix that ISO 32000-1 requires.
 
     PDF Reference 1.7, 3.8.3 made the prefix optional ("The prefix D:, although
     also optional, is strongly recommended"), whereas ISO 32000-1, 7.9.4 states
@@ -69,9 +70,9 @@ def _check_date(owner, key: str) -> int | None:
     as the ASCII string of the same date, as DocInfo dates are written.
 
     Returns:
-        The number of repaired entries, or None if the value is not a PDF date.
+        The value itself if it is a canonical date, the repaired date string,
+        or None if the value is not a PDF date.
     """
-    value = owner[key]
     if not isinstance(value, String):
         return None
     text = str(value)
@@ -82,10 +83,9 @@ def _check_date(owner, key: str) -> int | None:
         return None
     canonical = text.encode("ascii")
     if bytes(value) == canonical:
-        return 0
-    owner[key] = String(canonical)
-    logger.warning("Rewrote navigation date %s as an ASCII string with D:", key)
-    return 1
+        return value
+    logger.warning("Rewrote a navigation date as an ASCII string with D:")
+    return String(canonical)
 
 
 def _remove_entry(owner, key: str) -> int:
@@ -114,82 +114,53 @@ def _first_visit(item, seen: set) -> bool:
     return True
 
 
-# The roles in which this module checks or edits a dictionary. Information
-# dictionaries (/I), collection items (/CI) and subitems are edited in place as
-# metadata, so none of them may also be an object of another role.
-_STRUCTURE = "structure"
-_DOCINFO = "document information"
-_THREAD_INFO = "thread information"
-_ITEM = "collection item"
-_SUBITEM = "collection subitem"
-# ISO 32000-1, Table 160 gives /I the syntax of DocInfo (14.3.3), whose
-# conversion keeps it valid as such, so the two may be one dictionary.
-_THREAD_INFO_ROLES = frozenset({_THREAD_INFO, _DOCINFO})
+# The result of a metadata dictionary that needs no change, while memoized.
+_UNCHANGED = object()
 
 
-def _object_roles(
-    pdf: Pdf, found: dict, actions: list
-) -> dict[tuple[int, int], set[str]]:
-    """Map each indirect dictionary to the roles in which this module uses it.
+def _copy_on_write(pdf: Pdf, original, memo: dict, context, sanitize):
+    """Sanitize a metadata dictionary without ever editing it.
 
-    Structural objects are the catalog and the dictionaries it names directly,
-    the pages, annotations and outline items, the actions, the valid threads and
-    their beads, the collection schema, its fields and its sort dictionary, and
-    the file specifications of the EmbeddedFiles name tree. Metadata objects are
-    the trailer /Info dictionary, the /I dictionaries of the valid threads, and
-    the items (/CI) of those file specifications with the dictionaries that the
-    items contain (subitems). Two metadata roles would edit a shared dictionary
-    by different rules, so each of their references is removed, as is the
-    reference of a metadata role to a structural object. The catalog and
-    collection objects are examined once each, the rest once per reference, so
-    the work stays linear in the size of the document.
+    Thread information (/I), collection items (/CI) and subitems are referred to
+    by reference, and a malformed file may make that reference any other object,
+    such as a page, its resources, a font, an annotation's appearance or a bead.
+    So the original is never changed: a dictionary that needs no change is kept
+    as it is, and otherwise a new dictionary of the retained entries, indirect if
+    the original is, replaces it at the reference. The original stays unchanged
+    in all of its other roles and is not written if nothing refers to it anymore.
+
+    Each indirect dictionary is sanitized once per context (role and field
+    type), and its references share the result, so the work stays linear in the
+    size of the document and shared metadata stays shared.
+
+    Args:
+        pdf: The document.
+        original: The referenced dictionary.
+        memo: The results of this role, by object id and context.
+        context: What the result depends on besides the dictionary.
+        sanitize: Called with the dictionary; returns the entries to retain and
+            whether they differ from its own, or None to remove the reference.
+
+    Returns:
+        The original itself if it is kept, its sanitized copy, or None.
     """
-    roles: dict[tuple[int, int], set[str]] = {}
-
-    def claim(role: str, objects) -> None:
-        for item in objects:
-            if isinstance(item, Dictionary) and item.objgen != (0, 0):
-                roles.setdefault(item.objgen, set()).add(role)
-
-    root = pdf.Root
-    claim(_STRUCTURE, [root, *(root[key] for key in root.keys())])
-    claim(_STRUCTURE, chain(_action_owners(pdf), actions))
-    collection = root.get("/Collection")
-    if isinstance(collection, Dictionary):
-        schema = collection.get("/Schema")
-        claim(_STRUCTURE, [schema, collection.get("/Sort")])
-        if isinstance(schema, Dictionary):
-            claim(_STRUCTURE, (schema[key] for key in schema.keys()))
-    for thread, members in found.values():
-        claim(_STRUCTURE, [thread])
-        claim(_THREAD_INFO, [thread.get("/I")])
-        for bead_id in members:
-            roles.setdefault(bead_id, set()).add(_STRUCTURE)
-    claim(_DOCINFO, [pdf.trailer.get("/Info")])
-    filespecs = [filespec for _, filespec in _embedded_files(pdf)]
-    claim(_STRUCTURE, filespecs)
-    items = [filespec.get("/CI") for filespec in filespecs]
-    claim(_ITEM, items)
-    # Only an item that is checked as one has subitems; the entries of an
-    # object that another role shares are left to that role.
-    seen = set()
-    for item in items:
-        if (
-            isinstance(item, Dictionary)
-            and not _has_other_role(item, roles, {_ITEM})
-            and _first_visit(item, seen)
-        ):
-            claim(_SUBITEM, (item[key] for key in item.keys()))
-    return roles
-
-
-def _has_other_role(value, roles: dict, own) -> bool:
-    """Check if an indirect dictionary also has a role other than its own ones.
-
-    Such a dictionary is not edited in its metadata role; the reference to it
-    is removed instead, leaving the object unchanged for its other role.
-    """
-    return value.objgen != (0, 0) and not roles.get(value.objgen, set()) <= own
+    key = (original.objgen, context)
+    indirect = original.objgen != (0, 0)
+    if indirect and key in memo:
+        result = memo[key]
+    else:
+        checked = sanitize(original)
+        if checked is None:
+            result = None
+        elif not checked[1]:
+            result = _UNCHANGED
+        else:
+            result = Dictionary(checked[0])
+            if indirect:
+                result = pdf.make_indirect(result)
+        if indirect:
+            memo[key] = result
+    return original if result is _UNCHANGED else result
 
 
 def _embedded_files(pdf: Pdf) -> list[tuple]:
@@ -209,42 +180,35 @@ def _embedded_files(pdf: Pdf) -> list[tuple]:
     ]
 
 
-def _check_item_value(item, key: str, subtype) -> int | None:
-    """Check a collection item value, or a subitem's data, against its field type.
+def _field_data(value, subtype):
+    """Check collection item or subitem data against the type of its field.
 
-    Returns the number of repaired dates, or None if the value is to be removed.
+    A text string needs a valid PDFDocEncoding or UTF-16BE encoding (7.9.2.2),
+    as retained DocInfo values do.
 
-    ISO 32000-1, Table 49 (and PDF Reference 1.7, Table 3.43) defines every entry
-    of a collection subitem dictionary, /D included, as optional with no default,
-    so a subitem with only a /P prefix, or none at all, is well formed. A subitem
-    whose /Type, /P or /D contradicts the field is removed as one item value.
-    A text string, the /P prefix included, needs a valid PDFDocEncoding or
-    UTF-16BE encoding (7.9.2.2), as retained DocInfo values do.
+    Returns:
+        The value itself if it is valid, a repaired date, or None.
     """
-    owner, value = item, item[key]
-    if isinstance(value, Dictionary):
-        if value.get("/Type") not in (None, Name.CollectionSubitem):
-            return None
-        if value.get("/P") is not None and not _is_pdf_text_string(value.P):
-            return None
-        owner, key = value, "/D"
-        if value.get("/D") is None:
-            return 0
-        value = value.D
     if subtype == Name.S:
-        return 0 if _is_pdf_text_string(value) else None
+        return value if _is_pdf_text_string(value) else None
     if subtype == Name.D:
-        return _check_date(owner, key)
+        return _pdf_date(value)
     valid = (
         subtype == Name.N
         and not isinstance(value, bool)
         and isinstance(value, (int, float, Decimal))
         and math.isfinite(value)
     )
-    return 0 if valid else None
+    return value if valid else None
 
 
-def _sanitize_collection_items(pdf: Pdf, schema, roles: dict) -> int:
+def _dropped(key: str) -> int:
+    """Count one malformed entry that a sanitized copy does not retain."""
+    logger.warning("Removed malformed navigation entry %s", key)
+    return 1
+
+
+def _sanitize_collection_items(pdf: Pdf, schema) -> int:
     """Remove malformed item entries, and values that the schema does not describe.
 
     Without a schema there is nothing to compare the values with. PDF/A does not
@@ -252,9 +216,8 @@ def _sanitize_collection_items(pdf: Pdf, schema, roles: dict) -> int:
     A schema left with no fields (Table 156 makes each of them optional) describes
     no values, so its items keep only their /Type. Only files of the EmbeddedFiles
     name tree belong to the collection (ISO 32000-1, 12.3.5), so the items of other
-    file specifications are not checked against its schema. A file specification
-    or item that several names share is checked once; the two roles are tracked
-    separately.
+    file specifications are not checked against its schema. A file specification,
+    item or subitem that several references share is checked once.
 
     ISO 32000-1, Table 157 lists only S, D and N as "the types of fields in the
     collection item or collection subitem dictionary". The field data of the
@@ -262,52 +225,94 @@ def _sanitize_collection_items(pdf: Pdf, schema, roles: dict) -> int:
     corresponding entry of the file specification or embedded file parameters,
     so an item value under such a field's key is not field data and is removed.
 
-    An item or subitem that is also an object of another role (_object_roles),
-    such as a file specification, the schema or one of its fields, a bead or the
-    DocInfo dictionary, is not checked as one: the reference to it is removed,
-    leaving the object unchanged.
+    ISO 32000-1, Table 49 (and PDF Reference 1.7, Table 3.43) defines every entry
+    of a collection subitem dictionary, /D included, as optional with no default,
+    so a subitem with only a /P prefix, or none at all, is well formed. A subitem
+    whose /Type, /P or /D contradicts the field is removed as one item value.
+
+    Items and subitems are sanitized by copy on write (_copy_on_write), so an
+    item that is also another object, such as the page resources or the DocInfo
+    dictionary, keeps that object unchanged.
     """
-    removed, seen_specs, seen_items = 0, set(), set()
+    removed, seen_specs, items, subitems = 0, set(), {}, {}
+
+    def subitem(original, subtype):
+        nonlocal removed
+        if original.get("/Type") not in (None, Name.CollectionSubitem):
+            return None
+        prefix = original.get("/P")
+        if prefix is not None and not _is_pdf_text_string(prefix):
+            return None
+        data = original.get("/D")
+        if data is None:
+            return {}, False
+        checked = _field_data(data, subtype)
+        if checked is None:
+            return None
+        if checked is data:
+            return {}, False
+        removed += 1
+        entries = {key: original[key] for key in original.keys()}
+        entries["/D"] = checked
+        return entries, True
+
+    def item(original):
+        nonlocal removed
+        entries, changed = {}, False
+        for key in original.keys():
+            value = original[key]
+            if key == "/Type":
+                kept = value if value == Name.CollectionItem else None
+            elif schema is None:
+                kept = value
+            else:
+                field = schema.get(key)
+                subtype = field.get("/Subtype") if field is not None else None
+                if subtype not in (Name.S, Name.D, Name.N):
+                    kept = None
+                elif isinstance(value, Dictionary):
+                    kept = _copy_on_write(
+                        pdf,
+                        value,
+                        subitems,
+                        subtype,
+                        lambda found, subtype=subtype: subitem(found, subtype),
+                    )
+                else:
+                    kept = _field_data(value, subtype)
+                    # A repaired date; a subitem counts its own repair once.
+                    if kept is not None and kept is not value:
+                        removed += 1
+            if kept is None:
+                removed += _dropped(key)
+                changed = True
+            else:
+                changed = changed or kept is not value
+                entries[key] = kept
+        return entries, changed
+
     for _, filespec in _embedded_files(pdf):
         if not _first_visit(filespec, seen_specs):
             continue
-        item = filespec.get("/CI")
-        if item is None:
+        original = filespec.get("/CI")
+        if original is None:
             continue
         # A file specification, here also one outside the name tree that is
         # typed as such (Table 44), is not a collection item (Table 155).
-        if (
-            not isinstance(item, Dictionary)
-            or item.get("/Type") == Name.Filespec
-            or _has_other_role(item, roles, {_ITEM})
-        ):
+        checked = (
+            _copy_on_write(pdf, original, items, None, item)
+            if isinstance(original, Dictionary)
+            and original.get("/Type") != Name.Filespec
+            else None
+        )
+        if checked is None:
             removed += _remove_entry(filespec, "/CI")
             continue
         # A file specification refers to its collection item indirectly.
-        if item.objgen == (0, 0):
-            item = pdf.make_indirect(item)
-            filespec["/CI"] = item
-        if not _first_visit(item, seen_items):
-            continue
-        removed += _optional_type(item, Name.CollectionItem)
-        if schema is None:
-            continue
-        for key in list(item.keys()):
-            if key == "/Type":
-                continue
-            field = schema.get(key)
-            subtype = field.get("/Subtype") if field is not None else None
-            value = item[key]
-            repaired = (
-                _check_item_value(item, key, subtype)
-                if subtype in (Name.S, Name.D, Name.N)
-                and not (
-                    isinstance(value, Dictionary)
-                    and _has_other_role(value, roles, {_SUBITEM})
-                )
-                else None
-            )
-            removed += _remove_entry(item, key) if repaired is None else repaired
+        if checked.objgen == (0, 0):
+            checked = pdf.make_indirect(checked)
+        if checked is not original:
+            filespec["/CI"] = checked
     return removed
 
 
@@ -329,7 +334,7 @@ def remove_dangling_collection_default(pdf: Pdf) -> int:
     return _remove_entry(collection, "/D")
 
 
-def _sanitize_collection(pdf: Pdf, roles: dict) -> int:
+def _sanitize_collection(pdf: Pdf) -> int:
     """Repair optional portfolio settings while preserving valid fields and sorting."""
     collection = pdf.Root.get("/Collection")
     if collection is None:
@@ -377,7 +382,7 @@ def _sanitize_collection(pdf: Pdf, roles: dict) -> int:
                 isinstance(order, bool) or not isinstance(order, int)
             ):
                 removed += _remove_entry(field, "/O")
-    removed += _sanitize_collection_items(pdf, schema, roles)
+    removed += _sanitize_collection_items(pdf, schema)
     sorting = collection.get("/Sort")
     if sorting is None:
         return removed
@@ -626,9 +631,7 @@ def _listed_bead_threads(pdf: Pdf):
                 bead = bead.get("/N")
 
 
-def _validate_threads(
-    pdf: Pdf,
-) -> tuple[dict, dict[tuple[int, int], tuple], list]:
+def _validate_threads(pdf: Pdf) -> tuple[dict, dict[tuple[int, int], tuple]]:
     """Validate bead cycles and page links without renumbering local Thread actions.
 
     Every thread of the catalog /Threads array must be valid. A thread that a
@@ -639,8 +642,7 @@ def _validate_threads(
     Returns:
         For each valid thread, in /Threads and discovery order: its dictionary
         and the ids of its beads. For each of their beads, in the same order and
-        then in reading order: its page and bead dictionary. The actions of the
-        document.
+        then in reading order: its page and bead dictionary.
     """
     threads = pdf.Root.get("/Threads")
     if threads is not None and not isinstance(threads, Array):
@@ -672,10 +674,10 @@ def _validate_threads(
             # The Thread actions that name this thread are removed later.
             continue
         add(thread, cycle)
-    return found, beads, actions
+    return found, beads
 
 
-def _sanitize_thread_info(threads: list, roles: dict) -> int:
+def _sanitize_thread_info(pdf: Pdf, threads: list) -> int:
     """Remove the thread information entries that DocInfo could not contain.
 
     ISO 32000-1, Table 160 gives /I the syntax of the document information
@@ -684,43 +686,50 @@ def _sanitize_thread_info(threads: list, roles: dict) -> int:
     is not a PDF date, a /Trapped value other than the three names, and a text
     string, standard or custom, whose encoding is invalid. A date lacking only the
     D: prefix gains it. An information dictionary that threads share is checked
-    once.
+    once, and they share its sanitized copy.
 
-    An /I dictionary that is also an object of another role (_object_roles),
-    such as a bead, a page or the collection schema, is not checked as one: the
-    /I entry is removed, leaving the object unchanged. Only DocInfo, whose
-    syntax /I has, may be the same dictionary.
+    The dictionary is sanitized by copy on write (_copy_on_write), so an /I
+    entry that refers to another object, such as a bead, the page resources, a
+    font or the DocInfo dictionary itself, leaves that object unchanged.
     """
-    removed, seen = 0, set()
-    for thread in threads:
-        info = thread.get("/I")
-        if info is None:
-            continue
-        if not isinstance(info, Dictionary) or _has_other_role(
-            info, roles, _THREAD_INFO_ROLES
-        ):
-            removed += _remove_entry(thread, "/I")
-            continue
-        if not _first_visit(info, seen):
-            continue
-        for key in list(info.keys()):
+    removed, memo = 0, {}
+
+    def sanitize(info):
+        nonlocal removed
+        entries, changed = {}, False
+        for key in info.keys():
             value = info.get(key)
             if value is None:
                 continue
             if key == "/Trapped":
-                valid = isinstance(value, Name) and value in (
-                    Name("/True"),
-                    Name("/False"),
-                    Name.Unknown,
-                )
+                kept = value if isinstance(value, Name) and value in _TRAPPED else None
             elif key in ("/CreationDate", "/ModDate"):
-                repaired = _check_date(info, key)
-                valid = repaired is not None
-                removed += repaired or 0
+                kept = _pdf_date(value)
             else:
-                valid = _is_pdf_text_string(value)
-            if not valid:
-                removed += _remove_entry(info, key)
+                kept = value if _is_pdf_text_string(value) else None
+            if kept is None:
+                removed += _dropped(key)
+                changed = True
+            else:
+                entries[key] = kept
+                if kept is not value:
+                    removed += 1
+                    changed = True
+        return entries, changed
+
+    for thread in threads:
+        info = thread.get("/I")
+        if info is None:
+            continue
+        checked = (
+            _copy_on_write(pdf, info, memo, None, sanitize)
+            if isinstance(info, Dictionary)
+            else None
+        )
+        if checked is None:
+            removed += _remove_entry(thread, "/I")
+        elif checked is not info:
+            thread.I = checked
     return removed
 
 
@@ -932,21 +941,20 @@ def sanitize_catalog_navigation(pdf: Pdf) -> int:
         Number of article structures repaired (an inline /Threads array, a page
         /B array, a Thread action without a valid destination or its invalid
         bead) and malformed thread information and collection entries removed,
-        all in place. An /I or /CI entry, or a subitem, that refers to an
-        object of another role is removed rather than that object edited.
+        all in place apart from thread information, collection items and
+        subitems, which are replaced by sanitized copies, so that no other
+        object they may also be is changed.
 
     Raises:
         ConversionError: If an article of the catalog /Threads array is malformed.
             Article validation precedes all edits and leaves thread destinations
             unchanged.
     """
-    found, beads, actions = _validate_threads(pdf)
-    # Roles are collected before any edit, so that no repair can hide one.
-    roles = _object_roles(pdf, found, actions)
+    found, beads = _validate_threads(pdf)
     return (
         _make_threads_indirect(pdf)
         + _repair_page_beads(pdf, beads)
-        + _sanitize_thread_info([thread for thread, _ in found.values()], roles)
+        + _sanitize_thread_info(pdf, [thread for thread, _ in found.values()])
         + _repair_thread_actions(pdf, found)
-        + _sanitize_collection(pdf, roles)
+        + _sanitize_collection(pdf)
     )
