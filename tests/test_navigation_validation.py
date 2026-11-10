@@ -1848,3 +1848,223 @@ def test_action_that_is_also_an_additional_actions_dictionary_is_checked():
     assert remove_forbidden_catalog_entries(pdf) == 1
     assert "/Next" not in shared
     assert pdf.Root.OpenAction.objgen == shared.objgen
+
+
+@pytest.mark.parametrize("target", [-1, -7])
+def test_thread_action_into_another_file_rejects_a_negative_index(target):
+    """Table 205: an integer /D indexes the other file's /Threads array."""
+    pdf = new_pdf()
+    pdf.add_blank_page()
+    pdf.Root.OpenAction = Dictionary(S=Name.Thread, F="other.pdf", D=target)
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert "/OpenAction" not in pdf.Root
+
+
+def _structures(pdf):
+    """Create a valid article, portfolio and DocInfo of indirect objects.
+
+    Returns the thread, the file specification and the objects, by role name,
+    that a thread information or collection item reference may alias.
+    """
+    thread, bead, page = _article(pdf)
+    specs = _two_file_portfolio(pdf)
+    field = pdf.make_indirect(Dictionary(Subtype=Name.S, N="Good"))
+    schema = pdf.make_indirect(Dictionary(Type=Name.CollectionSchema, Good=field))
+    sort = pdf.make_indirect(Dictionary(Type=Name.CollectionSort, S=Name.Good))
+    collection = pdf.make_indirect(
+        Dictionary(Type=Name.Collection, Schema=schema, Sort=sort, View=Name.D)
+    )
+    pdf.Root.Collection = collection
+    action = pdf.make_indirect(Dictionary(S=Name.Thread, D=thread))
+    annotation = _link(pdf, pdf.pages[1], A=action)
+    pdf.trailer.Info = pdf.make_indirect(Dictionary(Title="Document"))
+    item = pdf.make_indirect(Dictionary(Type=Name.CollectionItem, Good="keep"))
+    specs[1].CI = item
+    targets = {
+        "bead": bead,
+        "thread": thread,
+        "page": page.obj,
+        "schema": schema,
+        "field": field,
+        "collection": collection,
+        "sort": sort,
+        "filespec": specs[1],
+        "catalog": pdf.Root,
+        "docinfo": pdf.trailer.Info,
+        "action": action,
+        "annotation": annotation,
+        "item": item,
+        "info": pdf.make_indirect(Dictionary(Title="Article")),
+    }
+    thread.I = targets["info"]
+    return thread, specs[0], targets
+
+
+def _snapshot(pdf, owner):
+    """Serialize every object but the owner, so that any other edit is detected."""
+    return [
+        bytes(item.unparse(resolved=True))
+        for item in pdf.objects
+        if item is not None and item.objgen != owner.objgen
+    ]
+
+
+def test_alias_fixture_is_valid():
+    """Without an alias, nothing in the fixture needs a repair."""
+    pdf = new_pdf()
+    _structures(pdf)
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "bead",
+        "thread",
+        "page",
+        "schema",
+        "field",
+        "collection",
+        "sort",
+        "filespec",
+        "catalog",
+        "action",
+        "annotation",
+    ],
+)
+def test_thread_information_aliasing_another_role_is_detached(target):
+    """A dictionary with another role is never sanitized as thread information.
+
+    Checking it as one would remove the entries of that role, such as the /T,
+    /N, /V, /P and /R links of a bead, so the /I reference is removed instead.
+    """
+    pdf = new_pdf()
+    thread, _, targets = _structures(pdf)
+    thread.I = targets[target]
+    before = _snapshot(pdf, thread)
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert "/I" not in thread
+    assert _snapshot(pdf, thread) == before
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+def test_thread_information_may_be_the_document_information():
+    """/I has the syntax of DocInfo (Table 160), so the two may be one object."""
+    pdf = new_pdf()
+    thread, _, targets = _structures(pdf)
+    thread.I = targets["docinfo"]
+    targets["docinfo"].ModDate = "20240101"
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert thread.I.objgen == targets["docinfo"].objgen
+    assert str(thread.I.ModDate) == "D:20240101"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "schema",
+        "field",
+        "collection",
+        "sort",
+        "bead",
+        "thread",
+        "page",
+        "catalog",
+        "docinfo",
+        "filespec",
+        "action",
+        "annotation",
+    ],
+)
+def test_collection_item_aliasing_another_role_is_detached(target):
+    """A dictionary with another role is never sanitized as a collection item.
+
+    Checking it as one would remove its /Type and every entry that the schema
+    does not describe, so the /CI reference is removed instead.
+    """
+    pdf = new_pdf()
+    _, spec, targets = _structures(pdf)
+    spec.CI = targets[target]
+    before = _snapshot(pdf, spec)
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert "/CI" not in spec
+    assert _snapshot(pdf, spec) == before
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+@pytest.mark.parametrize("target", ["docinfo", "bead", "page", "thread", "schema"])
+def test_collection_subitem_aliasing_another_role_is_removed(target):
+    """A subitem date is not rewritten in a dictionary that has another role."""
+    pdf = new_pdf()
+    _, spec, targets = _structures(pdf)
+    pdf.Root.Collection.Schema.Sent = Dictionary(Subtype=Name.D, N="Sent")
+    targets["info"].D = targets["docinfo"].D = "20240101"
+    spec.CI = pdf.make_indirect(Dictionary(Good="keep", Sent=targets[target]))
+    before = _snapshot(pdf, spec.CI)
+    assert remove_forbidden_catalog_entries(pdf) == 1
+    assert sorted(spec.CI.keys()) == ["/Good"]
+    assert _snapshot(pdf, spec.CI) == before
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+@pytest.mark.parametrize(
+    "alias", ["/I to item", "/CI to /I", "subitem to /I", "subitem to item"]
+)
+def test_dictionary_of_two_metadata_roles_is_detached_from_both(alias):
+    """Thread information, items and subitems are checked by different rules.
+
+    Neither role may edit the dictionary that both refer to, so each reference
+    to it is removed, and the dictionary itself is left unchanged.
+    """
+    pdf = new_pdf()
+    thread, spec, targets = _structures(pdf)
+    pdf.Root.Collection.Schema.Sent = Dictionary(Subtype=Name.D, N="Sent")
+    info, item = targets["info"], targets["item"]
+    info.D = "20240101"
+    if alias == "/I to item":
+        thread.I = shared = item
+    elif alias == "/CI to /I":
+        spec.CI = shared = info
+    else:
+        shared = info if alias == "subitem to /I" else item
+        spec.CI = pdf.make_indirect(Dictionary(Good="keep", Sent=shared))
+    before = bytes(shared.unparse(resolved=True))
+    assert remove_forbidden_catalog_entries(pdf) == 2
+    assert bytes(shared.unparse(resolved=True)) == before
+    references = [thread.get("/I"), spec.get("/CI"), targets["filespec"].get("/CI")]
+    if isinstance(spec.get("/CI"), Dictionary):
+        references.append(spec.CI.get("/Sent"))
+    assert all(ref is None or ref.objgen != shared.objgen for ref in references)
+    assert remove_forbidden_catalog_entries(pdf) == 0
+
+
+def test_conversion_detaches_aliased_thread_information_and_items(tmp_path):
+    """The converted article and portfolio stay valid and pass veraPDF."""
+    from pikepdf import Pdf
+
+    from pdftopdfa.verapdf import is_verapdf_available, validate_with_verapdf
+
+    pdf = new_pdf()
+    thread, spec, targets = _structures(pdf)
+    thread.I = targets["bead"]
+    spec.CI = targets["schema"]
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    pdf.save(source)
+    result = convert_to_pdfa(source, output, level="3b")
+    assert result.target_produced and not result.skipped, result
+    with Pdf.open(output) as converted:
+        written = converted.Root.Threads[0]
+        bead = written.F
+        assert "/I" not in written
+        assert sorted(bead.keys()) == ["/N", "/P", "/R", "/T", "/V"]
+        assert bead.T.objgen == written.objgen and bead.N.objgen == bead.objgen
+        assert [item.objgen for item in bead.P.B] == [bead.objgen]
+        first = converted.Root.Names.EmbeddedFiles.Names[1]
+        assert "/CI" not in first
+        schema = converted.Root.Collection.Schema
+        assert schema.Type == Name.CollectionSchema
+        assert str(schema.Good.N) == "Good"
+        assert sorted(converted.Root.Collection.Sort.keys()) == ["/S", "/Type"]
+    if is_verapdf_available():
+        validation = validate_with_verapdf(output, flavour="3b")
+        assert validation.compliant, validation.failed_rules
