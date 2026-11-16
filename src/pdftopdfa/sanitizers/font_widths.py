@@ -17,6 +17,7 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
 from ..fonts.analysis import is_symbolic_font
+from ..fonts.glyph_mapping import resolve_mac_roman_cmap_glyph
 from ..fonts.glyph_usage import (
     CharacterCode,
     FontUsageCache,
@@ -34,7 +35,6 @@ from ..fonts.tounicode import (
     parse_type1_font_program,
 )
 from ..fonts.traversal import iter_acroform_dr_fonts, iter_all_page_fonts
-from ..fonts.utils import get_any_cmap as _get_any_cmap
 from ..fonts.utils import get_truetype_byte_encoding
 from ..fonts.utils import safe_str as _safe_str
 from ..utils import log_suppressed_error
@@ -68,19 +68,41 @@ def _scaled_width(advance_width: int | float, units_per_em: int) -> float:
 def _compute_exact_widths_for_encoding(
     tt_font,
     code_to_unicode: dict[int, int],
+    *,
+    resolve_mac_roman_names: bool = False,
 ) -> dict[int, float]:
-    """Computes exact scaled glyph widths for a code-to-Unicode mapping."""
+    """Computes exact scaled glyph widths for a code-to-Unicode mapping.
+
+    Unicode values are only looked up in Unicode cmaps.  With
+    ``resolve_mac_roman_names`` (non-symbolic TrueType fonts), a code not
+    found there is resolved as in ISO 32000-1, 9.6.6.4 and veraPDF: its
+    glyph name is mapped to the Mac OS Roman code that keys the (1,0) cmap.
+    Looking a (1,0) cmap up by Unicode value selects another glyph above
+    0x7F, e.g. ``germandbls`` at 0xA7 instead of ``section`` (U+00A7).
+    Remaining codes fall back to the font's byte cmap.
+    """
     head = tt_font["head"]
     hmtx = tt_font["hmtx"]
-    cmap = _get_any_cmap(tt_font)
-    if not cmap:
-        return {}
+    try:
+        unicode_cmap = tt_font.getBestCmap() or {}
+    except KeyError:
+        unicode_cmap = {}
     byte_encoding = get_truetype_byte_encoding(tt_font)
     byte_mapping = byte_encoding[2] if byte_encoding is not None else {}
+    if resolve_mac_roman_names:
+        from ..fonts.subsetter import _get_uv2agl
+
+        uv2agl = _get_uv2agl()
+    else:
+        uv2agl = {}
 
     result: dict[int, float] = {}
     for code, unicode_val in code_to_unicode.items():
-        glyph_name = cmap.get(unicode_val) or byte_mapping.get(code)
+        glyph_name = unicode_cmap.get(unicode_val)
+        if not glyph_name and unicode_val in uv2agl:
+            glyph_name = resolve_mac_roman_cmap_glyph(tt_font, uv2agl[unicode_val])
+        if not glyph_name:
+            glyph_name = byte_mapping.get(code)
         if glyph_name and glyph_name in hmtx.metrics:
             result[code] = _scaled_width(hmtx.metrics[glyph_name][0], head.unitsPerEm)
 
@@ -1076,7 +1098,14 @@ def _fix_simple_font_widths(font: pikepdf.Object, font_name: str) -> bool:
         # is available.  veraPDF compares /Widths against the exact scaled
         # font-program width, not against our rounded replacement value.
         expected = (
-            _compute_exact_widths_for_encoding(tt_font, code_to_unicode)
+            _compute_exact_widths_for_encoding(
+                tt_font,
+                code_to_unicode,
+                resolve_mac_roman_names=(
+                    _safe_str(font.get("/Subtype") or "") == "/TrueType"
+                    and not is_symbolic_font(font)
+                ),
+            )
             if code_to_unicode is not None
             else {}
         )
