@@ -2195,6 +2195,93 @@ class TestSymbolicTrueTypeWithoutEncoding:
         )
 
 
+def _make_mac_roman_only_ttfont() -> bytes:
+    """Creates a non-symbolic TrueType font whose only cmap is Mac Roman (1,0).
+
+    The (1,0) cmap is keyed by Mac OS Roman codes: ``section`` (U+00A7)
+    sits at 0xA4, while 0xA7 is ``germandbls``.
+    """
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.ttLib.tables._c_m_a_p import CmapSubtable, table__c_m_a_p
+    from fontTools.ttLib.tables._g_l_y_f import Glyph
+
+    glyph_widths = {
+        ".notdef": 500,
+        "space": 250,
+        "section": 636,
+        "germandbls": 620,
+    }
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder(list(glyph_widths))
+    fb.setupCharacterMap({0x20: "space", 0xA7: "section", 0xDF: "germandbls"})
+    fb.setupGlyf({name: Glyph() for name in glyph_widths})
+    fb.setupHorizontalMetrics(
+        {name: (width, 0) for name, width in glyph_widths.items()}
+    )
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({"familyName": "TestMacRoman", "styleName": "Regular"})
+    fb.setupOS2(sTypoAscender=800, sTypoDescender=-200, sCapHeight=700)
+    fb.setupPost()
+    fb.setupHead(unitsPerEm=1000)
+
+    tt = fb.font
+    subtable10 = CmapSubtable.newSubtable(6)
+    subtable10.platformID = 1
+    subtable10.platEncID = 0
+    subtable10.language = 0
+    subtable10.cmap = {0x20: "space", 0xA4: "section", 0xA7: "germandbls"}
+    cmap_table = table__c_m_a_p()
+    cmap_table.tableVersion = 0
+    cmap_table.tables = [subtable10]
+    tt["cmap"] = cmap_table
+
+    buf = BytesIO()
+    tt.save(buf)
+    tt.close()
+    return buf.getvalue()
+
+
+class TestMacRomanCmapWidths:
+    """Tests for non-symbolic TrueType fonts with only a (1,0) cmap."""
+
+    @pytest.mark.parametrize(
+        ("encoding", "code"),
+        [("/MacRomanEncoding", 0xA4), ("/WinAnsiEncoding", 0xA7)],
+    )
+    @pytest.mark.parametrize("declared", [636, 999])
+    def test_glyph_resolved_through_mac_roman_code(
+        self,
+        encoding: str,
+        code: int,
+        declared: int,
+    ) -> None:
+        """Codes resolve by glyph name to the Mac OS Roman code of the cmap.
+
+        Both codes select ``section`` (U+00A7). Looking U+00A7 up in the
+        (1,0) cmap directly hits 0xA7 ``germandbls`` and writes its width
+        620, which veraPDF reports under rule 6.2.11.5.
+        """
+        pdf = new_pdf()
+        widths = [250] * (code - 31)
+        widths[-1] = declared
+        font = _make_simple_font_with_widths(
+            pdf,
+            widths=widths,
+            first_char=32,
+            last_char=code,
+            encoding=encoding,
+            font_data=_make_mac_roman_only_ttfont(),
+        )
+        _build_pdf_with_font(pdf, font)
+        pdf = _roundtrip(pdf)
+
+        sanitize_font_widths(pdf)
+
+        font_obj = resolve(pdf.pages[0].Resources.Font["/F1"])
+        corrected = [int(w) for w in resolve(font_obj.Widths)]
+        assert corrected[-1] == 636
+
+
 def _make_ttfont_with_empty_nbsp_glyphs() -> bytes:
     """Creates a TrueType font whose U+00A0/U+00AD glyphs have zero width.
 
