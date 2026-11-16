@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.1] - 2026-11-16
+
+### Bug Fixes
+
+- Resolve Mac Roman cmap glyphs by name when checking font widths, so correct `/Widths` of non-symbolic TrueType fonts are no longer replaced with wrong values
+
 ## [0.10.0] - 2026-11-10
 
 ### Features
